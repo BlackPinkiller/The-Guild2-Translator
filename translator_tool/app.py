@@ -81,7 +81,7 @@ TYPING_GROUP_DELAY_MS = 750
 class UnitTableModel(QAbstractTableModel):
     FILE, ID, LABEL, FIELD, SOURCE, TRANSLATION, STATUS, FORMAT, AI = range(9)
     HEADERS = ("文件", "ID", "标签 / Key", "字段", "原文", "译文", "状态", "格式", "AI")
-    WIDTHS = (145, 68, 210, 90, 280, 280, 88, 72, 52)
+    WIDTHS = (145, 68, 210, 90, 280, 280, 88, 72, 66)
 
     def __init__(self, project: Project | None = None) -> None:
         super().__init__()
@@ -121,6 +121,8 @@ class UnitTableModel(QAbstractTableModel):
                 return unit.source_text
             if index.column() == self.TRANSLATION:
                 return unit.current_text
+            if index.column() == self.AI:
+                return "左键：翻译当前条目\n右键：切换 Google Translate / OpenAI 兼容 LLM"
         if role == Qt.ItemDataRole.BackgroundRole:
             colors = {
                 STATUS_MISSING_ROW: "#fff6dc",
@@ -178,14 +180,17 @@ class UnitFilterProxyModel(QSortFilterProxyModel):
         self.status_filter = "待翻译"
         self.only_missing = True
         self.query = ""
-        self.setDynamicSortFilter(True)
+        # Source order is meaningful for this project. Disabling proxy sorting avoids a
+        # multi-second re-sort when the user reveals all 17k+ translation units.
+        self.setDynamicSortFilter(False)
 
     def set_filters(self, *, file_filter: str, status_filter: str, only_missing: bool, query: str) -> None:
         self.file_filter = file_filter
         self.status_filter = status_filter
         self.only_missing = only_missing
         self.query = query.strip().lower()
-        self.invalidateFilter()
+        self.beginFilterChange()
+        self.endFilterChange(QSortFilterProxyModel.Direction.Rows)
 
     def filterAcceptsRow(self, source_row: int, source_parent: QModelIndex) -> bool:  # noqa: N802
         source = self.sourceModel()
@@ -209,24 +214,55 @@ class UnitFilterProxyModel(QSortFilterProxyModel):
 class AiButtonDelegate(QStyledItemDelegate):
     translate_requested = Signal(str)
 
+    def __init__(self, parent: QWidget | None = None, provider: str = "google") -> None:
+        super().__init__(parent)
+        self.provider = provider
+        self._pressed_uid = ""
+
+    def set_provider(self, provider: str) -> None:
+        self.provider = provider
+        if self.parent():
+            self.parent().viewport().update()
+
     def paint(self, painter: QPainter, option: QStyleOptionViewItem, index: QModelIndex) -> None:
+        uid = str(index.data(Qt.ItemDataRole.UserRole) or "")
+        pressed = uid == self._pressed_uid
         painter.save()
-        rect = option.rect.adjusted(6, 6, -6, -6)
+        rect = option.rect.adjusted(7, 6, -7, -6)
+        if pressed:
+            rect.translate(2, 3)
         painter.setRenderHint(QPainter.RenderHint.Antialiasing)
-        painter.setPen(QColor("#2563eb"))
-        painter.setBrush(QColor("#e8f0ff"))
-        painter.drawRoundedRect(rect, 7, 7)
-        painter.setPen(QColor("#1d4ed8"))
+        if not pressed:
+            painter.setPen(Qt.PenStyle.NoPen)
+            painter.setBrush(QColor("#171717"))
+            painter.drawRoundedRect(rect.translated(3, 3), 4, 4)
+        fill = QColor("#ffe600") if self.provider == "google" else QColor("#ff4f98")
+        if pressed:
+            fill = fill.darker(115)
+        painter.setPen(QPen(QColor("#171717"), 2))
+        painter.setBrush(fill)
+        painter.drawRoundedRect(rect, 4, 4)
+        painter.setPen(QColor("#171717"))
         font = painter.font()
         font.setBold(True)
+        font.setPointSize(max(8, font.pointSize() - 1))
         painter.setFont(font)
-        painter.drawText(rect, Qt.AlignmentFlag.AlignCenter, "AI")
+        painter.drawText(rect, Qt.AlignmentFlag.AlignCenter, "GO!" if self.provider == "google" else "LLM")
         painter.restore()
 
     def editorEvent(self, event, model, option: QStyleOptionViewItem, index: QModelIndex) -> bool:  # noqa: N802
-        if event.type() == QEvent.Type.MouseButtonRelease and option.rect.contains(event.pos()):
-            uid = index.data(Qt.ItemDataRole.UserRole)
-            if uid:
+        uid = str(index.data(Qt.ItemDataRole.UserRole) or "")
+        if event.type() == QEvent.Type.MouseButtonPress and event.button() == Qt.MouseButton.LeftButton:
+            self._pressed_uid = uid
+            if self.parent():
+                self.parent().viewport().update(option.rect)
+            return True
+        if event.type() == QEvent.Type.MouseButtonRelease and event.button() == Qt.MouseButton.LeftButton:
+            was_pressed = self._pressed_uid == uid
+            self._pressed_uid = ""
+            if self.parent():
+                self.parent().viewport().update(option.rect)
+            if was_pressed and option.rect.contains(event.position().toPoint()) and uid:
                 self.translate_requested.emit(uid)
                 return True
         return super().editorEvent(event, model, option, index)
@@ -237,6 +273,7 @@ class BatchTranslateButton(QPushButton):
 
     def __init__(self, parent: QWidget | None = None) -> None:
         super().__init__("AI 批量翻译", parent)
+        self.setObjectName("batchAi")
         self.setMinimumWidth(118)
         self._busy = False
         self._hovering = False
@@ -289,7 +326,7 @@ class BatchTranslateButton(QPushButton):
             return
         painter = QPainter(self)
         painter.setRenderHint(QPainter.RenderHint.Antialiasing)
-        pen = QPen(QColor("#1d4ed8"), 2)
+        pen = QPen(QColor("#171717"), 2)
         pen.setCapStyle(Qt.PenCapStyle.RoundCap)
         painter.setPen(pen)
         spinner_rect = QRectF(10, (self.height() - 14) / 2, 14, 14)
@@ -304,16 +341,24 @@ class BatchTranslateButton(QPushButton):
         if not self._busy:
             self.setText("AI 批量翻译")
             self.setToolTip("翻译当前筛选的未译条目")
+            mode = "idle"
         elif self._cancelling:
             self.setText("正在取消…")
             self.setToolTip("正在停止剩余翻译请求")
+            mode = "cancelling"
         elif self._hovering:
             self.setText("取消  ×")
             self.setToolTip("点击取消当前批量翻译")
+            mode = "cancel"
         else:
             progress = f" {self._current}/{self._total}" if self._total else ""
             self.setText(f"翻译中…{progress}")
             self.setToolTip("批量翻译进行中；悬浮后点击可取消")
+            mode = "busy"
+        if self.property("mode") != mode:
+            self.setProperty("mode", mode)
+            self.style().unpolish(self)
+            self.style().polish(self)
         self.update()
 
 
@@ -600,7 +645,9 @@ class TranslatorWindow(QMainWindow):
         self.table.setSelectionBehavior(QTableView.SelectionBehavior.SelectRows)
         self.table.setSelectionMode(QTableView.SelectionMode.SingleSelection)
         self.table.setAlternatingRowColors(False)
-        self.table.setSortingEnabled(True)
+        # Keeping source order is both clearer for translators and dramatically faster
+        # when switching the filter from pending entries to the full project.
+        self.table.setSortingEnabled(False)
         self.table.setWordWrap(False)
         self.table.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
         self.table.customContextMenuRequested.connect(self._show_table_menu)
@@ -612,7 +659,7 @@ class TranslatorWindow(QMainWindow):
             self.table.setColumnWidth(column, width)
         self.table.horizontalHeader().setSectionResizeMode(UnitTableModel.SOURCE, QHeaderView.ResizeMode.Stretch)
         self.table.horizontalHeader().setSectionResizeMode(UnitTableModel.TRANSLATION, QHeaderView.ResizeMode.Stretch)
-        self.ai_delegate = AiButtonDelegate(self.table)
+        self.ai_delegate = AiButtonDelegate(self.table, self.settings.provider)
         self.ai_delegate.translate_requested.connect(self.translate_one_unit)
         self.table.setItemDelegateForColumn(UnitTableModel.AI, self.ai_delegate)
         table_layout.addWidget(self.table)
@@ -806,6 +853,9 @@ class TranslatorWindow(QMainWindow):
         if unit is None:
             return
         self.table.setCurrentIndex(index)
+        if index.column() == UnitTableModel.AI:
+            self._show_ai_provider_menu(self.table.viewport().mapToGlobal(point))
+            return
         menu = QMenu(self)
         restore = menu.addAction("恢复载入时的译文")
         source = menu.addAction("还原为原文")
@@ -827,9 +877,36 @@ class TranslatorWindow(QMainWindow):
             return
         self.project.set_unit_ignored(unit, ignored)
         self.model.refresh_unit(unit)
-        self.proxy.invalidateFilter()
+        self._apply_filters()
         self._update_issue_detail(unit)
-        self._update_counts()
+
+    def _show_ai_provider_menu(self, global_point: QPoint) -> None:
+        menu = QMenu(self)
+        menu.setTitle("AI 翻译服务")
+        google = menu.addAction("⚡ Google Translate（公共免费端点）")
+        google.setCheckable(True)
+        google.setChecked(self.settings.provider != "openai")
+        openai = menu.addAction("✦ OpenAI 兼容 LLM")
+        openai.setCheckable(True)
+        openai.setChecked(self.settings.provider == "openai")
+        menu.addSeparator()
+        settings_action = menu.addAction("打开 AI 设置…")
+        action = menu.exec(global_point)
+        if action == google:
+            self._set_ai_provider("google")
+        elif action == openai:
+            self._set_ai_provider("openai")
+        elif action == settings_action:
+            self.show_settings()
+
+    def _set_ai_provider(self, provider: str) -> None:
+        if self.settings.provider == provider:
+            return
+        self.settings = replace(self.settings, provider=provider)
+        save_settings(self.settings)
+        self.ai_delegate.set_provider(provider)
+        name = "Google Translate" if provider == "google" else "OpenAI 兼容 LLM"
+        self.statusBar().showMessage(f"AI 翻译服务已切换为：{name}", 3500)
 
     def translate_one_unit(self, uid: str) -> None:
         self._commit_typing_operation()
@@ -989,6 +1066,7 @@ class TranslatorWindow(QMainWindow):
             return
         self.settings = dialog.result_settings()
         save_settings(self.settings)
+        self.ai_delegate.set_provider(self.settings.provider)
         try:
             self.git.ensure_repository(self.settings)
         except GitError as exc:
@@ -1050,33 +1128,46 @@ def _text_format(color: str, underline: bool = False) -> QTextCharFormat:
 def apply_modern_style(app: QApplication) -> None:
     app.setStyle("Fusion")
     palette = app.palette()
-    palette.setColor(QPalette.ColorRole.Window, QColor("#f5f7fb"))
-    palette.setColor(QPalette.ColorRole.Base, QColor("#ffffff"))
-    palette.setColor(QPalette.ColorRole.AlternateBase, QColor("#f7f9fc"))
-    palette.setColor(QPalette.ColorRole.Text, QColor("#172033"))
-    palette.setColor(QPalette.ColorRole.Button, QColor("#ffffff"))
-    palette.setColor(QPalette.ColorRole.Highlight, QColor("#dbeafe"))
-    palette.setColor(QPalette.ColorRole.HighlightedText, QColor("#172033"))
+    palette.setColor(QPalette.ColorRole.Window, QColor("#ffe66d"))
+    palette.setColor(QPalette.ColorRole.Base, QColor("#fffdf6"))
+    palette.setColor(QPalette.ColorRole.AlternateBase, QColor("#fff2bf"))
+    palette.setColor(QPalette.ColorRole.Text, QColor("#171717"))
+    palette.setColor(QPalette.ColorRole.Button, QColor("#ffe600"))
+    palette.setColor(QPalette.ColorRole.Highlight, QColor("#21d4e6"))
+    palette.setColor(QPalette.ColorRole.HighlightedText, QColor("#171717"))
     app.setPalette(palette)
     app.setStyleSheet(
         """
-        QWidget { color: #172033; font-size: 13px; }
-        QMainWindow { background: #f5f7fb; }
-        #toolbar { background: #ffffff; border: 1px solid #e4e8f0; border-radius: 10px; }
-        #counts { color: #536176; font-weight: 600; padding: 1px 4px; }
-        #issues { background: #ffffff; border: 1px solid #e4e8f0; border-radius: 8px; padding: 8px 10px; color: #4a586d; }
-        #hint { color: #637187; padding: 4px 0; }
-        QGroupBox { background: #ffffff; border: 1px solid #e4e8f0; border-radius: 9px; margin-top: 8px; font-weight: 700; color: #34425a; }
-        QGroupBox::title { left: 10px; padding: 0 4px; }
-        QTableView { background: #ffffff; border: 1px solid #e4e8f0; border-radius: 9px; gridline-color: #edf0f5; selection-background-color: #dbeafe; selection-color: #172033; }
-        QHeaderView::section { background: #f8fafc; color: #56647a; border: 0; border-bottom: 1px solid #e4e8f0; padding: 8px; font-weight: 700; }
-        QPlainTextEdit { background: #ffffff; border: 0; padding: 8px; selection-background-color: #bfdbfe; }
-        QLineEdit, QComboBox { background: #ffffff; border: 1px solid #dbe1ea; border-radius: 6px; padding: 5px 7px; min-height: 20px; }
-        QPushButton, QToolButton { background: #ffffff; border: 1px solid #dbe1ea; border-radius: 6px; padding: 6px 10px; }
-        QPushButton:hover, QToolButton:hover { background: #f3f6fb; border-color: #b8c7dd; }
-        QPushButton#primary { background: #2563eb; color: white; border-color: #2563eb; font-weight: 700; }
-        QPushButton#primary:hover { background: #1d4ed8; }
-        QStatusBar { color: #5f6d82; }
+        QWidget { color: #171717; font-family: "Segoe UI", "Microsoft YaHei UI"; font-size: 13px; }
+        QMainWindow, #root { background: #ffe66d; }
+        #toolbar { background: #21d4e6; border: 3px solid #171717; border-radius: 10px; }
+        #toolbar QLabel { font-weight: 800; }
+        #counts { background: #fffdf6; border: 2px solid #171717; border-radius: 6px; color: #171717; font-weight: 800; padding: 5px 8px; }
+        #issues { background: #ff94c2; border: 3px solid #171717; border-radius: 7px; padding: 8px 10px; color: #171717; font-weight: 600; }
+        #hint { color: #171717; padding: 4px 0; font-weight: 600; }
+        QGroupBox { background: #fffdf6; border: 3px solid #171717; border-radius: 8px; margin-top: 11px; font-weight: 900; color: #171717; }
+        QGroupBox::title { left: 10px; padding: 0 6px; background: #fffdf6; }
+        QTableView { background: #fffdf6; border: 3px solid #171717; border-radius: 8px; gridline-color: #171717; selection-background-color: #21d4e6; selection-color: #171717; }
+        QTableView::item { border-bottom: 1px solid #e5d796; padding: 2px 4px; }
+        QTableView::item:selected { background: #21d4e6; color: #171717; }
+        QHeaderView::section { background: #ff4f98; color: #171717; border: 0; border-right: 2px solid #171717; border-bottom: 3px solid #171717; padding: 8px; font-weight: 900; }
+        QPlainTextEdit { background: #fffdf6; border: 0; padding: 8px; selection-background-color: #21d4e6; selection-color: #171717; }
+        QLineEdit, QComboBox { background: #fffdf6; border: 2px solid #171717; border-radius: 5px; padding: 5px 7px; min-height: 20px; font-weight: 600; }
+        QLineEdit:focus, QComboBox:focus { border: 3px solid #ff4f98; }
+        QComboBox QAbstractItemView { background: #fffdf6; border: 2px solid #171717; selection-background-color: #21d4e6; selection-color: #171717; }
+        QPushButton, QToolButton { background: #ffe600; color: #171717; border: 2px solid #171717; border-bottom: 5px solid #171717; border-radius: 5px; padding: 5px 10px 3px 10px; font-weight: 900; }
+        QPushButton:hover, QToolButton:hover { background: #fffdf6; }
+        QPushButton:pressed, QToolButton:pressed { border-top: 5px solid #171717; border-bottom: 2px solid #171717; padding: 8px 8px 2px 12px; }
+        QPushButton#primary { background: #ff4f98; color: #171717; }
+        QPushButton#primary:hover { background: #ff7caf; }
+        QPushButton#batchAi[mode="busy"] { background: #21d4e6; }
+        QPushButton#batchAi[mode="cancel"] { background: #ff5656; color: #fffdf6; }
+        QPushButton#batchAi[mode="cancelling"] { background: #ff9f1c; }
+        QMenu { background: #fffdf6; border: 3px solid #171717; padding: 4px; }
+        QMenu::item { padding: 7px 22px 7px 10px; font-weight: 700; }
+        QMenu::item:selected { background: #21d4e6; color: #171717; }
+        QToolTip { background: #171717; color: #fffdf6; border: 2px solid #ffe600; padding: 5px; font-weight: 700; }
+        QStatusBar { background: #ffe66d; color: #171717; font-weight: 700; }
         """
     )
 
