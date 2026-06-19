@@ -28,6 +28,7 @@ STATUS_EXTRA = "译文多余"
 STATUS_TRANSLATION_ONLY = "仅译文文件"
 STATUS_IGNORED = "无需翻译"
 MISSING_WORK_STATUSES = {STATUS_MISSING_ROW, STATUS_EMPTY, STATUS_SAME}
+NON_TRANSLATION_DBT_FILES = {"tables.dbt"}
 
 
 class ProjectError(RuntimeError):
@@ -132,6 +133,8 @@ class Project:
 
         source_docs: dict[str, DbtDocument] = {}
         for path in sorted(languages_root.glob("*.dbt")):
+            if path.name.lower() in NON_TRANSLATION_DBT_FILES:
+                continue
             source_docs[path.name] = load_dbt(path)
 
         source_text_docs: dict[str, PlainTextDocument] = {}
@@ -147,6 +150,8 @@ class Project:
 
         target_dbt_docs: dict[str, DbtDocument] = {}
         for path in sorted(language_root.glob("*.dbt")):
+            if path.name.lower() in NON_TRANSLATION_DBT_FILES:
+                continue
             target_dbt_docs[path.name] = load_dbt(path)
 
         target_text_docs: dict[str, PlainTextDocument] = {}

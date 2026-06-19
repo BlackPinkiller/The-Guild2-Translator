@@ -16,6 +16,7 @@ from .project import (
     SaveValidationError,
 )
 from .settings import AppSettings
+from .validation import validate_translation
 
 
 def project_root() -> Path:
@@ -45,6 +46,8 @@ def assert_statuses(root: Path) -> None:
         raise AssertionError("missing-work filter would be empty")
     if not any(unit.file_rel == "Guides/StartPage.txt" and unit.source_text for unit in project.units):
         raise AssertionError("Guides source files were not matched to translated Guides")
+    if any(unit.file_rel == "Tables.dbt" for unit in project.units):
+        raise AssertionError("Tables.dbt must not be exposed as a translation unit")
 
 
 def copy_project_subset(src_root: Path, dst_root: Path) -> None:
@@ -167,6 +170,12 @@ def assert_ai_token_protection() -> None:
     raise AssertionError("AI result missing a protected token was accepted")
 
 
+def assert_linebreak_format_is_ignored() -> None:
+    issues = validate_translation("First$NSecond", "First Second", dbt_field=True)
+    if any(issue.blocks_save and "$N" in issue.message for issue in issues):
+        raise AssertionError("$N line-break differences must not block translation saves")
+
+
 class FakeStreamingTransport:
     def get_json(self, url: str):
         raise AssertionError("LLM suggestion must not issue a GET request")
@@ -244,6 +253,7 @@ def main() -> int:
     assert_ignore_cache(root)
     assert_operation_history()
     assert_ai_token_protection()
+    assert_linebreak_format_is_ignored()
     assert_llm_suggestion_stream()
     assert_git_history(root)
     print("translator_tool self-test ok")

@@ -7,6 +7,7 @@ backups/
 # Local workflow state and credentials.
 translator_tool_cache.json
 .translator_tool/
+build/
 
 # Python runtime files.
 __pycache__/

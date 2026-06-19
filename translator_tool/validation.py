@@ -105,6 +105,10 @@ def compare_tokens(source: str, target: str) -> list[ValidationIssue]:
     issues: list[ValidationIssue] = []
     source_tokens = format_tokens(source)
     target_tokens = format_tokens(target)
+    # $N is a cosmetic line-break directive. Translators may legitimately reflow
+    # Chinese text, so it must not produce a save-blocking format difference.
+    source_tokens.pop("$N", None)
+    target_tokens.pop("$N", None)
     source_hard, source_color = split_soft_color_tokens(source_tokens)
     target_hard, target_color = split_soft_color_tokens(target_tokens)
 

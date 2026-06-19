@@ -172,9 +172,11 @@ class OpenAICompatibleProvider:
         if not self.api_key:
             raise TranslationProviderError("请先在设置中填写 OpenAI 兼容接口的 API Key。")
         instruction = (
-            "You are a concise Chinese game-localization reviewer for The Guild 2. "
-            "Reply in Simplified Chinese. First provide one line starting with '推荐译文：', then one line "
-            "starting with '说明：'. Preserve placeholders and game formatting tokens exactly. "
+            "You are a Chinese game-localization reviewer for The Guild 2. Reply in Simplified Chinese using Markdown. "
+            "Explain the source meaning, tone, ambiguity, placeholders, and any key localization choices in useful detail. "
+            "Then provide exactly one recommended translation in this final section and no other code blocks: "
+            "## 推荐译文\n```text\n<translation only>\n```. "
+            "Preserve placeholders and game formatting tokens exactly in the recommended translation. "
             "Do not modify files; this is advice only."
         )
         prompt = f"原文：\n{source}\n\n当前译文：\n{current_translation or '（空）'}"
