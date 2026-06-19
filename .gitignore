@@ -1,0 +1,14 @@
+# The language content has its own Git repository.
+languages/
+
+# Replaced by Git-backed language history.
+backups/
+
+# Local workflow state and credentials.
+translator_tool_cache.json
+.translator_tool/
+
+# Python runtime files.
+__pycache__/
+*.py[cod]
+*.tmp

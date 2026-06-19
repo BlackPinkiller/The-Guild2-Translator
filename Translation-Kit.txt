@@ -1,0 +1,83 @@
+Important notes for reading, translating, changing and adding new text-lines of the MegaMod
+
+
+
+List of important placeholders:
+%1 ---------> use the first argument in your message function
+% ----------> will be ignored. To add a % in your text, use: %%
+
+add the following to your argument (e.g: %1n)
+n ----------> integer, a number without comma
+i ----------> integer, a number without comma (unknown difference to "n")
+t ----------> integer, a number without comma. A small coin symbol appears behind the number.
+s ----------> string, if you want to insert a short string. Don't use this for your measures, but instead create new text-labels and use "l"
+l -----------> (small L) label, for example for item-names or text-based variables (he/she, his/her ...)
+SN ---------> the full name of a sim object
+SV ----------> the forename of a sim object
+GG ---------> the name of a building object
+DN ---------> the name of a dynasty object
+NAME ------> used for the name of a city
+SA ----------> sim office-name
+ST ----------> sim title-name
+SK ----------> sim character class-name
+
+You must not use ". Instead use >Text<. Ingame it will show as: 'Text'. You may additionally use a highlight colour (see below) to improve asthetics of Text in between >...<
+
+Every line has to start with a unique ID and has to end with |
+
+
+Formating:
+$N (no %) means line-break
+$C[255,255,255] is a colourcode which effects the whole message, unless you change the colour back at some point
+$S[2000-2255] shows a symbol from SetGame30.dds.
+#E[NT_NEUTRAL] integrates an emotional expression (here: neutral. See library/emotions for more) to the statement. Use this for speech files and dialog in general. This will never show ingame.
+
+The following show symbols for the talents
+
+$S[2016] - Dexterity
+$S[2017] - Constitution
+$S[2018] - Fighting
+$S[2019] - Craftsmanship
+$S[2020] - Shadow Arts
+$S[2021] - Rhetorics
+$S[2022] - Empathy
+$S[2023] - Bargaining
+$S[2024] - Secret Knowledge
+$S[2025] - Charisma
+
+-------
+
+Changing/Creating new lines:
+
+1. Please highlight game terms (names of items, actions, professions and those from the glossary: LINK) in tooltips of measures or messages with Colour codes. Write game terms in upper case (e.g. Title instead of title, Imperial Fame instead of imperial fame).
+
+-> Colourcode to highlight game terms and speech in Msg-Box / MsgNews: $C[115,5,20] Default Colour: $C[0,0,0] (black)
+-> Colourcode to highlight game terms in measure Tooltips or Black background: $C[225,214,158] Default Colour: $C[255,255,255] (white)
+-> Don't use colourcodes for abilites-description, item-tooltips or onscreen help (grey stone background), because the colours will bug after showing the first one correctly.
+
+2. Please choose labels which are easy to recognize. Use _HEAD for headers, _BODY for the main message, _BTN for Buttons _TOOLTIP for tooltips and _VAR for labels you want to use as variables inside of another label.
+
+3. Whenever you add a new line or change an existing line in a meaningful way (meaning more than simple typo-corrections) you should delete the old line and put the changed line at the bottom. This way, all the relevant changes will be in one block and the other block remains Vanilla-lines (with gaps), which makes comparisons much easier.
+
+4. Keep in mind that you must use unique IDs and label-names. If you use an existing one, only the first line will be read. 
+
+-------
+
+
+Translating:
+
+- Base language (native) is German, so the intended tone, wording and meaning is always the one from the German text.dbt. You can translate from other languages such as English, but keep in mind, that you might lose something here. Also English doesn't differenciate in gender-cases and some other grammatical cases which can make translating into a language which does these things difficult. If possible, cross-reference with another more complex language if you are unsure if the name of a game term / profession etc. is meant to be feminin or masculin.
+
+-------
+
+for the polish textfile, change some letters, they will show correctly ingame (missing letters will not show ingame!)
+
+ą - ç
+ć - è
+ę - ô
+ł - ø
+ń - ñ
+ó - exists
+ś - é
+ż - ö
+ź - ý
