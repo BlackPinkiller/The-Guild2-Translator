@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from collections import Counter
 from dataclasses import replace
+import math
 from pathlib import Path
 import threading
 import time
@@ -80,8 +81,8 @@ TYPING_GROUP_DELAY_MS = 750
 
 class UnitTableModel(QAbstractTableModel):
     FILE, ID, LABEL, FIELD, SOURCE, TRANSLATION, STATUS, FORMAT, AI = range(9)
-    HEADERS = ("文件", "ID", "标签 / Key", "字段", "原文", "译文", "状态", "格式", "AI")
-    WIDTHS = (145, 68, 210, 90, 280, 280, 88, 72, 66)
+    HEADERS = ("文件", "ID", "标签 / Key", "字段", "原文", "译文", "状态", "格式", "AI 翻译")
+    WIDTHS = (145, 68, 210, 90, 280, 280, 88, 72, 78)
 
     def __init__(self, project: Project | None = None) -> None:
         super().__init__()
@@ -145,7 +146,7 @@ class UnitTableModel(QAbstractTableModel):
             self.TRANSLATION: _clip(unit.current_text, 130),
             self.STATUS: unit.display_status(),
             self.FORMAT: _issue_badge(unit),
-            self.AI: "AI",
+            self.AI: "翻译",
         }
         return values.get(column, "")
 
@@ -218,6 +219,15 @@ class AiButtonDelegate(QStyledItemDelegate):
         super().__init__(parent)
         self.provider = provider
         self._pressed_uid = ""
+        self._hover_uid = ""
+        self._hover_phase = 0.0
+        self._hover_timer = QTimer(self)
+        self._hover_timer.setInterval(45)
+        self._hover_timer.timeout.connect(self._advance_hover)
+        if isinstance(parent, QTableView):
+            parent.setMouseTracking(True)
+            parent.viewport().setMouseTracking(True)
+            parent.viewport().installEventFilter(self)
 
     def set_provider(self, provider: str) -> None:
         self.provider = provider
@@ -227,27 +237,38 @@ class AiButtonDelegate(QStyledItemDelegate):
     def paint(self, painter: QPainter, option: QStyleOptionViewItem, index: QModelIndex) -> None:
         uid = str(index.data(Qt.ItemDataRole.UserRole) or "")
         pressed = uid == self._pressed_uid
+        hovered = uid == self._hover_uid
         painter.save()
         rect = option.rect.adjusted(7, 6, -7, -6)
         if pressed:
             rect.translate(2, 3)
         painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+        if hovered and not pressed:
+            rect.translate(0, -1)
         if not pressed:
             painter.setPen(Qt.PenStyle.NoPen)
             painter.setBrush(QColor("#171717"))
-            painter.drawRoundedRect(rect.translated(3, 3), 4, 4)
+            shadow_offset = 4 if hovered else 3
+            painter.drawRoundedRect(rect.translated(3, shadow_offset), 4, 4)
         fill = QColor("#ffe600") if self.provider == "google" else QColor("#ff4f98")
+        if hovered:
+            fill = fill.lighter(108 + int((math.sin(self._hover_phase) + 1) * 6))
         if pressed:
             fill = fill.darker(115)
-        painter.setPen(QPen(QColor("#171717"), 2))
+        painter.setPen(QPen(QColor("#171717"), 2 if not hovered else 3))
         painter.setBrush(fill)
         painter.drawRoundedRect(rect, 4, 4)
+        if hovered:
+            shine = QColor("#fffdf6")
+            shine.setAlpha(150 + int((math.sin(self._hover_phase) + 1) * 40))
+            painter.setPen(QPen(shine, 1.5))
+            painter.drawRoundedRect(rect.adjusted(3, 3, -3, -3), 2, 2)
         painter.setPen(QColor("#171717"))
         font = painter.font()
         font.setBold(True)
-        font.setPointSize(max(8, font.pointSize() - 1))
+        font.setPointSize(max(9, font.pointSize()))
         painter.setFont(font)
-        painter.drawText(rect, Qt.AlignmentFlag.AlignCenter, "GO!" if self.provider == "google" else "LLM")
+        painter.drawText(rect, Qt.AlignmentFlag.AlignCenter, "翻译")
         painter.restore()
 
     def editorEvent(self, event, model, option: QStyleOptionViewItem, index: QModelIndex) -> bool:  # noqa: N802
@@ -266,6 +287,42 @@ class AiButtonDelegate(QStyledItemDelegate):
                 self.translate_requested.emit(uid)
                 return True
         return super().editorEvent(event, model, option, index)
+
+    def eventFilter(self, watched: QObject, event: QEvent) -> bool:  # noqa: N802
+        table = self.parent()
+        if not isinstance(table, QTableView) or watched is not table.viewport():
+            return super().eventFilter(watched, event)
+        if event.type() == QEvent.Type.MouseMove:
+            index = table.indexAt(event.position().toPoint())
+            uid = str(index.data(Qt.ItemDataRole.UserRole) or "") if index.isValid() and index.column() == UnitTableModel.AI else ""
+            self._set_hover(uid)
+            if uid:
+                table.viewport().setCursor(Qt.CursorShape.PointingHandCursor)
+            else:
+                table.viewport().unsetCursor()
+        elif event.type() == QEvent.Type.Leave:
+            self._set_hover("")
+            table.viewport().unsetCursor()
+        return super().eventFilter(watched, event)
+
+    def _set_hover(self, uid: str) -> None:
+        if uid == self._hover_uid:
+            return
+        self._hover_uid = uid
+        self._hover_phase = 0.0
+        if uid:
+            self._hover_timer.start()
+        else:
+            self._hover_timer.stop()
+        table = self.parent()
+        if isinstance(table, QTableView):
+            table.viewport().update()
+
+    def _advance_hover(self) -> None:
+        self._hover_phase += 0.42
+        table = self.parent()
+        if isinstance(table, QTableView):
+            table.viewport().update()
 
 
 class BatchTranslateButton(QPushButton):
