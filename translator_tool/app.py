@@ -19,9 +19,10 @@ from PySide6.QtCore import (
     Qt,
     QThreadPool,
     QTimer,
+    QRectF,
     Signal,
 )
-from PySide6.QtGui import QAction, QColor, QFont, QKeySequence, QPainter, QPalette, QSyntaxHighlighter, QTextCharFormat
+from PySide6.QtGui import QAction, QColor, QFont, QKeySequence, QPainter, QPalette, QPen, QSyntaxHighlighter, QTextCharFormat
 from PySide6.QtWidgets import (
     QApplication,
     QCheckBox,
@@ -40,7 +41,6 @@ from PySide6.QtWidgets import (
     QMenu,
     QMessageBox,
     QPlainTextEdit,
-    QProgressDialog,
     QPushButton,
     QSplitter,
     QStyledItemDelegate,
@@ -48,6 +48,7 @@ from PySide6.QtWidgets import (
     QStyleOptionViewItem,
     QTableView,
     QToolButton,
+    QToolTip,
     QVBoxLayout,
     QWidget,
 )
@@ -229,6 +230,91 @@ class AiButtonDelegate(QStyledItemDelegate):
                 self.translate_requested.emit(uid)
                 return True
         return super().editorEvent(event, model, option, index)
+
+
+class BatchTranslateButton(QPushButton):
+    """A toolbar action that doubles as the visible progress and cancel affordance."""
+
+    def __init__(self, parent: QWidget | None = None) -> None:
+        super().__init__("AI 批量翻译", parent)
+        self.setMinimumWidth(118)
+        self._busy = False
+        self._hovering = False
+        self._cancelling = False
+        self._current = 0
+        self._total = 0
+        self._angle = 0
+        self._spinner = QTimer(self)
+        self._spinner.setInterval(55)
+        self._spinner.timeout.connect(self._advance_spinner)
+
+    @property
+    def busy(self) -> bool:
+        return self._busy
+
+    def set_busy(self, busy: bool, total: int = 0) -> None:
+        self._busy = busy
+        self._cancelling = False
+        self._current = 0
+        self._total = total if busy else 0
+        if busy:
+            self._spinner.start()
+        else:
+            self._spinner.stop()
+        self._update_presentation()
+
+    def set_progress(self, current: int, total: int) -> None:
+        self._current, self._total = current, total
+        self._update_presentation()
+
+    def set_cancelling(self) -> None:
+        if not self._busy:
+            return
+        self._cancelling = True
+        self._update_presentation()
+
+    def enterEvent(self, event) -> None:  # noqa: N802
+        self._hovering = True
+        self._update_presentation()
+        super().enterEvent(event)
+
+    def leaveEvent(self, event) -> None:  # noqa: N802
+        self._hovering = False
+        self._update_presentation()
+        super().leaveEvent(event)
+
+    def paintEvent(self, event) -> None:  # noqa: N802
+        super().paintEvent(event)
+        if not self._busy or self._hovering or self._cancelling:
+            return
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+        pen = QPen(QColor("#1d4ed8"), 2)
+        pen.setCapStyle(Qt.PenCapStyle.RoundCap)
+        painter.setPen(pen)
+        spinner_rect = QRectF(10, (self.height() - 14) / 2, 14, 14)
+        painter.drawArc(spinner_rect, self._angle * 16, 105 * 16)
+        painter.end()
+
+    def _advance_spinner(self) -> None:
+        self._angle = (self._angle + 28) % 360
+        self.update()
+
+    def _update_presentation(self) -> None:
+        if not self._busy:
+            self.setText("AI 批量翻译")
+            self.setToolTip("翻译当前筛选的未译条目")
+        elif self._cancelling:
+            self.setText("正在取消…")
+            self.setToolTip("正在停止剩余翻译请求")
+        elif self._hovering:
+            self.setText("取消  ×")
+            self.setToolTip("点击取消当前批量翻译")
+        else:
+            progress = f" {self._current}/{self._total}" if self._total else ""
+            self.setText(f"翻译中…{progress}")
+            self.setToolTip("批量翻译进行中；悬浮后点击可取消")
+        self.update()
 
 
 class TokenHighlighter(QSyntaxHighlighter):
@@ -421,8 +507,9 @@ class TranslatorWindow(QMainWindow):
         self.ai_cancel_event: threading.Event | None = None
         self.ai_results: dict[str, str] = {}
         self.ai_failures: list[str] = []
-        self.ai_progress: QProgressDialog | None = None
         self.ai_worker: AiWorker | None = None
+        self.ai_is_batch = False
+        self.ai_cancelled = False
         self.thread_pool = QThreadPool.globalInstance()
 
         self._build_ui()
@@ -479,8 +566,10 @@ class TranslatorWindow(QMainWindow):
         self.search_edit.textChanged.connect(lambda _value: self.search_debounce.start())
         toolbar_layout.addWidget(self.search_edit)
 
+        self.batch_ai_button = BatchTranslateButton()
+        self.batch_ai_button.clicked.connect(self._on_batch_ai_button_clicked)
+        toolbar_layout.addWidget(self.batch_ai_button)
         for text, slot, primary in (
-            ("AI 批量翻译", self.translate_visible_units, False),
             ("保存", self.save_all, True),
             ("更新日志", self.show_history, False),
             ("设置", self.show_settings, False),
@@ -769,9 +858,26 @@ class TranslatorWindow(QMainWindow):
             f"将翻译当前筛选的 {len(units)} 条未译条目。已有译文不会被覆盖，结果需保存后才写入文件。继续吗？",
         )
         if answer == QMessageBox.StandardButton.Yes:
-            self._start_ai(units, f"AI 批量翻译（{len(units)} 条）")
+            self._start_ai(units, f"AI 批量翻译（{len(units)} 条）", is_batch=True)
 
-    def _start_ai(self, units: list[TranslationUnit], label: str) -> None:
+    def _on_batch_ai_button_clicked(self) -> None:
+        if self.batch_ai_button.busy:
+            self.cancel_batch_translation()
+        else:
+            self.translate_visible_units()
+
+    def cancel_batch_translation(self) -> None:
+        if not self.ai_is_batch or self.ai_cancel_event is None or self.ai_cancelled:
+            return
+        self.ai_cancelled = True
+        self.ai_cancel_event.set()
+        self.batch_ai_button.set_cancelling()
+        self.statusBar().showMessage("正在取消批量翻译；已完成的结果仍会保留供审阅。", 4000)
+
+    def _start_ai(self, units: list[TranslationUnit], label: str, *, is_batch: bool = False) -> None:
+        if self.ai_worker is not None:
+            self.statusBar().showMessage("已有 AI 翻译任务正在运行，请先完成或取消它。", 3500)
+            return
         try:
             provider = provider_from_settings(self.settings)
         except Exception as exc:
@@ -780,11 +886,10 @@ class TranslatorWindow(QMainWindow):
         self.ai_results = {}
         self.ai_failures = []
         self.ai_cancel_event = threading.Event()
-        self.ai_progress = QProgressDialog("正在请求 AI 翻译…", "取消", 0, len(units), self)
-        self.ai_progress.setWindowTitle(label)
-        self.ai_progress.setWindowModality(Qt.WindowModality.ApplicationModal)
-        self.ai_progress.setAutoClose(False)
-        self.ai_progress.canceled.connect(self.ai_cancel_event.set)
+        self.ai_is_batch = is_batch
+        self.ai_cancelled = False
+        if is_batch:
+            self.batch_ai_button.set_busy(True, len(units))
         worker = AiWorker(provider, units, self.ai_cancel_event)
         worker.signals.translated.connect(self._collect_ai_result)
         worker.signals.failed.connect(self._collect_ai_failure)
@@ -800,17 +905,19 @@ class TranslatorWindow(QMainWindow):
         self.ai_failures.append(f"{uid}: {message}")
 
     def _update_ai_progress(self, current: int, total: int) -> None:
-        if self.ai_progress:
-            self.ai_progress.setMaximum(total)
-            self.ai_progress.setValue(current)
-            self.ai_progress.setLabelText(f"正在请求 AI 翻译… {current}/{total}")
+        if self.ai_is_batch:
+            self.batch_ai_button.set_progress(current, total)
+        self.statusBar().showMessage(f"正在请求 AI 翻译… {current}/{total}")
 
     def _finish_ai(self, label: str) -> None:
-        if self.ai_progress:
-            self.ai_progress.close()
-        self.ai_progress = None
+        was_batch = self.ai_is_batch
+        was_cancelled = self.ai_cancelled
+        if was_batch:
+            self.batch_ai_button.set_busy(False)
         self.ai_cancel_event = None
         self.ai_worker = None
+        self.ai_is_batch = False
+        self.ai_cancelled = False
         changes: list[UnitChange] = []
         for uid, translated in self.ai_results.items():
             unit = self.model.unit_for_uid(uid)
@@ -821,11 +928,18 @@ class TranslatorWindow(QMainWindow):
         if changes:
             self.history.push(TranslationOperation(label, tuple(changes)))
         summary = f"AI 已生成 {len(changes)} 条建议"
+        if was_cancelled:
+            summary = f"批量翻译已取消，已生成 {len(changes)} 条建议"
+        elif was_batch:
+            summary = f"批量翻译完成：已生成 {len(changes)} 条建议"
         if self.ai_failures:
             summary += f"；{len(self.ai_failures)} 条失败"
             QMessageBox.warning(self, "AI 翻译完成", summary + "\n\n" + "\n".join(self.ai_failures[:8]))
         else:
             self.statusBar().showMessage(summary + "，请审阅后保存。", 5000)
+        if was_batch:
+            anchor = self.batch_ai_button.mapToGlobal(self.batch_ai_button.rect().bottomLeft())
+            QToolTip.showText(anchor, summary + "，请审阅后保存。", self.batch_ai_button, self.batch_ai_button.rect(), 4500)
 
     def save_all(self) -> None:
         self._commit_typing_operation()
