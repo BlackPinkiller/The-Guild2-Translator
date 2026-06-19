@@ -4,7 +4,7 @@ from pathlib import Path
 import shutil
 import uuid
 
-from .ai import GoogleTranslateProvider, TranslationProviderError
+from .ai import GoogleTranslateProvider, OpenAICompatibleProvider, TranslationProviderError
 from .codec_adapter import Guild2Codec, default_codec_path
 from .git_history import LanguageGit, format_entries
 from .history import OperationHistory, TranslationOperation, UnitChange
@@ -167,6 +167,29 @@ def assert_ai_token_protection() -> None:
     raise AssertionError("AI result missing a protected token was accepted")
 
 
+class FakeStreamingTransport:
+    def get_json(self, url: str):
+        raise AssertionError("LLM suggestion must not issue a GET request")
+
+    def post_json(self, url: str, payload, headers):
+        raise AssertionError("stream-capable transport should use SSE")
+
+    def post_sse(self, url: str, payload, headers):
+        if not payload.get("stream"):
+            raise AssertionError("LLM suggestion did not request streaming")
+        yield {"choices": [{"delta": {"content": "推荐译文：测试"}}]}
+        yield {"choices": [{"delta": {"content": "\n说明：保留 %1s"}}]}
+
+
+def assert_llm_suggestion_stream() -> None:
+    provider = OpenAICompatibleProvider(
+        "https://example.invalid/v1", "test-model", "test-key", FakeStreamingTransport()
+    )
+    response = "".join(provider.stream_suggestion("Hello %1s", ""))
+    if "推荐译文：测试" not in response or "说明：保留 %1s" not in response:
+        raise AssertionError("LLM suggestion stream was not assembled correctly")
+
+
 def assert_operation_history() -> None:
     values = {"first": "旧一", "second": "旧二"}
     history = OperationHistory()
@@ -221,6 +244,7 @@ def main() -> int:
     assert_ignore_cache(root)
     assert_operation_history()
     assert_ai_token_protection()
+    assert_llm_suggestion_stream()
     assert_git_history(root)
     print("translator_tool self-test ok")
     return 0

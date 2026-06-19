@@ -23,13 +23,14 @@ from PySide6.QtCore import (
     QRectF,
     Signal,
 )
-from PySide6.QtGui import QAction, QColor, QFont, QKeySequence, QPainter, QPalette, QPen, QSyntaxHighlighter, QTextCharFormat
+from PySide6.QtGui import QAction, QColor, QFont, QKeySequence, QPainter, QPalette, QPen, QSyntaxHighlighter, QTextCharFormat, QTextCursor
 from PySide6.QtWidgets import (
     QApplication,
     QCheckBox,
     QComboBox,
     QDialog,
     QDialogButtonBox,
+    QDockWidget,
     QFormLayout,
     QFrame,
     QGroupBox,
@@ -54,7 +55,13 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
-from .ai import TranslationProvider, TranslationProviderError, provider_from_settings
+from .ai import (
+    OpenAICompatibleProvider,
+    TranslationProvider,
+    TranslationProviderError,
+    llm_provider_from_settings,
+    provider_from_settings,
+)
 from .git_history import GitCommit, GitError, LanguageGit, format_entries
 from .history import OperationHistory, TranslationOperation, UnitChange
 from .project import (
@@ -72,7 +79,14 @@ from .project import (
     TranslationUnit,
 )
 from .settings import AppSettings, load_settings, protect_secret, reveal_secret, save_settings
-from .validation import CHINESE_QUOTE_RE, FULLWIDTH_SYNTAX_RE, HIGHLIGHT_RE
+from .validation import (
+    CHINESE_QUOTE_RE,
+    FULLWIDTH_SYNTAX_RE,
+    HIGHLIGHT_RE,
+    format_counter_items,
+    format_tokens,
+    split_soft_color_tokens,
+)
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
@@ -82,7 +96,7 @@ TYPING_GROUP_DELAY_MS = 750
 class UnitTableModel(QAbstractTableModel):
     FILE, ID, LABEL, FIELD, SOURCE, TRANSLATION, STATUS, FORMAT, AI = range(9)
     HEADERS = ("文件", "ID", "标签 / Key", "字段", "原文", "译文", "状态", "格式", "AI 翻译")
-    WIDTHS = (145, 68, 210, 90, 280, 280, 88, 72, 78)
+    WIDTHS = (145, 68, 210, 90, 280, 280, 88, 118, 78)
 
     def __init__(self, project: Project | None = None) -> None:
         super().__init__()
@@ -117,7 +131,7 @@ class UnitTableModel(QAbstractTableModel):
             return unit.uid
         if role == Qt.ItemDataRole.ToolTipRole:
             if index.column() == self.FORMAT:
-                return unit.issue_text() or "格式正常"
+                return _format_diff_tooltip(unit)
             if index.column() == self.SOURCE:
                 return unit.source_text
             if index.column() == self.TRANSLATION:
@@ -145,7 +159,7 @@ class UnitTableModel(QAbstractTableModel):
             self.SOURCE: _clip(unit.source_text, 130),
             self.TRANSLATION: _clip(unit.current_text, 130),
             self.STATUS: unit.display_status(),
-            self.FORMAT: _issue_badge(unit),
+            self.FORMAT: _format_diff_text(unit),
             self.AI: "翻译",
         }
         return values.get(column, "")
@@ -325,6 +339,55 @@ class AiButtonDelegate(QStyledItemDelegate):
             table.viewport().update()
 
 
+class FormatDiffDelegate(QStyledItemDelegate):
+    """Paint a compact, Git-like token delta without wasting a wide column."""
+
+    COLORS = {
+        "+": QColor("#98971a"),
+        "-": QColor("#cc241d"),
+        "!": QColor("#cc241d"),
+        "~": QColor("#d79921"),
+        "✓": QColor("#689d6a"),
+    }
+
+    def paint(self, painter: QPainter, option: QStyleOptionViewItem, index: QModelIndex) -> None:
+        unit = index.model().data(index, Qt.ItemDataRole.UserRole)
+        table_model = index.model()
+        if isinstance(table_model, QSortFilterProxyModel):
+            source_index = table_model.mapToSource(index)
+            source_model = table_model.sourceModel()
+            unit = source_model.unit_at(source_index.row()) if isinstance(source_model, UnitTableModel) else None
+        if not isinstance(unit, TranslationUnit):
+            super().paint(painter, option, index)
+            return
+
+        background = QStyleOptionViewItem(option)
+        background.text = ""
+        style = option.widget.style() if option.widget else QApplication.style()
+        style.drawControl(QStyle.ControlElement.CE_ItemViewItem, background, painter, option.widget)
+
+        parts = _format_diff_parts(unit)
+        painter.save()
+        font = painter.font()
+        font.setBold(True)
+        painter.setFont(font)
+        metrics = painter.fontMetrics()
+        left = option.rect.left() + 5
+        right = option.rect.right() - 5
+        baseline = option.rect.top() + (option.rect.height() + metrics.ascent() - metrics.descent()) // 2
+        for marker, content in parts:
+            visible = marker + _compact_token(content)
+            width = metrics.horizontalAdvance(visible)
+            if left + width > right:
+                painter.setPen(QColor("#928374"))
+                painter.drawText(left, baseline, "…")
+                break
+            painter.setPen(self.COLORS.get(marker, QColor("#3c3836")))
+            painter.drawText(left, baseline, visible)
+            left += width + metrics.horizontalAdvance(" ")
+        painter.restore()
+
+
 class BatchTranslateButton(QPushButton):
     """A toolbar action that doubles as the visible progress and cancel affordance."""
 
@@ -484,6 +547,43 @@ class AiWorker(QRunnable):
         self.signals.finished.emit()
 
 
+class SuggestionWorkerSignals(QObject):
+    chunk = Signal(str)
+    failed = Signal(str)
+    finished = Signal()
+
+
+class LlmSuggestionWorker(QRunnable):
+    def __init__(
+        self,
+        provider: OpenAICompatibleProvider,
+        source_text: str,
+        current_translation: str,
+        cancel_event: threading.Event,
+    ) -> None:
+        super().__init__()
+        self.provider = provider
+        self.source_text = source_text
+        self.current_translation = current_translation
+        self.cancel_event = cancel_event
+        self.signals = SuggestionWorkerSignals()
+
+    def run(self) -> None:
+        try:
+            for chunk in self.provider.stream_suggestion(self.source_text, self.current_translation):
+                if self.cancel_event.is_set():
+                    break
+                self.signals.chunk.emit(chunk)
+        except TranslationProviderError as exc:
+            if not self.cancel_event.is_set():
+                self.signals.failed.emit(str(exc))
+        except Exception as exc:
+            if not self.cancel_event.is_set():
+                self.signals.failed.emit(f"意外错误：{exc}")
+        finally:
+            self.signals.finished.emit()
+
+
 class SettingsDialog(QDialog):
     def __init__(self, settings: AppSettings, parent: QWidget | None = None) -> None:
         super().__init__(parent)
@@ -491,34 +591,48 @@ class SettingsDialog(QDialog):
         self.setMinimumWidth(560)
         self.settings = settings
         layout = QVBoxLayout(self)
-        form = QFormLayout()
-        layout.addLayout(form)
 
+        service_group = QGroupBox("默认 AI 翻译服务")
+        service_form = QFormLayout(service_group)
         self.provider = QComboBox()
         self.provider.addItem("Google Translate（公共免费端点）", "google")
         self.provider.addItem("OpenAI 兼容接口", "openai")
         self.provider.setCurrentIndex(0 if settings.provider != "openai" else 1)
-        form.addRow("AI 服务", self.provider)
+        service_form.addRow("单条 / 批量翻译", self.provider)
+        self.provider_note = QLabel()
+        self.provider_note.setObjectName("hint")
+        self.provider_note.setWordWrap(True)
+        service_form.addRow(self.provider_note)
+        layout.addWidget(service_group)
 
+        google_group = QGroupBox("Google Translate（公共免费端点）")
+        google_form = QFormLayout(google_group)
         self.google_endpoint = QLineEdit(settings.google_endpoint)
         self.source_language = QLineEdit(settings.source_language)
         self.target_language = QLineEdit(settings.target_language)
-        form.addRow("Google 端点", self.google_endpoint)
-        form.addRow("源语言", self.source_language)
-        form.addRow("目标语言", self.target_language)
+        google_form.addRow("端点", self.google_endpoint)
+        google_form.addRow("源语言", self.source_language)
+        google_form.addRow("目标语言", self.target_language)
+        layout.addWidget(google_group)
 
+        openai_group = QGroupBox("OpenAI 兼容 LLM（也用于右键翻译建议）")
+        openai_form = QFormLayout(openai_group)
         self.openai_base_url = QLineEdit(settings.openai_base_url)
         self.openai_model = QLineEdit(settings.openai_model)
         self.openai_key = QLineEdit(reveal_secret(settings.openai_api_key_protected))
         self.openai_key.setEchoMode(QLineEdit.EchoMode.Password)
-        form.addRow("OpenAI Base URL", self.openai_base_url)
-        form.addRow("OpenAI 模型", self.openai_model)
-        form.addRow("OpenAI API Key", self.openai_key)
+        openai_form.addRow("Base URL", self.openai_base_url)
+        openai_form.addRow("模型", self.openai_model)
+        openai_form.addRow("API Key", self.openai_key)
+        layout.addWidget(openai_group)
 
+        git_group = QGroupBox("Git 自动提交身份")
+        git_form = QFormLayout(git_group)
         self.git_name = QLineEdit(settings.git_author_name)
         self.git_email = QLineEdit(settings.git_author_email)
-        form.addRow("Git 作者名", self.git_name)
-        form.addRow("Git 邮箱", self.git_email)
+        git_form.addRow("作者名", self.git_name)
+        git_form.addRow("邮箱", self.git_email)
+        layout.addWidget(git_group)
 
         note = QLabel("Google 公共端点不需要 Key，但可能受限速或上游变更影响。API Key 仅保存到当前 Windows 用户的本地设置。")
         note.setWordWrap(True)
@@ -532,11 +646,10 @@ class SettingsDialog(QDialog):
         self._update_enabled()
 
     def _update_enabled(self) -> None:
-        is_openai = self.provider.currentData() == "openai"
-        for widget in (self.openai_base_url, self.openai_model, self.openai_key):
-            widget.setEnabled(is_openai)
-        for widget in (self.google_endpoint, self.source_language, self.target_language):
-            widget.setEnabled(not is_openai)
+        if self.provider.currentData() == "openai":
+            self.provider_note.setText("单条和批量翻译将使用 OpenAI 兼容接口。右键“LLM 翻译建议”也使用此配置。")
+        else:
+            self.provider_note.setText("单条和批量翻译将使用 Google Translate。右键“LLM 翻译建议”始终使用下方 OpenAI 兼容配置。")
 
     def result_settings(self) -> AppSettings:
         return replace(
@@ -593,6 +706,7 @@ class TranslatorWindow(QMainWindow):
         self.resize(1480, 920)
         self.settings = load_settings()
         self.git = LanguageGit(PROJECT_ROOT)
+        self.git_pending = False
         self.project: Project | None = None
         self.model = UnitTableModel()
         self.proxy = UnitFilterProxyModel()
@@ -612,6 +726,8 @@ class TranslatorWindow(QMainWindow):
         self.ai_worker: AiWorker | None = None
         self.ai_is_batch = False
         self.ai_cancelled = False
+        self.suggestion_worker: LlmSuggestionWorker | None = None
+        self.suggestion_cancel_event: threading.Event | None = None
         self.thread_pool = QThreadPool.globalInstance()
 
         self._build_ui()
@@ -719,6 +835,8 @@ class TranslatorWindow(QMainWindow):
         self.ai_delegate = AiButtonDelegate(self.table, self.settings.provider)
         self.ai_delegate.translate_requested.connect(self.translate_one_unit)
         self.table.setItemDelegateForColumn(UnitTableModel.AI, self.ai_delegate)
+        self.format_delegate = FormatDiffDelegate(self.table)
+        self.table.setItemDelegateForColumn(UnitTableModel.FORMAT, self.format_delegate)
         table_layout.addWidget(self.table)
         splitter.addWidget(table_frame)
 
@@ -739,6 +857,7 @@ class TranslatorWindow(QMainWindow):
         self.issue_label.setObjectName("issues")
         self.issue_label.setWordWrap(True)
         layout.addWidget(self.issue_label)
+        self._build_suggestion_dock()
         self.statusBar().showMessage("准备就绪")
 
         for shortcut, slot in (
@@ -762,6 +881,37 @@ class TranslatorWindow(QMainWindow):
         editor.setLineWrapMode(QPlainTextEdit.LineWrapMode.WidgetWidth)
         layout.addWidget(editor)
         return box, editor
+
+    def _build_suggestion_dock(self) -> None:
+        self.suggestion_dock = QDockWidget("LLM 翻译建议", self)
+        self.suggestion_dock.setObjectName("suggestionDock")
+        self.suggestion_dock.setAllowedAreas(Qt.DockWidgetArea.LeftDockWidgetArea | Qt.DockWidgetArea.RightDockWidgetArea)
+        self.suggestion_dock.setFeatures(
+            QDockWidget.DockWidgetFeature.DockWidgetClosable
+            | QDockWidget.DockWidgetFeature.DockWidgetMovable
+            | QDockWidget.DockWidgetFeature.DockWidgetFloatable
+        )
+        panel = QWidget()
+        panel_layout = QVBoxLayout(panel)
+        panel_layout.setContentsMargins(8, 8, 8, 8)
+        header = QHBoxLayout()
+        self.suggestion_status = QLabel("右键条目后选择“LLM 翻译建议”")
+        self.suggestion_status.setObjectName("suggestionStatus")
+        self.suggestion_close = QToolButton()
+        self.suggestion_close.setText("× 关闭")
+        self.suggestion_close.setToolTip("关闭建议窗口")
+        self.suggestion_close.clicked.connect(self._close_suggestion_dock)
+        header.addWidget(self.suggestion_status, 1)
+        header.addWidget(self.suggestion_close)
+        panel_layout.addLayout(header)
+        self.suggestion_text = QPlainTextEdit()
+        self.suggestion_text.setReadOnly(True)
+        self.suggestion_text.setPlaceholderText("LLM 的建议会在这里实时显示。")
+        panel_layout.addWidget(self.suggestion_text, 1)
+        self.suggestion_dock.setWidget(panel)
+        self.suggestion_dock.visibilityChanged.connect(self._on_suggestion_visibility_changed)
+        self.addDockWidget(Qt.DockWidgetArea.RightDockWidgetArea, self.suggestion_dock)
+        self.suggestion_dock.hide()
 
     def _load_language_choices(self) -> None:
         choices = Project.language_dirs(PROJECT_ROOT)
@@ -826,11 +976,28 @@ class TranslatorWindow(QMainWindow):
             f"无需翻译 {effective[STATUS_IGNORED]:,}"
         )
 
+    def _update_window_title(self) -> None:
+        if self.project is None:
+            self.setWindowTitle("The Guild 2 · 中文翻译工作台 · 未加载")
+            return
+        unit = self._current_unit()
+        if unit is None:
+            location = self.project.language
+        elif unit.record_id:
+            location = f"{unit.file_rel} · #{unit.record_id}"
+        else:
+            location = unit.file_rel
+        dirty_count = len(self.project.dirty_units())
+        save_state = f"未保存 {dirty_count} 条" if dirty_count else "已保存"
+        git_state = " · Git 待提交" if self.git_pending else ""
+        self.setWindowTitle(f"The Guild 2 · {location} · {save_state}{git_state}")
+
     def _on_row_selected(self, current: QModelIndex, _previous: QModelIndex) -> None:
         self._commit_typing_operation()
         unit = self._unit_from_proxy_index(current)
         self.current_uid = unit.uid if unit else ""
         self._set_editor_unit(unit)
+        self._update_window_title()
 
     def _set_editor_unit(self, unit: TranslationUnit | None) -> None:
         self.loading_editor = True
@@ -861,6 +1028,7 @@ class TranslatorWindow(QMainWindow):
         self.model.refresh_unit(unit)
         self._update_issue_detail(unit)
         self._update_counts()
+        self._update_window_title()
         self.typing_timer.start()
 
     def _commit_typing_operation(self) -> None:
@@ -882,6 +1050,7 @@ class TranslatorWindow(QMainWindow):
         if uid == self.current_uid:
             self._set_editor_unit(unit)
         self._update_counts()
+        self._update_window_title()
 
     def _replace_current_text(self, text: str, label: str) -> None:
         self._commit_typing_operation()
@@ -914,10 +1083,14 @@ class TranslatorWindow(QMainWindow):
             self._show_ai_provider_menu(self.table.viewport().mapToGlobal(point))
             return
         menu = QMenu(self)
+        menu.addSection("译文编辑")
         restore = menu.addAction("恢复载入时的译文")
         source = menu.addAction("还原为原文")
         clear = menu.addAction("清空译文")
-        menu.addSeparator()
+        menu.addSection("AI 服务")
+        ai_translate = menu.addAction("AI 翻译并填入")
+        llm_suggestion = menu.addAction("LLM 翻译建议…")
+        menu.addSection("条目状态")
         ignored = menu.addAction("取消无需翻译" if unit.ignored else "标记为无需翻译")
         action = menu.exec(self.table.viewport().mapToGlobal(point))
         if action == restore:
@@ -926,6 +1099,10 @@ class TranslatorWindow(QMainWindow):
             self._replace_current_text(unit.source_text, "还原为原文")
         elif action == clear:
             self._replace_current_text("", "清空译文")
+        elif action == ai_translate:
+            self.translate_one_unit(unit.uid)
+        elif action == llm_suggestion:
+            self.request_llm_suggestion()
         elif action == ignored:
             self._set_ignored(unit, not unit.ignored)
 
@@ -936,6 +1113,7 @@ class TranslatorWindow(QMainWindow):
         self.model.refresh_unit(unit)
         self._apply_filters()
         self._update_issue_detail(unit)
+        self._update_window_title()
 
     def _show_ai_provider_menu(self, global_point: QPoint) -> None:
         menu = QMenu(self)
@@ -975,6 +1153,62 @@ class TranslatorWindow(QMainWindow):
             if answer != QMessageBox.StandardButton.Yes:
                 return
         self._start_ai([unit], "AI 单条翻译")
+
+    def request_llm_suggestion(self) -> None:
+        self._commit_typing_operation()
+        unit = self._current_unit()
+        if unit is None or not unit.source_text:
+            return
+        if self.suggestion_worker is not None:
+            self.suggestion_dock.show()
+            self.suggestion_dock.raise_()
+            self.statusBar().showMessage("LLM 建议正在生成中。", 2500)
+            return
+        provider = llm_provider_from_settings(self.settings)
+        if not provider.api_key:
+            QMessageBox.information(self, "需要 LLM 设置", "LLM 翻译建议需要 OpenAI 兼容接口。请先在设置中填写 Base URL、模型和 API Key。")
+            self.show_settings()
+            return
+        self.suggestion_cancel_event = threading.Event()
+        self.suggestion_text.clear()
+        self.suggestion_status.setText(f"正在分析：{unit.file_rel} · #{unit.record_id or unit.label}")
+        self.suggestion_dock.show()
+        self.suggestion_dock.raise_()
+        worker = LlmSuggestionWorker(provider, unit.source_text, unit.current_text, self.suggestion_cancel_event)
+        worker.signals.chunk.connect(self._append_suggestion_chunk)
+        worker.signals.failed.connect(self._show_suggestion_failure)
+        worker.signals.finished.connect(self._finish_suggestion)
+        self.suggestion_worker = worker
+        self.thread_pool.start(worker)
+
+    def _append_suggestion_chunk(self, chunk: str) -> None:
+        if self.suggestion_cancel_event is None or self.suggestion_cancel_event.is_set():
+            return
+        cursor = self.suggestion_text.textCursor()
+        cursor.movePosition(QTextCursor.MoveOperation.End)
+        cursor.insertText(chunk)
+        self.suggestion_text.setTextCursor(cursor)
+        self.suggestion_text.ensureCursorVisible()
+
+    def _show_suggestion_failure(self, message: str) -> None:
+        self.suggestion_status.setText("LLM 建议生成失败")
+        self.suggestion_text.setPlainText(message)
+
+    def _finish_suggestion(self) -> None:
+        cancelled = bool(self.suggestion_cancel_event and self.suggestion_cancel_event.is_set())
+        self.suggestion_worker = None
+        self.suggestion_cancel_event = None
+        if not cancelled and self.suggestion_text.toPlainText():
+            self.suggestion_status.setText("LLM 建议已完成 · 不会自动写入译文")
+
+    def _close_suggestion_dock(self) -> None:
+        if self.suggestion_cancel_event is not None:
+            self.suggestion_cancel_event.set()
+        self.suggestion_dock.hide()
+
+    def _on_suggestion_visibility_changed(self, visible: bool) -> None:
+        if not visible and self.suggestion_cancel_event is not None:
+            self.suggestion_cancel_event.set()
 
     def translate_visible_units(self) -> None:
         self._commit_typing_operation()
@@ -1110,9 +1344,11 @@ class TranslatorWindow(QMainWindow):
             pending = self.git.has_pending_changes()
         except GitError:
             pending = True
+        self.git_pending = pending
         self.retry_button.setVisible(pending)
         if pending:
             self.statusBar().showMessage("语言仓库有待提交修改。")
+        self._update_window_title()
 
     def show_history(self) -> None:
         HistoryDialog(self.git, self).exec()
@@ -1175,6 +1411,63 @@ def _issue_badge(unit: TranslationUnit) -> str:
     return f"!{warnings}" if warnings else "—"
 
 
+def _format_diff_parts(unit: TranslationUnit) -> list[tuple[str, str]]:
+    """Return source-relative format changes in the same visual language as Git."""
+    source_hard, source_color = split_soft_color_tokens(format_tokens(unit.source_text))
+    target_hard, target_color = split_soft_color_tokens(format_tokens(unit.current_text))
+    parts: list[tuple[str, str]] = []
+    parts.extend(("!", token) for token in _counter_tokens(source_hard - target_hard))
+    parts.extend(("-", token) for token in _counter_tokens(source_color - target_color))
+    parts.extend(("+", token) for token in _counter_tokens(target_hard - source_hard))
+    parts.extend(("+", token) for token in _counter_tokens(target_color - source_color))
+
+    known_prefixes = ("缺少格式标记", "新增格式标记", "颜色标记不一致")
+    for issue in unit.issues():
+        if issue.message.startswith(known_prefixes):
+            continue
+        marker = "!" if issue.blocks_save else "~"
+        parts.append((marker, _short_issue_name(issue.message)))
+    return parts or [("✓", "OK")]
+
+
+def _counter_tokens(counter: Counter[str]) -> list[str]:
+    values: list[str] = []
+    for token, count in sorted(counter.items()):
+        values.append(token if count == 1 else f"{token}×{count}")
+    return values
+
+
+def _short_issue_name(message: str) -> str:
+    if "全角" in message:
+        return "全角"
+    if "双引号" in message:
+        return "引号"
+    if "中文引号" in message:
+        return "中文引号"
+    if "单个 %" in message:
+        return "单%"
+    if "编码" in message:
+        return "编码"
+    return message[:10] + ("…" if len(message) > 10 else "")
+
+
+def _compact_token(token: str) -> str:
+    return token if len(token) <= 11 else token[:10] + "…"
+
+
+def _format_diff_text(unit: TranslationUnit) -> str:
+    return " ".join(marker + content for marker, content in _format_diff_parts(unit))
+
+
+def _format_diff_tooltip(unit: TranslationUnit) -> str:
+    source_tokens = format_counter_items(format_tokens(unit.source_text)) or "（原文无格式标记）"
+    parts = _format_diff_parts(unit)
+    if parts == [("✓", "OK")]:
+        return f"原文格式：{source_tokens}\n译文与原文格式一致"
+    difference = " ".join(marker + content for marker, content in parts)
+    return f"按原文格式比较：{source_tokens}\n差异：{difference}"
+
+
 def _text_format(color: str, underline: bool = False) -> QTextCharFormat:
     fmt = QTextCharFormat()
     fmt.setForeground(QColor(color))
@@ -1223,6 +1516,10 @@ def apply_modern_style(app: QApplication) -> None:
         QMenu { background: #fbf1c7; border: 3px solid #3c3836; padding: 4px; }
         QMenu::item { padding: 7px 22px 7px 10px; font-weight: 700; }
         QMenu::item:selected { background: #b8bb26; color: #3c3836; }
+        QMenu::separator { height: 1px; background: #bdae93; margin: 6px 8px; }
+        QDockWidget { background: #ebdbb2; border: 3px solid #3c3836; }
+        QDockWidget::title { background: #458588; color: #fbf1c7; padding: 7px; text-align: left; font-weight: 900; }
+        #suggestionStatus { color: #665c54; font-weight: 700; }
         QToolTip { background: #3c3836; color: #fbf1c7; border: 2px solid #d79921; padding: 5px; font-weight: 700; }
         QStatusBar { background: #ebdbb2; color: #3c3836; font-weight: 700; }
         """

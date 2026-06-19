@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 import json
-from typing import Any, Protocol
+from typing import Any, Iterator, Protocol
 from urllib.error import HTTPError, URLError
 from urllib.parse import urlencode
 from urllib.request import Request, urlopen
@@ -31,6 +31,29 @@ class UrlLibTransport:
         request_headers = {"Content-Type": "application/json", **headers}
         data = json.dumps(payload, ensure_ascii=False).encode("utf-8")
         return self._read_json(Request(url, data=data, headers=request_headers, method="POST"))
+
+    def post_sse(self, url: str, payload: dict[str, Any], headers: dict[str, str]) -> Iterator[Any]:
+        request_headers = {"Content-Type": "application/json", "Accept": "text/event-stream", **headers}
+        data = json.dumps(payload, ensure_ascii=False).encode("utf-8")
+        request = Request(url, data=data, headers=request_headers, method="POST")
+        try:
+            with urlopen(request, timeout=self.timeout_seconds) as response:
+                for raw_line in response:
+                    line = raw_line.decode("utf-8", errors="replace").strip()
+                    if not line.startswith("data:"):
+                        continue
+                    body = line[5:].strip()
+                    if body == "[DONE]":
+                        return
+                    try:
+                        yield json.loads(body)
+                    except json.JSONDecodeError as exc:
+                        raise TranslationProviderError("LLM 流式响应格式无效。") from exc
+        except HTTPError as exc:
+            detail = exc.read().decode("utf-8", errors="replace")[:500]
+            raise TranslationProviderError(f"HTTP {exc.code}: {detail}") from exc
+        except (URLError, TimeoutError) as exc:
+            raise TranslationProviderError(str(exc)) from exc
 
     def _read_json(self, request: Request) -> Any:
         try:
@@ -144,6 +167,49 @@ class OpenAICompatibleProvider:
             raise TranslationProviderError("OpenAI 兼容接口没有返回文本译文。")
         return _validate_result(source, restore_tokens(translated.strip(), protected), dbt_field)
 
+    def stream_suggestion(self, source: str, current_translation: str) -> Iterator[str]:
+        """Yield concise reviewer advice as an OpenAI-compatible SSE response arrives."""
+        if not self.api_key:
+            raise TranslationProviderError("请先在设置中填写 OpenAI 兼容接口的 API Key。")
+        instruction = (
+            "You are a concise Chinese game-localization reviewer for The Guild 2. "
+            "Reply in Simplified Chinese. First provide one line starting with '推荐译文：', then one line "
+            "starting with '说明：'. Preserve placeholders and game formatting tokens exactly. "
+            "Do not modify files; this is advice only."
+        )
+        prompt = f"原文：\n{source}\n\n当前译文：\n{current_translation or '（空）'}"
+        payload = {
+            "model": self.model,
+            "temperature": 0.25,
+            "stream": True,
+            "messages": [
+                {"role": "system", "content": instruction},
+                {"role": "user", "content": prompt},
+            ],
+        }
+        url = _chat_completions_url(self.base_url)
+        headers = {"Authorization": f"Bearer {self.api_key}"}
+        stream = getattr(self.transport, "post_sse", None)
+        if not callable(stream):
+            # Custom transports used by tests or simple relays may not support SSE.
+            payload["stream"] = False
+            response = self.transport.post_json(url, payload, headers)
+            try:
+                content = response["choices"][0]["message"]["content"]
+            except (IndexError, KeyError, TypeError) as exc:
+                raise TranslationProviderError("LLM 没有返回可显示的建议。") from exc
+            if not isinstance(content, str):
+                raise TranslationProviderError("LLM 没有返回文本建议。")
+            yield content
+            return
+        for event in stream(url, payload, headers):
+            try:
+                content = event["choices"][0]["delta"].get("content", "")
+            except (IndexError, KeyError, TypeError) as exc:
+                raise TranslationProviderError("LLM 流式响应缺少内容。") from exc
+            if isinstance(content, str) and content:
+                yield content
+
 
 def provider_from_settings(settings: AppSettings, transport: JsonTransport | None = None) -> TranslationProvider:
     client = transport or UrlLibTransport()
@@ -156,6 +222,15 @@ def provider_from_settings(settings: AppSettings, transport: JsonTransport | Non
         )
     return GoogleTranslateProvider(
         settings.google_endpoint.strip(), settings.source_language.strip(), settings.target_language.strip(), client
+    )
+
+
+def llm_provider_from_settings(settings: AppSettings, transport: JsonTransport | None = None) -> OpenAICompatibleProvider:
+    return OpenAICompatibleProvider(
+        settings.openai_base_url.strip(),
+        settings.openai_model.strip(),
+        reveal_secret(settings.openai_api_key_protected),
+        transport or UrlLibTransport(),
     )
 
 
