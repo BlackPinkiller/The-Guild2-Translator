@@ -28,6 +28,7 @@ from PySide6.QtCore import (
 from PySide6.QtGui import QAction, QColor, QFont, QKeySequence, QPainter, QPalette, QPen, QSyntaxHighlighter, QTextCharFormat
 from PySide6.QtWidgets import (
     QApplication,
+    QAbstractItemView,
     QCheckBox,
     QComboBox,
     QDialog,
@@ -105,12 +106,14 @@ class UnitTableModel(QAbstractTableModel):
         self.project = project
         self.units: list[TranslationUnit] = list(project.units) if project else []
         self._search: dict[str, str] = {}
+        self._format_warning: dict[str, bool] = {}
         self._rebuild_search()
 
     def set_project(self, project: Project) -> None:
         self.beginResetModel()
         self.project = project
         self.units = list(project.units)
+        self._format_warning.clear()
         self._rebuild_search()
         self.endResetModel()
 
@@ -140,16 +143,10 @@ class UnitTableModel(QAbstractTableModel):
                 return unit.current_text
             if index.column() == self.AI:
                 return "左键：翻译当前条目\n右键：切换 Google Translate / OpenAI 兼容 LLM"
+            if index.column() == self.STATUS:
+                return unit.display_status()
         if role == Qt.ItemDataRole.BackgroundRole:
-            colors = {
-                STATUS_MISSING_ROW: "#fff6dc",
-                STATUS_EMPTY: "#fff0e8",
-                STATUS_SAME: "#edf4ff",
-                STATUS_EXTRA: "#f4efff",
-                STATUS_IGNORED: "#eef8ef",
-            }
-            color = colors.get(unit.filter_status())
-            return QColor(color) if color else None
+            return None
         if role != Qt.ItemDataRole.DisplayRole:
             return None
         column = index.column()
@@ -184,7 +181,16 @@ class UnitTableModel(QAbstractTableModel):
         except ValueError:
             return
         self._search[unit.uid] = _search_blob(unit)
+        self._format_warning.pop(unit.uid, None)
         self.dataChanged.emit(self.index(row, 0), self.index(row, self.columnCount() - 1))
+
+    def has_format_warning(self, row: int) -> bool:
+        unit = self.unit_at(row)
+        if unit is None:
+            return False
+        if unit.uid not in self._format_warning:
+            self._format_warning[unit.uid] = bool(unit.issues())
+        return self._format_warning[unit.uid]
 
     def _rebuild_search(self) -> None:
         self._search = {unit.uid: _search_blob(unit) for unit in self.units}
@@ -196,15 +202,19 @@ class UnitFilterProxyModel(QSortFilterProxyModel):
         self.file_filter = "全部文件"
         self.status_filter = "全部"
         self.only_missing = True
+        self.only_format_warnings = False
         self.query = ""
         # Source order is meaningful for this project. Disabling proxy sorting avoids a
         # multi-second re-sort when the user reveals all 17k+ translation units.
         self.setDynamicSortFilter(False)
 
-    def set_filters(self, *, file_filter: str, status_filter: str, only_missing: bool, query: str) -> None:
+    def set_filters(
+        self, *, file_filter: str, status_filter: str, only_missing: bool, only_format_warnings: bool, query: str
+    ) -> None:
         self.file_filter = file_filter
         self.status_filter = status_filter
         self.only_missing = only_missing
+        self.only_format_warnings = only_format_warnings
         self.query = query.strip().lower()
         self.beginFilterChange()
         self.endFilterChange(QSortFilterProxyModel.Direction.Rows)
@@ -224,6 +234,8 @@ class UnitFilterProxyModel(QSortFilterProxyModel):
         if self.status_filter == "全部" and self.only_missing and (unit.ignored or unit.status not in MISSING_WORK_STATUSES):
             return False
         if self.status_filter not in {"全部", "待翻译"} and effective_status != self.status_filter:
+            return False
+        if self.only_format_warnings and not source.has_format_warning(source_row):
             return False
         return not self.query or self.query in source.search_blob(source_row)
 
@@ -387,6 +399,42 @@ class FormatDiffDelegate(QStyledItemDelegate):
             painter.setPen(self.COLORS.get(marker, QColor("#3c3836")))
             painter.drawText(left, baseline, visible)
             left += width + metrics.horizontalAdvance(" ")
+        painter.restore()
+
+
+class StatusBadgeDelegate(QStyledItemDelegate):
+    STYLES = {
+        STATUS_TRANSLATED: ("已翻译", "#98971a", "#fbf1c7"),
+        "已修改": ("已修改", "#458588", "#fbf1c7"),
+        "待新增": ("待新增", "#d65d0e", "#fbf1c7"),
+        STATUS_MISSING_ROW: ("待新增", "#d65d0e", "#fbf1c7"),
+        STATUS_EMPTY: ("空译文", "#cc241d", "#fbf1c7"),
+        STATUS_SAME: ("未翻译", "#d79921", "#3c3836"),
+        STATUS_IGNORED: ("已忽略", "#928374", "#fbf1c7"),
+        STATUS_EXTRA: ("多余", "#b16286", "#fbf1c7"),
+        STATUS_TRANSLATION_ONLY: ("仅译文", "#689d6a", "#fbf1c7"),
+    }
+
+    def paint(self, painter: QPainter, option: QStyleOptionViewItem, index: QModelIndex) -> None:
+        status = str(index.data(Qt.ItemDataRole.DisplayRole) or "")
+        label, fill, text = self.STYLES.get(status, (status or "未知", "#928374", "#fbf1c7"))
+        background = QStyleOptionViewItem(option)
+        background.text = ""
+        style = option.widget.style() if option.widget else QApplication.style()
+        style.drawControl(QStyle.ControlElement.CE_ItemViewItem, background, painter, option.widget)
+
+        painter.save()
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+        rect = option.rect.adjusted(5, 6, -5, -6)
+        painter.setPen(QPen(QColor("#3c3836"), 1.5))
+        painter.setBrush(QColor(fill))
+        painter.drawRoundedRect(rect, 4, 4)
+        font = painter.font()
+        font.setBold(True)
+        font.setPointSize(max(8, font.pointSize() - 1))
+        painter.setFont(font)
+        painter.setPen(QColor(text))
+        painter.drawText(rect, Qt.AlignmentFlag.AlignCenter, label)
         painter.restore()
 
 
@@ -676,9 +724,10 @@ class SuggestionDialog(QDialog):
         super().__init__(parent)
         self.setObjectName("suggestionDialog")
         self.setWindowTitle("LLM 翻译建议")
+        self.setWindowFlag(Qt.WindowType.FramelessWindowHint, True)
         self.setModal(False)
-        self.setMinimumSize(500, 420)
-        self.resize(590, 560)
+        self.setMinimumSize(350, 200)
+        self.resize(350, 250)
         self._markdown = ""
         self._recommended_translation = ""
 
@@ -703,11 +752,11 @@ class SuggestionDialog(QDialog):
         self.content.verticalScrollBar().setValue(self.content.verticalScrollBar().maximum())
 
     def show_failure(self, message: str) -> None:
-        self.loading_label.hide()
+        self.loading_label.setText("错误")
         self.content.setPlainText(message)
 
     def complete(self) -> None:
-        self.loading_label.hide()
+        self.loading_label.setText("建议")
         self._recommended_translation = _extract_recommended_translation(self._markdown)
         self.apply_button.setEnabled(bool(self._recommended_translation))
 
@@ -768,6 +817,7 @@ class TranslatorWindow(QMainWindow):
         self.proxy.setSourceModel(self.model)
         self.history = OperationHistory()
         self.current_uid = ""
+        self.last_applied_query = ""
         self.loading_editor = False
         self.typing_uid = ""
         self.typing_before = ""
@@ -828,6 +878,9 @@ class TranslatorWindow(QMainWindow):
         self.only_missing.setChecked(True)
         self.only_missing.toggled.connect(self._apply_filters)
         toolbar_layout.addWidget(self.only_missing)
+        self.only_format_warnings = QCheckBox("仅格式警告")
+        self.only_format_warnings.toggled.connect(self._apply_filters)
+        toolbar_layout.addWidget(self.only_format_warnings)
         toolbar_layout.addStretch(1)
         toolbar_layout.addWidget(QLabel("搜索"))
         self.search_edit = QLineEdit()
@@ -838,7 +891,7 @@ class TranslatorWindow(QMainWindow):
         self.search_debounce.setSingleShot(True)
         self.search_debounce.setInterval(250)
         self.search_debounce.timeout.connect(self._apply_filters)
-        self.search_edit.textChanged.connect(lambda _value: self.search_debounce.start())
+        self.search_edit.textChanged.connect(self._on_search_changed)
         toolbar_layout.addWidget(self.search_edit)
 
         self.batch_ai_button = BatchTranslateButton()
@@ -894,6 +947,8 @@ class TranslatorWindow(QMainWindow):
         self.table.setItemDelegateForColumn(UnitTableModel.AI, self.ai_delegate)
         self.format_delegate = FormatDiffDelegate(self.table)
         self.table.setItemDelegateForColumn(UnitTableModel.FORMAT, self.format_delegate)
+        self.status_delegate = StatusBadgeDelegate(self.table)
+        self.table.setItemDelegateForColumn(UnitTableModel.STATUS, self.status_delegate)
         table_layout.addWidget(self.table)
         splitter.addWidget(table_frame)
 
@@ -981,13 +1036,43 @@ class TranslatorWindow(QMainWindow):
         del blocker
 
     def _apply_filters(self) -> None:
+        query = self.search_edit.text()
+        clearing_search = bool(self.last_applied_query) and not query.strip()
+        selected_uid = self.current_uid
         self.proxy.set_filters(
             file_filter=self.file_combo.currentText() or "全部文件",
             status_filter=self.status_combo.currentText() or "待翻译",
             only_missing=self.only_missing.isChecked(),
-            query=self.search_edit.text(),
+            only_format_warnings=self.only_format_warnings.isChecked(),
+            query=query,
         )
+        self.last_applied_query = query.strip()
         self._update_counts()
+        if clearing_search and selected_uid:
+            self._restore_selected_row(selected_uid)
+
+    def _on_search_changed(self, text: str) -> None:
+        if not text.strip() and self.last_applied_query:
+            self.search_debounce.stop()
+            self._apply_filters()
+            return
+        self.search_debounce.start()
+
+    def _restore_selected_row(self, uid: str) -> None:
+        unit = self.model.unit_for_uid(uid)
+        if unit is None:
+            return
+        try:
+            source_row = self.model.units.index(unit)
+        except ValueError:
+            return
+        proxy_index = self.proxy.mapFromSource(self.model.index(source_row, 0))
+        if not proxy_index.isValid():
+            return
+        self.table.setCurrentIndex(proxy_index)
+        self.table.selectRow(proxy_index.row())
+        self.table.scrollTo(proxy_index, QAbstractItemView.ScrollHint.PositionAtCenter)
+        self.table.setFocus()
 
     def _update_counts(self) -> None:
         if self.project is None:
