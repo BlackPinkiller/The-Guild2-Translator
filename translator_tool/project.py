@@ -60,6 +60,8 @@ class UnitRef:
     source_field: str = ""
     target_field: str = ""
     source_order: int = -1
+    display_order: int = -1
+    field_order: int = -1
 
 
 @dataclass
@@ -144,10 +146,12 @@ class Project:
         codec = Guild2Codec.load(default_codec_path(root, codec_root))
 
         source_docs: dict[str, DbtDocument] = {}
+        file_order: dict[str, int] = {}
         for path in sorted(languages_root.glob("*.dbt")):
             if path.name.lower() in NON_TRANSLATION_DBT_FILES:
                 continue
             source_docs[path.name] = load_dbt(path)
+            file_order[path.name] = len(file_order)
 
         source_text_docs: dict[str, PlainTextDocument] = {}
         source_guides_root = languages_root / "Guides"
@@ -155,6 +159,7 @@ class Project:
             for path in sorted(source_guides_root.rglob("*.txt")):
                 rel = Path("Guides") / path.relative_to(source_guides_root)
                 source_text_docs[rel.as_posix()] = load_plain_text(path)
+                file_order[rel.as_posix()] = len(file_order)
 
         language_root = languages_root / language
         if not language_root.exists():
@@ -190,6 +195,18 @@ class Project:
             if file_rel in source_text_docs:
                 continue
             units.append(build_plain_text_unit(file_rel, text_doc, codec, None))
+            file_order.setdefault(file_rel, len(file_order))
+
+        # Do not rely on construction order: the table must always reflect the
+        # original file and physical line order, including target-only rows.
+        units.sort(
+            key=lambda unit: (
+                file_order.get(unit.file_rel, len(file_order)),
+                unit.ref.display_order,
+                unit.ref.field_order,
+                unit.uid,
+            )
+        )
 
         ignored = ignored_uids(root, language)
         for unit in units:
@@ -276,7 +293,11 @@ class Project:
                 continue
             missing_groups.setdefault((unit.file_rel, ref.row_key), []).append(unit)
 
-        for (file_rel, missing_key), grouped_units in missing_groups.items():
+        def missing_order(item: tuple[tuple[str, tuple[int, str]], list[TranslationUnit]]) -> tuple[str, int]:
+            (file_rel, missing_key), _grouped = item
+            return (file_rel, self.source_order.get(file_rel, {}).get(missing_key, 2**31 - 1))
+
+        for (file_rel, missing_key), grouped_units in sorted(missing_groups.items(), key=missing_order):
             target_doc = self.target_dbt_docs[file_rel]
             source_doc = self.source_docs[file_rel]
             source_row = grouped_units[0].ref.source_row
@@ -371,7 +392,8 @@ def build_dbt_units(
     for source_row in source_doc.rows:
         key = row_key(file_name, source_row)
         target_row = target_index.get(key)
-        for target_field in target_fields:
+        display_order = target_row.line_index if target_row is not None else source_row.line_index
+        for field_order, target_field in enumerate(target_fields):
             source_field = matching_source_field(target_field, source_doc.string_columns)
             source_text = source_row.get(source_field)
             initial_issues: list[ValidationIssue] = []
@@ -416,6 +438,8 @@ def build_dbt_units(
                         source_field=source_field,
                         target_field=target_field,
                         source_order=order.get(key, -1),
+                        display_order=display_order,
+                        field_order=field_order,
                     ),
                     initial_issues=initial_issues,
                 )
@@ -424,7 +448,7 @@ def build_dbt_units(
     for key, target_row in target_index.items():
         if key in source_index:
             continue
-        for target_field in target_fields:
+        for field_order, target_field in enumerate(target_fields):
             raw_value = target_row.get(target_field)
             initial_issues = []
             try:
@@ -451,6 +475,8 @@ def build_dbt_units(
                         row_key=key,
                         source_field="",
                         target_field=target_field,
+                        display_order=target_row.line_index,
+                        field_order=field_order,
                     ),
                     initial_issues=initial_issues,
                 )
@@ -490,6 +516,6 @@ def build_plain_text_unit(
         source_text=source_text,
         translate_text=translate_text,
         status=status,
-        ref=UnitRef(kind="text", target_doc=text_doc, source_doc=source_doc),
+        ref=UnitRef(kind="text", target_doc=text_doc, source_doc=source_doc, display_order=0, field_order=0),
         initial_issues=initial_issues,
     )

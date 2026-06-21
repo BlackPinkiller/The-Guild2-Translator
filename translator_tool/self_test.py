@@ -10,7 +10,7 @@ from .ai import GoogleTranslateProvider, OpenAICompatibleProvider, TranslationPr
 from .codec_adapter import Guild2Codec, default_codec_path
 from .git_history import LanguageGit, TranslationLogEntry, combine_entries, format_entries
 from .history import OperationHistory, TranslationOperation, UnitChange
-from .format_io import load_dbt, load_plain_text
+from .format_io import load_dbt, load_plain_text, row_key
 from .project import (
     MISSING_WORK_STATUSES,
     Project,
@@ -64,6 +64,19 @@ def assert_statuses(root: Path) -> None:
         raise AssertionError("Tables.dbt must not be exposed as a translation unit")
 
 
+def assert_loaded_order_matches_file_lines(root: Path) -> None:
+    project = Project.load(root, "#chinese", codec_root=tool_root())
+    last_position: dict[str, tuple[int, int]] = {}
+    for unit in project.units:
+        if unit.ref.kind != "dbt":
+            continue
+        position = (unit.ref.display_order, unit.ref.field_order)
+        previous = last_position.get(unit.file_rel)
+        if previous is not None and position < previous:
+            raise AssertionError(f"table order diverged from {unit.file_rel} line order")
+        last_position[unit.file_rel] = position
+
+
 def copy_project_subset(src_root: Path, dst_root: Path) -> None:
     (dst_root / "encoder" / "data").mkdir(parents=True)
     shutil.copy2(tool_root() / "encoder" / "data" / "guild2_chinese_codec.json", dst_root / "encoder" / "data")
@@ -91,13 +104,22 @@ def assert_save_existing(root: Path) -> None:
     temp = make_temp_project(root, "translator_tool_smoke_existing_")
     project = Project.load(temp, "#chinese")
     unit = next(unit for unit in project.units if unit.file_rel == "Text.dbt" and unit.status != STATUS_MISSING_ROW)
-    original = (temp / "languages" / "#chinese" / "Text.dbt").read_bytes()
+    target_path = temp / "languages" / "#chinese" / "Text.dbt"
+    original = target_path.read_bytes()
+    before_doc = load_dbt(target_path)
     unit.set_text(unit.current_text + "!")
     result = project.save([unit])
     if not result.changed_files:
         raise AssertionError("save_existing did not write a file")
-    if (temp / "languages" / "#chinese" / "Text.dbt").read_bytes() == original:
+    if target_path.read_bytes() == original:
         raise AssertionError("save_existing did not update the target file")
+    after_doc = load_dbt(target_path)
+    changed_key = (int(unit.record_id), unit.label)
+    if len(before_doc.rows) != len(after_doc.rows):
+        raise AssertionError("save_existing changed the existing row count")
+    for before_row, after_row in zip(before_doc.rows, after_doc.rows):
+        if row_key("Text.dbt", before_row) != changed_key and before_row.original_line != after_row.original_line:
+            raise AssertionError("save_existing rewrote an untouched DBT line")
     if (temp / "backups").exists():
         raise AssertionError("Git-backed save unexpectedly created a backup directory")
     safe_rmtree(temp)
@@ -115,6 +137,33 @@ def assert_save_missing(root: Path) -> None:
     saved = [item for item in reloaded.units if item.file_rel == unit.file_rel and item.record_id == unit.record_id and item.label == unit.label]
     if not saved or saved[0].status == STATUS_MISSING_ROW:
         raise AssertionError("inserted missing row did not reload as an existing row")
+    safe_rmtree(temp)
+
+
+def assert_missing_insertions_follow_file_order(root: Path) -> None:
+    temp = make_temp_project(root, "translator_tool_smoke_missing_order_")
+    project = Project.load(temp, "#chinese")
+    missing = [
+        unit
+        for unit in project.units
+        if unit.file_rel == "Text.dbt" and unit.status == STATUS_MISSING_ROW and unit.source_text
+    ][:2]
+    if len(missing) < 2:
+        safe_rmtree(temp)
+        return
+    for unit in missing:
+        unit.set_text(unit.source_text)
+    project.save(list(reversed(missing)))
+    after = load_dbt(temp / "languages" / "#chinese" / "Text.dbt")
+    positions = []
+    for unit in missing:
+        key = (int(unit.record_id), unit.label)
+        row = after.row_index.get(key)
+        if row is None:
+            raise AssertionError("missing row was not inserted")
+        positions.append((unit.ref.source_order, row.line_index))
+    if [line for _source, line in sorted(positions)] != sorted(line for _source, line in positions):
+        raise AssertionError("missing rows were not inserted in original file order")
     safe_rmtree(temp)
 
 
@@ -334,8 +383,10 @@ def main() -> int:
     assert_codec(root)
     assert_round_trip(root)
     assert_statuses(root)
+    assert_loaded_order_matches_file_lines(root)
     assert_save_existing(root)
     assert_save_missing(root)
+    assert_missing_insertions_follow_file_order(root)
     assert_unsaved_translation_status(root)
     assert_project_history_settings(root)
     assert_external_project_uses_tool_codec(root)
