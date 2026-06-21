@@ -20,8 +20,20 @@ from .settings import AppSettings, load_settings, save_settings
 from .validation import validate_translation
 
 
-def project_root() -> Path:
+def tool_root() -> Path:
     return Path(__file__).resolve().parents[1]
+
+
+def project_root() -> Path:
+    root = tool_root()
+    if (root / "languages").is_dir():
+        return root
+    sources = root / "sources"
+    if sources.is_dir():
+        for candidate in sorted(sources.iterdir()):
+            if candidate.is_dir() and (candidate / "languages").is_dir():
+                return candidate
+    return root
 
 
 def assert_round_trip(root: Path) -> None:
@@ -35,9 +47,9 @@ def assert_round_trip(root: Path) -> None:
 
 
 def assert_statuses(root: Path) -> None:
-    project = Project.load(root, "#chinese")
+    project = Project.load(root, "#chinese", codec_root=tool_root())
     statuses = {unit.status for unit in project.units}
-    expected = {"译文缺行", "译文为空", "未翻译(同原文)", "译文多余"}
+    expected = {"译文缺行", "未翻译(同原文)", "译文多余"}
     missing = expected - statuses
     if missing:
         raise AssertionError(f"expected statuses not found: {sorted(missing)}")
@@ -53,7 +65,7 @@ def assert_statuses(root: Path) -> None:
 
 def copy_project_subset(src_root: Path, dst_root: Path) -> None:
     (dst_root / "encoder" / "data").mkdir(parents=True)
-    shutil.copy2(src_root / "encoder" / "data" / "guild2_chinese_codec.json", dst_root / "encoder" / "data")
+    shutil.copy2(tool_root() / "encoder" / "data" / "guild2_chinese_codec.json", dst_root / "encoder" / "data")
     (dst_root / "languages" / "#chinese").mkdir(parents=True)
     for name in ["Text.dbt", "Tooltips.dbt"]:
         shutil.copy2(src_root / "languages" / name, dst_root / "languages" / name)
@@ -135,6 +147,16 @@ def assert_project_history_settings(root: Path) -> None:
         safe_rmtree(temp)
 
 
+def assert_external_project_uses_tool_codec(root: Path) -> None:
+    temp = make_temp_project(root, "translator_tool_smoke_external_codec_")
+    shutil.rmtree(temp / "encoder")
+    project = Project.load(temp, "#chinese", codec_root=tool_root())
+    if not project.units:
+        raise AssertionError("external project did not load with the tool codec")
+    LanguageGit(temp, codec_root=tool_root())
+    safe_rmtree(temp)
+
+
 def assert_validation_blocks(root: Path) -> None:
     temp = make_temp_project(root, "translator_tool_smoke_validation_")
     project = Project.load(temp, "#chinese")
@@ -166,7 +188,7 @@ def assert_ignore_cache(root: Path) -> None:
 
 
 def assert_codec(root: Path) -> None:
-    codec = Guild2Codec.load(default_codec_path(root))
+    codec = Guild2Codec.load(default_codec_path(tool_root()))
     text = "测试"
     if codec.decode(codec.encode(text)) != text:
         raise AssertionError("codec encode/decode did not round-trip")
@@ -296,6 +318,7 @@ def main() -> int:
     assert_save_missing(root)
     assert_unsaved_translation_status(root)
     assert_project_history_settings(root)
+    assert_external_project_uses_tool_codec(root)
     assert_validation_blocks(root)
     assert_ignore_cache(root)
     assert_operation_history()

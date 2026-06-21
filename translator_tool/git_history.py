@@ -62,11 +62,11 @@ class TranslationLogEntry:
 class LanguageGit:
     """A narrow Git facade: only the language repository is ever auto-committed."""
 
-    def __init__(self, project_root: Path, language: str = "#chinese") -> None:
+    def __init__(self, project_root: Path, language: str = "#chinese", codec_root: Path | None = None) -> None:
         self.project_root = project_root.resolve()
         self.repo = self.project_root / "languages"
         self.language = language
-        self.codec = Guild2Codec.load(default_codec_path(self.project_root))
+        self.codec = Guild2Codec.load(default_codec_path(self.project_root, codec_root))
 
     def ensure_repository(self, settings: AppSettings) -> bool:
         """Create the initial language baseline. Returns true when it was created."""

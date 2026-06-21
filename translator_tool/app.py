@@ -871,7 +871,7 @@ class TranslatorWindow(QMainWindow):
             self.load_project(discard_changes=True)
         else:
             self._update_project_button()
-            self.statusBar().showMessage("请选择包含 languages 和 encoder 的翻译项目文件夹。")
+            self.statusBar().showMessage("请选择包含 languages 的翻译项目文件夹。编码表将从软件目录读取。")
             QTimer.singleShot(0, self.choose_project_folder)
 
     def _build_ui(self) -> None:
@@ -1040,8 +1040,6 @@ class TranslatorWindow(QMainWindow):
             return "文件夹不存在或不可访问。"
         if not (root / "languages").is_dir():
             return "缺少 languages 文件夹。"
-        if not (root / "encoder" / "data" / "guild2_chinese_codec.json").is_file():
-            return "缺少 encoder/data/guild2_chinese_codec.json。"
         try:
             languages = Project.language_dirs(root)
         except OSError:
@@ -1090,9 +1088,13 @@ class TranslatorWindow(QMainWindow):
                     return
         try:
             if self.git is None:
-                self.git = LanguageGit(self.project_root)
+                self.git = LanguageGit(self.project_root, codec_root=DEFAULT_PROJECT_ROOT)
             self.git.ensure_repository(self.settings)
-            project = Project.load(self.project_root, self.language_combo.currentText() or "#chinese")
+            project = Project.load(
+                self.project_root,
+                self.language_combo.currentText() or "#chinese",
+                codec_root=DEFAULT_PROJECT_ROOT,
+            )
         except (ProjectError, GitError, OSError, ValueError) as exc:
             QMessageBox.critical(self, "无法加载项目", str(exc))
             return
@@ -1131,7 +1133,7 @@ class TranslatorWindow(QMainWindow):
             QMessageBox.warning(
                 self,
                 "不是翻译项目文件夹",
-                f"{problem}\n\n请选择包含 languages/ 和 encoder/ 的项目根目录。",
+                f"{problem}\n\n请选择包含 languages/ 的项目根目录。编码表会从软件目录读取。",
             )
             return
         if self.project_root is not None and root == self.project_root:
@@ -1150,9 +1152,9 @@ class TranslatorWindow(QMainWindow):
         preferred = self.language_combo.currentText()
         language = preferred if preferred in choices else ("#chinese" if "#chinese" in choices else choices[0])
         try:
-            git = LanguageGit(root)
+            git = LanguageGit(root, codec_root=DEFAULT_PROJECT_ROOT)
             git.ensure_repository(self.settings)
-            project = Project.load(root, language)
+            project = Project.load(root, language, codec_root=DEFAULT_PROJECT_ROOT)
         except (ProjectError, GitError, OSError, ValueError) as exc:
             QMessageBox.critical(self, "无法加载项目", str(exc))
             return
@@ -1172,7 +1174,7 @@ class TranslatorWindow(QMainWindow):
     def _update_project_button(self) -> None:
         if self.project_root is None:
             self.project_button.setText("打开项目…")
-            self.project_button.setToolTip("选择包含 languages 和 encoder 的翻译项目文件夹")
+            self.project_button.setToolTip("选择包含 languages 的翻译项目文件夹；编码表从软件目录读取")
             return
         self.project_button.setText(f"项目 · {self.project_root.name}")
         self.project_button.setToolTip(str(self.project_root))

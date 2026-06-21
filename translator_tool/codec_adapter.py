@@ -103,6 +103,7 @@ class Guild2Codec:
         return "".join(out)
 
 
-def default_codec_path(project_root: Path) -> Path:
-    return project_root / "encoder" / "data" / "guild2_chinese_codec.json"
-
+def default_codec_path(project_root: Path, codec_root: Path | None = None) -> Path:
+    """Return the bundled codec path, optionally separate from a language project."""
+    root = codec_root if codec_root is not None else project_root
+    return root / "encoder" / "data" / "guild2_chinese_codec.json"

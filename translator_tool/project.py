@@ -136,12 +136,12 @@ class Project:
     source_order: dict[str, dict[tuple[int, str], int]]
 
     @classmethod
-    def load(cls, root: Path, language: str = "#chinese") -> "Project":
+    def load(cls, root: Path, language: str = "#chinese", codec_root: Path | None = None) -> "Project":
         root = root.resolve()
         languages_root = root / "languages"
         if not languages_root.exists():
             raise ProjectError(f"languages directory not found: {languages_root}")
-        codec = Guild2Codec.load(default_codec_path(root))
+        codec = Guild2Codec.load(default_codec_path(root, codec_root))
 
         source_docs: dict[str, DbtDocument] = {}
         for path in sorted(languages_root.glob("*.dbt")):
