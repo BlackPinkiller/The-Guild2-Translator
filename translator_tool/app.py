@@ -33,6 +33,7 @@ from PySide6.QtWidgets import (
     QComboBox,
     QDialog,
     QDialogButtonBox,
+    QFileDialog,
     QFormLayout,
     QFrame,
     QGroupBox,
@@ -92,7 +93,7 @@ from .validation import (
 )
 
 
-PROJECT_ROOT = Path(getattr(sys, "_MEIPASS", Path(__file__).resolve().parents[1])).resolve()
+DEFAULT_PROJECT_ROOT = Path(getattr(sys, "_MEIPASS", Path(__file__).resolve().parents[1])).resolve()
 TYPING_GROUP_DELAY_MS = 750
 
 
@@ -829,7 +830,8 @@ class TranslatorWindow(QMainWindow):
         self.setWindowTitle("The Guild 2 · 中文翻译工作台")
         self.resize(1480, 920)
         self.settings = load_settings()
-        self.git = LanguageGit(PROJECT_ROOT)
+        self.project_root = self._startup_project_root()
+        self.git: LanguageGit | None = None
         self.git_pending = False
         self.project: Project | None = None
         self.model = UnitTableModel()
@@ -864,8 +866,13 @@ class TranslatorWindow(QMainWindow):
         self.thread_pool = QThreadPool.globalInstance()
 
         self._build_ui()
-        self._load_language_choices()
-        self.load_project(discard_changes=True)
+        if self.project_root is not None:
+            self._load_language_choices()
+            self.load_project(discard_changes=True)
+        else:
+            self._update_project_button()
+            self.statusBar().showMessage("请选择包含 languages 和 encoder 的翻译项目文件夹。")
+            QTimer.singleShot(0, self.choose_project_folder)
 
     def _build_ui(self) -> None:
         root = QWidget()
@@ -882,6 +889,13 @@ class TranslatorWindow(QMainWindow):
         toolbar_layout.setSpacing(8)
         layout.addWidget(toolbar)
 
+        self.project_button = QToolButton()
+        self.project_button.setPopupMode(QToolButton.ToolButtonPopupMode.MenuButtonPopup)
+        self.project_button.clicked.connect(self.choose_project_folder)
+        self.project_menu = QMenu(self.project_button)
+        self.project_menu.aboutToShow.connect(self._populate_project_menu)
+        self.project_button.setMenu(self.project_menu)
+        toolbar_layout.addWidget(self.project_button)
         toolbar_layout.addWidget(QLabel("语言"))
         self.language_combo = QComboBox()
         self.language_combo.setMinimumWidth(128)
@@ -1019,16 +1033,55 @@ class TranslatorWindow(QMainWindow):
         layout.addWidget(editor)
         return box, editor
 
-    def _load_language_choices(self) -> None:
-        choices = Project.language_dirs(PROJECT_ROOT)
+    @staticmethod
+    def _project_folder_problem(root: Path) -> str | None:
+        root = root.expanduser()
+        if not root.is_dir():
+            return "文件夹不存在或不可访问。"
+        if not (root / "languages").is_dir():
+            return "缺少 languages 文件夹。"
+        if not (root / "encoder" / "data" / "guild2_chinese_codec.json").is_file():
+            return "缺少 encoder/data/guild2_chinese_codec.json。"
+        try:
+            languages = Project.language_dirs(root)
+        except OSError:
+            return "无法读取 languages 文件夹。"
+        if not languages:
+            return "languages 中没有 # 开头的译文文件夹。"
+        return None
+
+    def _startup_project_root(self) -> Path | None:
+        candidates = [self.settings.last_project_root, *self.settings.recent_project_roots, str(DEFAULT_PROJECT_ROOT)]
+        seen: set[str] = set()
+        for raw_path in candidates:
+            if not raw_path:
+                continue
+            try:
+                root = Path(raw_path).expanduser().resolve()
+            except OSError:
+                continue
+            key = str(root).casefold()
+            if key in seen:
+                continue
+            seen.add(key)
+            if self._project_folder_problem(root) is None:
+                return root
+        return None
+
+    def _load_language_choices(self, preferred: str | None = None) -> None:
+        choices = Project.language_dirs(self.project_root) if self.project_root is not None else []
         blocker = QSignalBlocker(self.language_combo)
         self.language_combo.clear()
         self.language_combo.addItems(choices)
-        if "#chinese" in choices:
-            self.language_combo.setCurrentText("#chinese")
+        selected = preferred if preferred in choices else ("#chinese" if "#chinese" in choices else (choices[0] if choices else ""))
+        if selected in choices:
+            self.language_combo.setCurrentText(selected)
         del blocker
 
     def load_project(self, discard_changes: bool = False) -> None:
+        if self.project_root is None:
+            self.choose_project_folder()
+            return
         if self.project is not None and not discard_changes:
             self._commit_typing_operation()
             if self.project.dirty_units():
@@ -1036,11 +1089,18 @@ class TranslatorWindow(QMainWindow):
                 if answer != QMessageBox.StandardButton.Yes:
                     return
         try:
+            if self.git is None:
+                self.git = LanguageGit(self.project_root)
             self.git.ensure_repository(self.settings)
-            self.project = Project.load(PROJECT_ROOT, self.language_combo.currentText() or "#chinese")
-        except (ProjectError, GitError) as exc:
+            project = Project.load(self.project_root, self.language_combo.currentText() or "#chinese")
+        except (ProjectError, GitError, OSError, ValueError) as exc:
             QMessageBox.critical(self, "无法加载项目", str(exc))
             return
+        self._activate_project(project)
+        self._remember_project_root(self.project_root)
+
+    def _activate_project(self, project: Project) -> None:
+        self.project = project
         self.history.clear()
         self.typing_uid = ""
         self.current_uid = ""
@@ -1050,7 +1110,93 @@ class TranslatorWindow(QMainWindow):
         self._set_editor_unit(None)
         self._update_counts()
         self._update_pending_state()
+        self._update_project_button()
         self.statusBar().showMessage(f"已加载 {len(self.project.units)} 条翻译条目", 4500)
+
+    def choose_project_folder(self) -> None:
+        current = self.project_root or DEFAULT_PROJECT_ROOT
+        start_dir = current if current.is_dir() else current.parent
+        folder = QFileDialog.getExistingDirectory(self, "选择翻译项目文件夹", str(start_dir))
+        if folder:
+            self.switch_project_folder(Path(folder))
+
+    def switch_project_folder(self, root: Path) -> None:
+        try:
+            root = root.expanduser().resolve()
+        except OSError:
+            QMessageBox.warning(self, "无法打开项目", "所选文件夹不可访问。")
+            return
+        problem = self._project_folder_problem(root)
+        if problem is not None:
+            QMessageBox.warning(
+                self,
+                "不是翻译项目文件夹",
+                f"{problem}\n\n请选择包含 languages/ 和 encoder/ 的项目根目录。",
+            )
+            return
+        if self.project_root is not None and root == self.project_root:
+            self.load_project()
+            return
+        if self.ai_worker is not None:
+            QMessageBox.information(self, "正在翻译", "请先等待或取消当前 AI 翻译，再切换项目。")
+            return
+        if self.project is not None:
+            self._commit_typing_operation()
+            if self.project.dirty_units():
+                answer = QMessageBox.question(self, "切换项目", "当前项目有未保存译文，是否放弃并切换？")
+                if answer != QMessageBox.StandardButton.Yes:
+                    return
+        choices = Project.language_dirs(root)
+        preferred = self.language_combo.currentText()
+        language = preferred if preferred in choices else ("#chinese" if "#chinese" in choices else choices[0])
+        try:
+            git = LanguageGit(root)
+            git.ensure_repository(self.settings)
+            project = Project.load(root, language)
+        except (ProjectError, GitError, OSError, ValueError) as exc:
+            QMessageBox.critical(self, "无法加载项目", str(exc))
+            return
+        self.project_root = root
+        self.git = git
+        self._load_language_choices(language)
+        self._activate_project(project)
+        self._remember_project_root(root)
+
+    def _remember_project_root(self, root: Path) -> None:
+        value = str(root)
+        recent = [value]
+        recent.extend(path for path in self.settings.recent_project_roots if path.casefold() != value.casefold())
+        self.settings = replace(self.settings, last_project_root=value, recent_project_roots=recent[:8])
+        save_settings(self.settings)
+
+    def _update_project_button(self) -> None:
+        if self.project_root is None:
+            self.project_button.setText("打开项目…")
+            self.project_button.setToolTip("选择包含 languages 和 encoder 的翻译项目文件夹")
+            return
+        self.project_button.setText(f"项目 · {self.project_root.name}")
+        self.project_button.setToolTip(str(self.project_root))
+
+    def _populate_project_menu(self) -> None:
+        self.project_menu.clear()
+        self.project_menu.addAction("选择项目文件夹…", self.choose_project_folder)
+        self.project_menu.addSeparator()
+        self.project_menu.addSection("最近项目")
+        available = 0
+        for raw_path in self.settings.recent_project_roots:
+            try:
+                root = Path(raw_path).expanduser().resolve()
+            except OSError:
+                continue
+            if self._project_folder_problem(root) is not None:
+                continue
+            action = self.project_menu.addAction(root.name or str(root))
+            action.setToolTip(str(root))
+            action.triggered.connect(lambda _checked=False, project_root=root: self.switch_project_folder(project_root))
+            available += 1
+        if not available:
+            action = self.project_menu.addAction("暂无可用的最近项目")
+            action.setEnabled(False)
 
     def _update_file_choices(self) -> None:
         files = ["全部文件", *sorted({unit.file_rel for unit in self.model.units})]
@@ -1126,7 +1272,8 @@ class TranslatorWindow(QMainWindow):
         dirty_count = len(self.project.dirty_units())
         save_state = f"未保存 {dirty_count} 条" if dirty_count else "已保存"
         git_state = " · Git 待提交" if self.git_pending else ""
-        self.setWindowTitle(f"The Guild 2 · {location} · {save_state}{git_state}")
+        project_name = self.project_root.name if self.project_root is not None else "未加载"
+        self.setWindowTitle(f"The Guild 2 · {project_name} · {location} · {save_state}{git_state}")
 
     def _on_row_selected(self, current: QModelIndex, _previous: QModelIndex) -> None:
         self._commit_typing_operation()
@@ -1486,7 +1633,7 @@ class TranslatorWindow(QMainWindow):
             return
         commit_note = ""
         try:
-            commit = self.git.commit_saved(result.changed_files, result.saved_units)
+            commit = self.git.commit_saved(result.changed_files, result.saved_units) if self.git is not None else None
             commit_note = f"，已创建 Git 提交 {commit.short_hash}" if commit else ""
         except GitError as exc:
             commit_note = f"；文件已保存，但 Git 提交失败：{exc}"
@@ -1494,6 +1641,8 @@ class TranslatorWindow(QMainWindow):
         self.statusBar().showMessage(f"已保存 {len(result.changed_files)} 个文件{commit_note}", 7000)
 
     def retry_commit(self) -> None:
+        if self.git is None:
+            return
         try:
             commit = self.git.commit_pending()
         except GitError as exc:
@@ -1503,6 +1652,11 @@ class TranslatorWindow(QMainWindow):
         self.statusBar().showMessage(f"已提交待处理修改：{commit.short_hash}" if commit else "没有待提交的修改。", 5000)
 
     def _update_pending_state(self) -> None:
+        if self.git is None:
+            self.git_pending = False
+            self.retry_button.setVisible(False)
+            self._update_window_title()
+            return
         try:
             pending = self.git.has_pending_changes()
         except GitError:
@@ -1514,6 +1668,9 @@ class TranslatorWindow(QMainWindow):
         self._update_window_title()
 
     def show_history(self) -> None:
+        if self.git is None:
+            QMessageBox.information(self, "更新日志", "请先打开一个翻译项目。")
+            return
         HistoryDialog(self.git, self).exec()
 
     def show_settings(self) -> None:
@@ -1523,6 +1680,8 @@ class TranslatorWindow(QMainWindow):
         self.settings = dialog.result_settings()
         save_settings(self.settings)
         self.ai_delegate.set_provider(self.settings.provider)
+        if self.git is None:
+            return
         try:
             self.git.ensure_repository(self.settings)
         except GitError as exc:

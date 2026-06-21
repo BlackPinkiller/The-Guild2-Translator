@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 from pathlib import Path
 import shutil
 import uuid
@@ -15,7 +16,7 @@ from .project import (
     STATUS_MISSING_ROW,
     SaveValidationError,
 )
-from .settings import AppSettings
+from .settings import AppSettings, load_settings, save_settings
 from .validation import validate_translation
 
 
@@ -114,6 +115,24 @@ def assert_unsaved_translation_status(root: Path) -> None:
     if unit.display_status() != "已翻译" or unit.filter_status() != "已翻译":
         raise AssertionError("an unsaved translated unit did not report translated status")
     safe_rmtree(temp)
+
+
+def assert_project_history_settings(root: Path) -> None:
+    temp = root / f"_translator_tool_smoke_settings_{uuid.uuid4().hex[:8]}"
+    previous = os.environ.get("LOCALAPPDATA")
+    try:
+        os.environ["LOCALAPPDATA"] = str(temp)
+        expected = [str(root / f"project-{number}") for number in range(10)]
+        save_settings(AppSettings(last_project_root=expected[0], recent_project_roots=expected))
+        loaded = load_settings()
+        if loaded.last_project_root != expected[0] or loaded.recent_project_roots != expected[:8]:
+            raise AssertionError("project folder history was not persisted safely")
+    finally:
+        if previous is None:
+            os.environ.pop("LOCALAPPDATA", None)
+        else:
+            os.environ["LOCALAPPDATA"] = previous
+        safe_rmtree(temp)
 
 
 def assert_validation_blocks(root: Path) -> None:
@@ -276,6 +295,7 @@ def main() -> int:
     assert_save_existing(root)
     assert_save_missing(root)
     assert_unsaved_translation_status(root)
+    assert_project_history_settings(root)
     assert_validation_blocks(root)
     assert_ignore_cache(root)
     assert_operation_history()

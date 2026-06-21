@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, field
 import base64
 import ctypes
 from ctypes import wintypes
@@ -12,6 +12,7 @@ from typing import Any
 
 APP_DIR_NAME = "TheGuild2Translator"
 SETTINGS_FILE_NAME = "settings.json"
+RECENT_PROJECT_LIMIT = 8
 
 
 @dataclass
@@ -25,6 +26,8 @@ class AppSettings:
     target_language: str = "zh-CN"
     git_author_name: str = "The Guild 2 Translator"
     git_author_email: str = "translator@local"
+    last_project_root: str = ""
+    recent_project_roots: list[str] = field(default_factory=list)
 
 
 def settings_dir() -> Path:
@@ -44,8 +47,14 @@ def load_settings() -> AppSettings:
         return AppSettings()
     if not isinstance(raw, dict):
         return AppSettings()
-    allowed = {field: raw[field] for field in AppSettings.__dataclass_fields__ if isinstance(raw.get(field), str)}
-    return AppSettings(**allowed)
+    values: dict[str, Any] = {}
+    for name in AppSettings.__dataclass_fields__:
+        value = raw.get(name)
+        if isinstance(value, str):
+            values[name] = value
+        elif name == "recent_project_roots" and isinstance(value, list):
+            values[name] = [item for item in value if isinstance(item, str)][:RECENT_PROJECT_LIMIT]
+    return AppSettings(**values)
 
 
 def save_settings(settings: AppSettings) -> None:
