@@ -101,7 +101,9 @@ class LanguageGit:
         return self.list_commits(1)[0]
 
     def has_pending_changes(self) -> bool:
-        return bool(self._run("status", "--porcelain").stdout.strip())
+        # The source language and other target languages can legitimately have
+        # local changes.  This UI only owns the active target-language folder.
+        return bool(self._pending_target_paths())
 
     def commit_pending(self) -> GitCommit | None:
         paths = self._pending_target_paths()

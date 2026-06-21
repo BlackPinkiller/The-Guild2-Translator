@@ -802,7 +802,7 @@ class HistoryDialog(QDialog):
     def __init__(self, git: LanguageGit, parent: QWidget | None = None) -> None:
         super().__init__(parent)
         self.git = git
-        self.setWindowTitle("Git 更新日志")
+        self.setWindowTitle(f"Git 更新日志 · {git.project_root.name} · {git.language}")
         self.resize(1080, 680)
         layout = QHBoxLayout(self)
         self.commits = QListWidget()
@@ -1155,12 +1155,13 @@ class TranslatorWindow(QMainWindow):
                 if answer != QMessageBox.StandardButton.Yes:
                     return
         try:
-            if self.git is None:
-                self.git = LanguageGit(self.project_root, codec_root=DEFAULT_PROJECT_ROOT)
+            language = self.language_combo.currentText() or "#chinese"
+            if self.git is None or self.git.language != language:
+                self.git = LanguageGit(self.project_root, language, codec_root=DEFAULT_PROJECT_ROOT)
             self.git.ensure_repository(self.settings)
             project = Project.load(
                 self.project_root,
-                self.language_combo.currentText() or "#chinese",
+                language,
                 codec_root=DEFAULT_PROJECT_ROOT,
             )
         except (ProjectError, GitError, OSError, ValueError) as exc:
@@ -1220,7 +1221,7 @@ class TranslatorWindow(QMainWindow):
         preferred = self.language_combo.currentText()
         language = preferred if preferred in choices else ("#chinese" if "#chinese" in choices else choices[0])
         try:
-            git = LanguageGit(root, codec_root=DEFAULT_PROJECT_ROOT)
+            git = LanguageGit(root, language, codec_root=DEFAULT_PROJECT_ROOT)
             git.ensure_repository(self.settings)
             project = Project.load(root, language, codec_root=DEFAULT_PROJECT_ROOT)
         except (ProjectError, GitError, OSError, ValueError) as exc:

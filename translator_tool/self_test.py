@@ -300,6 +300,21 @@ def assert_git_history(root: Path) -> None:
     safe_rmtree(temp)
 
 
+def assert_git_pending_is_scoped_to_active_language(root: Path) -> None:
+    temp = make_temp_project(root, "translator_tool_smoke_git_scope_")
+    git = LanguageGit(temp)
+    git.ensure_repository(AppSettings())
+    source_path = temp / "languages" / "Text.dbt"
+    source_path.write_bytes(source_path.read_bytes() + b"\n")
+    if git.has_pending_changes():
+        raise AssertionError("source-language changes must not show as pending translation commits")
+    target_path = temp / "languages" / "#chinese" / "Text.dbt"
+    target_path.write_bytes(target_path.read_bytes() + b"\n")
+    if not git.has_pending_changes():
+        raise AssertionError("active-language changes were not detected as pending")
+    safe_rmtree(temp)
+
+
 def assert_combined_git_history_format() -> None:
     early = TranslationLogEntry("新增", "Text.dbt", "10", "Greeting", "Text", "Hello", "你好")
     later = TranslationLogEntry("更新", "Text.dbt", "10", "Greeting", "Text", "Hello", "您好")
@@ -331,6 +346,7 @@ def main() -> int:
     assert_linebreak_format_is_ignored()
     assert_llm_suggestion_stream()
     assert_git_history(root)
+    assert_git_pending_is_scoped_to_active_language(root)
     assert_combined_git_history_format()
     print("translator_tool self-test ok")
     return 0
