@@ -17,6 +17,9 @@ from .project import (
     MISSING_WORK_STATUSES,
     Project,
     STATUS_MISSING_ROW,
+    STATUS_MODIFIED,
+    STATUS_REVIEW,
+    STATUS_TRANSLATED,
     SaveValidationError,
 )
 from .settings import AppSettings, load_settings, save_settings
@@ -178,7 +181,49 @@ def assert_unsaved_translation_status(root: Path) -> None:
     unit.set_text("AI translated")
     if unit.display_status() != "已翻译" or unit.filter_status() != "已翻译":
         raise AssertionError("an unsaved translated unit did not report translated status")
+    translated = next(item for item in project.units if item.status == STATUS_TRANSLATED)
+    translated.set_text(translated.current_text + "x")
+    if translated.display_status() != STATUS_MODIFIED or translated.filter_status() != STATUS_TRANSLATED:
+        raise AssertionError("an edited translated unit did not keep a translated filter state with a modified marker")
     safe_rmtree(temp)
+
+
+def assert_mod_label_match_inserts_source_formatted_row(root: Path) -> None:
+    temp = make_temp_project(root, "translator_tool_smoke_label_match_")
+    try:
+        target_path = temp / "languages" / "#chinese" / "Text.dbt"
+        target_doc = load_dbt(target_path)
+        target_row = target_doc.rows[0]
+        original_key = row_key("Text.dbt", target_row)
+        source_doc = load_dbt(temp / "languages" / "Text.dbt")
+        source_row = source_doc.row_index[original_key]
+        old_line = target_row.original_line
+        new_line = old_line.replace(str(target_row.row_id), str(target_row.row_id + 900000), 1)
+        target_path.write_bytes(target_doc.text.replace(old_line, new_line, 1).encode(target_doc.profile.encoding))
+
+        project = Project.load(temp, "#chinese")
+        unit = next(
+            item
+            for item in project.units
+            if item.file_rel == "Text.dbt" and item.record_id == str(source_row.row_id) and item.label == original_key[1]
+        )
+        if not unit.needs_review or unit.display_status() != STATUS_REVIEW:
+            raise AssertionError("a unique mod label match was not marked for review")
+        if unit.ref.target_row is not None or not unit.is_dirty:
+            raise AssertionError("label match did not stage a source-row insertion")
+        unit.set_text(unit.current_text + "x")
+        project.save([unit])
+        saved = load_dbt(target_path)
+        inserted = saved.row_index.get(original_key)
+        legacy_key = (target_row.row_id + 900000, original_key[1])
+        if inserted is None or legacy_key not in saved.row_index:
+            raise AssertionError("label match did not retain the legacy extra row and insert the source key")
+        source_prefix = source_row.original_line[: source_row.fields[0].end]
+        inserted_prefix = inserted.original_line[: inserted.fields[0].end]
+        if source_prefix != inserted_prefix:
+            raise AssertionError("inserted label-match row did not preserve the source file layout")
+    finally:
+        safe_rmtree(temp)
 
 
 def assert_project_history_settings(root: Path) -> None:
@@ -425,6 +470,7 @@ def main() -> int:
     assert_save_missing(root)
     assert_missing_insertions_follow_file_order(root)
     assert_unsaved_translation_status(root)
+    assert_mod_label_match_inserts_source_formatted_row(root)
     assert_project_history_settings(root)
     assert_external_project_uses_tool_codec(root)
     assert_validation_blocks(root)

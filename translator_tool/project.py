@@ -24,6 +24,8 @@ STATUS_MISSING_ROW = "译文缺行"
 STATUS_EMPTY = "译文为空"
 STATUS_SAME = "未翻译(同原文)"
 STATUS_TRANSLATED = "已翻译"
+STATUS_MODIFIED = "已修改"
+STATUS_REVIEW = "需审核"
 STATUS_EXTRA = "译文多余"
 STATUS_TRANSLATION_ONLY = "仅译文文件"
 STATUS_IGNORED = "无需翻译"
@@ -82,6 +84,7 @@ class TranslationUnit:
     font_codec: Guild2Codec | None = field(default=None, repr=False)
     edited_text: str | None = None
     ignored: bool = False
+    needs_review: bool = False
 
     @property
     def current_text(self) -> str:
@@ -89,7 +92,9 @@ class TranslationUnit:
 
     @property
     def is_dirty(self) -> bool:
-        return self.edited_text is not None and self.edited_text != self.translate_text
+        # A label fallback is staged as a new source-row translation. It must
+        # be saved into the source row's own ID, label, and physical position.
+        return self.needs_review or (self.edited_text is not None and self.edited_text != self.translate_text)
 
     def set_text(self, text: str) -> None:
         self.edited_text = None if text == self.translate_text else text
@@ -127,6 +132,13 @@ class TranslationUnit:
         return issue_summary(self.issues())
 
     def display_status(self) -> str:
+        # A label-based match can preserve useful existing translations across
+        # modded files whose numeric IDs have shifted. It remains visible as a
+        # review item while retaining its translated filter classification.
+        if self.needs_review:
+            return STATUS_REVIEW
+        if self.is_dirty and self.status == STATUS_TRANSLATED:
+            return STATUS_MODIFIED
         return self.current_status()
 
     def filter_status(self) -> str:
@@ -193,7 +205,16 @@ class Project:
                 continue
             order = {row_key(file_name, row): index for index, row in enumerate(source_doc.rows)}
             source_order[file_name] = order
-            units.extend(build_dbt_units(file_name, source_doc, target_doc, codec, order))
+            units.extend(
+                build_dbt_units(
+                    file_name,
+                    source_doc,
+                    target_doc,
+                    codec,
+                    order,
+                    label_match_first=root.name.casefold() != "vanilla",
+                )
+            )
 
         for file_rel, source_text_doc in source_text_docs.items():
             target_text_doc = target_text_docs.get(file_rel)
@@ -392,28 +413,43 @@ def build_dbt_units(
     target_doc: DbtDocument,
     codec: Guild2Codec,
     order: dict[tuple[int, str], int],
+    *,
+    label_match_first: bool = False,
 ) -> list[TranslationUnit]:
     units: list[TranslationUnit] = []
-    source_index = source_doc.row_index
     target_index = target_doc.row_index
+    target_by_label: dict[str, list[DbtRow]] = {}
+    if label_match_first:
+        for row in target_doc.rows:
+            target_by_label.setdefault(row_key(file_name, row)[1], []).append(row)
     target_fields = translatable_fields(file_name, target_doc.string_columns)
+    matched_target_keys: set[tuple[int, str]] = set()
 
     for source_row in source_doc.rows:
         key = row_key(file_name, source_row)
+        label_matches = target_by_label.get(key[1], ()) if label_match_first and key[1] else ()
         target_row = target_index.get(key)
+        label_row = label_matches[0] if len(label_matches) == 1 else None
+        matched_by_label = label_row is not None and label_row.row_id != source_row.row_id
+        # Label matching is only a translation suggestion. It never reuses
+        # the legacy target row as the save target: saving inserts a new row
+        # built from the source language's original layout and source key.
+        translation_row = label_row if matched_by_label else target_row
+        if target_row is not None:
+            matched_target_keys.add(row_key(file_name, target_row))
         display_order = target_row.line_index if target_row is not None else source_row.line_index
         for field_order, target_field in enumerate(target_fields):
             source_field = matching_source_field(target_field, source_doc.string_columns)
             source_text = source_row.get(source_field)
             initial_issues: list[ValidationIssue] = []
-            if source_text == "" and target_row is None:
+            if source_text == "" and translation_row is None:
                 translate_text = ""
                 status = STATUS_IGNORED
-            elif target_row is None:
+            elif translation_row is None:
                 translate_text = ""
                 status = STATUS_MISSING_ROW
             else:
-                raw_value = target_row.get(target_field)
+                raw_value = translation_row.get(target_field)
                 try:
                     translate_text = codec.decode(raw_value)
                 except CodecError as exc:
@@ -452,11 +488,12 @@ def build_dbt_units(
                     ),
                     initial_issues=initial_issues,
                     font_codec=codec,
+                    needs_review=matched_by_label,
                 )
             )
 
     for key, target_row in target_index.items():
-        if key in source_index:
+        if key in matched_target_keys:
             continue
         for field_order, target_field in enumerate(target_fields):
             raw_value = target_row.get(target_field)

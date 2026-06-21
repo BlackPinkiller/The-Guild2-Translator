@@ -78,6 +78,8 @@ from .project import (
     STATUS_EXTRA,
     STATUS_IGNORED,
     STATUS_MISSING_ROW,
+    STATUS_MODIFIED,
+    STATUS_REVIEW,
     STATUS_SAME,
     STATUS_TRANSLATED,
     STATUS_TRANSLATION_ONLY,
@@ -271,10 +273,10 @@ class UnitFilterProxyModel(QSortFilterProxyModel):
         if self.file_filter != "全部文件" and unit.file_rel != self.file_filter:
             return False
         effective_status = unit.filter_status()
-        keep_recent = source.is_recently_translated(unit)
-        if self.status_filter == "待翻译" and effective_status not in MISSING_WORK_STATUSES and not keep_recent:
+        keep_visible = source.is_recently_translated(unit) or unit.needs_review
+        if self.status_filter == "待翻译" and effective_status not in MISSING_WORK_STATUSES and not keep_visible:
             return False
-        if self.status_filter == "全部" and self.only_missing and effective_status not in MISSING_WORK_STATUSES and not keep_recent:
+        if self.status_filter == "全部" and self.only_missing and effective_status not in MISSING_WORK_STATUSES and not keep_visible:
             return False
         if self.status_filter not in {"全部", "待翻译"} and effective_status != self.status_filter:
             return False
@@ -479,7 +481,8 @@ class FormatDiffDelegate(QStyledItemDelegate):
 class StatusBadgeDelegate(QStyledItemDelegate):
     STYLES = {
         STATUS_TRANSLATED: ("已翻译", "#98971a", "#fbf1c7"),
-        "已修改": ("已修改", "#458588", "#fbf1c7"),
+        STATUS_MODIFIED: ("已修改", "#98971a", "#fbf1c7"),
+        STATUS_REVIEW: ("需审核", "#d79921", "#3c3836"),
         "待新增": ("待新增", "#d65d0e", "#fbf1c7"),
         STATUS_MISSING_ROW: ("待新增", "#d65d0e", "#fbf1c7"),
         STATUS_EMPTY: ("空译文", "#cc241d", "#fbf1c7"),
@@ -1334,10 +1337,11 @@ class TranslatorWindow(QMainWindow):
     def _update_file_choices(self) -> None:
         files = ["全部文件", *sorted({unit.file_rel for unit in self.model.units})]
         previous = self.file_combo.currentText()
+        default_file = "Text.dbt" if "Text.dbt" in files else "全部文件"
         blocker = QSignalBlocker(self.file_combo)
         self.file_combo.clear()
         self.file_combo.addItems(files)
-        self.file_combo.setCurrentText(previous if previous in files else "全部文件")
+        self.file_combo.setCurrentText(previous if previous in files else default_file)
         del blocker
 
     def _apply_filters(self) -> None:

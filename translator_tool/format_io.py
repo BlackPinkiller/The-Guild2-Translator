@@ -353,8 +353,10 @@ def matching_source_field(target_field: str, source_columns: list[str]) -> str:
 
 def make_inserted_line(source_row: DbtRow, source_doc: DbtDocument, target_doc: DbtDocument, field_values: dict[str, str]) -> str:
     line = source_row.original_line
-    body, _ending = split_line_ending(line)
-    line = body + target_doc.profile.newline
+    body, ending = split_line_ending(line)
+    # A newly translated row follows the source-language file byte layout.
+    # The target file may have a different historical newline convention.
+    line = body + (ending or source_doc.profile.newline)
     target_names = target_doc.string_columns
     source_names = source_doc.string_columns
     replacements: list[tuple[int, int, str]] = []
