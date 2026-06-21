@@ -1355,8 +1355,12 @@ class TranslatorWindow(QMainWindow):
         self._update_window_title()
 
     def _replace_current_text(self, text: str, label: str) -> None:
-        self._commit_typing_operation()
         unit = self._current_unit()
+        if unit is not None:
+            self._replace_unit_text(unit, text, label)
+
+    def _replace_unit_text(self, unit: TranslationUnit, text: str, label: str) -> None:
+        self._commit_typing_operation()
         if unit is None or unit.current_text == text:
             return
         before = unit.current_text
@@ -1380,7 +1384,7 @@ class TranslatorWindow(QMainWindow):
         unit = self._unit_from_proxy_index(index)
         if unit is None:
             return
-        self.table.setCurrentIndex(index)
+        self._select_context_row(index)
         if index.column() == UnitTableModel.AI:
             self._show_ai_provider_menu(self.table.viewport().mapToGlobal(point))
             return
@@ -1396,17 +1400,25 @@ class TranslatorWindow(QMainWindow):
         ignored = menu.addAction("取消无需翻译" if unit.ignored else "标记为无需翻译")
         action = menu.exec(self.table.viewport().mapToGlobal(point))
         if action == restore:
-            self._replace_current_text(unit.translate_text, "恢复载入译文")
+            self._replace_unit_text(unit, unit.translate_text, "恢复载入译文")
         elif action == source:
-            self._replace_current_text(unit.source_text, "还原为原文")
+            self._replace_unit_text(unit, unit.source_text, "还原为原文")
         elif action == clear:
-            self._replace_current_text("", "清空译文")
+            self._replace_unit_text(unit, "", "清空译文")
         elif action == ai_translate:
             self.translate_one_unit(unit.uid)
         elif action == llm_suggestion:
-            self.request_llm_suggestion()
+            self.request_llm_suggestion(unit.uid)
         elif action == ignored:
             self._set_ignored(unit, not unit.ignored)
+
+    def _select_context_row(self, index: QModelIndex) -> None:
+        """Keep an existing multi-selection intact when opening its context menu."""
+        selection = self.table.selectionModel()
+        if selection.isSelected(index):
+            return
+        self.table.setCurrentIndex(index)
+        self.table.selectRow(index.row())
 
     def _set_ignored(self, unit: TranslationUnit, ignored: bool) -> None:
         if self.project is None:
@@ -1456,9 +1468,9 @@ class TranslatorWindow(QMainWindow):
                 return
         self._start_ai([unit], "AI 单条翻译")
 
-    def request_llm_suggestion(self) -> None:
+    def request_llm_suggestion(self, uid: str | None = None) -> None:
         self._commit_typing_operation()
-        unit = self._current_unit()
+        unit = self.model.unit_for_uid(uid) if uid else self._current_unit()
         if unit is None or not unit.source_text:
             return
         if self.suggestion_worker is not None:
