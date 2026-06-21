@@ -29,6 +29,9 @@ STATUS_TRANSLATION_ONLY = "仅译文文件"
 STATUS_IGNORED = "无需翻译"
 MISSING_WORK_STATUSES = {STATUS_MISSING_ROW, STATUS_EMPTY, STATUS_SAME}
 NON_TRANSLATION_DBT_FILES = {"tables.dbt"}
+# Internal compatibility switch.  Other game adapters can disable this until
+# they provide a font/character codec with equivalent coverage.
+ENABLE_FONT_GLYPH_VALIDATION = True
 
 
 class ProjectError(RuntimeError):
@@ -76,6 +79,7 @@ class TranslationUnit:
     status: str
     ref: UnitRef
     initial_issues: list[ValidationIssue] = field(default_factory=list)
+    font_codec: Guild2Codec | None = field(default=None, repr=False)
     edited_text: str | None = None
     ignored: bool = False
 
@@ -112,7 +116,12 @@ class TranslationUnit:
         if self.ignored and not self.is_dirty:
             return self.initial_issues
         dbt_field = self.ref.kind == "dbt"
-        return self.initial_issues + validate_translation(self.source_text, self.current_text, dbt_field=dbt_field)
+        return self.initial_issues + validate_translation(
+            self.source_text,
+            self.current_text,
+            dbt_field=dbt_field,
+            font_codec=self.font_codec if ENABLE_FONT_GLYPH_VALIDATION else None,
+        )
 
     def issue_text(self) -> str:
         return issue_summary(self.issues())
@@ -442,6 +451,7 @@ def build_dbt_units(
                         field_order=field_order,
                     ),
                     initial_issues=initial_issues,
+                    font_codec=codec,
                 )
             )
 
@@ -479,6 +489,7 @@ def build_dbt_units(
                         field_order=field_order,
                     ),
                     initial_issues=initial_issues,
+                    font_codec=codec,
                 )
             )
     return units
@@ -518,4 +529,5 @@ def build_plain_text_unit(
         status=status,
         ref=UnitRef(kind="text", target_doc=text_doc, source_doc=source_doc, display_order=0, field_order=0),
         initial_issues=initial_issues,
+        font_codec=codec,
     )

@@ -66,9 +66,11 @@ from .ai import (
     llm_provider_from_settings,
     provider_from_settings,
 )
+from .codec_adapter import Guild2Codec
 from .git_history import GitCommit, GitError, LanguageGit, format_entries
 from .history import OperationHistory, TranslationOperation, UnitChange
 from .project import (
+    ENABLE_FONT_GLYPH_VALIDATION,
     MISSING_WORK_STATUSES,
     Project,
     ProjectError,
@@ -108,6 +110,7 @@ class UnitTableModel(QAbstractTableModel):
         self.units: list[TranslationUnit] = list(project.units) if project else []
         self._search: dict[str, str] = {}
         self._format_warning: dict[str, bool] = {}
+        self._glyph_warning: dict[str, bool] = {}
         self._recently_translated: set[str] = set()
         self._rebuild_search()
 
@@ -116,6 +119,7 @@ class UnitTableModel(QAbstractTableModel):
         self.project = project
         self.units = list(project.units)
         self._format_warning.clear()
+        self._glyph_warning.clear()
         self._recently_translated.clear()
         self._rebuild_search()
         self.endResetModel()
@@ -150,6 +154,8 @@ class UnitTableModel(QAbstractTableModel):
                 suffix = "\n本次会话刚翻译，可继续审阅。" if unit.uid in self._recently_translated else ""
                 return unit.display_status() + suffix
         if role == Qt.ItemDataRole.BackgroundRole:
+            if self.has_glyph_warning(index.row()):
+                return QColor("#f3d9a4")
             return QColor("#dce5b5") if unit.uid in self._recently_translated else None
         if role != Qt.ItemDataRole.DisplayRole:
             return None
@@ -186,6 +192,7 @@ class UnitTableModel(QAbstractTableModel):
             return
         self._search[unit.uid] = _search_blob(unit)
         self._format_warning.pop(unit.uid, None)
+        self._glyph_warning.pop(unit.uid, None)
         self.dataChanged.emit(self.index(row, 0), self.index(row, self.columnCount() - 1))
 
     def set_recently_translated(self, unit: TranslationUnit, recent: bool) -> None:
@@ -213,6 +220,14 @@ class UnitTableModel(QAbstractTableModel):
         if unit.uid not in self._format_warning:
             self._format_warning[unit.uid] = bool(unit.issues())
         return self._format_warning[unit.uid]
+
+    def has_glyph_warning(self, row: int) -> bool:
+        unit = self.unit_at(row)
+        if unit is None:
+            return False
+        if unit.uid not in self._glyph_warning:
+            self._glyph_warning[unit.uid] = any(issue.code == "font-glyph" for issue in unit.issues())
+        return self._glyph_warning[unit.uid]
 
     def _rebuild_search(self) -> None:
         self._search = {unit.uid: _search_blob(unit) for unit in self.units}
@@ -561,14 +576,20 @@ class BatchTranslateButton(QPushButton):
 
 
 class TokenHighlighter(QSyntaxHighlighter):
-    def __init__(self, document) -> None:
+    def __init__(self, document, glyph_codec: Guild2Codec | None = None) -> None:
         super().__init__(document)
+        self.glyph_codec = glyph_codec
         self.format_token = _text_format("#075a9c")
         self.color_token = _text_format("#7a3e9d")
         self.markup_token = _text_format("#6b6b00")
         self.quote_token = _text_format("#107c10")
         self.bad_token = _text_format("#b00020", underline=True)
         self.warn_token = _text_format("#c45f00", underline=True)
+        self.glyph_token = _text_format("#cc241d", underline=True)
+
+    def set_glyph_codec(self, glyph_codec: Guild2Codec | None) -> None:
+        self.glyph_codec = glyph_codec
+        self.rehighlight()
 
     def highlightBlock(self, text: str) -> None:  # noqa: N802
         for match in HIGHLIGHT_RE.finditer(text):
@@ -585,6 +606,12 @@ class TokenHighlighter(QSyntaxHighlighter):
             self.setFormat(match.start(), match.end() - match.start(), self.bad_token)
         for match in CHINESE_QUOTE_RE.finditer(text):
             self.setFormat(match.start(), match.end() - match.start(), self.warn_token)
+        if self.glyph_codec is not None:
+            position = 0
+            for char in text:
+                if self.glyph_codec.unsupported_characters(char):
+                    self.setFormat(position, 2 if ord(char) > 0xFFFF else 1, self.glyph_token)
+                position += 2 if ord(char) > 0xFFFF else 1
 
 
 class AiWorkerSignals(QObject):
@@ -1176,6 +1203,7 @@ class TranslatorWindow(QMainWindow):
         self.typing_uid = ""
         self.current_uid = ""
         self.model.set_project(self.project)
+        self.translation_highlighter.set_glyph_codec(self.project.codec if ENABLE_FONT_GLYPH_VALIDATION else None)
         self._update_file_choices()
         self._apply_filters()
         self._set_editor_unit(None)
@@ -1945,6 +1973,8 @@ def _counter_tokens(counter: Counter[str]) -> list[str]:
 
 
 def _short_issue_name(message: str) -> str:
+    if "字库缺字" in message:
+        return "FONT"
     if "全角" in message:
         return "FW"
     if "双引号" in message:

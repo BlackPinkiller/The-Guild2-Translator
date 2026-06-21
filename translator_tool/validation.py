@@ -4,6 +4,8 @@ from collections import Counter
 from dataclasses import dataclass
 import re
 
+from .codec_adapter import Guild2Codec
+
 
 # Translation-Kit placeholders:
 #   %1, %1n, %1i, %1t, %1s, %1l, %1SN, %1SV, %1GG, %1DN, %1NAME, %1SA, %1ST, %1SK
@@ -78,6 +80,7 @@ BARE_PERCENT_RE = re.compile(
 class ValidationIssue:
     severity: str
     message: str
+    code: str = ""
 
     @property
     def blocks_save(self) -> bool:
@@ -132,7 +135,13 @@ def compare_tokens(source: str, target: str) -> list[ValidationIssue]:
     return issues
 
 
-def validate_translation(source: str, target: str, *, dbt_field: bool) -> list[ValidationIssue]:
+def validate_translation(
+    source: str,
+    target: str,
+    *,
+    dbt_field: bool,
+    font_codec: Guild2Codec | None = None,
+) -> list[ValidationIssue]:
     issues = compare_tokens(source, target)
     if dbt_field and '"' in target:
         issues.append(ValidationIssue("error", 'DBT 字段不能包含双引号 "，请使用 >Text<。'))
@@ -144,6 +153,12 @@ def validate_translation(source: str, target: str, *, dbt_field: bool) -> list[V
         issues.append(ValidationIssue("warning", f"中文引号可能不符合 Translation-Kit: {bad}"))
     if BARE_PERCENT_RE.search(target):
         issues.append(ValidationIssue("warning", "发现单个 %；若要显示百分号，Translation-Kit 建议使用 %%"))
+    if font_codec is not None:
+        missing = font_codec.unsupported_characters(target)
+        if missing:
+            chars = "".join(missing)
+            points = ", ".join(f"U+{ord(char):04X}" for char in missing)
+            issues.append(ValidationIssue("warning", f"字库缺字: {chars} ({points})", code="font-glyph"))
     return issues
 
 

@@ -81,7 +81,7 @@ class Guild2Codec:
 
     def encode(self, text: str) -> str:
         out: list[str] = []
-        missing: list[str] = []
+        missing = self.unsupported_characters(text)
         for char in text:
             target = self.plain_to_game.get(char)
             if isinstance(target, str) and len(target) == 1:
@@ -94,13 +94,22 @@ class Guild2Codec:
                 out.append(char)
                 continue
             out.append(char)
-            if char not in missing:
-                missing.append(char)
         if missing:
             chars = "".join(missing)
             points = ", ".join(f"{char}(U+{ord(char):04X})" for char in missing)
             raise CodecError(f"cannot encode character(s): {chars} / {points}")
         return "".join(out)
+
+    def unsupported_characters(self, text: str) -> list[str]:
+        """Return distinct characters the active game font codec cannot encode."""
+        missing: list[str] = []
+        for char in text:
+            target = self.plain_to_game.get(char)
+            if (isinstance(target, str) and len(target) == 1) or ord(char) < 128 or is_private(char):
+                continue
+            if char not in missing:
+                missing.append(char)
+        return missing
 
 
 def default_codec_path(project_root: Path, codec_root: Path | None = None) -> Path:

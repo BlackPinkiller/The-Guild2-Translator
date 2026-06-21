@@ -6,6 +6,7 @@ import shutil
 import tempfile
 import uuid
 
+from . import project as project_module
 from .ai import GoogleTranslateProvider, OpenAICompatibleProvider, TranslationProviderError
 from .codec_adapter import Guild2Codec, default_codec_path
 from .git_history import LanguageGit, TranslationLogEntry, combine_entries, format_entries
@@ -248,6 +249,21 @@ def assert_codec(root: Path) -> None:
         raise AssertionError("codec encode/decode did not round-trip")
 
 
+def assert_font_glyph_validation(root: Path) -> None:
+    project = Project.load(root, "#chinese", codec_root=tool_root())
+    unit = next(unit for unit in project.units if unit.source_text)
+    unit.set_text("字😀")
+    if not any(issue.code == "font-glyph" and "😀" in issue.message for issue in unit.issues()):
+        raise AssertionError("font glyph validation did not flag an unsupported character")
+    previous = project_module.ENABLE_FONT_GLYPH_VALIDATION
+    try:
+        project_module.ENABLE_FONT_GLYPH_VALIDATION = False
+        if any(issue.code == "font-glyph" for issue in unit.issues()):
+            raise AssertionError("internal font glyph switch did not disable validation")
+    finally:
+        project_module.ENABLE_FONT_GLYPH_VALIDATION = previous
+
+
 class FakeGoogleTransport:
     def __init__(self, response: str) -> None:
         self.response = response
@@ -381,6 +397,7 @@ def assert_combined_git_history_format() -> None:
 def main() -> int:
     root = project_root()
     assert_codec(root)
+    assert_font_glyph_validation(root)
     assert_round_trip(root)
     assert_statuses(root)
     assert_loaded_order_matches_file_lines(root)
