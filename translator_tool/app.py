@@ -108,6 +108,7 @@ class UnitTableModel(QAbstractTableModel):
         self.units: list[TranslationUnit] = list(project.units) if project else []
         self._search: dict[str, str] = {}
         self._format_warning: dict[str, bool] = {}
+        self._recently_translated: set[str] = set()
         self._rebuild_search()
 
     def set_project(self, project: Project) -> None:
@@ -115,6 +116,7 @@ class UnitTableModel(QAbstractTableModel):
         self.project = project
         self.units = list(project.units)
         self._format_warning.clear()
+        self._recently_translated.clear()
         self._rebuild_search()
         self.endResetModel()
 
@@ -145,9 +147,10 @@ class UnitTableModel(QAbstractTableModel):
             if index.column() == self.AI:
                 return "左键：翻译当前条目\n右键：切换 Google Translate / OpenAI 兼容 LLM"
             if index.column() == self.STATUS:
-                return unit.display_status()
+                suffix = "\n本次会话刚翻译，可继续审阅。" if unit.uid in self._recently_translated else ""
+                return unit.display_status() + suffix
         if role == Qt.ItemDataRole.BackgroundRole:
-            return None
+            return QColor("#dce5b5") if unit.uid in self._recently_translated else None
         if role != Qt.ItemDataRole.DisplayRole:
             return None
         column = index.column()
@@ -184,6 +187,24 @@ class UnitTableModel(QAbstractTableModel):
         self._search[unit.uid] = _search_blob(unit)
         self._format_warning.pop(unit.uid, None)
         self.dataChanged.emit(self.index(row, 0), self.index(row, self.columnCount() - 1))
+
+    def set_recently_translated(self, unit: TranslationUnit, recent: bool) -> None:
+        if recent:
+            self._recently_translated.add(unit.uid)
+        else:
+            self._recently_translated.discard(unit.uid)
+        try:
+            row = self.units.index(unit)
+        except ValueError:
+            return
+        self.dataChanged.emit(self.index(row, 0), self.index(row, self.columnCount() - 1))
+
+    def is_recently_translated(self, unit: TranslationUnit) -> bool:
+        return unit.uid in self._recently_translated
+
+    @property
+    def recently_translated_count(self) -> int:
+        return len(self._recently_translated)
 
     def has_format_warning(self, row: int) -> bool:
         unit = self.unit_at(row)
@@ -235,9 +256,10 @@ class UnitFilterProxyModel(QSortFilterProxyModel):
         if self.file_filter != "全部文件" and unit.file_rel != self.file_filter:
             return False
         effective_status = unit.filter_status()
-        if self.status_filter == "待翻译" and effective_status not in MISSING_WORK_STATUSES:
+        keep_recent = source.is_recently_translated(unit)
+        if self.status_filter == "待翻译" and effective_status not in MISSING_WORK_STATUSES and not keep_recent:
             return False
-        if self.status_filter == "全部" and self.only_missing and effective_status not in MISSING_WORK_STATUSES:
+        if self.status_filter == "全部" and self.only_missing and effective_status not in MISSING_WORK_STATUSES and not keep_recent:
             return False
         if self.status_filter not in {"全部", "待翻译"} and effective_status != self.status_filter:
             return False
@@ -1300,10 +1322,11 @@ class TranslatorWindow(QMainWindow):
             return
         effective = Counter(unit.filter_status() for unit in self.project.units)
         todo = sum(unit.filter_status() in MISSING_WORK_STATUSES for unit in self.project.units)
+        recent = self.model.recently_translated_count
         self.counts_label.setText(
             f"当前显示 {self.proxy.rowCount():,} / 总计 {len(self.project.units):,}   ·   "
             f"待翻译 {todo:,}   ·   已翻译 {effective[STATUS_TRANSLATED]:,}   ·   "
-            f"无需翻译 {effective[STATUS_IGNORED]:,}"
+            f"刚译 {recent:,}   ·   无需翻译 {effective[STATUS_IGNORED]:,}"
         )
 
     def _update_window_title(self) -> None:
@@ -1355,8 +1378,10 @@ class TranslatorWindow(QMainWindow):
             self._commit_typing_operation()
             self.typing_uid = unit.uid
             self.typing_before = unit.current_text
+        before_status = unit.filter_status()
         unit.set_text(text)
         self.model.refresh_unit(unit)
+        self._update_recent_translation_marker(unit, before_status)
         self._update_issue_detail(unit)
         self._update_counts()
         self._update_window_title()
@@ -1376,12 +1401,21 @@ class TranslatorWindow(QMainWindow):
         unit = self.model.unit_for_uid(uid)
         if unit is None:
             return
+        before_status = unit.filter_status()
         unit.set_text(text)
         self.model.refresh_unit(unit)
+        self._update_recent_translation_marker(unit, before_status)
         if uid == self.current_uid:
             self._set_editor_unit(unit)
         self._update_counts()
         self._update_window_title()
+
+    def _update_recent_translation_marker(self, unit: TranslationUnit, before_status: str) -> None:
+        current_status = unit.filter_status()
+        if before_status in MISSING_WORK_STATUSES and current_status == STATUS_TRANSLATED:
+            self.model.set_recently_translated(unit, True)
+        elif current_status != STATUS_TRANSLATED:
+            self.model.set_recently_translated(unit, False)
 
     def _replace_current_text(self, text: str, label: str) -> None:
         unit = self._current_unit()
@@ -1403,8 +1437,10 @@ class TranslatorWindow(QMainWindow):
         for change in changes:
             unit = self.model.unit_for_uid(change.uid)
             if unit is not None:
+                before_status = unit.filter_status()
                 unit.set_text(change.after)
                 self.model.refresh_unit(unit)
+                self._update_recent_translation_marker(unit, before_status)
         current = self._current_unit()
         if current is not None and any(change.uid == current.uid for change in changes):
             self._set_editor_unit(current)
@@ -1501,6 +1537,7 @@ class TranslatorWindow(QMainWindow):
         self.project.set_units_ignored(selected, ignored)
         for unit in selected:
             self.model.refresh_unit(unit)
+            self.model.set_recently_translated(unit, False)
         self._apply_filters()
         self._update_issue_detail(self._current_unit())
         self._update_window_title()
