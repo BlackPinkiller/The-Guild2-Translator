@@ -25,7 +25,7 @@ from PySide6.QtCore import (
     QRectF,
     Signal,
 )
-from PySide6.QtGui import QAction, QColor, QFont, QKeySequence, QPainter, QPalette, QPen, QSyntaxHighlighter, QTextCharFormat
+from PySide6.QtGui import QAction, QCloseEvent, QColor, QFont, QKeySequence, QPainter, QPalette, QPen, QSyntaxHighlighter, QTextCharFormat
 from PySide6.QtWidgets import (
     QApplication,
     QAbstractItemView,
@@ -1506,6 +1506,34 @@ class TranslatorWindow(QMainWindow):
         if unit.is_dirty:
             parts.append("未保存")
         self.issue_label.setText("   ·   ".join(parts) if parts else "格式正常")
+
+    def closeEvent(self, event: QCloseEvent) -> None:  # noqa: N802
+        self._commit_typing_operation()
+        if self.project is None:
+            event.accept()
+            return
+        dirty_count = len(self.project.dirty_units())
+        if not dirty_count:
+            event.accept()
+            return
+        choice = QMessageBox.warning(
+            self,
+            "未保存的翻译",
+            f"当前有 {dirty_count} 条译文尚未保存。退出前要如何处理？",
+            QMessageBox.StandardButton.Save | QMessageBox.StandardButton.Discard | QMessageBox.StandardButton.Cancel,
+            QMessageBox.StandardButton.Save,
+        )
+        if choice == QMessageBox.StandardButton.Save:
+            self.save_all()
+            if self.project is None or not self.project.dirty_units():
+                event.accept()
+            else:
+                event.ignore()
+            return
+        if choice == QMessageBox.StandardButton.Discard:
+            event.accept()
+            return
+        event.ignore()
 
 
 def _search_blob(unit: TranslationUnit) -> str:
