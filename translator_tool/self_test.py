@@ -104,6 +104,18 @@ def assert_save_missing(root: Path) -> None:
     safe_rmtree(temp)
 
 
+def assert_unsaved_translation_status(root: Path) -> None:
+    temp = make_temp_project(root, "translator_tool_smoke_status_")
+    project = Project.load(temp, "#chinese")
+    unit = next(item for item in project.units if item.status == STATUS_MISSING_ROW and item.source_text)
+    if unit.display_status() != STATUS_MISSING_ROW:
+        raise AssertionError("an untouched missing row no longer reported missing status")
+    unit.set_text("AI translated")
+    if unit.display_status() != "已翻译" or unit.filter_status() != "已翻译":
+        raise AssertionError("an unsaved translated unit did not report translated status")
+    safe_rmtree(temp)
+
+
 def assert_validation_blocks(root: Path) -> None:
     temp = make_temp_project(root, "translator_tool_smoke_validation_")
     project = Project.load(temp, "#chinese")
@@ -263,6 +275,7 @@ def main() -> int:
     assert_statuses(root)
     assert_save_existing(root)
     assert_save_missing(root)
+    assert_unsaved_translation_status(root)
     assert_validation_blocks(root)
     assert_ignore_cache(root)
     assert_operation_history()

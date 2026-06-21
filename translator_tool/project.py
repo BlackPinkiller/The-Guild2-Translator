@@ -88,6 +88,24 @@ class TranslationUnit:
     def set_text(self, text: str) -> None:
         self.edited_text = None if text == self.translate_text else text
 
+    def current_status(self) -> str:
+        """Classify the visible translation text, including unsaved edits."""
+        if self.ignored:
+            return STATUS_IGNORED
+        # These entries have no corresponding source entry, so an edit cannot
+        # turn them into a regular translated source entry.
+        if self.status in {STATUS_EXTRA, STATUS_TRANSLATION_ONLY}:
+            return self.status
+        if not self.source_text and self.status == STATUS_IGNORED:
+            return STATUS_IGNORED
+        if self.status == STATUS_MISSING_ROW and not self.is_dirty:
+            return STATUS_MISSING_ROW
+        if not self.current_text:
+            return STATUS_EMPTY
+        if self.current_text == self.source_text:
+            return STATUS_SAME
+        return STATUS_TRANSLATED
+
     def issues(self) -> list[ValidationIssue]:
         if self.ignored and not self.is_dirty:
             return self.initial_issues
@@ -98,16 +116,10 @@ class TranslationUnit:
         return issue_summary(self.issues())
 
     def display_status(self) -> str:
-        if self.ignored:
-            return STATUS_IGNORED
-        if self.is_dirty and self.status == STATUS_MISSING_ROW:
-            return "待新增"
-        if self.is_dirty:
-            return "已修改"
-        return self.status
+        return self.current_status()
 
     def filter_status(self) -> str:
-        return STATUS_IGNORED if self.ignored else self.status
+        return self.current_status()
 
 
 @dataclass

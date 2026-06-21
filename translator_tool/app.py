@@ -219,6 +219,11 @@ class UnitFilterProxyModel(QSortFilterProxyModel):
         self.beginFilterChange()
         self.endFilterChange(QSortFilterProxyModel.Direction.Rows)
 
+    def refresh_rows(self) -> None:
+        """Re-evaluate status-dependent rows without resetting the source model."""
+        self.beginFilterChange()
+        self.endFilterChange(QSortFilterProxyModel.Direction.Rows)
+
     def filterAcceptsRow(self, source_row: int, source_parent: QModelIndex) -> bool:  # noqa: N802
         source = self.sourceModel()
         if not isinstance(source, UnitTableModel):
@@ -229,9 +234,9 @@ class UnitFilterProxyModel(QSortFilterProxyModel):
         if self.file_filter != "全部文件" and unit.file_rel != self.file_filter:
             return False
         effective_status = unit.filter_status()
-        if self.status_filter == "待翻译" and (unit.ignored or unit.status not in MISSING_WORK_STATUSES):
+        if self.status_filter == "待翻译" and effective_status not in MISSING_WORK_STATUSES:
             return False
-        if self.status_filter == "全部" and self.only_missing and (unit.ignored or unit.status not in MISSING_WORK_STATUSES):
+        if self.status_filter == "全部" and self.only_missing and effective_status not in MISSING_WORK_STATUSES:
             return False
         if self.status_filter not in {"全部", "待翻译"} and effective_status != self.status_filter:
             return False
@@ -842,7 +847,13 @@ class TranslatorWindow(QMainWindow):
         self.typing_timer.timeout.connect(self._commit_typing_operation)
         self.ai_cancel_event: threading.Event | None = None
         self.ai_results: dict[str, str] = {}
+        self.ai_changes: list[UnitChange] = []
         self.ai_failures: list[str] = []
+        self.ai_filter_refresh_pending = False
+        self.ai_filter_refresh_timer = QTimer(self)
+        self.ai_filter_refresh_timer.setSingleShot(True)
+        self.ai_filter_refresh_timer.setInterval(120)
+        self.ai_filter_refresh_timer.timeout.connect(self._refresh_ai_filter)
         self.ai_worker: AiWorker | None = None
         self.ai_is_batch = False
         self.ai_cancelled = False
@@ -1094,7 +1105,7 @@ class TranslatorWindow(QMainWindow):
             self.counts_label.setText("")
             return
         effective = Counter(unit.filter_status() for unit in self.project.units)
-        todo = sum(not unit.ignored and unit.status in MISSING_WORK_STATUSES for unit in self.project.units)
+        todo = sum(unit.filter_status() in MISSING_WORK_STATUSES for unit in self.project.units)
         self.counts_label.setText(
             f"当前显示 {self.proxy.rowCount():,} / 总计 {len(self.project.units):,}   ·   "
             f"待翻译 {todo:,}   ·   已翻译 {effective[STATUS_TRANSLATED]:,}   ·   "
@@ -1273,7 +1284,7 @@ class TranslatorWindow(QMainWindow):
         unit = self.model.unit_for_uid(uid)
         if unit is None or not unit.source_text:
             return
-        if unit.status not in MISSING_WORK_STATUSES and unit.current_text:
+        if unit.filter_status() not in MISSING_WORK_STATUSES and unit.current_text:
             answer = QMessageBox.question(self, "重新 AI 翻译", "此条已有译文，是否用 AI 建议替换当前未保存内容？")
             if answer != QMessageBox.StandardButton.Yes:
                 return
@@ -1347,7 +1358,7 @@ class TranslatorWindow(QMainWindow):
         units: list[TranslationUnit] = []
         for row in range(self.proxy.rowCount()):
             unit = self._unit_from_proxy_index(self.proxy.index(row, 0))
-            if unit and not unit.ignored and unit.source_text and unit.status in MISSING_WORK_STATUSES:
+            if unit and unit.source_text and unit.filter_status() in MISSING_WORK_STATUSES:
                 units.append(unit)
         if not units:
             QMessageBox.information(self, "AI 批量翻译", "当前筛选中没有可翻译的未译条目。")
@@ -1384,6 +1395,7 @@ class TranslatorWindow(QMainWindow):
             QMessageBox.critical(self, "AI 设置错误", str(exc))
             return
         self.ai_results = {}
+        self.ai_changes = []
         self.ai_failures = []
         self.ai_cancel_event = threading.Event()
         self.ai_is_batch = is_batch
@@ -1400,6 +1412,15 @@ class TranslatorWindow(QMainWindow):
 
     def _collect_ai_result(self, uid: str, translated: str) -> None:
         self.ai_results[uid] = translated
+        unit = self.model.unit_for_uid(uid)
+        if unit is None or unit.current_text == translated:
+            return
+        self.ai_changes.append(UnitChange(uid, unit.current_text, translated))
+        # AI signals are delivered on the GUI thread. Apply each completed
+        # result immediately, while retaining one combined undo operation.
+        self._apply_operation_text(uid, translated)
+        if self.ai_is_batch:
+            self._schedule_ai_filter_refresh()
 
     def _collect_ai_failure(self, uid: str, message: str) -> None:
         self.ai_failures.append(f"{uid}: {message}")
@@ -1408,6 +1429,18 @@ class TranslatorWindow(QMainWindow):
         if self.ai_is_batch:
             self.batch_ai_button.set_progress(current, total)
         self.statusBar().showMessage(f"正在请求 AI 翻译… {current}/{total}")
+
+    def _schedule_ai_filter_refresh(self) -> None:
+        self.ai_filter_refresh_pending = True
+        if not self.ai_filter_refresh_timer.isActive():
+            self.ai_filter_refresh_timer.start()
+
+    def _refresh_ai_filter(self) -> None:
+        if not self.ai_filter_refresh_pending:
+            return
+        self.ai_filter_refresh_pending = False
+        self.proxy.refresh_rows()
+        self._update_counts()
 
     def _finish_ai(self, label: str) -> None:
         was_batch = self.ai_is_batch
@@ -1418,15 +1451,13 @@ class TranslatorWindow(QMainWindow):
         self.ai_worker = None
         self.ai_is_batch = False
         self.ai_cancelled = False
-        changes: list[UnitChange] = []
-        for uid, translated in self.ai_results.items():
-            unit = self.model.unit_for_uid(uid)
-            if unit is None or unit.current_text == translated:
-                continue
-            changes.append(UnitChange(uid, unit.current_text, translated))
-            self._apply_operation_text(uid, translated)
+        self.ai_filter_refresh_timer.stop()
+        self._refresh_ai_filter()
+        changes = tuple(self.ai_changes)
         if changes:
-            self.history.push(TranslationOperation(label, tuple(changes)))
+            # A cancelled batch still preserves all completed translations as
+            # one application-level operation, so Ctrl+Z remains predictable.
+            self.history.push(TranslationOperation(label, changes))
         summary = f"AI 已生成 {len(changes)} 条建议"
         if was_cancelled:
             summary = f"批量翻译已取消，已生成 {len(changes)} 条建议"
