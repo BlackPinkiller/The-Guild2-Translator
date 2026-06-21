@@ -863,6 +863,8 @@ class TranslatorWindow(QMainWindow):
         self.suggestion_cancel_event: threading.Event | None = None
         self.suggestion_dialog: SuggestionDialog | None = None
         self.suggestion_uid = ""
+        self._table_context_click: tuple[QModelIndex, QPoint] | None = None
+        self._suppress_table_context_event = False
         self.thread_pool = QThreadPool.globalInstance()
 
         self._build_ui()
@@ -991,6 +993,7 @@ class TranslatorWindow(QMainWindow):
         self.table.setWordWrap(False)
         self.table.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
         self.table.customContextMenuRequested.connect(self._show_table_menu)
+        self.table.viewport().installEventFilter(self)
         self.table.selectionModel().currentRowChanged.connect(self._on_row_selected)
         self.table.verticalHeader().setVisible(False)
         self.table.verticalHeader().setDefaultSectionSize(30)
@@ -1038,6 +1041,32 @@ class TranslatorWindow(QMainWindow):
             action.setShortcut(shortcut)
             action.triggered.connect(slot)
             self.addAction(action)
+
+    def eventFilter(self, watched: QObject, event: QEvent) -> bool:  # noqa: N802
+        table = getattr(self, "table", None)
+        if isinstance(table, QTableView) and watched is table.viewport():
+            if event.type() == QEvent.Type.MouseButtonPress and event.button() == Qt.MouseButton.RightButton:
+                index = self.table.indexAt(event.position().toPoint())
+                if index.isValid():
+                    # QTableView normally clears the selection during the
+                    # press.  Consume it and defer the menu until release.
+                    self._table_context_click = (index, event.position().toPoint())
+                    return True
+            elif event.type() == QEvent.Type.MouseButtonRelease and event.button() == Qt.MouseButton.RightButton:
+                if self._table_context_click is not None:
+                    index, point = self._table_context_click
+                    self._table_context_click = None
+                    self._suppress_table_context_event = True
+                    QTimer.singleShot(0, lambda: self._show_table_menu_for_index(index, self.table.viewport().mapToGlobal(point)))
+                    QTimer.singleShot(0, self._clear_table_context_suppression)
+                    return True
+            elif event.type() == QEvent.Type.ContextMenu and self._suppress_table_context_event:
+                self._suppress_table_context_event = False
+                return True
+        return super().eventFilter(watched, event)
+
+    def _clear_table_context_suppression(self) -> None:
+        self._suppress_table_context_event = False
 
     def _editor_group(self, title: str, read_only: bool) -> tuple[QGroupBox, QPlainTextEdit]:
         box = QGroupBox(title)
@@ -1381,12 +1410,15 @@ class TranslatorWindow(QMainWindow):
 
     def _show_table_menu(self, point: QPoint) -> None:
         index = self.table.indexAt(point)
+        self._show_table_menu_for_index(index, self.table.viewport().mapToGlobal(point))
+
+    def _show_table_menu_for_index(self, index: QModelIndex, global_point: QPoint) -> None:
         unit = self._unit_from_proxy_index(index)
         if unit is None:
             return
         self._select_context_row(index)
         if index.column() == UnitTableModel.AI:
-            self._show_ai_provider_menu(self.table.viewport().mapToGlobal(point))
+            self._show_ai_provider_menu(global_point)
             return
         menu = QMenu(self)
         menu.addSection("译文编辑")
@@ -1398,7 +1430,7 @@ class TranslatorWindow(QMainWindow):
         llm_suggestion = menu.addAction("LLM 翻译建议…")
         menu.addSection("条目状态")
         ignored = menu.addAction("取消无需翻译" if unit.ignored else "标记为无需翻译")
-        action = menu.exec(self.table.viewport().mapToGlobal(point))
+        action = menu.exec(global_point)
         if action == restore:
             self._replace_unit_text(unit, unit.translate_text, "恢复载入译文")
         elif action == source:
@@ -1415,7 +1447,7 @@ class TranslatorWindow(QMainWindow):
     def _select_context_row(self, index: QModelIndex) -> None:
         """Keep an existing multi-selection intact when opening its context menu."""
         selection = self.table.selectionModel()
-        if selection.isSelected(index):
+        if any(selected.row() == index.row() for selected in selection.selectedRows()):
             return
         self.table.setCurrentIndex(index)
         self.table.selectRow(index.row())
