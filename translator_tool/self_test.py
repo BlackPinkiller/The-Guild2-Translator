@@ -23,7 +23,7 @@ from .project import (
     SaveValidationError,
 )
 from .settings import AppSettings, load_settings, save_settings
-from .validation import validate_translation
+from .validation import format_tokens, validate_translation
 
 
 def tool_root() -> Path:
@@ -185,6 +185,13 @@ def assert_unsaved_translation_status(root: Path) -> None:
     translated.set_text(translated.current_text + "x")
     if translated.display_status() != STATUS_MODIFIED or translated.filter_status() != STATUS_TRANSLATED:
         raise AssertionError("an edited translated unit did not keep a translated filter state with a modified marker")
+    before_bytes = (temp / "languages" / "#chinese" / translated.file_rel).read_bytes()
+    translated.set_text("")
+    removed = project.save([translated])
+    if not removed.changed_files or [item.uid for item in removed.cleared_empty_units] != [translated.uid]:
+        raise AssertionError("an empty translation did not remove its existing override")
+    if (temp / "languages" / "#chinese" / translated.file_rel).read_bytes() == before_bytes:
+        raise AssertionError("an empty translation left its existing target row intact")
     safe_rmtree(temp)
 
 
@@ -211,7 +218,25 @@ def assert_mod_label_match_inserts_source_formatted_row(root: Path) -> None:
             raise AssertionError("a unique mod label match was not marked for review")
         if unit.ref.target_row is not None or not unit.is_dirty:
             raise AssertionError("label match did not stage a source-row insertion")
+        unit.set_text("")
+        removed = project.save([unit])
+        if not removed.changed_files or [item.uid for item in removed.cleared_empty_units] != [unit.uid]:
+            raise AssertionError("an empty label-match translation did not remove its old override")
+        if original_key in load_dbt(target_path).row_index:
+            raise AssertionError("an empty label-match translation inserted a source row")
+
+        # Restore the temporary legacy row so the next branch verifies that a
+        # non-empty review edit inserts a new source-formatted row.
+        target_path.write_bytes(target_doc.text.replace(old_line, new_line, 1).encode(target_doc.profile.encoding))
+        project = Project.load(temp, "#chinese")
+        unit = next(
+            item
+            for item in project.units
+            if item.file_rel == "Text.dbt" and item.record_id == str(source_row.row_id) and item.label == original_key[1]
+        )
         unit.set_text(unit.current_text + "x")
+        if unit.needs_review or unit.display_status() != STATUS_MODIFIED:
+            raise AssertionError("editing a review item did not clear its temporary review state")
         project.save([unit])
         saved = load_dbt(target_path)
         inserted = saved.row_index.get(original_key)
@@ -343,6 +368,34 @@ def assert_linebreak_format_is_ignored() -> None:
     issues = validate_translation("First$NSecond", "First Second", dbt_field=True)
     if any(issue.blocks_save and "$N" in issue.message for issue in issues):
         raise AssertionError("$N line-break differences must not block translation saves")
+
+
+def assert_guild2_format_grammar() -> None:
+    syntax = (
+        "%1NAME %2n %3i %4f %5t %6c %7z %8j %9s %10l "
+        "%11GG %12GN %13GT %% %> %< %14SN %15Sn %16SV %17Sv %18SZ %19Sz "
+        "%20SK %21ST %22SA %23SD %24SB %25SL %26DN %27DS "
+        "$N $Z $L $R $T $> $< $C[1,2,3,255] $F[Body] $S[12] $B[label] "
+        "$[ornament$] #E[NT_NEUTRAL] #SP+ #SP- @L_TEST_KEY_+n @T\"fallback\""
+    )
+    tokens = format_tokens(syntax)
+    required = {"%1NAME", "%11GG", "%14SN", "$C[1,2,3,255]", "$[ornament$]", "#SP+", "@L_TEST_KEY_+n"}
+    if not required.issubset(tokens):
+        raise AssertionError("Guild 2 format grammar did not recognize all core token forms")
+    if any(issue.blocks_save for issue in validate_translation(syntax, syntax, dbt_field=False)):
+        raise AssertionError("valid Guild 2 syntax was rejected")
+    compatible = validate_translation("Name: %1SN", "姓名：%1SV", dbt_field=True)
+    if any(issue.blocks_save for issue in compatible) or not any(issue.code == "argument-variant" for issue in compatible):
+        raise AssertionError("SN/SV compatible character-name variant was not accepted")
+    wrong_index = validate_translation("Name: %1SN", "姓名：%2SN", dbt_field=True)
+    if not any(issue.blocks_save and issue.code == "argument-index" for issue in wrong_index):
+        raise AssertionError("invalid argument index did not block saving")
+    wrong_type = validate_translation("Name: %1SN", "数值：%1n", dbt_field=True)
+    if not any(issue.blocks_save and issue.code == "argument-type" for issue in wrong_type):
+        raise AssertionError("incompatible argument type did not block saving")
+    unknown = validate_translation("Plain text", "未知 %A", dbt_field=True)
+    if any(issue.blocks_save for issue in unknown) or not any(issue.code == "unknown-format" for issue in unknown):
+        raise AssertionError("unknown format token was not reduced to a non-blocking warning")
 
 
 class FakeStreamingTransport:
@@ -478,6 +531,7 @@ def main() -> int:
     assert_operation_history()
     assert_ai_token_protection()
     assert_linebreak_format_is_ignored()
+    assert_guild2_format_grammar()
     assert_llm_suggestion_stream()
     assert_git_history(root)
     assert_git_pending_is_scoped_to_active_language(root)

@@ -36,6 +36,7 @@ class DbtRow:
     fields: list[QuotedField]
     parse_error: str = ""
     updates: dict[str, str] = field(default_factory=dict)
+    deleted: bool = False
 
     @property
     def string_names(self) -> list[str]:
@@ -54,7 +55,12 @@ class DbtRow:
             raise KeyError(f"field not found in row {self.row_id}: {field_name}")
         self.updates[field_name] = value
 
+    def delete(self) -> None:
+        self.deleted = True
+
     def render(self) -> str:
+        if self.deleted:
+            return ""
         if not self.updates:
             return self.original_line
         line = self.original_line

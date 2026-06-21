@@ -153,7 +153,7 @@ class UnitTableModel(QAbstractTableModel):
             if index.column() == self.AI:
                 return "左键：翻译当前条目\n右键：切换 Google Translate / OpenAI 兼容 LLM"
             if index.column() == self.STATUS:
-                suffix = "\n本次会话刚翻译，可继续审阅。" if unit.uid in self._recently_translated else ""
+                suffix = "\n本次会话有改动，可继续审阅。" if unit.uid in self._recently_translated else ""
                 return unit.display_status() + suffix
         if role == Qt.ItemDataRole.BackgroundRole:
             if self.has_glyph_warning(index.row()):
@@ -1393,7 +1393,7 @@ class TranslatorWindow(QMainWindow):
         self.counts_label.setText(
             f"当前显示 {self.proxy.rowCount():,} / 总计 {len(self.project.units):,}   ·   "
             f"待翻译 {todo:,}   ·   已翻译 {effective[STATUS_TRANSLATED]:,}   ·   "
-            f"刚译 {recent:,}   ·   无需翻译 {effective[STATUS_IGNORED]:,}"
+            f"本次改动 {recent:,}   ·   无需翻译 {effective[STATUS_IGNORED]:,}"
         )
 
     def _update_window_title(self) -> None:
@@ -1479,9 +1479,10 @@ class TranslatorWindow(QMainWindow):
 
     def _update_recent_translation_marker(self, unit: TranslationUnit, before_status: str) -> None:
         current_status = unit.filter_status()
-        if before_status in MISSING_WORK_STATUSES and current_status == STATUS_TRANSLATED:
+        changed_existing_translation = unit.is_dirty and unit.status == STATUS_TRANSLATED
+        if current_status == STATUS_TRANSLATED and (before_status in MISSING_WORK_STATUSES or changed_existing_translation):
             self.model.set_recently_translated(unit, True)
-        elif current_status != STATUS_TRANSLATED:
+        elif current_status != STATUS_TRANSLATED or not unit.is_dirty:
             self.model.set_recently_translated(unit, False)
 
     def _replace_current_text(self, text: str, label: str) -> None:
@@ -1852,6 +1853,10 @@ class TranslatorWindow(QMainWindow):
             QMessageBox.warning(self, "保存被阻止", "\n".join(exc.messages[:20]))
             return
         if not result.changed_files:
+            if result.cleared_empty_units:
+                self.load_project(discard_changes=True)
+                self.statusBar().showMessage(f"已移除 {len(result.cleared_empty_units)} 条译文覆盖。", 4000)
+                return
             self.statusBar().showMessage("没有需要保存的变更。", 3000)
             return
         commit_note = ""
@@ -1861,7 +1866,8 @@ class TranslatorWindow(QMainWindow):
         except GitError as exc:
             commit_note = f"；文件已保存，但 Git 提交失败：{exc}"
         self.load_project(discard_changes=True)
-        self.statusBar().showMessage(f"已保存 {len(result.changed_files)} 个文件{commit_note}", 7000)
+        cleared_note = f"，已移除 {len(result.cleared_empty_units)} 条译文覆盖" if result.cleared_empty_units else ""
+        self.statusBar().showMessage(f"已保存 {len(result.changed_files)} 个文件{cleared_note}{commit_note}", 7000)
 
     def retry_commit(self) -> None:
         if self.git is None:

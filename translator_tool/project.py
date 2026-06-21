@@ -52,6 +52,7 @@ class SaveResult:
 
     changed_files: tuple[Path, ...]
     saved_units: tuple["TranslationUnit", ...]
+    cleared_empty_units: tuple["TranslationUnit", ...] = ()
 
 
 @dataclass
@@ -61,6 +62,7 @@ class UnitRef:
     source_doc: DbtDocument | PlainTextDocument | None = None
     source_row: DbtRow | None = None
     target_row: DbtRow | None = None
+    suggested_row: DbtRow | None = None
     row_key: tuple[int, str] | None = None
     source_field: str = ""
     target_field: str = ""
@@ -97,6 +99,10 @@ class TranslationUnit:
         return self.needs_review or (self.edited_text is not None and self.edited_text != self.translate_text)
 
     def set_text(self, text: str) -> None:
+        # Label fallback is a one-time import hint. Once a translator touches
+        # the text, their edit is the review decision and the hint is cleared.
+        if self.needs_review and text != self.current_text:
+            self.needs_review = False
         self.edited_text = None if text == self.translate_text else text
 
     def current_status(self) -> str:
@@ -286,9 +292,24 @@ class Project:
             set_ignored_many(self.root, self.language, tuple(unit.uid for unit in selected), ignored)
 
     def save(self, units: Iterable[TranslationUnit] | None = None) -> SaveResult:
-        selected = list(self.dirty_units() if units is None else [unit for unit in units if unit.is_dirty])
-        if not selected:
-            return SaveResult((), ())
+        requested = list(self.dirty_units() if units is None else [unit for unit in units if unit.is_dirty])
+        empty_units = [unit for unit in requested if not unit.current_text.strip()]
+        touched_docs: dict[Path, DbtDocument | PlainTextDocument] = {}
+        deleted_paths: set[Path] = set()
+        for unit in empty_units:
+            ref = unit.ref
+            if ref.kind == "dbt":
+                row = ref.target_row or ref.suggested_row
+                if row is not None:
+                    row.delete()
+                    assert isinstance(ref.target_doc, DbtDocument)
+                    touched_docs[ref.target_doc.path] = ref.target_doc
+            elif ref.kind == "text":
+                deleted_paths.add(ref.target_doc.path)
+        empty_uids = {unit.uid for unit in empty_units}
+        selected = [unit for unit in requested if unit.uid not in empty_uids]
+        if not selected and not touched_docs and not deleted_paths:
+            return SaveResult((), (), tuple(empty_units))
 
         encoded_values: dict[str, str] = {}
         errors: list[str] = []
@@ -305,7 +326,6 @@ class Project:
             raise SaveValidationError(errors)
 
         missing_groups: dict[tuple[str, tuple[int, str]], list[TranslationUnit]] = {}
-        touched_docs: dict[Path, DbtDocument | PlainTextDocument] = {}
         for unit in selected:
             ref = unit.ref
             if ref.kind == "text":
@@ -365,13 +385,22 @@ class Project:
             raise SaveValidationError(errors)
 
         changed_files: list[Path] = []
+        for path in sorted(deleted_paths, key=str):
+            if path.exists():
+                path.unlink()
+                changed_files.append(path)
         for doc in sorted(touched_docs.values(), key=lambda item: str(item.path)):
+            if doc.path in deleted_paths:
+                continue
             new_bytes = doc.render_bytes()
             if new_bytes == doc.raw:
                 continue
             atomic_write(doc.path, new_bytes)
             changed_files.append(doc.path)
-        return SaveResult(tuple(changed_files), tuple(selected))
+        for unit in empty_units:
+            unit.edited_text = None
+            unit.needs_review = False
+        return SaveResult(tuple(changed_files), tuple(selected), tuple(empty_units))
 
     def _insertion_line_index(self, file_rel: str, missing_key: tuple[int, str]) -> int | None:
         order_map = self.source_order.get(file_rel, {})
@@ -479,6 +508,7 @@ def build_dbt_units(
                         target_doc=target_doc,
                         source_row=source_row,
                         target_row=target_row,
+                        suggested_row=label_row if matched_by_label else None,
                         row_key=key,
                         source_field=source_field,
                         target_field=target_field,
