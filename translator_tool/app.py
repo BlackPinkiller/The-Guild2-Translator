@@ -1389,12 +1389,28 @@ class TranslatorWindow(QMainWindow):
             self._replace_unit_text(unit, text, label)
 
     def _replace_unit_text(self, unit: TranslationUnit, text: str, label: str) -> None:
+        self._replace_units_text((unit,), {unit.uid: text}, label)
+
+    def _replace_units_text(self, units: Iterable[TranslationUnit], texts: dict[str, str], label: str) -> None:
         self._commit_typing_operation()
-        if unit is None or unit.current_text == text:
+        changes = tuple(
+            UnitChange(unit.uid, unit.current_text, texts[unit.uid])
+            for unit in units
+            if unit.uid in texts and unit.current_text != texts[unit.uid]
+        )
+        if not changes:
             return
-        before = unit.current_text
-        self._apply_operation_text(unit.uid, text)
-        self.history.push(TranslationOperation(label, (UnitChange(unit.uid, before, text),)))
+        for change in changes:
+            unit = self.model.unit_for_uid(change.uid)
+            if unit is not None:
+                unit.set_text(change.after)
+                self.model.refresh_unit(unit)
+        current = self._current_unit()
+        if current is not None and any(change.uid == current.uid for change in changes):
+            self._set_editor_unit(current)
+        self._update_counts()
+        self._update_window_title()
+        self.history.push(TranslationOperation(label, changes))
 
     def undo(self) -> None:
         self._commit_typing_operation()
@@ -1420,29 +1436,36 @@ class TranslatorWindow(QMainWindow):
         if index.column() == UnitTableModel.AI:
             self._show_ai_provider_menu(global_point)
             return
+        units = self._selected_units()
+        count = len(units)
+        suffix = f" · {count}" if count > 1 else ""
         menu = QMenu(self)
+        menu.addSection("选中条目")
+        copy_translation = menu.addAction(f"复制选中译文{suffix}")
         menu.addSection("译文编辑")
-        restore = menu.addAction("恢复载入时的译文")
-        source = menu.addAction("还原为原文")
-        clear = menu.addAction("清空译文")
+        restore = menu.addAction(f"恢复载入时的译文{suffix}")
+        source = menu.addAction(f"还原为原文{suffix}")
+        clear = menu.addAction(f"清空译文{suffix}")
         menu.addSection("AI 服务")
-        ai_translate = menu.addAction("AI 翻译并填入")
-        llm_suggestion = menu.addAction("LLM 翻译建议…")
+        ai_translate = menu.addAction(f"AI 翻译选中未译条目{suffix}")
+        llm_suggestion = menu.addAction("LLM 翻译建议（右键条目）…")
         menu.addSection("条目状态")
-        ignored = menu.addAction("取消无需翻译" if unit.ignored else "标记为无需翻译")
+        ignored = menu.addAction(f"取消无需翻译{suffix}" if all(item.ignored for item in units) else f"标记为无需翻译{suffix}")
         action = menu.exec(global_point)
-        if action == restore:
-            self._replace_unit_text(unit, unit.translate_text, "恢复载入译文")
+        if action == copy_translation:
+            self._copy_unit_translations(units)
+        elif action == restore:
+            self._replace_units_text(units, {item.uid: item.translate_text for item in units}, "恢复载入译文")
         elif action == source:
-            self._replace_unit_text(unit, unit.source_text, "还原为原文")
+            self._replace_units_text(units, {item.uid: item.source_text for item in units}, "还原为原文")
         elif action == clear:
-            self._replace_unit_text(unit, "", "清空译文")
+            self._replace_units_text(units, {item.uid: "" for item in units}, "清空译文")
         elif action == ai_translate:
-            self.translate_one_unit(unit.uid)
+            self.translate_selected_units(units)
         elif action == llm_suggestion:
             self.request_llm_suggestion(unit.uid)
         elif action == ignored:
-            self._set_ignored(unit, not unit.ignored)
+            self._set_units_ignored(units, not all(item.ignored for item in units))
 
     def _select_context_row(self, index: QModelIndex) -> None:
         """Keep an existing multi-selection intact when opening its context menu."""
@@ -1452,13 +1475,34 @@ class TranslatorWindow(QMainWindow):
         self.table.setCurrentIndex(index)
         self.table.selectRow(index.row())
 
+    def _selected_units(self) -> list[TranslationUnit]:
+        units: list[TranslationUnit] = []
+        for index in self.table.selectionModel().selectedRows():
+            unit = self._unit_from_proxy_index(index)
+            if unit is not None:
+                units.append(unit)
+        return units
+
+    def _copy_unit_translations(self, units: Iterable[TranslationUnit]) -> None:
+        texts = [unit.current_text for unit in units if unit.current_text]
+        if not texts:
+            self.statusBar().showMessage("选中条目没有可复制的译文。", 2500)
+            return
+        QApplication.clipboard().setText("\n".join(texts))
+        self.statusBar().showMessage(f"已复制 {len(texts)} 条译文。", 2500)
+
     def _set_ignored(self, unit: TranslationUnit, ignored: bool) -> None:
+        self._set_units_ignored((unit,), ignored)
+
+    def _set_units_ignored(self, units: Iterable[TranslationUnit], ignored: bool) -> None:
         if self.project is None:
             return
-        self.project.set_unit_ignored(unit, ignored)
-        self.model.refresh_unit(unit)
+        selected = tuple(units)
+        self.project.set_units_ignored(selected, ignored)
+        for unit in selected:
+            self.model.refresh_unit(unit)
         self._apply_filters()
-        self._update_issue_detail(unit)
+        self._update_issue_detail(self._current_unit())
         self._update_window_title()
 
     def _show_ai_provider_menu(self, global_point: QPoint) -> None:
@@ -1499,6 +1543,18 @@ class TranslatorWindow(QMainWindow):
             if answer != QMessageBox.StandardButton.Yes:
                 return
         self._start_ai([unit], "AI 单条翻译")
+
+    def translate_selected_units(self, selected: Iterable[TranslationUnit]) -> None:
+        self._commit_typing_operation()
+        units = [
+            unit
+            for unit in selected
+            if not unit.ignored and unit.source_text and unit.filter_status() in MISSING_WORK_STATUSES
+        ]
+        if not units:
+            QMessageBox.information(self, "AI 翻译", "选中条目中没有可翻译的未译内容。")
+            return
+        self._start_ai(units, f"AI 翻译选中条目（{len(units)} 条）", is_batch=True)
 
     def request_llm_suggestion(self, uid: str | None = None) -> None:
         self._commit_typing_operation()

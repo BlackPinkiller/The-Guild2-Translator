@@ -4,7 +4,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Iterable
 
-from .cache import ignored_uids, set_ignored
+from .cache import ignored_uids, set_ignored_many
 from .codec_adapter import CodecError, Guild2Codec, default_codec_path
 from .format_io import (
     DbtDocument,
@@ -229,8 +229,14 @@ class Project:
         return [unit for unit in self.units if unit.is_dirty]
 
     def set_unit_ignored(self, unit: TranslationUnit, ignored: bool) -> None:
-        unit.ignored = ignored
-        set_ignored(self.root, self.language, unit.uid, ignored)
+        self.set_units_ignored((unit,), ignored)
+
+    def set_units_ignored(self, units: Iterable[TranslationUnit], ignored: bool) -> None:
+        selected = tuple(units)
+        for unit in selected:
+            unit.ignored = ignored
+        if selected:
+            set_ignored_many(self.root, self.language, tuple(unit.uid for unit in selected), ignored)
 
     def save(self, units: Iterable[TranslationUnit] | None = None) -> SaveResult:
         selected = list(self.dirty_units() if units is None else [unit for unit in units if unit.is_dirty])

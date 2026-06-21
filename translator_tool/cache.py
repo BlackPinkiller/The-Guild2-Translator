@@ -44,6 +44,10 @@ def ignored_uids(root: Path, language: str) -> set[str]:
 
 
 def set_ignored(root: Path, language: str, uid: str, ignored: bool) -> None:
+    set_ignored_many(root, language, (uid,), ignored)
+
+
+def set_ignored_many(root: Path, language: str, uids: list[str] | tuple[str, ...], ignored: bool) -> None:
     cache = load_cache(root)
     languages = cache.setdefault("languages", {})
     language_data = languages.setdefault(language, {})
@@ -55,9 +59,8 @@ def set_ignored(root: Path, language: str, uid: str, ignored: bool) -> None:
         current = []
     values = {str(item) for item in current}
     if ignored:
-        values.add(uid)
+        values.update(str(uid) for uid in uids)
     else:
-        values.discard(uid)
+        values.difference_update(str(uid) for uid in uids)
     language_data["ignored"] = sorted(values)
     save_cache(root, cache)
-
