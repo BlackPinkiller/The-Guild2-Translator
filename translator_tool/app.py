@@ -283,6 +283,35 @@ class UnitFilterProxyModel(QSortFilterProxyModel):
         return not self.query or self.query in source.search_blob(source_row)
 
 
+class RowTintDelegate(QStyledItemDelegate):
+    """Force model-provided review colors through the stylesheet paint path."""
+
+    def paint(self, painter: QPainter, option: QStyleOptionViewItem, index: QModelIndex) -> None:
+        if _paint_review_background(painter, option, index):
+            painter.save()
+            painter.setFont(option.font)
+            painter.setPen(QColor("#3c3836"))
+            text_rect = option.rect.adjusted(5, 0, -5, 0)
+            text = str(index.data(Qt.ItemDataRole.DisplayRole) or "")
+            text = painter.fontMetrics().elidedText(text, option.textElideMode, text_rect.width())
+            painter.drawText(text_rect, option.displayAlignment or (Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter), text)
+            painter.setPen(QColor("#d5c4a1"))
+            painter.drawLine(option.rect.bottomLeft(), option.rect.bottomRight())
+            painter.restore()
+            return
+        super().paint(painter, option, index)
+
+
+def _paint_review_background(painter: QPainter, option: QStyleOptionViewItem, index: QModelIndex) -> bool:
+    tint = index.data(Qt.ItemDataRole.BackgroundRole)
+    if not isinstance(tint, QColor) or option.state & QStyle.StateFlag.State_Selected:
+        return False
+    painter.save()
+    painter.fillRect(option.rect, tint)
+    painter.restore()
+    return True
+
+
 class AiButtonDelegate(QStyledItemDelegate):
     translate_requested = Signal(str)
 
@@ -310,6 +339,7 @@ class AiButtonDelegate(QStyledItemDelegate):
         pressed = uid == self._pressed_uid
         hovered = uid == self._hover_uid
         painter.save()
+        _paint_review_background(painter, option, index)
         rect = option.rect.adjusted(7, 6, -7, -6)
         if pressed:
             rect.translate(2, 3)
@@ -418,10 +448,11 @@ class FormatDiffDelegate(QStyledItemDelegate):
             super().paint(painter, option, index)
             return
 
-        background = QStyleOptionViewItem(option)
-        background.text = ""
-        style = option.widget.style() if option.widget else QApplication.style()
-        style.drawControl(QStyle.ControlElement.CE_ItemViewItem, background, painter, option.widget)
+        if not _paint_review_background(painter, option, index):
+            background = QStyleOptionViewItem(option)
+            background.text = ""
+            style = option.widget.style() if option.widget else QApplication.style()
+            style.drawControl(QStyle.ControlElement.CE_ItemViewItem, background, painter, option.widget)
 
         parts = _format_diff_parts(unit)
         painter.save()
@@ -461,10 +492,11 @@ class StatusBadgeDelegate(QStyledItemDelegate):
     def paint(self, painter: QPainter, option: QStyleOptionViewItem, index: QModelIndex) -> None:
         status = str(index.data(Qt.ItemDataRole.DisplayRole) or "")
         label, fill, text = self.STYLES.get(status, (status or "未知", "#928374", "#fbf1c7"))
-        background = QStyleOptionViewItem(option)
-        background.text = ""
-        style = option.widget.style() if option.widget else QApplication.style()
-        style.drawControl(QStyle.ControlElement.CE_ItemViewItem, background, painter, option.widget)
+        if not _paint_review_background(painter, option, index):
+            background = QStyleOptionViewItem(option)
+            background.text = ""
+            style = option.widget.style() if option.widget else QApplication.style()
+            style.drawControl(QStyle.ControlElement.CE_ItemViewItem, background, painter, option.widget)
 
         painter.save()
         painter.setRenderHint(QPainter.RenderHint.Antialiasing)
@@ -1051,6 +1083,8 @@ class TranslatorWindow(QMainWindow):
             self.table.setColumnWidth(column, width)
         self.table.horizontalHeader().setSectionResizeMode(UnitTableModel.SOURCE, QHeaderView.ResizeMode.Stretch)
         self.table.horizontalHeader().setSectionResizeMode(UnitTableModel.TRANSLATION, QHeaderView.ResizeMode.Stretch)
+        self.row_tint_delegate = RowTintDelegate(self.table)
+        self.table.setItemDelegate(self.row_tint_delegate)
         self.ai_delegate = AiButtonDelegate(self.table, self.settings.provider)
         self.ai_delegate.translate_requested.connect(self.translate_one_unit)
         self.table.setItemDelegateForColumn(UnitTableModel.AI, self.ai_delegate)
@@ -2049,7 +2083,7 @@ def apply_modern_style(app: QApplication) -> None:
         QGroupBox { background: #fbf1c7; border: 3px solid #3c3836; border-radius: 8px; margin-top: 14px; padding-top: 8px; font-weight: 900; color: #3c3836; }
         QGroupBox::title { subcontrol-origin: margin; subcontrol-position: top left; left: 12px; padding: 0 6px; background: #fbf1c7; }
         QTableView { background: #fbf1c7; border: 3px solid #3c3836; border-radius: 8px; gridline-color: #928374; selection-background-color: #b8bb26; selection-color: #3c3836; }
-        QTableView::item { border-bottom: 1px solid #d5c4a1; padding: 2px 4px; }
+        QTableView::item { background: transparent; border-bottom: 1px solid #d5c4a1; padding: 2px 4px; }
         QTableView::item:selected { background: #b8bb26; color: #3c3836; }
         QHeaderView::section { background: #d79921; color: #3c3836; border: 0; border-right: 2px solid #3c3836; border-bottom: 3px solid #3c3836; padding: 8px; font-weight: 900; }
         QPlainTextEdit { background: #fbf1c7; border: 0; padding: 8px; selection-background-color: #b8bb26; selection-color: #3c3836; }
