@@ -882,6 +882,23 @@ class TranslatorWindow(QMainWindow):
         layout.setContentsMargins(14, 12, 14, 12)
         layout.setSpacing(9)
 
+        titlebar = QFrame()
+        titlebar.setObjectName("titlebar")
+        title_layout = QHBoxLayout(titlebar)
+        title_layout.setContentsMargins(14, 9, 12, 9)
+        title_layout.setSpacing(8)
+        title_copy = QVBoxLayout()
+        title_copy.setSpacing(0)
+        workspace_title = QLabel("THE GUILD 2 · TRANSLATOR")
+        workspace_title.setObjectName("workspaceTitle")
+        workspace_subtitle = QLabel("TRANSLATION WORKSPACE")
+        workspace_subtitle.setObjectName("workspaceSubtitle")
+        title_copy.addWidget(workspace_title)
+        title_copy.addWidget(workspace_subtitle)
+        title_layout.addLayout(title_copy)
+        title_layout.addStretch(1)
+        layout.addWidget(titlebar)
+
         toolbar = QFrame()
         toolbar.setObjectName("toolbar")
         toolbar_layout = QHBoxLayout(toolbar)
@@ -895,7 +912,7 @@ class TranslatorWindow(QMainWindow):
         self.project_menu = QMenu(self.project_button)
         self.project_menu.aboutToShow.connect(self._populate_project_menu)
         self.project_button.setMenu(self.project_menu)
-        toolbar_layout.addWidget(self.project_button)
+        title_layout.addWidget(self.project_button)
         toolbar_layout.addWidget(QLabel("语言"))
         self.language_combo = QComboBox()
         self.language_combo.setMinimumWidth(128)
@@ -946,13 +963,13 @@ class TranslatorWindow(QMainWindow):
             if primary:
                 button.setObjectName("primary")
             button.clicked.connect(slot)
-            toolbar_layout.addWidget(button)
+            title_layout.addWidget(button)
         self.retry_button = QToolButton()
         self.retry_button.setText("重试提交")
         self.retry_button.setToolTip("提交尚未进入 Git 的语言修改")
         self.retry_button.clicked.connect(self.retry_commit)
         self.retry_button.setVisible(False)
-        toolbar_layout.addWidget(self.retry_button)
+        title_layout.addWidget(self.retry_button)
 
         self.counts_label = QLabel()
         self.counts_label.setObjectName("counts")
@@ -966,7 +983,7 @@ class TranslatorWindow(QMainWindow):
         self.table = QTableView()
         self.table.setModel(self.proxy)
         self.table.setSelectionBehavior(QTableView.SelectionBehavior.SelectRows)
-        self.table.setSelectionMode(QTableView.SelectionMode.SingleSelection)
+        self.table.setSelectionMode(QTableView.SelectionMode.ExtendedSelection)
         self.table.setAlternatingRowColors(False)
         # Keeping source order is both clearer for translators and dramatically faster
         # when switching the filter from pending entries to the full project.
@@ -1853,6 +1870,9 @@ def apply_modern_style(app: QApplication) -> None:
         """
         QWidget { color: #3c3836; font-family: "Segoe UI", "Microsoft YaHei UI"; font-size: 13px; }
         QMainWindow, #root { background: #ebdbb2; }
+        #titlebar { background: #3c3836; border: 3px solid #282828; border-radius: 10px; }
+        #workspaceTitle { color: #fbf1c7; font-size: 18px; font-weight: 900; letter-spacing: 1px; }
+        #workspaceSubtitle { color: #d5c4a1; font-size: 10px; font-weight: 800; letter-spacing: 2px; }
         #toolbar { background: #d5c4a1; border: 3px solid #3c3836; border-radius: 10px; }
         #toolbar QLabel { font-weight: 800; }
         #counts { background: #fbf1c7; border: 2px solid #3c3836; border-radius: 6px; color: #3c3836; font-weight: 800; padding: 5px 8px; }

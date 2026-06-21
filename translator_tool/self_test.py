@@ -3,6 +3,7 @@ from __future__ import annotations
 import os
 from pathlib import Path
 import shutil
+import tempfile
 import uuid
 
 from .ai import GoogleTranslateProvider, OpenAICompatibleProvider, TranslationProviderError
@@ -73,7 +74,7 @@ def copy_project_subset(src_root: Path, dst_root: Path) -> None:
 
 
 def make_temp_project(root: Path, prefix: str) -> Path:
-    temp = root / f"_{prefix}{uuid.uuid4().hex[:8]}"
+    temp = Path(tempfile.gettempdir()) / f"{prefix}{uuid.uuid4().hex[:8]}"
     temp.mkdir(parents=True, exist_ok=False)
     copy_project_subset(root, temp)
     return temp
@@ -130,7 +131,7 @@ def assert_unsaved_translation_status(root: Path) -> None:
 
 
 def assert_project_history_settings(root: Path) -> None:
-    temp = root / f"_translator_tool_smoke_settings_{uuid.uuid4().hex[:8]}"
+    temp = Path(tempfile.gettempdir()) / f"translator_tool_smoke_settings_{uuid.uuid4().hex[:8]}"
     previous = os.environ.get("LOCALAPPDATA")
     try:
         os.environ["LOCALAPPDATA"] = str(temp)
@@ -148,8 +149,12 @@ def assert_project_history_settings(root: Path) -> None:
 
 
 def assert_external_project_uses_tool_codec(root: Path) -> None:
-    temp = make_temp_project(root, "translator_tool_smoke_external_codec_")
-    shutil.rmtree(temp / "encoder")
+    temp = Path(tempfile.gettempdir()) / f"translator_tool_smoke_external_codec_{uuid.uuid4().hex[:8]}"
+    temp.mkdir(parents=True, exist_ok=False)
+    (temp / "languages" / "#chinese").mkdir(parents=True)
+    for name in ["Text.dbt", "Tooltips.dbt"]:
+        shutil.copy2(root / "languages" / name, temp / "languages" / name)
+        shutil.copy2(root / "languages" / "#chinese" / name, temp / "languages" / "#chinese" / name)
     project = Project.load(temp, "#chinese", codec_root=tool_root())
     if not project.units:
         raise AssertionError("external project did not load with the tool codec")
