@@ -5,6 +5,7 @@ from datetime import datetime
 from pathlib import Path
 import argparse
 import subprocess
+import time
 from typing import Iterable
 
 from .codec_adapter import CodecError, Guild2Codec, default_codec_path
@@ -61,6 +62,11 @@ class TranslationLogEntry:
 
 class LanguageGit:
     """A narrow Git facade: only the language repository is ever auto-committed."""
+
+    # A zero-byte lock left by a killed Git process is safe to remove after a
+    # brief grace period. Never touch a non-empty or freshly-created lock:
+    # those may still belong to a live Git operation.
+    STALE_INDEX_LOCK_SECONDS = 5
 
     def __init__(self, project_root: Path, language: str = "#chinese", codec_root: Path | None = None) -> None:
         self.project_root = project_root.resolve()
@@ -269,8 +275,37 @@ class LanguageGit:
             raise GitError("找不到 Git；请安装 Git 并重新打开翻译器。") from exc
         if check and result.returncode != 0:
             stderr = result.stderr.decode("utf-8", "replace") if isinstance(result.stderr, bytes) else result.stderr
+            if "index.lock" in stderr and self._clear_stale_index_lock():
+                # Retry exactly once. A real concurrent Git operation will
+                # keep or recreate its own lock and report its own error.
+                result = subprocess.run(
+                    ["git", "-C", str(self.repo), *args],
+                    capture_output=True,
+                    text=text,
+                    encoding="utf-8" if text else None,
+                    errors="replace" if text else None,
+                    check=False,
+                )
+                if result.returncode == 0:
+                    return result
+                stderr = result.stderr.decode("utf-8", "replace") if isinstance(result.stderr, bytes) else result.stderr
             raise GitError(stderr.strip() or "Git 命令执行失败。")
         return result
+
+    def _clear_stale_index_lock(self) -> bool:
+        """Remove only an old, empty repository index lock left after a crash."""
+        lock_path = self.repo / ".git" / "index.lock"
+        try:
+            stat = lock_path.stat()
+        except OSError:
+            return False
+        if stat.st_size != 0 or time.time() - stat.st_mtime < self.STALE_INDEX_LOCK_SECONDS:
+            return False
+        try:
+            lock_path.unlink()
+        except OSError:
+            return False
+        return True
 
 
 def combine_entries(entry_groups: Iterable[Iterable[TranslationLogEntry]]) -> list[TranslationLogEntry]:

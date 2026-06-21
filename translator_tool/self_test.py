@@ -4,6 +4,7 @@ import os
 from pathlib import Path
 import shutil
 import tempfile
+import time
 import uuid
 
 from . import project as project_module
@@ -380,6 +381,25 @@ def assert_git_pending_is_scoped_to_active_language(root: Path) -> None:
     safe_rmtree(temp)
 
 
+def assert_git_recovers_stale_index_lock(root: Path) -> None:
+    temp = make_temp_project(root, "translator_tool_smoke_git_lock_")
+    try:
+        git = LanguageGit(temp)
+        git.ensure_repository(AppSettings())
+        target = temp / "languages" / "#chinese" / "Text.dbt"
+        target.write_bytes(target.read_bytes() + b"\n")
+        lock = temp / "languages" / ".git" / "index.lock"
+        lock.write_bytes(b"")
+        stale = time.time() - LanguageGit.STALE_INDEX_LOCK_SECONDS - 1
+        os.utime(lock, (stale, stale))
+        if git.commit_pending() is None:
+            raise AssertionError("stale Git index lock was not recovered for pending commit")
+        if lock.exists():
+            raise AssertionError("stale Git index lock was not removed")
+    finally:
+        safe_rmtree(temp)
+
+
 def assert_combined_git_history_format() -> None:
     early = TranslationLogEntry("新增", "Text.dbt", "10", "Greeting", "Text", "Hello", "你好")
     later = TranslationLogEntry("更新", "Text.dbt", "10", "Greeting", "Text", "Hello", "您好")
@@ -415,6 +435,7 @@ def main() -> int:
     assert_llm_suggestion_stream()
     assert_git_history(root)
     assert_git_pending_is_scoped_to_active_language(root)
+    assert_git_recovers_stale_index_lock(root)
     assert_combined_git_history_format()
     print("translator_tool self-test ok")
     return 0
