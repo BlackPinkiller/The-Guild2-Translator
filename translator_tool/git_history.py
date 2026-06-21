@@ -48,12 +48,15 @@ class TranslationLogEntry:
 
     @property
     def heading(self) -> str:
-        identity = self.file_rel
+        """The entry identity, intentionally excluding the enclosing file name."""
+        identity = ""
         if self.record_id:
-            identity += f" · #{self.record_id}"
+            identity = f"#{self.record_id}"
         if self.label:
-            identity += f" · {self.label}"
-        return f"[{self.kind}] {identity} · {self.field_name}"
+            identity = f"{identity} · {self.label}" if identity else self.label
+        if self.field_name:
+            identity = f"{identity} · {self.field_name}" if identity else self.field_name
+        return f"[{self.kind}] {identity or self.file_rel}"
 
 
 class LanguageGit:
@@ -141,6 +144,16 @@ class LanguageGit:
             elif target_rel.lower().endswith(".txt"):
                 entries.extend(self._text_entries(file_rel, source, before, after))
         return entries
+
+    def entries_for_commits(self, commits_oldest_first: Iterable[str]) -> list[TranslationLogEntry]:
+        """Return the net translation changes across several commits.
+
+        The caller supplies commits from oldest to newest.  If one entry was
+        edited more than once in the selected range, its last translation is
+        retained so the log describes the combined result rather than showing
+        several noisy intermediate revisions.
+        """
+        return combine_entries(self.entries_for_commit(commit) for commit in commits_oldest_first)
 
     def _dbt_entries(
         self, file_rel: str, source_raw: bytes, before_raw: bytes | None, after_raw: bytes
@@ -258,12 +271,29 @@ class LanguageGit:
         return result
 
 
+def combine_entries(entry_groups: Iterable[Iterable[TranslationLogEntry]]) -> list[TranslationLogEntry]:
+    """Merge commit entry lists while keeping one final result per translation field."""
+    combined: dict[tuple[str, str, str, str], TranslationLogEntry] = {}
+    for entries in entry_groups:
+        for entry in entries:
+            key = (entry.file_rel, entry.record_id, entry.label, entry.field_name)
+            combined[key] = entry
+    return list(combined.values())
+
+
 def format_entries(entries: Iterable[TranslationLogEntry]) -> str:
-    parts: list[str] = []
+    grouped: dict[str, list[TranslationLogEntry]] = {}
     for entry in entries:
-        source = entry.source_text.replace("\r", "").replace("\n", " ↵ ")
-        translated = entry.translated_text.replace("\r", "").replace("\n", " ↵ ")
-        parts.append(f"{entry.heading}\n{source} → {translated}")
+        grouped.setdefault(entry.file_rel, []).append(entry)
+
+    parts: list[str] = []
+    for file_rel, file_entries in grouped.items():
+        lines = [file_rel]
+        for entry in file_entries:
+            source = entry.source_text.replace("\r", "").replace("\n", " ↵ ")
+            translated = entry.translated_text.replace("\r", "").replace("\n", " ↵ ")
+            lines.extend((f"  {entry.heading}", f"  {source} → {translated}"))
+        parts.append("\n".join(lines))
     return "\n\n".join(parts) or "此提交没有译文条目变化。"
 
 

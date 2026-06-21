@@ -779,10 +779,17 @@ class HistoryDialog(QDialog):
         layout = QHBoxLayout(self)
         self.commits = QListWidget()
         self.commits.setMinimumWidth(370)
+        self.commits.setSelectionMode(QAbstractItemView.SelectionMode.ExtendedSelection)
+        history_column = QVBoxLayout()
+        selection_hint = QLabel("Shift 选择范围 · Ctrl 添加提交")
+        selection_hint.setObjectName("historyHint")
+        selection_hint.setWordWrap(True)
+        history_column.addWidget(selection_hint)
+        history_column.addWidget(self.commits, 1)
         self.content = QPlainTextEdit()
         self.content.setReadOnly(True)
         self.content.setLineWrapMode(QPlainTextEdit.LineWrapMode.WidgetWidth)
-        layout.addWidget(self.commits, 1)
+        layout.addLayout(history_column, 1)
         layout.addWidget(self.content, 2)
         self._items: list[GitCommit] = []
         try:
@@ -790,17 +797,25 @@ class HistoryDialog(QDialog):
             self.commits.addItems([commit.display for commit in self._items])
         except GitError as exc:
             self.content.setPlainText(str(exc))
-        self.commits.currentRowChanged.connect(self._show_commit)
+        self.commits.itemSelectionChanged.connect(self._show_selected_commits)
         if self._items:
             self.commits.setCurrentRow(0)
+            self.commits.item(0).setSelected(True)
 
-    def _show_commit(self, row: int) -> None:
-        if not 0 <= row < len(self._items):
+    def _show_selected_commits(self) -> None:
+        # Git lists newest first, while combining must apply the oldest change
+        # first so a later revision wins when the same entry appears twice.
+        rows = sorted((self.commits.row(item) for item in self.commits.selectedItems()), reverse=True)
+        if not rows:
+            self.content.clear()
             return
         try:
-            self.content.setPlainText(format_entries(self.git.entries_for_commit(self._items[row].full_hash)))
+            commits = [self._items[row].full_hash for row in rows]
+            entries = self.git.entries_for_commits(commits)
+            summary = f"已合并 {len(rows)} 次提交 · {len(entries)} 条最终变更"
+            self.content.setPlainText(f"{summary}\n\n{format_entries(entries)}")
         except (GitError, OSError, UnicodeError) as exc:
-            self.content.setPlainText(f"无法读取此提交：{exc}")
+            self.content.setPlainText(f"无法读取所选提交：{exc}")
 
 
 class TranslatorWindow(QMainWindow):

@@ -6,7 +6,7 @@ import uuid
 
 from .ai import GoogleTranslateProvider, OpenAICompatibleProvider, TranslationProviderError
 from .codec_adapter import Guild2Codec, default_codec_path
-from .git_history import LanguageGit, format_entries
+from .git_history import LanguageGit, TranslationLogEntry, combine_entries, format_entries
 from .history import OperationHistory, TranslationOperation, UnitChange
 from .format_io import load_dbt, load_plain_text
 from .project import (
@@ -242,6 +242,20 @@ def assert_git_history(root: Path) -> None:
     safe_rmtree(temp)
 
 
+def assert_combined_git_history_format() -> None:
+    early = TranslationLogEntry("新增", "Text.dbt", "10", "Greeting", "Text", "Hello", "你好")
+    later = TranslationLogEntry("更新", "Text.dbt", "10", "Greeting", "Text", "Hello", "您好")
+    other = TranslationLogEntry("新增", "Tooltips.dbt", "2", "Tip", "Text", "Save", "保存")
+    combined = combine_entries(((early, other), (later,)))
+    if combined != [later, other]:
+        raise AssertionError("combined history did not keep the final entry revision")
+    rendered = format_entries(combined)
+    if rendered.count("Text.dbt") != 1 or rendered.count("Tooltips.dbt") != 1:
+        raise AssertionError("history format repeated a file heading")
+    if "Hello → 您好" not in rendered:
+        raise AssertionError("history format did not render the final translation")
+
+
 def main() -> int:
     root = project_root()
     assert_codec(root)
@@ -256,6 +270,7 @@ def main() -> int:
     assert_linebreak_format_is_ignored()
     assert_llm_suggestion_stream()
     assert_git_history(root)
+    assert_combined_git_history_format()
     print("translator_tool self-test ok")
     return 0
 
