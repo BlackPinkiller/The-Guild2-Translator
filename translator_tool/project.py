@@ -53,6 +53,7 @@ class SaveResult:
     changed_files: tuple[Path, ...]
     saved_units: tuple["TranslationUnit", ...]
     cleared_empty_units: tuple["TranslationUnit", ...] = ()
+    removed_extra_units: tuple["TranslationUnit", ...] = ()
 
 
 @dataclass
@@ -292,10 +293,22 @@ class Project:
             set_ignored_many(self.root, self.language, tuple(unit.uid for unit in selected), ignored)
 
     def save(self, units: Iterable[TranslationUnit] | None = None) -> SaveResult:
-        requested = list(self.dirty_units() if units is None else [unit for unit in units if unit.is_dirty])
+        supplied = tuple(units) if units is not None else None
+        requested = list(self.dirty_units() if supplied is None else [unit for unit in supplied if unit.is_dirty])
+        extra_units = [
+            unit
+            for unit in (self.units if supplied is None else supplied)
+            if unit.status == STATUS_EXTRA and unit.ref.kind == "dbt" and unit.ref.target_row is not None
+        ]
         empty_units = [unit for unit in requested if not unit.current_text.strip()]
         touched_docs: dict[Path, DbtDocument | PlainTextDocument] = {}
         deleted_paths: set[Path] = set()
+        for unit in extra_units:
+            ref = unit.ref
+            assert isinstance(ref.target_doc, DbtDocument)
+            assert ref.target_row is not None
+            ref.target_row.delete()
+            touched_docs[ref.target_doc.path] = ref.target_doc
         for unit in empty_units:
             ref = unit.ref
             if ref.kind == "dbt":
@@ -306,10 +319,10 @@ class Project:
                     touched_docs[ref.target_doc.path] = ref.target_doc
             elif ref.kind == "text":
                 deleted_paths.add(ref.target_doc.path)
-        empty_uids = {unit.uid for unit in empty_units}
-        selected = [unit for unit in requested if unit.uid not in empty_uids]
+        cleanup_uids = {unit.uid for unit in (*empty_units, *extra_units)}
+        selected = [unit for unit in requested if unit.uid not in cleanup_uids]
         if not selected and not touched_docs and not deleted_paths:
-            return SaveResult((), (), tuple(empty_units))
+            return SaveResult((), (), tuple(empty_units), tuple(extra_units))
 
         encoded_values: dict[str, str] = {}
         errors: list[str] = []
@@ -400,7 +413,7 @@ class Project:
         for unit in empty_units:
             unit.edited_text = None
             unit.needs_review = False
-        return SaveResult(tuple(changed_files), tuple(selected), tuple(empty_units))
+        return SaveResult(tuple(changed_files), tuple(selected), tuple(empty_units), tuple(extra_units))
 
     def _insertion_line_index(self, file_rel: str, missing_key: tuple[int, str]) -> int | None:
         order_map = self.source_order.get(file_rel, {})

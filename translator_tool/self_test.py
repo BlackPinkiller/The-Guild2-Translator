@@ -16,6 +16,7 @@ from .format_io import load_dbt, load_plain_text, row_key
 from .project import (
     MISSING_WORK_STATUSES,
     Project,
+    STATUS_EXTRA,
     STATUS_MISSING_ROW,
     STATUS_MODIFIED,
     STATUS_REVIEW,
@@ -128,6 +129,23 @@ def assert_save_existing(root: Path) -> None:
     if (temp / "backups").exists():
         raise AssertionError("Git-backed save unexpectedly created a backup directory")
     safe_rmtree(temp)
+
+
+def assert_save_removes_extra_target_row(root: Path) -> None:
+    temp = make_temp_project(root, "translator_tool_smoke_extra_")
+    try:
+        project = Project.load(temp, "#chinese")
+        extra = next(unit for unit in project.units if unit.status == STATUS_EXTRA and unit.ref.kind == "dbt")
+        assert extra.ref.target_row is not None
+        key = (extra.ref.target_row.row_id, extra.label)
+        target_path = extra.ref.target_doc.path
+        result = project.save([extra])
+        if not result.changed_files or not result.removed_extra_units:
+            raise AssertionError("saving an extra target row did not schedule cleanup")
+        if key in load_dbt(target_path).row_index:
+            raise AssertionError("extra target row remained after save")
+    finally:
+        safe_rmtree(temp)
 
 
 def assert_save_missing(root: Path) -> None:
@@ -534,6 +552,7 @@ def main() -> int:
     assert_statuses(root)
     assert_loaded_order_matches_file_lines(root)
     assert_save_existing(root)
+    assert_save_removes_extra_target_row(root)
     assert_save_missing(root)
     assert_missing_insertions_follow_file_order(root)
     assert_unsaved_translation_status(root)

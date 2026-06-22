@@ -1858,9 +1858,12 @@ class TranslatorWindow(QMainWindow):
             if not issue.blocks_save
         )
         if not result.changed_files:
-            if result.cleared_empty_units:
+            if result.cleared_empty_units or result.removed_extra_units:
                 self.load_project(discard_changes=True)
-                self.statusBar().showMessage(f"已移除 {len(result.cleared_empty_units)} 条译文覆盖。", 4000)
+                self.statusBar().showMessage(
+                    f"已移除 {len(result.cleared_empty_units)} 条译文覆盖，清理 {len(result.removed_extra_units)} 条多余译文。",
+                    4000,
+                )
                 return
             self.statusBar().showMessage("没有需要保存的变更。", 3000)
             return
@@ -1872,8 +1875,9 @@ class TranslatorWindow(QMainWindow):
             commit_note = f"；文件已保存，但 Git 提交失败：{exc}"
         self.load_project(discard_changes=True)
         cleared_note = f"，已移除 {len(result.cleared_empty_units)} 条译文覆盖" if result.cleared_empty_units else ""
+        extra_note = f"，清理 {len(result.removed_extra_units)} 条多余译文" if result.removed_extra_units else ""
         warning_note = f"，格式提示 {format_warning_count} 条" if format_warning_count else ""
-        self.statusBar().showMessage(f"已保存 {len(result.changed_files)} 个文件{cleared_note}{warning_note}{commit_note}", 7000)
+        self.statusBar().showMessage(f"已保存 {len(result.changed_files)} 个文件{cleared_note}{extra_note}{warning_note}{commit_note}", 7000)
 
     def retry_commit(self) -> None:
         if self.git is None:
