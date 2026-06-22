@@ -1361,10 +1361,9 @@ class TranslatorWindow(QMainWindow):
             self._restore_selected_row(selected_uid)
 
     def _on_search_changed(self, text: str) -> None:
-        if not text.strip() and self.last_applied_query:
-            self.search_debounce.stop()
-            self._apply_filters()
-            return
+        # Do not apply an empty intermediate value synchronously. Replacing a
+        # Ctrl+A selection can briefly emit "" before the first new character;
+        # restoring the table selection at that point steals focus from search.
         self.search_debounce.start()
 
     def _restore_selected_row(self, uid: str) -> None:
