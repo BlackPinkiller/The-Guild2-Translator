@@ -382,6 +382,9 @@ def assert_guild2_format_grammar() -> None:
     required = {"%1NAME", "%11GG", "%14SN", "$C[1,2,3,255]", "$[ornament$]", "#SP+", "@L_TEST_KEY_+n"}
     if not required.issubset(tokens):
         raise AssertionError("Guild 2 format grammar did not recognize all core token forms")
+    colors = format_tokens("$C[255,0,0] $C[115, 5,20] $C[255,90,90,255]")
+    if len(colors) != 3:
+        raise AssertionError("RGB/RGBA color directives with optional whitespace were not recognized")
     if any(issue.blocks_save for issue in validate_translation(syntax, syntax, dbt_field=False)):
         raise AssertionError("valid Guild 2 syntax was rejected")
     compatible = validate_translation("Name: %1SN", "姓名：%1SV", dbt_field=True)

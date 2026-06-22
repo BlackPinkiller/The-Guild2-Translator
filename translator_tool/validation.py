@@ -13,7 +13,7 @@ PRINTF_TOKEN = r"%(?:\d+\$)?[-+#0]*(?:\d+|\*)?(?:\.(?:\d+|\*))?[diufFeEgGxXos](?
 PERCENT_TOKEN = rf"%%|%[<>]|{ARG_TOKEN}|{PRINTF_TOKEN}"
 
 BYTE_TOKEN = r"(?:0|[1-9]\d?|1\d\d|2[0-4]\d|25[0-5])"
-COLOR_TOKEN = rf"\$C\[{BYTE_TOKEN},{BYTE_TOKEN},{BYTE_TOKEN},{BYTE_TOKEN}\]"
+COLOR_TOKEN = rf"\$C\s*\[\s*{BYTE_TOKEN}(?:\s*,\s*{BYTE_TOKEN}){{2,3}}\s*\]"
 COLOR_TOKEN_RE = re.compile(rf"^{COLOR_TOKEN}$")
 FONT_TOKEN = r"\$F\[[^\]\r\n]*\]"
 SYMBOL_TOKEN = r"\$S\[[^\]\r\n]*\]"
@@ -109,8 +109,11 @@ def split_soft_color_tokens(tokens: Counter[str]) -> tuple[Counter[str], Counter
     hard: Counter[str] = Counter()
     soft: Counter[str] = Counter()
     for token, count in tokens.items():
-        target = soft if COLOR_TOKEN_RE.fullmatch(token) else hard
-        target[token] = count
+        if COLOR_TOKEN_RE.fullmatch(token):
+            # `$C[115,5,20]` and `$C[115, 5, 20]` are identical game data.
+            soft[re.sub(r"\s+", "", token)] = count
+        else:
+            hard[token] = count
     return hard, soft
 
 
