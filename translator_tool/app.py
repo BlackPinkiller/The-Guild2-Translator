@@ -1852,6 +1852,12 @@ class TranslatorWindow(QMainWindow):
         except SaveValidationError as exc:
             QMessageBox.warning(self, "保存被阻止", "\n".join(exc.messages[:20]))
             return
+        format_warning_count = sum(
+            1
+            for unit in result.saved_units
+            for issue in unit.issues()
+            if not issue.blocks_save
+        )
         if not result.changed_files:
             if result.cleared_empty_units:
                 self.load_project(discard_changes=True)
@@ -1867,7 +1873,8 @@ class TranslatorWindow(QMainWindow):
             commit_note = f"；文件已保存，但 Git 提交失败：{exc}"
         self.load_project(discard_changes=True)
         cleared_note = f"，已移除 {len(result.cleared_empty_units)} 条译文覆盖" if result.cleared_empty_units else ""
-        self.statusBar().showMessage(f"已保存 {len(result.changed_files)} 个文件{cleared_note}{commit_note}", 7000)
+        warning_note = f"，格式提示 {format_warning_count} 条" if format_warning_count else ""
+        self.statusBar().showMessage(f"已保存 {len(result.changed_files)} 个文件{cleared_note}{warning_note}{commit_note}", 7000)
 
     def retry_commit(self) -> None:
         if self.git is None:

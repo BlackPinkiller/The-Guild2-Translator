@@ -296,6 +296,14 @@ def assert_validation_blocks(root: Path) -> None:
     raise AssertionError("fullwidth placeholder damage was not blocked")
 
 
+def assert_validation_warnings_do_not_block() -> None:
+    issues = validate_translation("Value %1n", "bad %2n", dbt_field=True)
+    if any(issue.blocks_save for issue in issues):
+        raise AssertionError("format validation warning unexpectedly blocked saving")
+    if not any(issue.code == "argument-index" for issue in issues):
+        raise AssertionError("invalid argument index was not reported as a warning")
+
+
 def assert_ignore_cache(root: Path) -> None:
     temp = make_temp_project(root, "translator_tool_smoke_ignore_")
     project = Project.load(temp, "#chinese")
@@ -385,17 +393,20 @@ def assert_guild2_format_grammar() -> None:
     colors = format_tokens("$C[255,0,0] $C[115, 5,20] $C[255,90,90,255]")
     if len(colors) != 3:
         raise AssertionError("RGB/RGBA color directives with optional whitespace were not recognized")
+    plural = format_tokens("The %1DNs disagree")
+    if plural != {"%1DN": 1}:
+        raise AssertionError("plural suffix after a dynasty placeholder was parsed as an invalid token")
     if any(issue.blocks_save for issue in validate_translation(syntax, syntax, dbt_field=False)):
         raise AssertionError("valid Guild 2 syntax was rejected")
     compatible = validate_translation("Name: %1SN", "姓名：%1SV", dbt_field=True)
     if any(issue.blocks_save for issue in compatible) or not any(issue.code == "argument-variant" for issue in compatible):
         raise AssertionError("SN/SV compatible character-name variant was not accepted")
     wrong_index = validate_translation("Name: %1SN", "姓名：%2SN", dbt_field=True)
-    if not any(issue.blocks_save and issue.code == "argument-index" for issue in wrong_index):
-        raise AssertionError("invalid argument index did not block saving")
+    if any(issue.blocks_save for issue in wrong_index) or not any(issue.code == "argument-index" for issue in wrong_index):
+        raise AssertionError("invalid argument index was not retained as a non-blocking warning")
     wrong_type = validate_translation("Name: %1SN", "数值：%1n", dbt_field=True)
-    if not any(issue.blocks_save and issue.code == "argument-type" for issue in wrong_type):
-        raise AssertionError("incompatible argument type did not block saving")
+    if any(issue.blocks_save for issue in wrong_type) or not any(issue.code == "argument-type" for issue in wrong_type):
+        raise AssertionError("incompatible argument type was not retained as a non-blocking warning")
     unknown = validate_translation("Plain text", "未知 %A", dbt_field=True)
     if any(issue.blocks_save for issue in unknown) or not any(issue.code == "unknown-format" for issue in unknown):
         raise AssertionError("unknown format token was not reduced to a non-blocking warning")
@@ -529,7 +540,7 @@ def main() -> int:
     assert_mod_label_match_inserts_source_formatted_row(root)
     assert_project_history_settings(root)
     assert_external_project_uses_tool_codec(root)
-    assert_validation_blocks(root)
+    assert_validation_warnings_do_not_block()
     assert_ignore_cache(root)
     assert_operation_history()
     assert_ai_token_protection()

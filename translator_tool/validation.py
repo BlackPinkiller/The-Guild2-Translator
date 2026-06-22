@@ -8,7 +8,9 @@ from .codec_adapter import Guild2Codec
 
 
 ARG_SUFFIX = r"(?:NAME|GG|GN|GT|SN|Sn|SV|Sv|SZ|Sz|SK|ST|SA|SD|SB|SL|DN|DS|[niftczjsl])?"
-ARG_TOKEN = rf"%\d+{ARG_SUFFIX}(?![A-Za-z0-9])"
+# English source text commonly pluralizes a dynasty name as `%1DNs`.
+# Treat that as `%1DN` followed by literal text, never as a new placeholder.
+ARG_TOKEN = rf"%\d+(?:(?:NAME|DN)(?=s(?![A-Za-z0-9]))|{ARG_SUFFIX}(?![A-Za-z0-9]))"
 PRINTF_TOKEN = r"%(?:\d+\$)?[-+#0]*(?:\d+|\*)?(?:\.(?:\d+|\*))?[diufFeEgGxXos](?![A-Za-z0-9])"
 PERCENT_TOKEN = rf"%%|%[<>]|{ARG_TOKEN}|{PRINTF_TOKEN}"
 
@@ -161,12 +163,12 @@ def _compare_argument_tokens(source: Counter[str], target: Counter[str]) -> list
         source_suffixes = source_by_index.get(number)
         if not source_suffixes:
             tokens = Counter(token for token in target if (_arg_parts(token) or (0, ""))[0] == number)
-            issues.append(ValidationIssue("error", f"参数编号不存在: {format_counter_items(tokens)}", code="argument-index"))
+            issues.append(ValidationIssue("warning", f"参数编号不存在: {format_counter_items(tokens)}", code="argument-index"))
             continue
         source_categories = {_arg_category(suffix) for suffix in source_suffixes}
         for suffix in sorted(target_suffixes):
             if _arg_category(suffix) not in source_categories:
-                issues.append(ValidationIssue("error", f"参数类型不匹配: %{number}{suffix}", code="argument-type"))
+                issues.append(ValidationIssue("warning", f"参数类型不匹配: %{number}{suffix}", code="argument-type"))
             elif suffix not in source_suffixes:
                 issues.append(ValidationIssue("warning", f"参数类型替换: %{number}{suffix}", code="argument-variant"))
     for number, source_suffixes in sorted(source_by_index.items()):
@@ -230,7 +232,7 @@ def compare_tokens(source: str, target: str) -> list[ValidationIssue]:
 
     if missing:
         items = format_counter_items(missing)
-        issues.append(ValidationIssue("error", f"缺少格式标记: {items}"))
+        issues.append(ValidationIssue("warning", f"缺少格式标记: {items}"))
     if extra:
         items = format_counter_items(extra)
         issues.append(ValidationIssue("warning", f"新增格式标记: {items}"))
@@ -241,7 +243,7 @@ def compare_tokens(source: str, target: str) -> list[ValidationIssue]:
         items = format_counter_items(extra_color)
         issues.append(ValidationIssue("warning", f"颜色标记不一致(不阻止保存): 新增 {items}"))
     if source_fallbacks != target_fallbacks:
-        issues.append(ValidationIssue("error", "@T inline fallback count differs", code="format-fallback"))
+        issues.append(ValidationIssue("warning", "@T inline fallback count differs", code="format-fallback"))
     return issues
 
 
@@ -257,7 +259,7 @@ def validate_translation(
         issues.append(ValidationIssue("error", 'DBT 字段不能包含双引号 "，请使用 >Text<。'))
     if FULLWIDTH_SYNTAX_RE.search(target):
         bad = "".join(dict.fromkeys(FULLWIDTH_SYNTAX_RE.findall(target)))
-        issues.append(ValidationIssue("error", f"疑似全角格式符号: {bad}"))
+        issues.append(ValidationIssue("warning", f"疑似全角格式符号: {bad}"))
     if CHINESE_QUOTE_RE.search(target):
         bad = "".join(dict.fromkeys(CHINESE_QUOTE_RE.findall(target)))
         issues.append(ValidationIssue("warning", f"中文引号可能不符合 Translation-Kit: {bad}"))
