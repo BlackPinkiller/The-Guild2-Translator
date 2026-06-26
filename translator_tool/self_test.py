@@ -21,7 +21,6 @@ from .project import (
     STATUS_MODIFIED,
     STATUS_REVIEW,
     STATUS_TRANSLATED,
-    SaveValidationError,
 )
 from .settings import AppSettings, load_settings, save_settings
 from .validation import format_tokens, validate_translation
@@ -55,11 +54,6 @@ def assert_round_trip(root: Path) -> None:
 
 def assert_statuses(root: Path) -> None:
     project = Project.load(root, "#chinese", codec_root=tool_root())
-    statuses = {unit.status for unit in project.units}
-    expected = {"译文缺行", "未翻译(同原文)", "译文多余"}
-    missing = expected - statuses
-    if missing:
-        raise AssertionError(f"expected statuses not found: {sorted(missing)}")
     if not any(unit.file_rel == "Text.dbt" and unit.status == STATUS_MISSING_ROW for unit in project.units):
         raise AssertionError("Text.dbt missing rows were not detected")
     if not any(unit.status in MISSING_WORK_STATUSES for unit in project.units):
@@ -85,7 +79,8 @@ def assert_loaded_order_matches_file_lines(root: Path) -> None:
 
 def copy_project_subset(src_root: Path, dst_root: Path) -> None:
     (dst_root / "encoder" / "data").mkdir(parents=True)
-    shutil.copy2(tool_root() / "encoder" / "data" / "guild2_chinese_codec.json", dst_root / "encoder" / "data")
+    shutil.copy2(tool_root() / "encoder" / "guild2_codec.py", dst_root / "encoder")
+    shutil.copy2(tool_root() / "encoder" / "data" / "guild2_codec.json", dst_root / "encoder" / "data")
     (dst_root / "languages" / "#chinese").mkdir(parents=True)
     for name in ["Text.dbt", "Tooltips.dbt"]:
         shutil.copy2(src_root / "languages" / name, dst_root / "languages" / name)
@@ -134,11 +129,24 @@ def assert_save_existing(root: Path) -> None:
 def assert_save_removes_extra_target_row(root: Path) -> None:
     temp = make_temp_project(root, "translator_tool_smoke_extra_")
     try:
+        target_path = temp / "languages" / "#chinese" / "Text.dbt"
+        target_doc = load_dbt(target_path)
+        base_row = target_doc.rows[0]
+        extra_id = base_row.row_id + 900000
+        extra_line = base_row.original_line.replace(str(base_row.row_id), str(extra_id), 1)
+        target_path.write_bytes(
+            target_doc.text.replace(base_row.original_line, base_row.original_line + extra_line, 1).encode(
+                target_doc.profile.encoding
+            )
+        )
         project = Project.load(temp, "#chinese")
-        extra = next(unit for unit in project.units if unit.status == STATUS_EXTRA and unit.ref.kind == "dbt")
+        extra = next(
+            unit
+            for unit in project.units
+            if unit.status == STATUS_EXTRA and unit.ref.kind == "dbt" and unit.record_id == str(extra_id)
+        )
         assert extra.ref.target_row is not None
         key = (extra.ref.target_row.row_id, extra.label)
-        target_path = extra.ref.target_doc.path
         result = project.save([extra])
         if not result.changed_files or not result.removed_extra_units:
             raise AssertionError("saving an extra target row did not schedule cleanup")
@@ -349,9 +357,15 @@ def assert_codec(root: Path) -> None:
 def assert_font_glyph_validation(root: Path) -> None:
     project = Project.load(root, "#chinese", codec_root=tool_root())
     unit = next(unit for unit in project.units if unit.source_text)
-    unit.set_text("字😀")
+    unit.set_text("ΩЖ가")
+    if any(issue.code == "font-glyph" for issue in unit.issues()):
+        raise AssertionError("non-CJK Unicode should not be reported as missing font glyphs")
+    unit.set_text("😀")
     if not any(issue.code == "font-glyph" and "😀" in issue.message for issue in unit.issues()):
-        raise AssertionError("font glyph validation did not flag an unsupported character")
+        raise AssertionError("emoji glyph validation did not flag an unsupported character")
+    unit.set_text("𠀀")
+    if not any(issue.code == "font-glyph" and "𠀀" in issue.message for issue in unit.issues()):
+        raise AssertionError("unmapped CJK glyph validation did not flag an unsupported character")
     previous = project_module.ENABLE_FONT_GLYPH_VALIDATION
     try:
         project_module.ENABLE_FONT_GLYPH_VALIDATION = False

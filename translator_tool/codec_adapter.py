@@ -1,118 +1,83 @@
 from __future__ import annotations
 
-import html
-import json
-import re
+import importlib.util
+from functools import lru_cache
 from pathlib import Path
-
-
-PRIVATE_MIN = 0xA100
-PRIVATE_MAX = 0xACFF
-ENTITY_RE = re.compile(r"&#x([0-9a-fA-F]+);|&#([0-9]+);")
-SLASH_U_RE = re.compile(r"\\u([0-9a-fA-F]{4})|\\U([0-9a-fA-F]{8})")
-UPLUS_RE = re.compile(r"U\+([0-9a-fA-F]{4,6})")
+from types import ModuleType
 
 
 class CodecError(ValueError):
     """Raised when text cannot be converted to or from the game font map."""
 
 
-def is_private(char: str) -> bool:
-    return len(char) == 1 and PRIVATE_MIN <= ord(char) <= PRIVATE_MAX
-
-
-def normalize_game_input(text: str) -> str:
-    text = html.unescape(text)
-
-    def entity_replace(match: re.Match[str]) -> str:
-        raw = match.group(1) or match.group(2)
-        base = 16 if match.group(1) else 10
-        return chr(int(raw, base))
-
-    text = ENTITY_RE.sub(entity_replace, text)
-
-    def slash_u_replace(match: re.Match[str]) -> str:
-        raw = match.group(1) or match.group(2)
-        return chr(int(raw, 16))
-
-    text = SLASH_U_RE.sub(slash_u_replace, text)
-    tokens = UPLUS_RE.findall(text)
-    if tokens and re.fullmatch(r"(?:\s|,|;|\|)*" + r"(?:U\+[0-9a-fA-F]{4,6}(?:\s|,|;|\|)*)+", text):
-        return "".join(chr(int(token, 16)) for token in tokens)
-    return UPLUS_RE.sub(lambda match: chr(int(match.group(1), 16)), text)
+def is_unsupported_emoji(char: str) -> bool:
+    """The game can pass through normal Unicode text, but not emoji glyphs."""
+    codepoint = ord(char)
+    return 0x1F000 <= codepoint <= 0x1FAFF
 
 
 class Guild2Codec:
-    def __init__(self, plain_to_game: dict[str, str], game_to_plain: dict[str, str]) -> None:
-        self.plain_to_game = plain_to_game
-        self.game_to_plain = game_to_plain
+    def __init__(self, codec: dict[str, str], codec_module: ModuleType) -> None:
+        self.codec = codec
+        self.codec_module = codec_module
 
     @classmethod
     def load(cls, codec_path: Path) -> "Guild2Codec":
-        raw = json.loads(codec_path.read_text(encoding="utf-8"))
-        plain_to_game = raw.get("plain_to_game")
-        game_to_plain = raw.get("game_to_plain")
-        if not isinstance(plain_to_game, dict) or not isinstance(game_to_plain, dict):
-            raise CodecError(f"invalid codec table: {codec_path}")
-        return cls(
-            {str(key): str(value) for key, value in plain_to_game.items()},
-            {str(key): str(value) for key, value in game_to_plain.items()},
-        )
+        module = _load_encoder_module(codec_path)
+        try:
+            codec = module.load_codec(codec_path)
+        except Exception as exc:
+            raise CodecError(str(exc)) from exc
+        return cls(codec, module)
 
     def decode(self, text: str) -> str:
-        text = normalize_game_input(text)
-        out: list[str] = []
-        missing: list[str] = []
-        for char in text:
-            if is_private(char):
-                target = self.game_to_plain.get(char)
-                if target:
-                    out.append(target)
-                else:
-                    out.append(char)
-                    if char not in missing:
-                        missing.append(char)
-            else:
-                out.append(char)
-        if missing:
-            points = ", ".join(f"U+{ord(char):04X}" for char in missing)
-            raise CodecError(f"cannot decode game character(s): {points}")
-        return "".join(out)
+        try:
+            converted, _missing = self.codec_module.decode_text(text, self.codec, "error", "")
+        except Exception as exc:
+            raise CodecError(str(exc)) from exc
+        return converted
 
     def encode(self, text: str) -> str:
-        out: list[str] = []
         missing = self.unsupported_characters(text)
-        for char in text:
-            target = self.plain_to_game.get(char)
-            if isinstance(target, str) and len(target) == 1:
-                out.append(target)
-                continue
-            if ord(char) < 128:
-                out.append(char)
-                continue
-            if is_private(char):
-                out.append(char)
-                continue
-            out.append(char)
         if missing:
             chars = "".join(missing)
             points = ", ".join(f"{char}(U+{ord(char):04X})" for char in missing)
             raise CodecError(f"cannot encode character(s): {chars} / {points}")
-        return "".join(out)
+        try:
+            converted, _missing = self.codec_module.encode_text(text, self.codec, "error", "")
+        except Exception as exc:
+            raise CodecError(str(exc)) from exc
+        return converted
 
     def unsupported_characters(self, text: str) -> list[str]:
-        """Return distinct characters the active game font codec cannot encode."""
+        """Return distinct characters the game font cannot encode/display."""
         missing: list[str] = []
         for char in text:
-            target = self.plain_to_game.get(char)
-            if (isinstance(target, str) and len(target) == 1) or ord(char) < 128 or is_private(char):
+            if char in self.codec:
+                continue
+            if self.codec_module.is_private_char(char):
+                continue
+            if not is_unsupported_emoji(char) and not self.codec_module.requires_codec_mapping(char):
                 continue
             if char not in missing:
                 missing.append(char)
         return missing
 
 
+@lru_cache(maxsize=4)
+def _load_encoder_module(codec_path: Path) -> ModuleType:
+    script = codec_path.resolve().parents[1] / "guild2_codec.py"
+    if not script.exists():
+        raise CodecError(f"codec module not found: {script}")
+    spec = importlib.util.spec_from_file_location("guild2_codec_runtime", script)
+    if spec is None or spec.loader is None:
+        raise CodecError(f"cannot load codec module: {script}")
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
 def default_codec_path(project_root: Path, codec_root: Path | None = None) -> Path:
     """Return the bundled codec path, optionally separate from a language project."""
     root = codec_root if codec_root is not None else project_root
-    return root / "encoder" / "data" / "guild2_chinese_codec.json"
+    return root / "encoder" / "data" / "guild2_codec.json"
