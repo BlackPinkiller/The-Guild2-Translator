@@ -428,6 +428,12 @@ def assert_guild2_format_grammar() -> None:
     plural = format_tokens("The %1DNs disagree")
     if plural != {"%1DN": 1}:
         raise AssertionError("plural suffix after a dynasty placeholder was parsed as an invalid token")
+    decoration = format_tokens("$[ ($] $[ ornament $] $[ $(")
+    if sum(count for token, count in decoration.items() if token.startswith("$[")) != 3:
+        raise AssertionError("ornamental bracket syntax was not recognized robustly")
+    decoration_issues = validate_translation("$[ ($] Label %1n", "Label %1n", dbt_field=True)
+    if any(issue.code in {"format-missing", "format-extra", "unknown-format"} for issue in decoration_issues):
+        raise AssertionError("ornamental bracket syntax produced a format false positive")
     if any(issue.blocks_save for issue in validate_translation(syntax, syntax, dbt_field=False)):
         raise AssertionError("valid Guild 2 syntax was rejected")
     compatible = validate_translation("Name: %1SN", "姓名：%1SV", dbt_field=True)

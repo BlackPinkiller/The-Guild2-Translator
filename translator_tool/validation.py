@@ -20,7 +20,10 @@ COLOR_TOKEN_RE = re.compile(rf"^{COLOR_TOKEN}$")
 FONT_TOKEN = r"\$F\[[^\]\r\n]*\]"
 SYMBOL_TOKEN = r"\$S\[[^\]\r\n]*\]"
 BACKGROUND_TOKEN = r"\$B\[[^\]\r\n]*\]"
-HEADER_TOKEN = r"\$\[[^\r\n]*?\$\]"
+# Ornamental/literal bracket decoration.  It has no runtime placeholder
+# semantics, and real text may use short forms such as `$[ $(` to show bracket
+# glyphs, so recognize it broadly and exclude it from source/target diffs.
+HEADER_TOKEN = r"\$\[(?:[^\r\n]*?\$\]|[^\r\n]*?\$|(?=\s|$))"
 LINE_OR_LAYOUT_TOKEN = r"\$[NLRZT<>]"
 EMOTION_TOKEN = r"#E\[[A-Za-z0-9_]+\]"
 SPEECH_TIMING_TOKEN = r"#SP[+-]"
@@ -148,6 +151,11 @@ def _take_inline_fallbacks(tokens: Counter[str]) -> int:
     return sum(tokens.pop(token) for token in values)
 
 
+def _drop_decoration_tokens(tokens: Counter[str]) -> None:
+    for token in [token for token in tokens if token.startswith("$[")]:
+        del tokens[token]
+
+
 def _compare_argument_tokens(source: Counter[str], target: Counter[str]) -> list[ValidationIssue]:
     source_by_index: dict[int, set[str]] = {}
     target_by_index: dict[int, set[str]] = {}
@@ -220,6 +228,8 @@ def compare_tokens(source: str, target: str) -> list[ValidationIssue]:
     target_args = _take_arg_tokens(target_tokens)
     source_fallbacks = _take_inline_fallbacks(source_tokens)
     target_fallbacks = _take_inline_fallbacks(target_tokens)
+    _drop_decoration_tokens(source_tokens)
+    _drop_decoration_tokens(target_tokens)
     source_hard, source_color = split_soft_color_tokens(source_tokens)
     target_hard, target_color = split_soft_color_tokens(target_tokens)
 
