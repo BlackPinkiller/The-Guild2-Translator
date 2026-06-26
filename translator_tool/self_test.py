@@ -434,6 +434,9 @@ def assert_guild2_format_grammar() -> None:
     decoration_issues = validate_translation("$[ ($] Label %1n", "Label %1n", dbt_field=True)
     if any(issue.code in {"format-missing", "format-extra", "unknown-format"} for issue in decoration_issues):
         raise AssertionError("ornamental bracket syntax produced a format false positive")
+    literal_dollars = validate_translation("$A $( $? $foo", "plain", dbt_field=True)
+    if any(issue.code == "unknown-format" for issue in literal_dollars):
+        raise AssertionError("literal dollar escapes should not produce unknown-format warnings")
     if any(issue.blocks_save for issue in validate_translation(syntax, syntax, dbt_field=False)):
         raise AssertionError("valid Guild 2 syntax was rejected")
     compatible = validate_translation("Name: %1SN", "姓名：%1SV", dbt_field=True)

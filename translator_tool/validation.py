@@ -200,7 +200,7 @@ def unknown_syntax_tokens(text: str) -> list[str]:
                 unknown.append(candidate.group(0))
                 position = candidate.end()
                 continue
-        elif marker in "$#@":
+        elif marker in "#@":
             known = TOKEN_RE.match(text, position)
             if known is not None:
                 position = known.end()
