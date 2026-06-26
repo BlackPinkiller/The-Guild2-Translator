@@ -89,7 +89,6 @@ from .project import (
 from .settings import AppSettings, load_settings, protect_secret, reveal_secret, save_settings
 from .validation import (
     CHINESE_QUOTE_RE,
-    FULLWIDTH_SYNTAX_RE,
     HIGHLIGHT_RE,
     format_counter_items,
     format_tokens,
@@ -637,8 +636,6 @@ class TokenHighlighter(QSyntaxHighlighter):
             elif token.startswith(">") and token.endswith("<"):
                 fmt = self.quote_token
             self.setFormat(match.start(), match.end() - match.start(), fmt)
-        for match in FULLWIDTH_SYNTAX_RE.finditer(text):
-            self.setFormat(match.start(), match.end() - match.start(), self.bad_token)
         for match in CHINESE_QUOTE_RE.finditer(text):
             self.setFormat(match.start(), match.end() - match.start(), self.warn_token)
         if self.glyph_codec is not None:
@@ -2029,8 +2026,6 @@ def _counter_tokens(counter: Counter[str]) -> list[str]:
 def _short_issue_name(message: str) -> str:
     if "字库缺字" in message:
         return "FONT"
-    if "全角" in message:
-        return "FW"
     if "双引号" in message:
         return '"'
     if "中文引号" in message:

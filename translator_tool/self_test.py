@@ -309,25 +309,15 @@ def assert_external_project_uses_tool_codec(root: Path) -> None:
     safe_rmtree(temp)
 
 
-def assert_validation_blocks(root: Path) -> None:
-    temp = make_temp_project(root, "translator_tool_smoke_validation_")
-    project = Project.load(temp, "#chinese")
-    unit = next(unit for unit in project.units if "%1n" in unit.source_text)
-    unit.set_text("坏％1ｎ")
-    try:
-        project.save([unit])
-    except SaveValidationError:
-        safe_rmtree(temp)
-        return
-    raise AssertionError("fullwidth placeholder damage was not blocked")
-
-
 def assert_validation_warnings_do_not_block() -> None:
     issues = validate_translation("Value %1n", "bad %2n", dbt_field=True)
     if any(issue.blocks_save for issue in issues):
         raise AssertionError("format validation warning unexpectedly blocked saving")
     if not any(issue.code == "argument-index" for issue in issues):
         raise AssertionError("invalid argument index was not reported as a warning")
+    fullwidth = validate_translation("Value", "％１Ａ", dbt_field=True)
+    if any("全角" in issue.message or "fullwidth" in issue.message.lower() for issue in fullwidth):
+        raise AssertionError("fullwidth characters should be validated only through the codec")
 
 
 def assert_ignore_cache(root: Path) -> None:

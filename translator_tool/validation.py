@@ -89,7 +89,6 @@ HIGHLIGHT_RE = re.compile(
     )
 )
 
-FULLWIDTH_SYNTAX_RE = re.compile(r"[\uFF05\uFF04\uFF03\uFF3B\uFF3D\uFF5C\uFF10-\uFF19\uFF21-\uFF3A\uFF41-\uFF5A]")
 CHINESE_QUOTE_RE = re.compile(r"[\u201C\u201D\u2018\u2019]")
 ARG_TOKEN_RE = re.compile(ARG_TOKEN)
 UNKNOWN_PERCENT_RE = re.compile(r"%(?:\d*[A-Za-z][A-Za-z0-9]*|[^\s])?")
@@ -267,9 +266,6 @@ def validate_translation(
     issues = compare_tokens(source, target)
     if dbt_field and '"' in target:
         issues.append(ValidationIssue("error", 'DBT 字段不能包含双引号 "，请使用 >Text<。'))
-    if FULLWIDTH_SYNTAX_RE.search(target):
-        bad = "".join(dict.fromkeys(FULLWIDTH_SYNTAX_RE.findall(target)))
-        issues.append(ValidationIssue("warning", f"疑似全角格式符号: {bad}"))
     if CHINESE_QUOTE_RE.search(target):
         bad = "".join(dict.fromkeys(CHINESE_QUOTE_RE.findall(target)))
         issues.append(ValidationIssue("warning", f"中文引号可能不符合 Translation-Kit: {bad}"))
