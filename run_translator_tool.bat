@@ -11,4 +11,3 @@ if errorlevel 1 (
   )
 )
 py -3.12 -m translator_tool.app
-pause
