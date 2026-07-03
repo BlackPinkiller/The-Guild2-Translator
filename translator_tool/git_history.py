@@ -4,7 +4,9 @@ from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
 import argparse
+import re
 import subprocess
+import threading
 import time
 from typing import Iterable
 
@@ -34,7 +36,7 @@ class GitCommit:
 
     @property
     def display(self) -> str:
-        return f"{self.short_hash} · {self.timestamp:%Y-%m-%d %H:%M} · {self.subject}"
+        return f"{self.short_hash} · {self.timestamp:%Y-%m-%d %H:%M} · {_display_subject(self.subject)}"
 
 
 @dataclass(frozen=True)
@@ -46,6 +48,7 @@ class TranslationLogEntry:
     field_name: str
     source_text: str
     translated_text: str
+    previous_text: str | None = None
 
     @property
     def heading(self) -> str:
@@ -58,6 +61,37 @@ class TranslationLogEntry:
         if self.field_name:
             identity = f"{identity} · {self.field_name}" if identity else self.field_name
         return f"[{self.kind}] {identity or self.file_rel}"
+
+    @property
+    def change_key(self) -> tuple[str, str, str, str]:
+        return (self.file_rel, self.record_id, self.label, self.field_name)
+
+    @property
+    def before_text(self) -> str:
+        return self.source_text if self.previous_text is None else self.previous_text
+
+    @property
+    def display_before_text(self) -> str:
+        return self.source_text if self.kind == "新增" else self.before_text
+
+    def merged_with(self, newer: "TranslationLogEntry") -> "TranslationLogEntry":
+        if self.change_key != newer.change_key:
+            raise ValueError("cannot merge unrelated history entries")
+        previous_text = self.previous_text
+        if newer.kind == "删除" and previous_text not in {None, "", self.source_text}:
+            kind = "删除"
+        else:
+            kind = "新增" if previous_text in {None, "", self.source_text} else "更新"
+        return TranslationLogEntry(
+            kind,
+            newer.file_rel,
+            newer.record_id,
+            newer.label,
+            newer.field_name,
+            newer.source_text,
+            newer.translated_text,
+            previous_text,
+        )
 
 
 class LanguageGit:
@@ -73,6 +107,10 @@ class LanguageGit:
         self.repo = self.project_root / "languages"
         self.language = language
         self.codec = Guild2Codec.load(default_codec_path(self.project_root, codec_root))
+        self._cache_lock = threading.Lock()
+        self._commit_list_cache: tuple[GitCommit, ...] | None = None
+        self._entry_cache: dict[str, tuple[TranslationLogEntry, ...]] = {}
+        self._combined_cache: dict[tuple[str, ...], tuple[TranslationLogEntry, ...]] = {}
 
     def ensure_repository(self, settings: AppSettings) -> bool:
         """Create the initial language baseline. Returns true when it was created."""
@@ -84,9 +122,15 @@ class LanguageGit:
         self._run("add", "--all")
         if self._has_staged_changes():
             self._run("commit", "-m", "chore: import language baseline")
+        self._invalidate_history_cache()
         return True
 
-    def commit_saved(self, changed_files: Iterable[Path], saved_units: Iterable[TranslationUnit]) -> GitCommit | None:
+    def commit_saved(
+        self,
+        changed_files: Iterable[Path],
+        saved_units: Iterable[TranslationUnit],
+        deleted_units: Iterable[TranslationUnit] = (),
+    ) -> GitCommit | None:
         relative_paths = [str(path.resolve().relative_to(self.repo)).replace("\\", "/") for path in changed_files]
         if not relative_paths:
             return None
@@ -94,6 +138,7 @@ class LanguageGit:
         if not self._has_staged_changes(relative_paths):
             return None
         units = tuple(saved_units)
+        deleted = len(tuple(deleted_units))
         added = sum(1 for unit in units if unit.status in MISSING_WORK_STATUSES)
         updated = len(units) - added
         files = ", ".join(sorted({Path(path).name for path in relative_paths}))
@@ -102,8 +147,13 @@ class LanguageGit:
             portions.append(f"add {added}")
         if updated:
             portions.append(f"update {updated}")
+        if deleted:
+            portions.append(f"delete {deleted}")
+        if not portions:
+            portions.append("sync")
         subject = f"translation: {', '.join(portions)} ({files})"
         self._run("commit", "--only", "-m", subject, "--", *relative_paths)
+        self._invalidate_history_cache()
         return self.list_commits(1)[0]
 
     def has_pending_changes(self) -> bool:
@@ -119,9 +169,14 @@ class LanguageGit:
         if not self._has_staged_changes(paths):
             return None
         self._run("commit", "--only", "-m", "translation: commit pending language changes", "--", *paths)
+        self._invalidate_history_cache()
         return self.list_commits(1)[0]
 
     def list_commits(self, limit: int = 100) -> list[GitCommit]:
+        with self._cache_lock:
+            cached = self._commit_list_cache
+        if cached is not None and limit <= 100:
+            return list(cached[:limit])
         result = self._run("log", f"-n{limit}", "--format=%H%x1f%h%x1f%ct%x1f%s")
         commits: list[GitCommit] = []
         for line in result.stdout.splitlines():
@@ -129,9 +184,16 @@ class LanguageGit:
             if len(parts) != 4:
                 continue
             commits.append(GitCommit(parts[0], parts[1], datetime.fromtimestamp(int(parts[2])), parts[3]))
+        if limit == 100:
+            with self._cache_lock:
+                self._commit_list_cache = tuple(commits)
         return commits
 
     def entries_for_commit(self, commit: str) -> list[TranslationLogEntry]:
+        with self._cache_lock:
+            cached = self._entry_cache.get(commit)
+        if cached is not None:
+            return list(cached)
         parent = self._parent_of(commit)
         if parent is None:
             return []
@@ -145,13 +207,19 @@ class LanguageGit:
             after = self._show_bytes(commit, target_rel)
             before = self._show_bytes(parent, target_rel)
             source = self._show_bytes(commit, file_rel)
-            if after is None or source is None:
+            if source is None:
                 continue
             if target_rel.lower().endswith(".dbt"):
+                if after is None:
+                    continue
                 entries.extend(self._dbt_entries(file_rel, source, before, after))
             elif target_rel.lower().endswith(".txt"):
                 entries.extend(self._text_entries(file_rel, source, before, after))
-        return entries
+        packed = tuple(entries)
+        with self._cache_lock:
+            self._entry_cache.setdefault(commit, packed)
+            cached = self._entry_cache[commit]
+        return list(cached)
 
     def entries_for_commits(self, commits_oldest_first: Iterable[str]) -> list[TranslationLogEntry]:
         """Return the net translation changes across several commits.
@@ -161,7 +229,18 @@ class LanguageGit:
         retained so the log describes the combined result rather than showing
         several noisy intermediate revisions.
         """
-        return combine_entries(self.entries_for_commit(commit) for commit in commits_oldest_first)
+        commit_list = tuple(commits_oldest_first)
+        if not commit_list:
+            return []
+        with self._cache_lock:
+            cached = self._combined_cache.get(commit_list)
+        if cached is not None:
+            return list(cached)
+        combined = tuple(combine_entries(self.entries_for_commit(commit) for commit in commit_list))
+        with self._cache_lock:
+            self._combined_cache.setdefault(commit_list, combined)
+            cached = self._combined_cache[commit_list]
+        return list(cached)
 
     def _dbt_entries(
         self, file_rel: str, source_raw: bytes, before_raw: bytes | None, after_raw: bytes
@@ -171,6 +250,7 @@ class LanguageGit:
         after_doc = load_dbt_bytes(Path(file_name), after_raw)
         before_doc = load_dbt_bytes(Path(file_name), before_raw) if before_raw is not None else None
         source_rows = source_doc.row_index
+        after_rows = after_doc.row_index
         before_rows = before_doc.row_index if before_doc is not None else {}
         fields = translatable_fields(file_name, after_doc.string_columns)
         entries: list[TranslationLogEntry] = []
@@ -187,7 +267,8 @@ class LanguageGit:
                     continue
                 source_field = matching_source_field(field_name, source_doc.string_columns)
                 source_text = source_row.get(source_field)
-                kind = "新增" if before_value is None or before_value in {"", source_text} else "更新"
+                previous_text = self._decode(before_value) if before_value is not None else None
+                kind = "新增" if previous_text in {None, "", source_text} else "更新"
                 entries.append(
                     TranslationLogEntry(
                         kind,
@@ -197,20 +278,49 @@ class LanguageGit:
                         field_name,
                         source_text,
                         self._decode(after_value),
+                        previous_text,
+                    )
+                )
+        for key, before_row in before_rows.items():
+            if key in after_rows:
+                continue
+            source_row = source_rows.get(key)
+            if source_row is None:
+                continue
+            for field_name in fields:
+                before_value = before_row.get(field_name)
+                if before_value is None:
+                    continue
+                source_field = matching_source_field(field_name, source_doc.string_columns)
+                source_text = source_row.get(source_field)
+                entries.append(
+                    TranslationLogEntry(
+                        "删除",
+                        file_rel,
+                        str(key[0]),
+                        key[1],
+                        field_name,
+                        source_text,
+                        "",
+                        self._decode(before_value),
                     )
                 )
         return entries
 
     def _text_entries(
-        self, file_rel: str, source_raw: bytes, before_raw: bytes | None, after_raw: bytes
+        self, file_rel: str, source_raw: bytes, before_raw: bytes | None, after_raw: bytes | None
     ) -> list[TranslationLogEntry]:
         source = load_plain_text_bytes(Path(file_rel), source_raw).text
-        after = load_plain_text_bytes(Path(file_rel), after_raw).text
+        after = load_plain_text_bytes(Path(file_rel), after_raw).text if after_raw is not None else None
         before = load_plain_text_bytes(Path(file_rel), before_raw).text if before_raw is not None else None
         if before == after:
             return []
-        kind = "新增" if before is None or before in {"", source} else "更新"
-        return [TranslationLogEntry(kind, file_rel, "", file_rel, "body", source, self._decode(after))]
+        if after is None:
+            previous_text = before if before is not None else ""
+            return [TranslationLogEntry("删除", file_rel, "", file_rel, "body", source, "", previous_text)]
+        previous_text = before if before is not None else None
+        kind = "新增" if previous_text in {None, "", source} else "更新"
+        return [TranslationLogEntry(kind, file_rel, "", file_rel, "body", source, after, previous_text)]
 
     def _decode(self, value: str) -> str:
         try:
@@ -307,15 +417,41 @@ class LanguageGit:
             return False
         return True
 
+    def _invalidate_history_cache(self) -> None:
+        with self._cache_lock:
+            self._commit_list_cache = None
+            self._combined_cache.clear()
+
 
 def combine_entries(entry_groups: Iterable[Iterable[TranslationLogEntry]]) -> list[TranslationLogEntry]:
     """Merge commit entry lists while keeping one final result per translation field."""
     combined: dict[tuple[str, str, str, str], TranslationLogEntry] = {}
     for entries in entry_groups:
         for entry in entries:
-            key = (entry.file_rel, entry.record_id, entry.label, entry.field_name)
-            combined[key] = entry
-    return list(combined.values())
+            current = combined.get(entry.change_key)
+            combined[entry.change_key] = entry if current is None else current.merged_with(entry)
+    return [entry for entry in combined.values() if entry.translated_text != entry.before_text]
+
+
+def _display_subject(subject: str) -> str:
+    if subject == "translation: commit pending language changes":
+        return "待处理变更"
+    if subject == "chore: import language baseline":
+        return "导入语言基线"
+    match = re.match(r"^translation:\s*(.+?)\s*\((.+)\)$", subject)
+    if not match:
+        return subject
+    counts_raw, files = match.groups()
+    parts: list[str] = []
+    for chunk in [item.strip() for item in counts_raw.split(",") if item.strip()]:
+        count_match = re.match(r"^(add|update|delete)\s+(\d+)$", chunk)
+        if not count_match:
+            parts.append(chunk)
+            continue
+        kind, count = count_match.groups()
+        parts.append(f"{'新增' if kind == 'add' else '修订' if kind == 'update' else '删除'} {count}")
+    summary = " · ".join(parts) if parts else "变更"
+    return f"{summary} · {files}"
 
 
 def format_entries(entries: Iterable[TranslationLogEntry]) -> str:
@@ -328,8 +464,11 @@ def format_entries(entries: Iterable[TranslationLogEntry]) -> str:
         lines = [file_rel]
         for entry in file_entries:
             source = entry.source_text.replace("\r", "").replace("\n", " ↵ ")
-            translated = entry.translated_text.replace("\r", "").replace("\n", " ↵ ")
-            lines.extend((f"  {entry.heading}", f"  {source} → {translated}"))
+            before = entry.display_before_text.replace("\r", "").replace("\n", " ↵ ")
+            translated = "[已删除]" if entry.kind == "删除" else entry.translated_text.replace("\r", "").replace("\n", " ↵ ")
+            lines.extend((f"  {entry.heading}", f"  {before} → {translated}"))
+            if entry.kind == "更新" and entry.before_text != entry.source_text:
+                lines.append(f"  原文：{source}")
         parts.append("\n".join(lines))
     return "\n\n".join(parts) or "此提交没有译文条目变化。"
 

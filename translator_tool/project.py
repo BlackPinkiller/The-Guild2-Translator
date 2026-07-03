@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Iterable
 
@@ -12,12 +12,15 @@ from .format_io import (
     PlainTextDocument,
     load_dbt,
     load_plain_text,
+    load_plain_text_bytes,
+    make_virtual_translation_dbt,
     make_inserted_line,
     matching_source_field,
     row_key,
     translatable_fields,
 )
 from .validation import ValidationIssue, issue_summary, validate_translation
+from .validation import normalize_color_token_spacing
 
 
 STATUS_MISSING_ROW = "译文缺行"
@@ -29,6 +32,7 @@ STATUS_REVIEW = "需审核"
 STATUS_EXTRA = "译文多余"
 STATUS_TRANSLATION_ONLY = "仅译文文件"
 STATUS_IGNORED = "无需翻译"
+STATUS_PENDING_DELETE = "待删除"
 MISSING_WORK_STATUSES = {STATUS_MISSING_ROW, STATUS_EMPTY, STATUS_SAME}
 NON_TRANSLATION_DBT_FILES = {"tables.dbt"}
 # Internal compatibility switch.  Other game adapters can disable this until
@@ -52,8 +56,7 @@ class SaveResult:
 
     changed_files: tuple[Path, ...]
     saved_units: tuple["TranslationUnit", ...]
-    cleared_empty_units: tuple["TranslationUnit", ...] = ()
-    removed_extra_units: tuple["TranslationUnit", ...] = ()
+    deleted_units: tuple["TranslationUnit", ...] = ()
 
 
 @dataclass
@@ -88,6 +91,7 @@ class TranslationUnit:
     edited_text: str | None = None
     ignored: bool = False
     needs_review: bool = False
+    pending_delete: bool = False
 
     @property
     def current_text(self) -> str:
@@ -97,17 +101,31 @@ class TranslationUnit:
     def is_dirty(self) -> bool:
         # A label fallback is staged as a new source-row translation. It must
         # be saved into the source row's own ID, label, and physical position.
-        return self.needs_review or (self.edited_text is not None and self.edited_text != self.translate_text)
+        return self.pending_delete or self.needs_review or (self.edited_text is not None and self.edited_text != self.translate_text)
 
     def set_text(self, text: str) -> None:
         # Label fallback is a one-time import hint. Once a translator touches
         # the text, their edit is the review decision and the hint is cleared.
         if self.needs_review and text != self.current_text:
             self.needs_review = False
+        if self.pending_delete and text != self.current_text:
+            self.pending_delete = False
         self.edited_text = None if text == self.translate_text else text
+
+    def set_pending_delete(self, pending_delete: bool) -> None:
+        self.pending_delete = pending_delete
+
+    def can_delete_translation(self) -> bool:
+        if self.ref.kind == "dbt":
+            return self.ref.target_row is not None or self.ref.suggested_row is not None
+        if self.ref.kind == "text":
+            return self.ref.target_doc.path.exists() or self.status == STATUS_TRANSLATION_ONLY
+        return False
 
     def current_status(self) -> str:
         """Classify the visible translation text, including unsaved edits."""
+        if self.pending_delete:
+            return STATUS_PENDING_DELETE
         if self.ignored:
             return STATUS_IGNORED
         # These entries have no corresponding source entry, so an edit cannot
@@ -125,6 +143,8 @@ class TranslationUnit:
         return STATUS_TRANSLATED
 
     def issues(self) -> list[ValidationIssue]:
+        if self.pending_delete:
+            return self.initial_issues
         if self.ignored and not self.is_dirty:
             return self.initial_issues
         dbt_field = self.ref.kind == "dbt"
@@ -139,6 +159,8 @@ class TranslationUnit:
         return issue_summary(self.issues())
 
     def display_status(self) -> str:
+        if self.pending_delete:
+            return STATUS_PENDING_DELETE
         # A label-based match can preserve useful existing translations across
         # modded files whose numeric IDs have shifted. It remains visible as a
         # review item while retaining its translated filter classification.
@@ -164,6 +186,8 @@ class Project:
     target_text_docs: dict[str, PlainTextDocument]
     units: list[TranslationUnit]
     source_order: dict[str, dict[tuple[int, str], int]]
+    unit_index: dict[str, TranslationUnit]
+    insertion_anchors: dict[str, dict[tuple[int, str], int | None]]
 
     @classmethod
     def load(cls, root: Path, language: str = "#chinese", codec_root: Path | None = None) -> "Project":
@@ -209,7 +233,8 @@ class Project:
         for file_name, source_doc in source_docs.items():
             target_doc = target_dbt_docs.get(file_name)
             if target_doc is None:
-                continue
+                target_doc = make_virtual_translation_dbt(source_doc, language_root / file_name, language)
+                target_dbt_docs[file_name] = target_doc
             order = {row_key(file_name, row): index for index, row in enumerate(source_doc.rows)}
             source_order[file_name] = order
             units.extend(
@@ -225,13 +250,26 @@ class Project:
 
         for file_rel, source_text_doc in source_text_docs.items():
             target_text_doc = target_text_docs.get(file_rel)
-            if target_text_doc is not None:
-                units.append(build_plain_text_unit(file_rel, target_text_doc, codec, source_text_doc))
+            if target_text_doc is None:
+                target_text_doc = load_plain_text_bytes(language_root / file_rel, b"")
+                target_text_doc.profile = replace(
+                    source_text_doc.profile,
+                    path=target_text_doc.path,
+                    sha256=target_text_doc.profile.sha256,
+                )
+                target_text_docs[file_rel] = target_text_doc
+            else:
+                target_text_doc.profile = replace(
+                    source_text_doc.profile,
+                    path=target_text_doc.path,
+                    sha256=target_text_doc.profile.sha256,
+                )
+            units.append(build_plain_text_unit(file_rel, target_text_doc, source_text_doc))
 
         for file_rel, text_doc in target_text_docs.items():
             if file_rel in source_text_docs:
                 continue
-            units.append(build_plain_text_unit(file_rel, text_doc, codec, None))
+            units.append(build_plain_text_unit(file_rel, text_doc, None))
             file_order.setdefault(file_rel, len(file_order))
 
         # Do not rely on construction order: the table must always reflect the
@@ -249,6 +287,13 @@ class Project:
         for unit in units:
             unit.ignored = unit.uid in ignored
 
+        unit_index = {unit.uid: unit for unit in units}
+        insertion_anchors = {
+            file_name: _build_insertion_anchors(file_name, order, target_dbt_docs[file_name])
+            for file_name, order in source_order.items()
+            if file_name in target_dbt_docs
+        }
+
         return cls(
             root=root,
             languages_root=languages_root,
@@ -260,6 +305,8 @@ class Project:
             target_text_docs=target_text_docs,
             units=units,
             source_order=source_order,
+            unit_index=unit_index,
+            insertion_anchors=insertion_anchors,
         )
 
     @staticmethod
@@ -274,13 +321,16 @@ class Project:
         return dirs
 
     def unit_by_uid(self, uid: str) -> TranslationUnit | None:
-        for unit in self.units:
-            if unit.uid == uid:
-                return unit
-        return None
+        return self.unit_index.get(uid)
 
     def dirty_units(self) -> list[TranslationUnit]:
         return [unit for unit in self.units if unit.is_dirty]
+
+    def dirty_count(self) -> int:
+        return sum(unit.is_dirty for unit in self.units)
+
+    def has_dirty_units(self) -> bool:
+        return any(unit.is_dirty for unit in self.units)
 
     def set_unit_ignored(self, unit: TranslationUnit, ignored: bool) -> None:
         self.set_units_ignored((unit,), ignored)
@@ -292,47 +342,50 @@ class Project:
         if selected:
             set_ignored_many(self.root, self.language, tuple(unit.uid for unit in selected), ignored)
 
-    def save(self, units: Iterable[TranslationUnit] | None = None) -> SaveResult:
+    def save(
+        self, units: Iterable[TranslationUnit] | None = None, *, auto_space_before_color_tokens: bool = False
+    ) -> SaveResult:
         supplied = tuple(units) if units is not None else None
         requested = list(self.dirty_units() if supplied is None else [unit for unit in supplied if unit.is_dirty])
-        extra_units = [
-            unit
-            for unit in (self.units if supplied is None else supplied)
-            if unit.status == STATUS_EXTRA and unit.ref.kind == "dbt" and unit.ref.target_row is not None
-        ]
-        empty_units = [unit for unit in requested if not unit.current_text.strip()]
+        deleted_units = [unit for unit in requested if unit.pending_delete]
         touched_docs: dict[Path, DbtDocument | PlainTextDocument] = {}
         deleted_paths: set[Path] = set()
-        for unit in extra_units:
-            ref = unit.ref
-            assert isinstance(ref.target_doc, DbtDocument)
-            assert ref.target_row is not None
-            ref.target_row.delete()
-            touched_docs[ref.target_doc.path] = ref.target_doc
-        for unit in empty_units:
+        errors: list[str] = []
+        for unit in deleted_units:
+            if not unit.can_delete_translation():
+                errors.append(f"{unit.file_rel} #{unit.record_id}: 没有可删除的译文条目")
+                continue
             ref = unit.ref
             if ref.kind == "dbt":
+                assert isinstance(ref.target_doc, DbtDocument)
                 row = ref.target_row or ref.suggested_row
-                if row is not None:
-                    row.delete()
-                    assert isinstance(ref.target_doc, DbtDocument)
-                    touched_docs[ref.target_doc.path] = ref.target_doc
+                assert row is not None
+                row.delete()
+                touched_docs[ref.target_doc.path] = ref.target_doc
             elif ref.kind == "text":
                 deleted_paths.add(ref.target_doc.path)
-        cleanup_uids = {unit.uid for unit in (*empty_units, *extra_units)}
-        selected = [unit for unit in requested if unit.uid not in cleanup_uids]
+        selected = [unit for unit in requested if not unit.pending_delete]
+        if errors:
+            raise SaveValidationError(errors)
         if not selected and not touched_docs and not deleted_paths:
-            return SaveResult((), (), tuple(empty_units), tuple(extra_units))
+            return SaveResult((), (), tuple(deleted_units))
 
-        encoded_values: dict[str, str] = {}
-        errors: list[str] = []
+        prepared_values: dict[str, str] = {}
         for unit in selected:
             blocking = [issue.message for issue in unit.issues() if issue.blocks_save]
             if blocking:
                 errors.append(f"{unit.file_rel} #{unit.record_id} {unit.field_name}: {'; '.join(blocking)}")
                 continue
+            text_to_save = (
+                normalize_color_token_spacing(unit.current_text)
+                if auto_space_before_color_tokens
+                else unit.current_text
+            )
+            if unit.ref.kind == "text":
+                prepared_values[unit.uid] = text_to_save
+                continue
             try:
-                encoded_values[unit.uid] = self.codec.encode(unit.current_text)
+                prepared_values[unit.uid] = self.codec.encode(text_to_save)
             except CodecError as exc:
                 errors.append(f"{unit.file_rel} #{unit.record_id} {unit.field_name}: {exc}")
         if errors:
@@ -343,12 +396,12 @@ class Project:
             ref = unit.ref
             if ref.kind == "text":
                 assert isinstance(ref.target_doc, PlainTextDocument)
-                ref.target_doc.set_raw_text(encoded_values[unit.uid])
+                ref.target_doc.set_raw_text(prepared_values[unit.uid])
                 touched_docs[ref.target_doc.path] = ref.target_doc
                 continue
             if ref.target_row is not None:
                 assert isinstance(ref.target_doc, DbtDocument)
-                ref.target_row.set_raw(ref.target_field, encoded_values[unit.uid])
+                ref.target_row.set_raw(ref.target_field, prepared_values[unit.uid])
                 touched_docs[ref.target_doc.path] = ref.target_doc
                 continue
             if ref.row_key is None:
@@ -374,7 +427,7 @@ class Project:
                 default_value = source_row.get(source_field)
                 values[field_name] = default_value
             for unit in grouped_units:
-                values[unit.ref.target_field] = encoded_values[unit.uid]
+                values[unit.ref.target_field] = prepared_values[unit.uid]
 
             try:
                 new_line = make_inserted_line(source_row, source_doc, target_doc, values)
@@ -410,30 +463,15 @@ class Project:
                 continue
             atomic_write(doc.path, new_bytes)
             changed_files.append(doc.path)
-        for unit in empty_units:
-            unit.edited_text = None
-            unit.needs_review = False
-        return SaveResult(tuple(changed_files), tuple(selected), tuple(empty_units), tuple(extra_units))
+        return SaveResult(tuple(changed_files), tuple(selected), tuple(deleted_units))
 
     def _insertion_line_index(self, file_rel: str, missing_key: tuple[int, str]) -> int | None:
-        order_map = self.source_order.get(file_rel, {})
-        missing_order = order_map.get(missing_key)
-        if missing_order is None:
-            return None
-        target_doc = self.target_dbt_docs[file_rel]
-        candidate: tuple[int, int] | None = None
-        for row in target_doc.rows:
-            key = row_key(file_rel, row)
-            row_order = order_map.get(key)
-            if row_order is None or row_order <= missing_order:
-                continue
-            if candidate is None or row_order < candidate[0]:
-                candidate = (row_order, row.line_index)
-        return candidate[1] if candidate else None
+        return self.insertion_anchors.get(file_rel, {}).get(missing_key)
 
 
 def atomic_write(path: Path, data: bytes) -> None:
     """Replace a project file without ever exposing a partially written file."""
+    path.parent.mkdir(parents=True, exist_ok=True)
     temp_path = path.with_name(path.name + ".tmp")
     temp_path.write_bytes(data)
     try:
@@ -447,6 +485,28 @@ def atomic_write(path: Path, data: bytes) -> None:
             temp_path.unlink()
         except OSError:
             pass
+
+
+def _build_insertion_anchors(
+    file_name: str, order_map: dict[tuple[int, str], int], target_doc: DbtDocument
+) -> dict[tuple[int, str], int | None]:
+    existing_rows = sorted(
+        (
+            (row_order, row.line_index)
+            for row in target_doc.rows
+            if (row_order := order_map.get(row_key(file_name, row))) is not None
+        ),
+        key=lambda item: item[0],
+    )
+    anchors: dict[tuple[int, str], int | None] = {}
+    next_line_index: int | None = None
+    cursor = len(existing_rows) - 1
+    for key, source_row_order in sorted(order_map.items(), key=lambda item: item[1], reverse=True):
+        while cursor >= 0 and existing_rows[cursor][0] > source_row_order:
+            next_line_index = existing_rows[cursor][1]
+            cursor -= 1
+        anchors[key] = next_line_index
+    return anchors
 
 
 def build_dbt_units(
@@ -578,15 +638,10 @@ def build_dbt_units(
 def build_plain_text_unit(
     file_rel: str,
     text_doc: PlainTextDocument,
-    codec: Guild2Codec,
     source_doc: PlainTextDocument | None,
 ) -> TranslationUnit:
     initial_issues: list[ValidationIssue] = []
-    try:
-        translate_text = codec.decode(text_doc.text)
-    except CodecError as exc:
-        translate_text = text_doc.text
-        initial_issues.append(ValidationIssue("error", str(exc)))
+    translate_text = text_doc.text
     source_text = source_doc.text if source_doc is not None else ""
     if source_doc is None:
         status = STATUS_TRANSLATION_ONLY
@@ -609,5 +664,5 @@ def build_plain_text_unit(
         status=status,
         ref=UnitRef(kind="text", target_doc=text_doc, source_doc=source_doc, display_order=0, field_order=0),
         initial_issues=initial_issues,
-        font_codec=codec,
+        font_codec=None,
     )

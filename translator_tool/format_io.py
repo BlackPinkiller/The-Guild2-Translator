@@ -142,7 +142,8 @@ class PlainTextDocument:
         self.replacement_text = text
 
     def render_text(self) -> str:
-        return self.text if self.replacement_text is None else self.replacement_text
+        text = self.text if self.replacement_text is None else self.replacement_text
+        return normalize_plain_text_layout(text, self.profile.newline, self.profile.final_newline)
 
     def render_bytes(self) -> bytes:
         return encode_text(self.render_text(), self.profile.encoding)
@@ -190,6 +191,18 @@ def split_line_ending(line: str) -> tuple[str, str]:
     if line.endswith("\r"):
         return line[:-1], "\r"
     return line, ""
+
+
+def normalize_plain_text_layout(text: str, newline: str, final_newline: bool) -> str:
+    if not text:
+        return ""
+    parts = text.replace("\r\n", "\n").replace("\r", "\n").split("\n")
+    if text.endswith(("\r\n", "\n", "\r")):
+        parts = parts[:-1]
+    rendered = newline.join(parts)
+    if final_newline:
+        return rendered + newline
+    return rendered
 
 
 def read_profile(path: Path) -> tuple[bytes, str, FileProfile]:
@@ -343,6 +356,11 @@ def translatable_fields(file_name: str, string_columns: list[str]) -> list[str]:
     return []
 
 
+def translation_string_column_name(language: str) -> str:
+    stripped = language.lstrip("#").strip().casefold()
+    return stripped or "translation"
+
+
 def matching_source_field(target_field: str, source_columns: list[str]) -> str:
     lowered = {name.lower(): name for name in source_columns}
     target_lower = target_field.lower()
@@ -355,6 +373,53 @@ def matching_source_field(target_field: str, source_columns: list[str]) -> str:
     if source_columns:
         return source_columns[-1]
     return target_field
+
+
+def make_virtual_translation_dbt(source_doc: DbtDocument, path: Path, language: str) -> DbtDocument:
+    target_translation_name = translation_string_column_name(language)
+    source_string_columns = [name for name, type_name in source_doc.columns if type_name == "STRING"]
+    source_target_fields = set(translatable_fields(source_doc.path.name, source_string_columns))
+
+    def rename_column(name: str, type_name: str) -> str:
+        if type_name.upper() != "STRING":
+            return name
+        if name not in source_target_fields:
+            return name
+        if name.casefold() != "english":
+            return name
+        return target_translation_name
+
+    renamed_columns = [(rename_column(name, type_name), type_name) for name, type_name in source_doc.columns]
+    rename_map = {name: renamed for (name, _type_name), (renamed, _target_type) in zip(source_doc.columns, renamed_columns) if renamed != name}
+    column_name_re = re.compile(r'"([^"]+)"(\s+)(INT|STRING)', re.IGNORECASE)
+
+    def rewrite_header_line(line: str) -> str:
+        return column_name_re.sub(
+            lambda match: f'"{rename_map.get(match.group(1), match.group(1))}"{match.group(2)}{match.group(3)}',
+            line,
+        )
+
+    header_end = source_doc.rows[0].line_index if source_doc.rows else len(source_doc.lines)
+    header_lines = [rewrite_header_line(line) for line in source_doc.lines[:header_end]]
+    header_text = "".join(header_lines)
+    profile = FileProfile(
+        path=path,
+        encoding=source_doc.profile.encoding,
+        newline=source_doc.profile.newline,
+        final_newline=header_text.endswith(("\n", "\r")),
+        sha256=sha256_bytes(b""),
+    )
+    return DbtDocument(
+        path=path,
+        raw=b"",
+        text=header_text,
+        profile=profile,
+        lines=header_lines,
+        columns=renamed_columns,
+        string_columns=[name for name, type_name in renamed_columns if type_name.upper() == "STRING"],
+        data_line_index=source_doc.data_line_index,
+        rows=[],
+    )
 
 
 def make_inserted_line(source_row: DbtRow, source_doc: DbtDocument, target_doc: DbtDocument, field_values: dict[str, str]) -> str:

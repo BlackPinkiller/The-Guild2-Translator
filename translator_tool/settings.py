@@ -26,6 +26,7 @@ class AppSettings:
     target_language: str = "zh-CN"
     git_author_name: str = "The Guild 2 Translator"
     git_author_email: str = "translator@local"
+    auto_space_before_color_tokens_on_save: bool = False
     last_project_root: str = ""
     recent_project_roots: list[str] = field(default_factory=list)
 
@@ -51,6 +52,8 @@ def load_settings() -> AppSettings:
     for name in AppSettings.__dataclass_fields__:
         value = raw.get(name)
         if isinstance(value, str):
+            values[name] = value
+        elif isinstance(value, bool):
             values[name] = value
         elif name == "recent_project_roots" and isinstance(value, list):
             values[name] = [item for item in value if isinstance(item, str)][:RECENT_PROJECT_LIMIT]

@@ -5,25 +5,28 @@ from pathlib import Path
 import shutil
 import tempfile
 import time
+from datetime import datetime
 import uuid
 
 from . import project as project_module
 from .ai import GoogleTranslateProvider, OpenAICompatibleProvider, TranslationProviderError
 from .codec_adapter import Guild2Codec, default_codec_path
-from .git_history import LanguageGit, TranslationLogEntry, combine_entries, format_entries
+from .git_history import GitCommit, LanguageGit, TranslationLogEntry, combine_entries, format_entries
 from .history import OperationHistory, TranslationOperation, UnitChange
 from .format_io import load_dbt, load_plain_text, row_key
 from .project import (
     MISSING_WORK_STATUSES,
     Project,
+    STATUS_EMPTY,
     STATUS_EXTRA,
     STATUS_MISSING_ROW,
     STATUS_MODIFIED,
+    STATUS_PENDING_DELETE,
     STATUS_REVIEW,
     STATUS_TRANSLATED,
 )
 from .settings import AppSettings, load_settings, save_settings
-from .validation import format_tokens, validate_translation
+from .validation import format_tokens, normalize_color_token_spacing, validate_translation
 
 
 def tool_root() -> Path:
@@ -58,7 +61,9 @@ def assert_statuses(root: Path) -> None:
         raise AssertionError("Text.dbt missing rows were not detected")
     if not any(unit.status in MISSING_WORK_STATUSES for unit in project.units):
         raise AssertionError("missing-work filter would be empty")
-    if not any(unit.file_rel == "Guides/StartPage.txt" and unit.source_text for unit in project.units):
+    if (root / "languages" / "Guides").exists() and not any(
+        unit.file_rel.startswith("Guides/") and unit.source_text for unit in project.units
+    ):
         raise AssertionError("Guides source files were not matched to translated Guides")
     if any(unit.file_rel == "Tables.dbt" for unit in project.units):
         raise AssertionError("Tables.dbt must not be exposed as a translation unit")
@@ -126,6 +131,88 @@ def assert_save_existing(root: Path) -> None:
     safe_rmtree(temp)
 
 
+def assert_save_auto_formats_color_tokens(root: Path) -> None:
+    temp = make_temp_project(root, "translator_tool_smoke_color_spacing_")
+    try:
+        project = Project.load(temp, "#chinese")
+        unit = next(unit for unit in project.units if unit.file_rel == "Text.dbt" and unit.status != STATUS_MISSING_ROW)
+        unit.set_text(
+            "$C[10,20,30]句首中$C[225,214,158]测试，$C[255,255,255]恢复#E[NT_NEUTRAL]$C[225,214,158]颜色测试$N$N$C[255,255,255]对齐"
+        )
+        project.save([unit], auto_space_before_color_tokens=True)
+        saved = Project.load(temp, "#chinese")
+        reloaded = next(item for item in saved.units if item.uid == unit.uid)
+        expected = (
+            "$C[10,20,30]句首中 $C[225,214,158]测试， $C[255,255,255]恢复 #E[NT_NEUTRAL]$C[225,214,158]颜色测试 $N$N$C[255,255,255]对齐"
+        )
+        if reloaded.current_text != expected:
+            raise AssertionError("save did not normalize color-token spacing with the expected exceptions")
+    finally:
+        safe_rmtree(temp)
+
+
+def assert_save_guides_plain_text_uses_source_profile(root: Path) -> None:
+    temp = make_temp_project(root, "translator_tool_smoke_guides_txt_")
+    try:
+        source_path = temp / "languages" / "Guides" / "Intro.txt"
+        source_path.parent.mkdir(parents=True, exist_ok=True)
+        source_text = "Guide Title\r\nGuide Body\r\n"
+        source_path.write_bytes(source_text.encode("utf-16"))
+
+        project = Project.load(temp, "#chinese")
+        unit = next(item for item in project.units if item.file_rel == "Guides/Intro.txt")
+        if unit.source_text != source_text or unit.current_text != "":
+            raise AssertionError("guide text files were not loaded as plain source text")
+
+        translated_text = "甲😀\n乙"
+        unit.set_text(translated_text)
+        result = project.save([unit])
+        target_path = temp / "languages" / "#chinese" / "Guides" / "Intro.txt"
+        if not result.changed_files or target_path not in result.changed_files:
+            raise AssertionError("guide text save did not write the translated txt file")
+        expected_bytes = "甲😀\r\n乙\r\n".encode("utf-16")
+        if target_path.read_bytes() != expected_bytes:
+            raise AssertionError("guide text save did not preserve the source encoding and newline style")
+
+        reloaded = Project.load(temp, "#chinese")
+        updated = next(item for item in reloaded.units if item.file_rel == "Guides/Intro.txt")
+        if updated.current_text != "甲😀\r\n乙\r\n":
+            raise AssertionError("guide text reload did not preserve the plain-text translation content")
+    finally:
+        safe_rmtree(temp)
+
+
+def assert_save_creates_missing_target_dbt_incrementally(root: Path) -> None:
+    temp = make_temp_project(root, "translator_tool_smoke_missing_target_dbt_")
+    try:
+        target_path = temp / "languages" / "#chinese" / "Text.dbt"
+        if target_path.exists():
+            target_path.unlink()
+
+        project = Project.load(temp, "#chinese")
+        missing_units = [unit for unit in project.units if unit.file_rel == "Text.dbt" and unit.source_text]
+        if not missing_units:
+            raise AssertionError("missing target DBT file did not expose source rows as translatable units")
+        unit = missing_units[0]
+        if unit.status != STATUS_MISSING_ROW:
+            raise AssertionError("missing target DBT rows were not classified as missing translations")
+        unit.set_text("增量保存测试")
+        result = project.save([unit])
+        if not target_path.exists() or target_path not in result.changed_files:
+            raise AssertionError("saving into a missing target DBT did not create the translated file")
+
+        saved = load_dbt(target_path)
+        if saved.string_columns != ["label", "chinese"]:
+            raise AssertionError("new target DBT file did not derive the translated-column header correctly")
+        if len(saved.rows) != 1:
+            raise AssertionError("incremental DBT save should only write the translated row")
+        saved_row = saved.row_index.get((int(unit.record_id), unit.label))
+        if saved_row is None or saved_row.get("chinese") != project.codec.encode("增量保存测试"):
+            raise AssertionError("incremental DBT save did not persist the translated row with the expected raw text")
+    finally:
+        safe_rmtree(temp)
+
+
 def assert_save_removes_extra_target_row(root: Path) -> None:
     temp = make_temp_project(root, "translator_tool_smoke_extra_")
     try:
@@ -147,9 +234,10 @@ def assert_save_removes_extra_target_row(root: Path) -> None:
         )
         assert extra.ref.target_row is not None
         key = (extra.ref.target_row.row_id, extra.label)
+        extra.set_pending_delete(True)
         result = project.save([extra])
-        if not result.changed_files or not result.removed_extra_units:
-            raise AssertionError("saving an extra target row did not schedule cleanup")
+        if not result.changed_files or [item.uid for item in result.deleted_units] != [extra.uid]:
+            raise AssertionError("saving a marked extra target row did not delete it")
         if key in load_dbt(target_path).row_index:
             raise AssertionError("extra target row remained after save")
     finally:
@@ -211,13 +299,20 @@ def assert_unsaved_translation_status(root: Path) -> None:
     translated.set_text(translated.current_text + "x")
     if translated.display_status() != STATUS_MODIFIED or translated.filter_status() != STATUS_TRANSLATED:
         raise AssertionError("an edited translated unit did not keep a translated filter state with a modified marker")
-    before_bytes = (temp / "languages" / "#chinese" / translated.file_rel).read_bytes()
     translated.set_text("")
-    removed = project.save([translated])
-    if not removed.changed_files or [item.uid for item in removed.cleared_empty_units] != [translated.uid]:
-        raise AssertionError("an empty translation did not remove its existing override")
-    if (temp / "languages" / "#chinese" / translated.file_rel).read_bytes() == before_bytes:
-        raise AssertionError("an empty translation left its existing target row intact")
+    saved_empty = project.save([translated])
+    if not saved_empty.changed_files or saved_empty.deleted_units:
+        raise AssertionError("an empty translation should save as an empty override instead of deleting it")
+    reloaded = Project.load(temp, "#chinese")
+    updated = next(item for item in reloaded.units if item.uid == translated.uid)
+    if updated.status != STATUS_EMPTY:
+        raise AssertionError("an empty translation did not reload as an empty target override")
+    updated.set_pending_delete(True)
+    if updated.display_status() != STATUS_PENDING_DELETE or updated.filter_status() != STATUS_PENDING_DELETE:
+        raise AssertionError("a marked deletion did not expose the pending-delete status")
+    removed = reloaded.save([updated])
+    if not removed.changed_files or [item.uid for item in removed.deleted_units] != [updated.uid]:
+        raise AssertionError("a marked deletion did not remove the existing override")
     safe_rmtree(temp)
 
 
@@ -244,12 +339,14 @@ def assert_mod_label_match_inserts_source_formatted_row(root: Path) -> None:
             raise AssertionError("a unique mod label match was not marked for review")
         if unit.ref.target_row is not None or not unit.is_dirty:
             raise AssertionError("label match did not stage a source-row insertion")
-        unit.set_text("")
+        legacy_key = (target_row.row_id + 900000, original_key[1])
+        unit.set_pending_delete(True)
         removed = project.save([unit])
-        if not removed.changed_files or [item.uid for item in removed.cleared_empty_units] != [unit.uid]:
-            raise AssertionError("an empty label-match translation did not remove its old override")
-        if original_key in load_dbt(target_path).row_index:
-            raise AssertionError("an empty label-match translation inserted a source row")
+        if not removed.changed_files or [item.uid for item in removed.deleted_units] != [unit.uid]:
+            raise AssertionError("a marked label-match deletion did not remove its old override")
+        saved_after_delete = load_dbt(target_path)
+        if original_key in saved_after_delete.row_index or legacy_key in saved_after_delete.row_index:
+            raise AssertionError("a marked label-match deletion did not remove the legacy target row cleanly")
 
         # Restore the temporary legacy row so the next branch verifies that a
         # non-empty review edit inserts a new source-formatted row.
@@ -266,7 +363,6 @@ def assert_mod_label_match_inserts_source_formatted_row(root: Path) -> None:
         project.save([unit])
         saved = load_dbt(target_path)
         inserted = saved.row_index.get(original_key)
-        legacy_key = (target_row.row_id + 900000, original_key[1])
         if inserted is None or legacy_key not in saved.row_index:
             raise AssertionError("label match did not retain the legacy extra row and insert the source key")
         source_prefix = source_row.original_line[: source_row.fields[0].end]
@@ -283,9 +379,19 @@ def assert_project_history_settings(root: Path) -> None:
     try:
         os.environ["LOCALAPPDATA"] = str(temp)
         expected = [str(root / f"project-{number}") for number in range(10)]
-        save_settings(AppSettings(last_project_root=expected[0], recent_project_roots=expected))
+        save_settings(
+            AppSettings(
+                last_project_root=expected[0],
+                recent_project_roots=expected,
+                auto_space_before_color_tokens_on_save=True,
+            )
+        )
         loaded = load_settings()
-        if loaded.last_project_root != expected[0] or loaded.recent_project_roots != expected[:8]:
+        if (
+            loaded.last_project_root != expected[0]
+            or loaded.recent_project_roots != expected[:8]
+            or not loaded.auto_space_before_color_tokens_on_save
+        ):
             raise AssertionError("project folder history was not persisted safely")
     finally:
         if previous is None:
@@ -398,6 +504,8 @@ def assert_linebreak_format_is_ignored() -> None:
     issues = validate_translation("First$NSecond", "First Second", dbt_field=True)
     if any(issue.blocks_save and "$N" in issue.message for issue in issues):
         raise AssertionError("$N line-break differences must not block translation saves")
+    if any("$N" in issue.message for issue in issues):
+        raise AssertionError("$N line-break differences should remain ignored")
 
 
 def assert_guild2_format_grammar() -> None:
@@ -405,11 +513,23 @@ def assert_guild2_format_grammar() -> None:
         "%1NAME %2n %3i %4f %5t %6c %7z %8j %9s %10l "
         "%11GG %12GN %13GT %% %> %< %14SN %15Sn %16SV %17Sv %18SZ %19Sz "
         "%20SK %21ST %22SA %23SD %24SB %25SL %26DN %27DS "
+        "%gold_icon% %measure:LevelUpCity:name% %officer:guildmaster:rogue% "
         "$N $Z $L $R $T $> $< $C[1,2,3,255] $F[Body] $S[12] $B[label] "
-        "$[ornament$] #E[NT_NEUTRAL] #SP+ #SP- @L_TEST_KEY_+n @T\"fallback\""
+        "$[ornament$] #E[NT_NEUTRAL] #SP+ #SP- @NMale @L_TEST_KEY_+n @T\"fallback\""
     )
     tokens = format_tokens(syntax)
-    required = {"%1NAME", "%11GG", "%14SN", "$C[1,2,3,255]", "$[ornament$]", "#SP+", "@L_TEST_KEY_+n"}
+    required = {
+        "%1NAME",
+        "%11GG",
+        "%14SN",
+        "%gold_icon%",
+        "%measure:LevelUpCity:name%",
+        "$C[1,2,3,255]",
+        "$[ornament$]",
+        "#SP+",
+        "@NMale",
+        "@L_TEST_KEY_+n",
+    }
     if not required.issubset(tokens):
         raise AssertionError("Guild 2 format grammar did not recognize all core token forms")
     colors = format_tokens("$C[255,0,0] $C[115, 5,20] $C[255,90,90,255]")
@@ -427,6 +547,66 @@ def assert_guild2_format_grammar() -> None:
     literal_dollars = validate_translation("$A $( $? $foo", "plain", dbt_field=True)
     if any(issue.code == "unknown-format" for issue in literal_dollars):
         raise AssertionError("literal dollar escapes should not produce unknown-format warnings")
+    tooltip_macros = validate_translation(
+        "%gold_icon%%n%%char_name% @NMale",
+        "%gold_icon%%n%%char_name% @NMale",
+        dbt_field=True,
+    )
+    if any(issue.code == "unknown-format" for issue in tooltip_macros):
+        raise AssertionError("tooltip macros or @N gender tags were not recognized")
+    literal_percent = validate_translation(
+        "Weak beer has 3-6% of alcohol and costs 50%.",
+        "淡啤酒酒精度为 3-6%，价格是 50%。",
+        dbt_field=True,
+    )
+    if any(issue.code == "unknown-format" for issue in literal_percent):
+        raise AssertionError("literal percentage signs produced false unknown-format warnings")
+    decorated_percent = validate_translation(
+        "Prerequisites: The title %$C[225,214,158]Commoner%$C[255,255,255]",
+        "Prerequisites: The title %$C[225,214,158]Commoner%$C[255,255,255]",
+        dbt_field=True,
+    )
+    if any(issue.code == "unknown-format" for issue in decorated_percent):
+        raise AssertionError("literal percent wrappers around color markup produced false warnings")
+    glued_argument = validate_translation("%2NAMEwe confirm with this", "%2NAMEwe confirm with this", dbt_field=True)
+    if any(issue.code == "unknown-format" for issue in glued_argument):
+        raise AssertionError("argument placeholders glued to following text produced false unknown-format warnings")
+    glued_building = validate_translation("Building %2GG6小时", "Building %2GG6小时", dbt_field=True)
+    if any(issue.code == "unknown-format" for issue in glued_building):
+        raise AssertionError("building placeholders glued to following digits produced false unknown-format warnings")
+    percent_equivalence = validate_translation("%1i%%", "%1i%", dbt_field=True)
+    if percent_equivalence:
+        raise AssertionError("single and double percent signs were not treated as equivalent literal percent markup")
+    gender_case = validate_translation("@Nmale", "@NMale", dbt_field=True)
+    if gender_case:
+        raise AssertionError("@N gender suffix comparison should be case-insensitive")
+    gender_typo = validate_translation("@Nmal", "@NMale", dbt_field=True)
+    if gender_typo:
+        raise AssertionError("@N gender suffix typo repair should not produce a false warning")
+    gender_missing = validate_translation("@NMale", "", dbt_field=True)
+    if not any("@NMale" in issue.message for issue in gender_missing):
+        raise AssertionError("missing gender suffix should still produce a warning")
+    false_tab = validate_translation("Damage.$The cure is rest.", "Damage. The cure is rest.", dbt_field=True)
+    if any("$T" in issue.message for issue in false_tab):
+        raise AssertionError("embedded $T in plain text was misread as a layout token")
+    source_fix = validate_translation("%1NAE", "%1NAME", dbt_field=True)
+    if any(issue.code in {"argument-index", "format-extra", "unknown-format"} for issue in source_fix):
+        raise AssertionError("repairing a malformed source placeholder still produced a false-positive warning")
+    if not any(issue.code == "source-format-suspect" for issue in source_fix):
+        raise AssertionError("repairing a malformed source placeholder should leave a lightweight source-format marker")
+    source_drop = validate_translation("Rate %A", "Rate", dbt_field=True)
+    if any(issue.code == "unknown-format" for issue in source_drop):
+        raise AssertionError("dropping an invalid source-only marker should not create an unknown-format warning")
+    if not any(issue.code == "source-format-suspect" for issue in source_drop):
+        raise AssertionError("dropping an invalid source-only marker should leave a lightweight source-format marker")
+    color_spacing = normalize_color_token_spacing(
+        "$C[1,2,3]开头甲$C[4,5,6]乙，$C[7,8,9]丙#E[NT_NEUTRAL]$C[10,11,12]丁测试$N$N$C[13,14,15]戊"
+    )
+    if color_spacing != "$C[1,2,3]开头甲 $C[4,5,6]乙， $C[7,8,9]丙 #E[NT_NEUTRAL]$C[10,11,12]丁测试 $N$N$C[13,14,15]戊":
+        raise AssertionError("save-time color-token spacing normalization did not respect its exceptions")
+    color_spacing_at_start = normalize_color_token_spacing("$N$N$C[13,14,15]句首")
+    if color_spacing_at_start != "$N$N$C[13,14,15]句首":
+        raise AssertionError("save-time color-token spacing normalization should not insert before a token run at line start")
     if any(issue.blocks_save for issue in validate_translation(syntax, syntax, dbt_field=False)):
         raise AssertionError("valid Guild 2 syntax was rejected")
     compatible = validate_translation("Name: %1SN", "姓名：%1SV", dbt_field=True)
@@ -467,46 +647,78 @@ def assert_llm_suggestion_stream() -> None:
 
 
 def assert_operation_history() -> None:
-    values = {"first": "旧一", "second": "旧二"}
+    values = {"first": ("旧一", False), "second": ("旧二", False)}
     history = OperationHistory()
     history.push(TranslationOperation("连续编辑", (UnitChange("first", "旧一", "新一"),)))
-    values["first"] = "新一"
+    values["first"] = ("新一", False)
     history.push(
         TranslationOperation(
             "AI 批量翻译",
             (UnitChange("first", "新一", "AI 一"), UnitChange("second", "旧二", "AI 二")),
         )
     )
-    values.update({"first": "AI 一", "second": "AI 二"})
-    history.undo(lambda uid, text: values.__setitem__(uid, text))
-    if values != {"first": "新一", "second": "旧二"}:
+    values.update({"first": ("AI 一", False), "second": ("AI 二", False)})
+    history.push(TranslationOperation("标记删除", (UnitChange("second", "AI 二", "AI 二", False, True),)))
+    values["second"] = ("AI 二", True)
+    history.undo(lambda uid, text, deleted: values.__setitem__(uid, (text, deleted)))
+    if values != {"first": ("AI 一", False), "second": ("AI 二", False)}:
+        raise AssertionError("delete-mark undo did not restore the previous delete state")
+    history.undo(lambda uid, text, deleted: values.__setitem__(uid, (text, deleted)))
+    if values != {"first": ("新一", False), "second": ("旧二", False)}:
         raise AssertionError("batch undo did not restore exactly one whole operation")
-    history.undo(lambda uid, text: values.__setitem__(uid, text))
-    if values["first"] != "旧一" or values["second"] != "旧二":
+    history.undo(lambda uid, text, deleted: values.__setitem__(uid, (text, deleted)))
+    if values["first"] != ("旧一", False) or values["second"] != ("旧二", False):
         raise AssertionError("undo crossed or missed a translation unit")
-    history.redo(lambda uid, text: values.__setitem__(uid, text))
-    if values["first"] != "新一":
+    history.redo(lambda uid, text, deleted: values.__setitem__(uid, (text, deleted)))
+    if values["first"] != ("新一", False):
         raise AssertionError("redo did not restore the expected operation")
+    history.redo(lambda uid, text, deleted: values.__setitem__(uid, (text, deleted)))
+    if values != {"first": ("AI 一", False), "second": ("AI 二", False)}:
+        raise AssertionError("redo did not restore the batch translation")
+    history.redo(lambda uid, text, deleted: values.__setitem__(uid, (text, deleted)))
+    if values["second"] != ("AI 二", True):
+        raise AssertionError("redo did not restore the delete mark")
 
 
 def assert_git_history(root: Path) -> None:
     temp = make_temp_project(root, "translator_tool_smoke_git_")
-    git = LanguageGit(temp)
-    git.ensure_repository(AppSettings())
-    project = Project.load(temp, "#chinese")
-    unit = next(item for item in project.units if item.file_rel == "Text.dbt" and item.status != STATUS_MISSING_ROW)
-    unit.set_text(unit.current_text + "测试")
-    result = project.save([unit])
-    commit = git.commit_saved(result.changed_files, result.saved_units)
-    if commit is None:
-        raise AssertionError("Git commit was not created after saving")
-    entries = git.entries_for_commit(commit.full_hash)
-    if not entries or entries[0].translated_text != unit.current_text:
-        raise AssertionError("Git history did not decode the saved translation entry")
-    rendered = format_entries(entries)
-    if "→" not in rendered or "Text.dbt" not in rendered:
-        raise AssertionError("Git history is not rendering original-to-translation output")
-    safe_rmtree(temp)
+    try:
+        git = LanguageGit(temp)
+        git.ensure_repository(AppSettings())
+        project = Project.load(temp, "#chinese")
+        unit = next(item for item in project.units if item.file_rel == "Text.dbt" and item.status != STATUS_MISSING_ROW)
+        unit.set_text(unit.current_text + "测试")
+        result = project.save([unit])
+        commit = git.commit_saved(result.changed_files, result.saved_units, result.deleted_units)
+        if commit is None:
+            raise AssertionError("Git commit was not created after saving")
+        entries = git.entries_for_commit(commit.full_hash)
+        if not entries or entries[0].translated_text != unit.current_text:
+            raise AssertionError("Git history did not decode the saved translation entry")
+        rendered = format_entries(entries)
+        if "→" not in rendered or "Text.dbt" not in rendered:
+            raise AssertionError("Git history is not rendering original-to-translation output")
+
+        deleted_text = unit.current_text
+        reloaded = Project.load(temp, "#chinese")
+        deleted_unit = next(item for item in reloaded.units if item.uid == unit.uid)
+        deleted_unit.set_pending_delete(True)
+        deleted_result = reloaded.save([deleted_unit])
+        delete_commit = git.commit_saved(
+            deleted_result.changed_files, deleted_result.saved_units, deleted_result.deleted_units
+        )
+        if delete_commit is None:
+            raise AssertionError("Git delete commit was not created after saving")
+        delete_entries = git.entries_for_commit(delete_commit.full_hash)
+        if not delete_entries or delete_entries[0].kind != "删除":
+            raise AssertionError("Git history did not report the deleted translation entry")
+        if delete_entries[0].previous_text != deleted_text or delete_entries[0].translated_text != "":
+            raise AssertionError("Git delete history did not preserve the removed translation text")
+        delete_rendered = format_entries(delete_entries)
+        if "[已删除]" not in delete_rendered:
+            raise AssertionError("Git history text output did not label deleted entries")
+    finally:
+        safe_rmtree(temp)
 
 
 def assert_git_pending_is_scoped_to_active_language(root: Path) -> None:
@@ -545,16 +757,44 @@ def assert_git_recovers_stale_index_lock(root: Path) -> None:
 
 def assert_combined_git_history_format() -> None:
     early = TranslationLogEntry("新增", "Text.dbt", "10", "Greeting", "Text", "Hello", "你好")
-    later = TranslationLogEntry("更新", "Text.dbt", "10", "Greeting", "Text", "Hello", "您好")
+    later = TranslationLogEntry("更新", "Text.dbt", "10", "Greeting", "Text", "Hello", "您好", "你好")
     other = TranslationLogEntry("新增", "Tooltips.dbt", "2", "Tip", "Text", "Save", "保存")
     combined = combine_entries(((early, other), (later,)))
-    if combined != [later, other]:
-        raise AssertionError("combined history did not keep the final entry revision")
+    by_label = {entry.label: entry for entry in combined}
+    greeting = by_label.get("Greeting")
+    if greeting is None or greeting.kind != "新增" or greeting.translated_text != "您好" or greeting.previous_text is not None:
+        raise AssertionError("combined history did not keep the net add-result across several commits")
+    revised_early = TranslationLogEntry("更新", "Text.dbt", "11", "Farewell", "Text", "Bye", "再见", "拜拜")
+    revised_later = TranslationLogEntry("更新", "Text.dbt", "11", "Farewell", "Text", "Bye", "回头见", "再见")
+    merged_update = combine_entries(((revised_early,), (revised_later,)))
+    if len(merged_update) != 1 or merged_update[0].kind != "更新":
+        raise AssertionError("combined history lost a net update")
+    if merged_update[0].before_text != "拜拜" or merged_update[0].translated_text != "回头见":
+        raise AssertionError("combined history did not preserve the earliest old text and the latest new text")
+    reverted = TranslationLogEntry("更新", "Text.dbt", "10", "Greeting", "Text", "Hello", "Hello", "您好")
+    if combine_entries(((early,), (reverted,))):
+        raise AssertionError("combined history kept an entry whose final translation reverted to the starting text")
     rendered = format_entries(combined)
     if rendered.count("Text.dbt") != 1 or rendered.count("Tooltips.dbt") != 1:
         raise AssertionError("history format repeated a file heading")
     if "Hello → 您好" not in rendered:
         raise AssertionError("history format did not render the final translation")
+
+
+def assert_git_commit_display() -> None:
+    timestamp = datetime.fromtimestamp(1_700_000_000)
+    commit = GitCommit("a" * 40, "abcdef1", timestamp, "translation: add 3, update 2 (Text.dbt, Tooltips.dbt)")
+    display = commit.display
+    if "translation:" in display:
+        raise AssertionError("commit list display should not expose the raw translation prefix")
+    if "新增 3" not in display or "修订 2" not in display or "Text.dbt, Tooltips.dbt" not in display:
+        raise AssertionError("commit list display did not summarize translation commits correctly")
+    delete_commit = GitCommit("c" * 40, "89abcde", timestamp, "translation: delete 4 (Text.dbt)")
+    if "删除 4" not in delete_commit.display or "Text.dbt" not in delete_commit.display:
+        raise AssertionError("delete-only translation commits were not summarized correctly")
+    pending = GitCommit("b" * 40, "1234567", timestamp, "translation: commit pending language changes")
+    if "待处理变更" not in pending.display:
+        raise AssertionError("pending translation commit display was not simplified")
 
 
 def main() -> int:
@@ -565,6 +805,9 @@ def main() -> int:
     assert_statuses(root)
     assert_loaded_order_matches_file_lines(root)
     assert_save_existing(root)
+    assert_save_auto_formats_color_tokens(root)
+    assert_save_guides_plain_text_uses_source_profile(root)
+    assert_save_creates_missing_target_dbt_incrementally(root)
     assert_save_removes_extra_target_row(root)
     assert_save_missing(root)
     assert_missing_insertions_follow_file_order(root)
@@ -580,6 +823,7 @@ def main() -> int:
     assert_guild2_format_grammar()
     assert_llm_suggestion_stream()
     assert_git_history(root)
+    assert_git_commit_display()
     assert_git_pending_is_scoped_to_active_language(root)
     assert_git_recovers_stale_index_lock(root)
     assert_combined_git_history_format()

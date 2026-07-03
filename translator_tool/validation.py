@@ -3,16 +3,51 @@ from __future__ import annotations
 from collections import Counter
 from dataclasses import dataclass
 import re
+import unicodedata
 
 from .codec_adapter import Guild2Codec
 
 
-ARG_SUFFIX = r"(?:NAME|GG|GN|GT|SN|Sn|SV|Sv|SZ|Sz|SK|ST|SA|SD|SB|SL|DN|DS|[niftczjsl])?"
-# English source text commonly pluralizes a dynasty name as `%1DNs`.
-# Treat that as `%1DN` followed by literal text, never as a new placeholder.
-ARG_TOKEN = rf"%\d+(?:(?:NAME|DN)(?=s(?![A-Za-z0-9]))|{ARG_SUFFIX}(?![A-Za-z0-9]))"
+ARG_SUFFIXES = (
+    "NAME",
+    "GG",
+    "GN",
+    "GT",
+    "SN",
+    "Sn",
+    "SV",
+    "Sv",
+    "SZ",
+    "Sz",
+    "SK",
+    "ST",
+    "SA",
+    "SD",
+    "SB",
+    "SL",
+    "DN",
+    "DS",
+    "n",
+    "i",
+    "f",
+    "t",
+    "c",
+    "z",
+    "j",
+    "s",
+    "l",
+)
+KNOWN_GENDER_SUFFIXES = ("Male", "Female")
+ARG_SUFFIX = "(?:" + "|".join(re.escape(suffix) for suffix in ARG_SUFFIXES) + ")"
+ARG_PLAIN_TOKEN = r"%\d+(?![A-Za-z0-9_:])"
+# The engine stops parsing as soon as a known suffix is complete, even when
+# translators continue immediately with letters or digits such as `%2NAMEwe`
+# or `%2GG6小时`.
+ARG_TOKEN = rf"(?:{ARG_PLAIN_TOKEN}|%\d+{ARG_SUFFIX})"
 PRINTF_TOKEN = r"%(?:\d+\$)?[-+#0]*(?:\d+|\*)?(?:\.(?:\d+|\*))?[diufFeEgGxXos](?![A-Za-z0-9])"
-PERCENT_TOKEN = rf"%%|%[<>]|{ARG_TOKEN}|{PRINTF_TOKEN}"
+NAMED_PERCENT_TOKEN = r"%[A-Za-z][A-Za-z0-9_:-]*%"
+LITERAL_PERCENT_TOKEN = r"%(?=$|[\s$.,:;!?()\[\]{}\"'”’<>]|[^\x00-\x7F])|(?<=\d)%(?![A-Za-z0-9_:])"
+PERCENT_TOKEN = rf"%%|%[<>]|{ARG_TOKEN}|{NAMED_PERCENT_TOKEN}|{PRINTF_TOKEN}|{LITERAL_PERCENT_TOKEN}"
 
 BYTE_TOKEN = r"(?:0|[1-9]\d?|1\d\d|2[0-4]\d|25[0-5])"
 COLOR_TOKEN = rf"\$C\s*\[\s*{BYTE_TOKEN}(?:\s*,\s*{BYTE_TOKEN}){{2,3}}\s*\]"
@@ -24,9 +59,11 @@ BACKGROUND_TOKEN = r"\$B\[[^\]\r\n]*\]"
 # semantics, and real text may use short forms such as `$[ $(` to show bracket
 # glyphs, so recognize it broadly and exclude it from source/target diffs.
 HEADER_TOKEN = r"\$\[(?:[^\r\n]*?\$\]|[^\r\n]*?\$|(?=\s|$))"
-LINE_OR_LAYOUT_TOKEN = r"\$[NLRZT<>]"
+TAB_LAYOUT_TOKEN = r"\$T(?=\$|#|@|%|<|>|[ \t\r\n.,:;!?()\[\]{}]|$)"
+LINE_OR_LAYOUT_TOKEN = rf"\$[NLRZ<>]|{TAB_LAYOUT_TOKEN}"
 EMOTION_TOKEN = r"#E\[[A-Za-z0-9_]+\]"
 SPEECH_TIMING_TOKEN = r"#SP[+-]"
+NAME_SUFFIX_TOKEN = r"@N[A-Za-z]+"
 LOCALIZATION_TOKEN = r"@L_[A-Za-z0-9_]+_\+[A-Za-z0-9]+"
 INLINE_FALLBACK_TOKEN = r'@T"(?:[^"\\\r\n]|\\.)*"'
 
@@ -57,6 +94,7 @@ TOKEN_RE = re.compile(
             LINE_OR_LAYOUT_TOKEN,
             EMOTION_TOKEN,
             SPEECH_TIMING_TOKEN,
+            NAME_SUFFIX_TOKEN,
             LOCALIZATION_TOKEN,
             INLINE_FALLBACK_TOKEN,
             GUIDE_TAG_TOKEN,
@@ -78,6 +116,7 @@ HIGHLIGHT_RE = re.compile(
             LINE_OR_LAYOUT_TOKEN,
             EMOTION_TOKEN,
             SPEECH_TIMING_TOKEN,
+            NAME_SUFFIX_TOKEN,
             LOCALIZATION_TOKEN,
             INLINE_FALLBACK_TOKEN,
             GUIDE_TAG_TOKEN,
@@ -91,6 +130,7 @@ HIGHLIGHT_RE = re.compile(
 
 CHINESE_QUOTE_RE = re.compile(r"[\u201C\u201D\u2018\u2019]")
 ARG_TOKEN_RE = re.compile(ARG_TOKEN)
+NAME_SUFFIX_TOKEN_RE = re.compile(rf"^{NAME_SUFFIX_TOKEN}$")
 UNKNOWN_PERCENT_RE = re.compile(r"%(?:\d*[A-Za-z][A-Za-z0-9]*|[^\s])?")
 
 
@@ -109,6 +149,66 @@ def format_tokens(text: str) -> Counter[str]:
     return Counter(match.group(0) for match in TOKEN_RE.finditer(text))
 
 
+def normalize_color_token_spacing(text: str) -> str:
+    if "$C[" not in text:
+        return text
+    matches = list(TOKEN_RE.finditer(text))
+    if not matches:
+        return text
+    token_by_end = {match.end(): match for match in matches}
+    insertion_points: set[int] = set()
+    for match in matches:
+        token = match.group(0)
+        if not COLOR_TOKEN_RE.fullmatch(token):
+            continue
+        run_start = match.start()
+        while True:
+            previous = token_by_end.get(run_start)
+            if previous is None or not _is_color_spacing_prefix_token(previous.group(0)):
+                break
+            run_start = previous.start()
+        if _should_insert_space_before_run(text, run_start):
+            insertion_points.add(run_start)
+    if not insertion_points:
+        return text
+    parts: list[str] = []
+    cursor = 0
+    for point in sorted(insertion_points):
+        parts.append(text[cursor:point])
+        parts.append(" ")
+        cursor = point
+    parts.append(text[cursor:])
+    return "".join(parts)
+
+
+def _is_color_spacing_prefix_token(token: str) -> bool:
+    if COLOR_TOKEN_RE.fullmatch(token):
+        return True
+    if token in {"$N", "$Z", "$L", "$R", "$T", "$>", "$<"}:
+        return True
+    if token.startswith("#E[") or token.startswith("#SP"):
+        return True
+    if token.startswith("$F[") or token.startswith("$B["):
+        return True
+    if NAME_SUFFIX_TOKEN_RE.fullmatch(token):
+        return True
+    return False
+
+
+def _should_insert_space_before_run(text: str, run_start: int) -> bool:
+    if run_start <= 0:
+        return False
+    char = text[run_start - 1]
+    if not char or char.isspace():
+        return False
+    if char in "([{<\u3008\u300a\u3010\u300c\u300e\uff08":
+        return False
+    category = unicodedata.category(char)
+    if category[0] in {"L", "N"}:
+        return True
+    return category in {"Pe", "Pf", "Po", "Sm", "Sc"}
+
+
 def split_soft_color_tokens(tokens: Counter[str]) -> tuple[Counter[str], Counter[str]]:
     hard: Counter[str] = Counter()
     soft: Counter[str] = Counter()
@@ -116,13 +216,61 @@ def split_soft_color_tokens(tokens: Counter[str]) -> tuple[Counter[str], Counter
         if COLOR_TOKEN_RE.fullmatch(token):
             # `$C[115,5,20]` and `$C[115, 5, 20]` are identical game data.
             soft[re.sub(r"\s+", "", token)] = count
+        elif token == "%":
+            hard["%%"] += count
+        elif NAME_SUFFIX_TOKEN_RE.fullmatch(token):
+            hard[_canonical_name_suffix(token)] += count
         else:
-            hard[token] = count
+            hard[token] += count
     return hard, soft
 
 
 def format_counter_items(tokens: Counter[str]) -> str:
     return ", ".join(token for token, count in sorted(tokens.items()) for _ in range(count))
+
+
+def _common_prefix_length(left: str, right: str) -> int:
+    size = min(len(left), len(right))
+    for index in range(size):
+        if left[index] != right[index]:
+            return index
+    return size
+
+
+def _bounded_edit_distance(left: str, right: str, max_distance: int) -> int | None:
+    if abs(len(left) - len(right)) > max_distance:
+        return None
+    previous = list(range(len(right) + 1))
+    for left_index, left_char in enumerate(left, start=1):
+        current = [left_index]
+        row_minimum = left_index
+        for right_index, right_char in enumerate(right, start=1):
+            substitution = previous[right_index - 1] + (left_char != right_char)
+            insertion = current[right_index - 1] + 1
+            deletion = previous[right_index] + 1
+            value = min(substitution, insertion, deletion)
+            current.append(value)
+            row_minimum = min(row_minimum, value)
+        if row_minimum > max_distance:
+            return None
+        previous = current
+    return previous[-1] if previous[-1] <= max_distance else None
+
+
+def _canonical_name_suffix(token: str) -> str:
+    suffix = token[2:]
+    lowered = suffix.lower()
+    for known in KNOWN_GENDER_SUFFIXES:
+        known_lowered = known.lower()
+        if lowered == known_lowered:
+            return "@N" + known
+        if len(lowered) >= 3 and (
+            known_lowered.startswith(lowered)
+            or lowered.startswith(known_lowered)
+            or _bounded_edit_distance(lowered, known_lowered, 1) is not None
+        ):
+            return "@N" + known
+    return "@N" + lowered.capitalize()
 
 
 def _arg_parts(token: str) -> tuple[int, str] | None:
@@ -155,19 +303,29 @@ def _drop_decoration_tokens(tokens: Counter[str]) -> None:
         del tokens[token]
 
 
-def _compare_argument_tokens(source: Counter[str], target: Counter[str]) -> list[ValidationIssue]:
+def _compare_argument_tokens(
+    source: Counter[str], target: Counter[str], optional_source: Counter[str] | None = None
+) -> list[ValidationIssue]:
     source_by_index: dict[int, set[str]] = {}
+    optional_by_index: dict[int, set[str]] = {}
     target_by_index: dict[int, set[str]] = {}
     for token in source:
         number, suffix = _arg_parts(token) or (0, "")
         source_by_index.setdefault(number, set()).add(suffix)
+    for token in optional_source or ():
+        number, suffix = _arg_parts(token) or (0, "")
+        optional_by_index.setdefault(number, set()).add(suffix)
     for token in target:
         number, suffix = _arg_parts(token) or (0, "")
         target_by_index.setdefault(number, set()).add(suffix)
 
+    matching_source: dict[int, set[str]] = {number: set(suffixes) for number, suffixes in source_by_index.items()}
+    for number, suffixes in optional_by_index.items():
+        matching_source.setdefault(number, set()).update(suffixes)
+
     issues: list[ValidationIssue] = []
     for number, target_suffixes in sorted(target_by_index.items()):
-        source_suffixes = source_by_index.get(number)
+        source_suffixes = matching_source.get(number)
         if not source_suffixes:
             tokens = Counter(token for token in target if (_arg_parts(token) or (0, ""))[0] == number)
             issues.append(ValidationIssue("warning", f"参数编号不存在: {format_counter_items(tokens)}", code="argument-index"))
@@ -184,6 +342,20 @@ def _compare_argument_tokens(source: Counter[str], target: Counter[str]) -> list
     return issues
 
 
+def _literal_percent_end(text: str, position: int) -> int | None:
+    if position < 0 or position >= len(text) or text[position] != "%":
+        return None
+    next_char = text[position + 1] if position + 1 < len(text) else ""
+    previous_char = text[position - 1] if position > 0 else ""
+    if not next_char or next_char.isspace():
+        return position + 1
+    if previous_char.isdigit() and not (next_char.isascii() and (next_char.isalnum() or next_char in {"_", ":"})):
+        return position + 1
+    if next_char in '$.,:;!?)]}"\'”’':
+        return position + 1
+    return None
+
+
 def unknown_syntax_tokens(text: str) -> list[str]:
     unknown: list[str] = []
     position = 0
@@ -193,6 +365,10 @@ def unknown_syntax_tokens(text: str) -> list[str]:
             known = TOKEN_RE.match(text, position)
             if known is not None:
                 position = known.end()
+                continue
+            literal = _literal_percent_end(text, position)
+            if literal is not None:
+                position = literal
                 continue
             candidate = UNKNOWN_PERCENT_RE.match(text, position)
             if candidate is not None:
@@ -215,12 +391,74 @@ def unknown_syntax_tokens(text: str) -> list[str]:
     return unknown
 
 
-def compare_tokens(source: str, target: str) -> list[ValidationIssue]:
+def _arg_suffix_repair_candidates(raw_suffix: str) -> list[str]:
+    normalized = raw_suffix.lower()
+    if len(normalized) < 2:
+        return []
+    ranked: list[tuple[tuple[int, int, int], str]] = []
+    for suffix in ARG_SUFFIXES:
+        lowered = suffix.lower()
+        distance = _bounded_edit_distance(normalized, lowered, 2)
+        prefix = _common_prefix_length(normalized, lowered)
+        if distance is None and prefix < 2:
+            continue
+        score = (
+            distance if distance is not None else max(len(normalized), len(lowered)),
+            abs(len(normalized) - len(lowered)),
+            -prefix,
+        )
+        ranked.append((score, suffix))
+    return [suffix for _, suffix in sorted(ranked)]
+
+
+def _repair_candidates_from_unknown(token: str) -> list[str]:
+    candidates: list[str] = []
+    if re.fullmatch(r"%[A-Za-z][A-Za-z0-9_:-]*", token):
+        candidates.append(token + "%")
+    match = re.fullmatch(r"%(\d+)([A-Za-z0-9_:]+)", token)
+    if match is not None:
+        number, raw_suffix = match.groups()
+        candidates.extend(f"%{number}{suffix}" for suffix in _arg_suffix_repair_candidates(raw_suffix))
+    seen: set[str] = set()
+    ordered: list[str] = []
+    for candidate in candidates:
+        if candidate not in seen:
+            seen.add(candidate)
+            ordered.append(candidate)
+    return ordered
+
+
+def _match_source_unknown_repairs(
+    source_unknown: Counter[str],
+    source_hard: Counter[str],
+    source_args: Counter[str],
+    target_hard: Counter[str],
+    target_args: Counter[str],
+) -> tuple[Counter[str], Counter[str]]:
+    matched: Counter[str] = Counter()
+    suspect: Counter[str] = Counter()
+    available = (target_hard - source_hard) + (target_args - source_args)
+    for token, count in sorted(source_unknown.items()):
+        for _ in range(count):
+            repaired = False
+            for candidate in _repair_candidates_from_unknown(token):
+                if available[candidate] <= matched[candidate]:
+                    continue
+                matched[candidate] += 1
+                suspect[f"{token}→{candidate}"] += 1
+                repaired = True
+                break
+            if not repaired:
+                suspect[token] += 1
+    return matched, suspect
+
+
+def compare_tokens(source: str, target: str, *, source_unknown: Counter[str] | None = None) -> tuple[list[ValidationIssue], Counter[str]]:
     issues: list[ValidationIssue] = []
     source_tokens = format_tokens(source)
     target_tokens = format_tokens(target)
     # $N is a cosmetic line-break directive. Translators may legitimately reflow
-    # Chinese text, so it must not produce a save-blocking format difference.
+    # Chinese text, so it must not produce a format mismatch warning.
     source_tokens.pop("$N", None)
     target_tokens.pop("$N", None)
     source_args = _take_arg_tokens(source_tokens)
@@ -231,29 +469,38 @@ def compare_tokens(source: str, target: str) -> list[ValidationIssue]:
     _drop_decoration_tokens(target_tokens)
     source_hard, source_color = split_soft_color_tokens(source_tokens)
     target_hard, target_color = split_soft_color_tokens(target_tokens)
+    repaired, source_suspect = _match_source_unknown_repairs(
+        source_unknown or Counter(),
+        source_hard,
+        source_args,
+        target_hard,
+        target_args,
+    )
+    repaired_args = Counter({token: count for token, count in repaired.items() if ARG_TOKEN_RE.fullmatch(token)})
+    repaired_hard = Counter({token: count for token, count in repaired.items() if not ARG_TOKEN_RE.fullmatch(token)})
 
     missing = source_hard - target_hard
-    extra = target_hard - source_hard
+    extra = (target_hard - source_hard) - repaired_hard
     missing_color = source_color - target_color
     extra_color = target_color - source_color
 
-    issues.extend(_compare_argument_tokens(source_args, target_args))
+    issues.extend(_compare_argument_tokens(source_args, target_args, optional_source=repaired_args))
 
     if missing:
         items = format_counter_items(missing)
-        issues.append(ValidationIssue("warning", f"缺少格式标记: {items}"))
+        issues.append(ValidationIssue("warning", f"缺少格式标记: {items}", code="format-missing"))
     if extra:
         items = format_counter_items(extra)
-        issues.append(ValidationIssue("warning", f"新增格式标记: {items}"))
+        issues.append(ValidationIssue("warning", f"新增格式标记: {items}", code="format-extra"))
     if missing_color:
         items = format_counter_items(missing_color)
-        issues.append(ValidationIssue("warning", f"颜色标记不一致(不阻止保存): 缺少 {items}"))
+        issues.append(ValidationIssue("warning", f"颜色标记不一致(不阻止保存): 缺少 {items}", code="format-color-missing"))
     if extra_color:
         items = format_counter_items(extra_color)
-        issues.append(ValidationIssue("warning", f"颜色标记不一致(不阻止保存): 新增 {items}"))
+        issues.append(ValidationIssue("warning", f"颜色标记不一致(不阻止保存): 新增 {items}", code="format-color-extra"))
     if source_fallbacks != target_fallbacks:
         issues.append(ValidationIssue("warning", "@T inline fallback count differs", code="format-fallback"))
-    return issues
+    return issues, source_suspect
 
 
 def validate_translation(
@@ -263,18 +510,22 @@ def validate_translation(
     dbt_field: bool,
     font_codec: Guild2Codec | None = None,
 ) -> list[ValidationIssue]:
-    issues = compare_tokens(source, target)
+    source_unknown_raw = Counter(unknown_syntax_tokens(source))
+    target_unknown_raw = Counter(unknown_syntax_tokens(target))
+    source_unknown = source_unknown_raw - target_unknown_raw
+    target_unknown = target_unknown_raw - source_unknown_raw
+    issues, source_suspect = compare_tokens(source, target, source_unknown=source_unknown)
     if dbt_field and '"' in target:
-        issues.append(ValidationIssue("error", 'DBT 字段不能包含双引号 "，请使用 >Text<。'))
+        issues.append(ValidationIssue("error", 'DBT 字段不能包含双引号 "，请使用 >Text<。', code="dbt-quote"))
     if CHINESE_QUOTE_RE.search(target):
         bad = "".join(dict.fromkeys(CHINESE_QUOTE_RE.findall(target)))
-        issues.append(ValidationIssue("warning", f"中文引号可能不符合 Translation-Kit: {bad}"))
-    source_unknown = unknown_syntax_tokens(source)
-    target_unknown = unknown_syntax_tokens(target)
-    if source_unknown:
-        issues.append(ValidationIssue("warning", f"原文包含未知格式: {', '.join(source_unknown)}", code="unknown-format"))
+        issues.append(ValidationIssue("warning", f"中文引号可能不符合 Translation-Kit: {bad}", code="quote-style"))
+    if source_suspect:
+        issues.append(
+            ValidationIssue("warning", f"原文格式可疑: {format_counter_items(source_suspect)}", code="source-format-suspect")
+        )
     if target_unknown:
-        issues.append(ValidationIssue("warning", f"译文包含未知格式: {', '.join(target_unknown)}", code="unknown-format"))
+        issues.append(ValidationIssue("warning", f"译文包含未知格式: {format_counter_items(target_unknown)}", code="unknown-format"))
     if font_codec is not None:
         missing = font_codec.unsupported_characters(target)
         if missing:

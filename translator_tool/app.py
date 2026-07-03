@@ -2,6 +2,8 @@ from __future__ import annotations
 
 from collections import Counter
 from dataclasses import replace
+from difflib import SequenceMatcher
+import html
 import math
 from pathlib import Path
 import re
@@ -25,7 +27,7 @@ from PySide6.QtCore import (
     QRectF,
     Signal,
 )
-from PySide6.QtGui import QAction, QCloseEvent, QColor, QFont, QKeySequence, QPainter, QPalette, QPen, QSyntaxHighlighter, QTextCharFormat
+from PySide6.QtGui import QAction, QCloseEvent, QColor, QFont, QKeyEvent, QKeySequence, QPainter, QPalette, QPen, QSyntaxHighlighter, QTextCharFormat
 from PySide6.QtWidgets import (
     QApplication,
     QAbstractItemView,
@@ -67,7 +69,7 @@ from .ai import (
     provider_from_settings,
 )
 from .codec_adapter import Guild2Codec
-from .git_history import GitCommit, GitError, LanguageGit, format_entries
+from .git_history import GitCommit, GitError, LanguageGit, TranslationLogEntry
 from .history import OperationHistory, TranslationOperation, UnitChange
 from .project import (
     ENABLE_FONT_GLYPH_VALIDATION,
@@ -79,6 +81,7 @@ from .project import (
     STATUS_IGNORED,
     STATUS_MISSING_ROW,
     STATUS_MODIFIED,
+    STATUS_PENDING_DELETE,
     STATUS_REVIEW,
     STATUS_SAME,
     STATUS_TRANSLATED,
@@ -101,19 +104,20 @@ TYPING_GROUP_DELAY_MS = 750
 
 
 class UnitTableModel(QAbstractTableModel):
-    FILE, ID, LABEL, FIELD, SOURCE, TRANSLATION, STATUS, FORMAT, AI = range(9)
-    HEADERS = ("文件", "ID", "标签 / Key", "字段", "原文", "译文", "状态", "格式", "AI 翻译")
-    WIDTHS = (145, 68, 210, 90, 280, 280, 88, 76, 78)
+    FILE, ID, LABEL, SOURCE, TRANSLATION, STATUS, FORMAT, AI = range(8)
+    HEADERS = ("文件", "ID", "标签 / Key", "原文", "译文", "状态", "格式", "AI")
+    WIDTHS = (88, 60, 240, 300, 300, 60, 40, 55)
 
     def __init__(self, project: Project | None = None) -> None:
         super().__init__()
         self.project = project
         self.units: list[TranslationUnit] = list(project.units) if project else []
+        self._row_by_uid: dict[str, int] = {}
         self._search: dict[str, str] = {}
         self._format_warning: dict[str, bool] = {}
         self._glyph_warning: dict[str, bool] = {}
         self._recently_translated: set[str] = set()
-        self._rebuild_search()
+        self._rebuild_indexes()
 
     def set_project(self, project: Project) -> None:
         self.beginResetModel()
@@ -122,7 +126,7 @@ class UnitTableModel(QAbstractTableModel):
         self._format_warning.clear()
         self._glyph_warning.clear()
         self._recently_translated.clear()
-        self._rebuild_search()
+        self._rebuild_indexes()
         self.endResetModel()
 
     def rowCount(self, parent: QModelIndex = QModelIndex()) -> int:  # noqa: N802
@@ -150,14 +154,24 @@ class UnitTableModel(QAbstractTableModel):
             if index.column() == self.TRANSLATION:
                 return unit.current_text
             if index.column() == self.AI:
+                if unit.pending_delete:
+                    return "该条目已标记删除；保存后只删除译文。右键可取消删除标记。"
                 return "左键：翻译当前条目\n右键：切换 Google Translate / OpenAI 兼容 LLM"
             if index.column() == self.STATUS:
                 suffix = "\n本次会话有改动，可继续审阅。" if unit.uid in self._recently_translated else ""
                 return unit.display_status() + suffix
         if role == Qt.ItemDataRole.BackgroundRole:
+            if unit.pending_delete:
+                return QColor("#f2d6d3")
             if self.has_glyph_warning(index.row()):
                 return QColor("#f3d9a4")
             return QColor("#dce5b5") if unit.uid in self._recently_translated else None
+        if role == Qt.ItemDataRole.ForegroundRole and unit.pending_delete:
+            return QColor("#9d0006")
+        if role == Qt.ItemDataRole.FontRole and unit.pending_delete:
+            font = QFont()
+            font.setStrikeOut(True)
+            return font
         if role != Qt.ItemDataRole.DisplayRole:
             return None
         column = index.column()
@@ -165,7 +179,6 @@ class UnitTableModel(QAbstractTableModel):
             self.FILE: unit.file_rel,
             self.ID: unit.record_id,
             self.LABEL: _clip(unit.label, 72),
-            self.FIELD: unit.field_name,
             self.SOURCE: _clip(unit.source_text, 130),
             self.TRANSLATION: _clip(unit.current_text, 130),
             self.STATUS: unit.display_status(),
@@ -187,9 +200,8 @@ class UnitTableModel(QAbstractTableModel):
         return self._search.get(unit.uid, "")
 
     def refresh_unit(self, unit: TranslationUnit) -> None:
-        try:
-            row = self.units.index(unit)
-        except ValueError:
+        row = self._row_by_uid.get(unit.uid)
+        if row is None:
             return
         self._search[unit.uid] = _search_blob(unit)
         self._format_warning.pop(unit.uid, None)
@@ -201,9 +213,8 @@ class UnitTableModel(QAbstractTableModel):
             self._recently_translated.add(unit.uid)
         else:
             self._recently_translated.discard(unit.uid)
-        try:
-            row = self.units.index(unit)
-        except ValueError:
+        row = self._row_by_uid.get(unit.uid)
+        if row is None:
             return
         self.dataChanged.emit(self.index(row, 0), self.index(row, self.columnCount() - 1))
 
@@ -230,7 +241,11 @@ class UnitTableModel(QAbstractTableModel):
             self._glyph_warning[unit.uid] = any(issue.code == "font-glyph" for issue in unit.issues())
         return self._glyph_warning[unit.uid]
 
-    def _rebuild_search(self) -> None:
+    def row_for_uid(self, uid: str) -> int | None:
+        return self._row_by_uid.get(uid)
+
+    def _rebuild_indexes(self) -> None:
+        self._row_by_uid = {unit.uid: index for index, unit in enumerate(self.units)}
         self._search = {unit.uid: _search_blob(unit) for unit in self.units}
 
 
@@ -269,10 +284,14 @@ class UnitFilterProxyModel(QSortFilterProxyModel):
         unit = source.unit_at(source_row)
         if unit is None:
             return False
+        if self.file_filter != "全部文件" and self.file_filter.lower().endswith(".txt"):
+            return unit.file_rel == self.file_filter
         if self.file_filter != "全部文件" and unit.file_rel != self.file_filter:
             return False
         effective_status = unit.filter_status()
         keep_visible = source.is_recently_translated(unit) or unit.needs_review
+        if unit.pending_delete:
+            keep_visible = True
         if self.status_filter == "待翻译" and effective_status not in MISSING_WORK_STATUSES and not keep_visible:
             return False
         if self.status_filter == "全部" and self.only_missing and effective_status not in MISSING_WORK_STATUSES and not keep_visible:
@@ -290,8 +309,10 @@ class RowTintDelegate(QStyledItemDelegate):
     def paint(self, painter: QPainter, option: QStyleOptionViewItem, index: QModelIndex) -> None:
         if _paint_review_background(painter, option, index):
             painter.save()
-            painter.setFont(option.font)
-            painter.setPen(QColor("#3c3836"))
+            font = index.data(Qt.ItemDataRole.FontRole)
+            painter.setFont(font if isinstance(font, QFont) else option.font)
+            foreground = index.data(Qt.ItemDataRole.ForegroundRole)
+            painter.setPen(foreground if isinstance(foreground, QColor) else QColor("#3c3836"))
             text_rect = option.rect.adjusted(5, 0, -5, 0)
             text = str(index.data(Qt.ItemDataRole.DisplayRole) or "")
             text = painter.fontMetrics().elidedText(text, option.textElideMode, text_rect.width())
@@ -311,6 +332,17 @@ def _paint_review_background(painter: QPainter, option: QStyleOptionViewItem, in
     painter.fillRect(option.rect, tint)
     painter.restore()
     return True
+
+
+def _unit_from_model_index(index: QModelIndex) -> TranslationUnit | None:
+    model = index.model()
+    if isinstance(model, QSortFilterProxyModel):
+        source_index = model.mapToSource(index)
+        source_model = model.sourceModel()
+        return source_model.unit_at(source_index.row()) if isinstance(source_model, UnitTableModel) else None
+    if isinstance(model, UnitTableModel):
+        return model.unit_at(index.row())
+    return None
 
 
 class AiButtonDelegate(QStyledItemDelegate):
@@ -336,6 +368,21 @@ class AiButtonDelegate(QStyledItemDelegate):
             self.parent().viewport().update()
 
     def paint(self, painter: QPainter, option: QStyleOptionViewItem, index: QModelIndex) -> None:
+        unit = _unit_from_model_index(index)
+        if isinstance(unit, TranslationUnit) and unit.pending_delete:
+            if not _paint_review_background(painter, option, index):
+                background = QStyleOptionViewItem(option)
+                background.text = ""
+                style = option.widget.style() if option.widget else QApplication.style()
+                style.drawControl(QStyle.ControlElement.CE_ItemViewItem, background, painter, option.widget)
+            painter.save()
+            font = painter.font()
+            font.setBold(True)
+            painter.setFont(font)
+            painter.setPen(QColor("#9d0006"))
+            painter.drawText(option.rect, Qt.AlignmentFlag.AlignCenter, "删除中")
+            painter.restore()
+            return
         uid = str(index.data(Qt.ItemDataRole.UserRole) or "")
         pressed = uid == self._pressed_uid
         hovered = uid == self._hover_uid
@@ -374,6 +421,9 @@ class AiButtonDelegate(QStyledItemDelegate):
         painter.restore()
 
     def editorEvent(self, event, model, option: QStyleOptionViewItem, index: QModelIndex) -> bool:  # noqa: N802
+        unit = _unit_from_model_index(index)
+        if isinstance(unit, TranslationUnit) and unit.pending_delete:
+            return False
         uid = str(index.data(Qt.ItemDataRole.UserRole) or "")
         if event.type() == QEvent.Type.MouseButtonPress and event.button() == Qt.MouseButton.LeftButton:
             self._pressed_uid = uid
@@ -431,22 +481,31 @@ class FormatDiffDelegate(QStyledItemDelegate):
     """Paint a compact, Git-like token delta without wasting a wide column."""
 
     COLORS = {
-        "+": QColor("#98971a"),
-        "-": QColor("#cc241d"),
         "!": QColor("#cc241d"),
-        "~": QColor("#d79921"),
+        "?": QColor("#d79921"),
+        "~": QColor("#928374"),
         "✓": QColor("#689d6a"),
     }
 
     def paint(self, painter: QPainter, option: QStyleOptionViewItem, index: QModelIndex) -> None:
-        unit = index.model().data(index, Qt.ItemDataRole.UserRole)
-        table_model = index.model()
-        if isinstance(table_model, QSortFilterProxyModel):
-            source_index = table_model.mapToSource(index)
-            source_model = table_model.sourceModel()
-            unit = source_model.unit_at(source_index.row()) if isinstance(source_model, UnitTableModel) else None
+        unit = _unit_from_model_index(index)
         if not isinstance(unit, TranslationUnit):
             super().paint(painter, option, index)
+            return
+        if unit.pending_delete:
+            if not _paint_review_background(painter, option, index):
+                background = QStyleOptionViewItem(option)
+                background.text = ""
+                style = option.widget.style() if option.widget else QApplication.style()
+                style.drawControl(QStyle.ControlElement.CE_ItemViewItem, background, painter, option.widget)
+            painter.save()
+            font = painter.font()
+            font.setBold(True)
+            font.setStrikeOut(True)
+            painter.setFont(font)
+            painter.setPen(QColor("#9d0006"))
+            painter.drawText(option.rect.adjusted(5, 0, -5, 0), Qt.AlignmentFlag.AlignCenter, "删除")
+            painter.restore()
             return
 
         if not _paint_review_background(painter, option, index):
@@ -455,25 +514,15 @@ class FormatDiffDelegate(QStyledItemDelegate):
             style = option.widget.style() if option.widget else QApplication.style()
             style.drawControl(QStyle.ControlElement.CE_ItemViewItem, background, painter, option.widget)
 
-        parts = _format_diff_parts(unit)
+        marker, _summary = _format_indicator(unit)
         painter.save()
         font = painter.font()
         font.setBold(True)
+        font.setPointSize(max(font.pointSize(), 12))
         painter.setFont(font)
         metrics = painter.fontMetrics()
-        left = option.rect.left() + 5
-        right = option.rect.right() - 5
-        baseline = option.rect.top() + (option.rect.height() + metrics.ascent() - metrics.descent()) // 2
-        for marker, content in parts:
-            visible = marker + _compact_token(content)
-            width = metrics.horizontalAdvance(visible)
-            if left + width > right:
-                painter.setPen(QColor("#928374"))
-                painter.drawText(left, baseline, "…")
-                break
-            painter.setPen(self.COLORS.get(marker, QColor("#3c3836")))
-            painter.drawText(left, baseline, visible)
-            left += width + metrics.horizontalAdvance(" ")
+        painter.setPen(self.COLORS.get(marker, QColor("#3c3836")))
+        painter.drawText(option.rect.adjusted(5, 0, -5, 0), Qt.AlignmentFlag.AlignCenter, marker)
         painter.restore()
 
 
@@ -485,6 +534,7 @@ class StatusBadgeDelegate(QStyledItemDelegate):
         "待新增": ("待新增", "#d65d0e", "#fbf1c7"),
         STATUS_MISSING_ROW: ("待新增", "#d65d0e", "#fbf1c7"),
         STATUS_EMPTY: ("空译文", "#cc241d", "#fbf1c7"),
+        STATUS_PENDING_DELETE: ("待删除", "#cc241d", "#fbf1c7"),
         STATUS_SAME: ("未翻译", "#d79921", "#3c3836"),
         STATUS_IGNORED: ("已忽略", "#928374", "#fbf1c7"),
         STATUS_EXTRA: ("多余", "#b16286", "#fbf1c7"),
@@ -721,10 +771,35 @@ class LlmSuggestionWorker(QRunnable):
             self.signals.finished.emit()
 
 
+class HistoryRenderWorkerSignals(QObject):
+    rendered = Signal(int, str)
+    failed = Signal(int, str)
+
+
+class HistoryRenderWorker(QRunnable):
+    def __init__(self, request_id: int, git: LanguageGit, commits_oldest_first: tuple[GitCommit, ...]) -> None:
+        super().__init__()
+        self.request_id = request_id
+        self.git = git
+        self.commits_oldest_first = commits_oldest_first
+        self.signals = HistoryRenderWorkerSignals()
+
+    def run(self) -> None:
+        try:
+            hashes = tuple(commit.full_hash for commit in self.commits_oldest_first)
+            entries = self.git.entries_for_commits(hashes)
+            rendered = _render_history_html(self.commits_oldest_first, entries)
+            self.signals.rendered.emit(self.request_id, rendered)
+        except (GitError, OSError, UnicodeError) as exc:
+            self.signals.failed.emit(self.request_id, str(exc))
+        except Exception as exc:
+            self.signals.failed.emit(self.request_id, f"意外错误：{exc}")
+
+
 class SettingsDialog(QDialog):
     def __init__(self, settings: AppSettings, parent: QWidget | None = None) -> None:
         super().__init__(parent)
-        self.setWindowTitle("AI 与 Git 设置")
+        self.setWindowTitle("AI、Git 与保存设置")
         self.setMinimumWidth(680)
         self.settings = settings
         layout = QVBoxLayout(self)
@@ -771,6 +846,17 @@ class SettingsDialog(QDialog):
         git_form.addRow("邮箱", self.git_email)
         layout.addWidget(git_group)
 
+        save_group = QGroupBox("保存选项")
+        save_layout = QVBoxLayout(save_group)
+        self.auto_space_before_color_tokens = QCheckBox("保存时自动在正文与 $C[...] 之间补空格")
+        self.auto_space_before_color_tokens.setChecked(settings.auto_space_before_color_tokens_on_save)
+        save_layout.addWidget(self.auto_space_before_color_tokens)
+        save_hint = QLabel("仅当 $C[...] 前面紧挨普通文本字符时才补空格；句首、空白后、或前面紧挨其他格式标记时保持不变。")
+        save_hint.setObjectName("hint")
+        save_hint.setWordWrap(True)
+        save_layout.addWidget(save_hint)
+        layout.addWidget(save_group)
+
         note = QLabel("Google 公共端点不需要 Key，但可能受限速或上游变更影响。API Key 仅保存到当前 Windows 用户的本地设置。")
         note.setWordWrap(True)
         note.setObjectName("hint")
@@ -800,6 +886,7 @@ class SettingsDialog(QDialog):
             openai_api_key_protected=protect_secret(self.openai_key.text().strip()),
             git_author_name=self.git_name.text().strip() or "The Guild 2 Translator",
             git_author_email=self.git_email.text().strip() or "translator@local",
+            auto_space_before_color_tokens_on_save=self.auto_space_before_color_tokens.isChecked(),
         )
 
 
@@ -861,48 +948,102 @@ class HistoryDialog(QDialog):
     def __init__(self, git: LanguageGit, parent: QWidget | None = None) -> None:
         super().__init__(parent)
         self.git = git
+        self.setObjectName("historyDialog")
         self.setWindowTitle(f"Git 更新日志 · {git.project_root.name} · {git.language}")
-        self.resize(1080, 680)
+        self.resize(1180, 720)
         layout = QHBoxLayout(self)
         self.commits = QListWidget()
+        self.commits.setObjectName("historyList")
         self.commits.setMinimumWidth(370)
+        self.commits.setUniformItemSizes(True)
+        self.commits.setSpacing(1)
         self.commits.setSelectionMode(QAbstractItemView.SelectionMode.ExtendedSelection)
         history_column = QVBoxLayout()
+        history_column.setContentsMargins(0, 0, 0, 0)
         selection_hint = QLabel("Shift 选择范围 · Ctrl 添加提交")
         selection_hint.setObjectName("historyHint")
         selection_hint.setWordWrap(True)
         history_column.addWidget(selection_hint)
         history_column.addWidget(self.commits, 1)
-        self.content = QPlainTextEdit()
-        self.content.setReadOnly(True)
-        self.content.setLineWrapMode(QPlainTextEdit.LineWrapMode.WidgetWidth)
-        layout.addLayout(history_column, 1)
-        layout.addWidget(self.content, 2)
+        history_panel = QWidget()
+        history_panel.setLayout(history_column)
+        splitter = QSplitter(Qt.Orientation.Horizontal)
+        splitter.addWidget(history_panel)
+        self.content = QTextBrowser()
+        self.content.setObjectName("historyContent")
+        self.content.setOpenExternalLinks(False)
+        self.content.document().setDocumentMargin(14)
+        splitter.addWidget(self.content)
+        splitter.setStretchFactor(0, 1)
+        splitter.setStretchFactor(1, 2)
+        layout.addWidget(splitter)
         self._items: list[GitCommit] = []
+        self._request_id = 0
+        self._selected_rows: tuple[int, ...] = ()
+        self._rendered_rows: tuple[int, ...] = ()
+        self._history_workers: set[HistoryRenderWorker] = set()
+        self._selection_timer = QTimer(self)
+        self._selection_timer.setSingleShot(True)
+        self._selection_timer.setInterval(110)
+        self._selection_timer.timeout.connect(self._load_selected_commits)
         try:
             self._items = git.list_commits()
             self.commits.addItems([commit.display for commit in self._items])
         except GitError as exc:
-            self.content.setPlainText(str(exc))
+            self.content.setHtml(_history_state_html("无法读取更新日志", str(exc), kind="error"))
+        else:
+            self.content.setHtml(_history_state_html("选择左侧提交查看净变化", "支持 Shift 范围选择和 Ctrl 多选。"))
         self.commits.itemSelectionChanged.connect(self._show_selected_commits)
         if self._items:
-            self.commits.setCurrentRow(0)
-            self.commits.item(0).setSelected(True)
+            QTimer.singleShot(0, self._select_latest_commit)
+
+    def _select_latest_commit(self) -> None:
+        if not self._items:
+            return
+        self.commits.setCurrentRow(0)
+        item = self.commits.item(0)
+        if item is not None:
+            item.setSelected(True)
 
     def _show_selected_commits(self) -> None:
-        # Git lists newest first, while combining must apply the oldest change
-        # first so a later revision wins when the same entry appears twice.
-        rows = sorted((self.commits.row(item) for item in self.commits.selectedItems()), reverse=True)
+        rows = tuple(sorted((self.commits.row(item) for item in self.commits.selectedItems()), reverse=True))
+        self._request_id += 1
+        self._selected_rows = rows
         if not rows:
-            self.content.clear()
+            self._rendered_rows = ()
+            self._selection_timer.stop()
+            self.content.setHtml(_history_state_html("没有选中提交", "请从左侧选择一个或多个提交。"))
             return
-        try:
-            commits = [self._items[row].full_hash for row in rows]
-            entries = self.git.entries_for_commits(commits)
-            summary = f"已合并 {len(rows)} 次提交 · {len(entries)} 条最终变更"
-            self.content.setPlainText(f"{summary}\n\n{format_entries(entries)}")
-        except (GitError, OSError, UnicodeError) as exc:
-            self.content.setPlainText(f"无法读取所选提交：{exc}")
+        if rows == self._rendered_rows:
+            return
+        self.content.setHtml(_history_state_html("正在整理更新日志…", f"已选中 {len(rows)} 次提交。"))
+        self._selection_timer.start()
+
+    def _load_selected_commits(self) -> None:
+        rows = self._selected_rows
+        if not rows:
+            return
+        request_id = self._request_id
+        commits = tuple(self._items[row] for row in rows)
+        worker = HistoryRenderWorker(request_id, self.git, commits)
+        self._history_workers.add(worker)
+        worker.signals.rendered.connect(lambda *_args, current=worker: self._history_workers.discard(current))
+        worker.signals.failed.connect(lambda *_args, current=worker: self._history_workers.discard(current))
+        worker.signals.rendered.connect(self._apply_history_render)
+        worker.signals.failed.connect(self._apply_history_error)
+        QThreadPool.globalInstance().start(worker)
+
+    def _apply_history_render(self, request_id: int, rendered: str) -> None:
+        if request_id != self._request_id:
+            return
+        self._rendered_rows = self._selected_rows
+        self.content.setHtml(rendered)
+
+    def _apply_history_error(self, request_id: int, message: str) -> None:
+        if request_id != self._request_id:
+            return
+        self._rendered_rows = ()
+        self.content.setHtml(_history_state_html("无法读取所选提交", message, kind="error"))
 
 
 class TranslatorWindow(QMainWindow):
@@ -924,6 +1065,7 @@ class TranslatorWindow(QMainWindow):
         self.loading_editor = False
         self.typing_uid = ""
         self.typing_before = ""
+        self.typing_before_deleted = False
         self.typing_timer = QTimer(self)
         self.typing_timer.setSingleShot(True)
         self.typing_timer.setInterval(TYPING_GROUP_DELAY_MS)
@@ -1004,7 +1146,18 @@ class TranslatorWindow(QMainWindow):
         toolbar_layout.addWidget(QLabel("状态"))
         self.status_combo = QComboBox()
         self.status_combo.addItems(
-            ["全部", "待翻译", STATUS_MISSING_ROW, STATUS_EMPTY, STATUS_SAME, STATUS_TRANSLATED, STATUS_IGNORED, STATUS_EXTRA, STATUS_TRANSLATION_ONLY]
+            [
+                "全部",
+                "待翻译",
+                STATUS_MISSING_ROW,
+                STATUS_EMPTY,
+                STATUS_SAME,
+                STATUS_TRANSLATED,
+                STATUS_PENDING_DELETE,
+                STATUS_IGNORED,
+                STATUS_EXTRA,
+                STATUS_TRANSLATION_ONLY,
+            ]
         )
         self.status_combo.setCurrentText("全部")
         self.status_combo.currentTextChanged.connect(self._apply_filters)
@@ -1058,10 +1211,10 @@ class TranslatorWindow(QMainWindow):
         self.counts_label.setObjectName("counts")
         layout.addWidget(self.counts_label)
 
-        splitter = QSplitter(Qt.Orientation.Vertical)
-        layout.addWidget(splitter, 1)
-        table_frame = QFrame()
-        table_layout = QVBoxLayout(table_frame)
+        self.main_splitter = QSplitter(Qt.Orientation.Vertical)
+        layout.addWidget(self.main_splitter, 1)
+        self.table_frame = QFrame()
+        table_layout = QVBoxLayout(self.table_frame)
         table_layout.setContentsMargins(0, 0, 0, 0)
         self.table = QTableView()
         self.table.setModel(self.proxy)
@@ -1093,20 +1246,24 @@ class TranslatorWindow(QMainWindow):
         self.status_delegate = StatusBadgeDelegate(self.table)
         self.table.setItemDelegateForColumn(UnitTableModel.STATUS, self.status_delegate)
         table_layout.addWidget(self.table)
-        splitter.addWidget(table_frame)
+        self.main_splitter.addWidget(self.table_frame)
 
-        editors = QSplitter(Qt.Orientation.Horizontal)
+        self.editors_splitter = QSplitter(Qt.Orientation.Horizontal)
         source_box, self.source_edit = self._editor_group("原文 / English", True)
         translated_box, self.translation_edit = self._editor_group("译文", False)
-        self.translation_edit.setUndoRedoEnabled(False)
+        # Keep a local text history while typing so Ctrl+Z in the editor feels
+        # natural, then transfer the completed change into the app history.
+        self.translation_edit.setUndoRedoEnabled(True)
+        self.translation_edit.installEventFilter(self)
         self.translation_edit.textChanged.connect(self._on_editor_changed)
         self.source_highlighter = TokenHighlighter(self.source_edit.document())
         self.translation_highlighter = TokenHighlighter(self.translation_edit.document())
-        editors.addWidget(source_box)
-        editors.addWidget(translated_box)
-        editors.setSizes([620, 620])
-        splitter.addWidget(editors)
-        splitter.setSizes([560, 270])
+        self.editors_splitter.addWidget(source_box)
+        self.editors_splitter.addWidget(translated_box)
+        self.editors_splitter.setSizes([620, 620])
+        self.main_splitter.addWidget(self.editors_splitter)
+        self.main_splitter.setSizes([560, 270])
+        self._table_visible_splitter_sizes = [560, 270]
 
         self.issue_label = QLabel("选择一个条目开始翻译。")
         self.issue_label.setObjectName("issues")
@@ -1126,6 +1283,14 @@ class TranslatorWindow(QMainWindow):
             self.addAction(action)
 
     def eventFilter(self, watched: QObject, event: QEvent) -> bool:  # noqa: N802
+        editor = getattr(self, "translation_edit", None)
+        if isinstance(editor, QPlainTextEdit) and watched is editor and isinstance(event, QKeyEvent):
+            if event.matches(QKeySequence.StandardKey.Undo):
+                self.undo()
+                return True
+            if event.matches(QKeySequence.StandardKey.Redo) or self._is_ctrl_shift_z(event):
+                self.redo()
+                return True
         table = getattr(self, "table", None)
         if isinstance(table, QTableView) and watched is table.viewport():
             if event.type() == QEvent.Type.MouseButtonPress and event.button() == Qt.MouseButton.RightButton:
@@ -1150,6 +1315,31 @@ class TranslatorWindow(QMainWindow):
 
     def _clear_table_context_suppression(self) -> None:
         self._suppress_table_context_event = False
+
+    @staticmethod
+    def _is_ctrl_shift_z(event: QKeyEvent) -> bool:
+        return event.key() == Qt.Key.Key_Z and event.modifiers() == (
+            Qt.KeyboardModifier.ControlModifier | Qt.KeyboardModifier.ShiftModifier
+        )
+
+    def _translation_editor_has_focus(self) -> bool:
+        editor = getattr(self, "translation_edit", None)
+        if not isinstance(editor, QPlainTextEdit):
+            return False
+        focus = QApplication.focusWidget()
+        return focus is editor or (focus is not None and editor.isAncestorOf(focus))
+
+    def _try_editor_undo(self) -> bool:
+        if not self._translation_editor_has_focus() or not self.translation_edit.document().isUndoAvailable():
+            return False
+        self.translation_edit.undo()
+        return True
+
+    def _try_editor_redo(self) -> bool:
+        if not self._translation_editor_has_focus() or not self.translation_edit.document().isRedoAvailable():
+            return False
+        self.translation_edit.redo()
+        return True
 
     def _editor_group(self, title: str, read_only: bool) -> tuple[QGroupBox, QPlainTextEdit]:
         box = QGroupBox(title)
@@ -1211,7 +1401,7 @@ class TranslatorWindow(QMainWindow):
             return
         if self.project is not None and not discard_changes:
             self._commit_typing_operation()
-            if self.project.dirty_units():
+            if self.project.has_dirty_units():
                 answer = QMessageBox.question(self, "重新加载", "有未保存译文，是否放弃并重新加载？")
                 if answer != QMessageBox.StandardButton.Yes:
                     return
@@ -1240,7 +1430,8 @@ class TranslatorWindow(QMainWindow):
         self.translation_highlighter.set_glyph_codec(self.project.codec if ENABLE_FONT_GLYPH_VALIDATION else None)
         self._update_file_choices()
         self._apply_filters()
-        self._set_editor_unit(None)
+        if not self._is_document_file_selected():
+            self._set_editor_unit(None)
         self._update_counts()
         self._update_pending_state()
         self._update_project_button()
@@ -1275,7 +1466,7 @@ class TranslatorWindow(QMainWindow):
             return
         if self.project is not None:
             self._commit_typing_operation()
-            if self.project.dirty_units():
+            if self.project.has_dirty_units():
                 answer = QMessageBox.question(self, "切换项目", "当前项目有未保存译文，是否放弃并切换？")
                 if answer != QMessageBox.StandardButton.Yes:
                     return
@@ -1341,9 +1532,39 @@ class TranslatorWindow(QMainWindow):
         self.file_combo.setCurrentText(previous if previous in files else default_file)
         del blocker
 
+    def _is_document_file_selected(self) -> bool:
+        selected = self.file_combo.currentText() or ""
+        return selected != "全部文件" and selected.lower().endswith(".txt")
+
+    def _current_document_unit(self) -> TranslationUnit | None:
+        if self.project is None or not self._is_document_file_selected():
+            return None
+        file_rel = self.file_combo.currentText() or ""
+        return next((unit for unit in self.project.units if unit.file_rel == file_rel and unit.ref.kind == "text"), None)
+
+    def _sync_document_layout(self) -> bool:
+        document_mode = self._is_document_file_selected()
+        if document_mode:
+            if self.table_frame.isVisible():
+                sizes = self.main_splitter.sizes()
+                if len(sizes) == 2 and sizes[0] > 0:
+                    self._table_visible_splitter_sizes = sizes
+            self.table_frame.setVisible(False)
+            self.main_splitter.setSizes([0, max(sum(self._table_visible_splitter_sizes), 1)])
+            unit = self._current_document_unit()
+            self.current_uid = unit.uid if unit is not None else ""
+            self._set_editor_unit(unit)
+            self._update_window_title()
+            return True
+        if not self.table_frame.isVisible():
+            self.table_frame.setVisible(True)
+            self.main_splitter.setSizes(self._table_visible_splitter_sizes)
+        return False
+
     def _apply_filters(self) -> None:
         query = self.search_edit.text()
         clearing_search = bool(self.last_applied_query) and not query.strip()
+        previous_document_mode = not self.table_frame.isVisible()
         selected_uid = self.current_uid
         self.proxy.set_filters(
             file_filter=self.file_combo.currentText() or "全部文件",
@@ -1354,6 +1575,13 @@ class TranslatorWindow(QMainWindow):
         )
         self.last_applied_query = query.strip()
         self._update_counts()
+        if self._sync_document_layout():
+            return
+        if previous_document_mode:
+            self.current_uid = ""
+            self._set_editor_unit(None)
+            self._update_window_title()
+            return
         if clearing_search and selected_uid:
             self._restore_selected_row(selected_uid)
 
@@ -1364,12 +1592,10 @@ class TranslatorWindow(QMainWindow):
         self.search_debounce.start()
 
     def _restore_selected_row(self, uid: str) -> None:
-        unit = self.model.unit_for_uid(uid)
-        if unit is None:
+        if self._is_document_file_selected():
             return
-        try:
-            source_row = self.model.units.index(unit)
-        except ValueError:
+        source_row = self.model.row_for_uid(uid)
+        if source_row is None:
             return
         proxy_index = self.proxy.mapFromSource(self.model.index(source_row, 0))
         if not proxy_index.isValid():
@@ -1377,14 +1603,17 @@ class TranslatorWindow(QMainWindow):
         self.table.setCurrentIndex(proxy_index)
         self.table.selectRow(proxy_index.row())
         self.table.scrollTo(proxy_index, QAbstractItemView.ScrollHint.PositionAtCenter)
-        self.table.setFocus()
 
     def _update_counts(self) -> None:
         if self.project is None:
             self.counts_label.setText("")
             return
-        effective = Counter(unit.filter_status() for unit in self.project.units)
-        todo = sum(unit.filter_status() in MISSING_WORK_STATUSES for unit in self.project.units)
+        effective: Counter[str] = Counter()
+        todo = 0
+        for unit in self.project.units:
+            status = unit.filter_status()
+            effective[status] += 1
+            todo += status in MISSING_WORK_STATUSES
         recent = self.model.recently_translated_count
         self.counts_label.setText(
             f"当前显示 {self.proxy.rowCount():,} / 总计 {len(self.project.units):,}   ·   "
@@ -1403,13 +1632,15 @@ class TranslatorWindow(QMainWindow):
             location = f"{unit.file_rel} · #{unit.record_id}"
         else:
             location = unit.file_rel
-        dirty_count = len(self.project.dirty_units())
+        dirty_count = self.project.dirty_count()
         save_state = f"未保存 {dirty_count} 条" if dirty_count else "已保存"
         git_state = " · Git 待提交" if self.git_pending else ""
         project_name = self.project_root.name if self.project_root is not None else "未加载"
         self.setWindowTitle(f"The Guild 2 · {project_name} · {location} · {save_state}{git_state}")
 
     def _on_row_selected(self, current: QModelIndex, _previous: QModelIndex) -> None:
+        if self._is_document_file_selected():
+            return
         self._commit_typing_operation()
         unit = self._unit_from_proxy_index(current)
         self.current_uid = unit.uid if unit else ""
@@ -1437,10 +1668,12 @@ class TranslatorWindow(QMainWindow):
         if not self.typing_uid:
             self.typing_uid = unit.uid
             self.typing_before = unit.current_text
+            self.typing_before_deleted = unit.pending_delete
         elif self.typing_uid != unit.uid:
             self._commit_typing_operation()
             self.typing_uid = unit.uid
             self.typing_before = unit.current_text
+            self.typing_before_deleted = unit.pending_delete
         before_status = unit.filter_status()
         unit.set_text(text)
         self.model.refresh_unit(unit)
@@ -1457,15 +1690,23 @@ class TranslatorWindow(QMainWindow):
         unit = self.model.unit_for_uid(self.typing_uid)
         before, self.typing_uid = self.typing_before, ""
         self.typing_before = ""
-        if unit is not None and unit.current_text != before:
-            self.history.push(TranslationOperation("连续编辑", (UnitChange(unit.uid, before, unit.current_text),)))
+        before_deleted, self.typing_before_deleted = self.typing_before_deleted, False
+        if unit is not None and (unit.current_text != before or unit.pending_delete != before_deleted):
+            self.history.push(
+                TranslationOperation(
+                    "连续编辑",
+                    (UnitChange(unit.uid, before, unit.current_text, before_deleted, unit.pending_delete),),
+                )
+            )
+            self.translation_edit.document().clearUndoRedoStacks()
 
-    def _apply_operation_text(self, uid: str, text: str) -> None:
+    def _apply_operation_state(self, uid: str, text: str, pending_delete: bool) -> None:
         unit = self.model.unit_for_uid(uid)
         if unit is None:
             return
         before_status = unit.filter_status()
         unit.set_text(text)
+        unit.set_pending_delete(pending_delete)
         self.model.refresh_unit(unit)
         self._update_recent_translation_marker(unit, before_status)
         if uid == self.current_uid:
@@ -1487,24 +1728,34 @@ class TranslatorWindow(QMainWindow):
             self._replace_unit_text(unit, text, label)
 
     def _replace_unit_text(self, unit: TranslationUnit, text: str, label: str) -> None:
-        self._replace_units_text((unit,), {unit.uid: text}, label)
+        self._replace_units_state((unit,), {unit.uid: text}, False, label)
 
-    def _replace_units_text(self, units: Iterable[TranslationUnit], texts: dict[str, str], label: str) -> None:
+    def _replace_units_state(
+        self, units: Iterable[TranslationUnit], texts: dict[str, str], pending_delete: bool | None, label: str
+    ) -> None:
         self._commit_typing_operation()
         changes = tuple(
-            UnitChange(unit.uid, unit.current_text, texts[unit.uid])
+            UnitChange(
+                unit.uid,
+                unit.current_text,
+                texts.get(unit.uid, unit.current_text),
+                unit.pending_delete,
+                unit.pending_delete if pending_delete is None else pending_delete,
+            )
             for unit in units
-            if unit.uid in texts and unit.current_text != texts[unit.uid]
+            if (
+                unit.uid in texts or pending_delete is not None
+            )
+            and (
+                unit.current_text != texts.get(unit.uid, unit.current_text)
+                or unit.pending_delete != (unit.pending_delete if pending_delete is None else pending_delete)
+            )
         )
         if not changes:
             return
         for change in changes:
-            unit = self.model.unit_for_uid(change.uid)
-            if unit is not None:
-                before_status = unit.filter_status()
-                unit.set_text(change.after)
-                self.model.refresh_unit(unit)
-                self._update_recent_translation_marker(unit, before_status)
+            self._apply_operation_state(change.uid, change.after, change.after_deleted)
+        self.proxy.refresh_rows()
         current = self._current_unit()
         if current is not None and any(change.uid == current.uid for change in changes):
             self._set_editor_unit(current)
@@ -1512,15 +1763,23 @@ class TranslatorWindow(QMainWindow):
         self._update_window_title()
         self.history.push(TranslationOperation(label, changes))
 
+    def _set_units_pending_delete(self, units: Iterable[TranslationUnit], pending_delete: bool) -> None:
+        self._replace_units_state(tuple(units), {}, pending_delete, "标记删除" if pending_delete else "取消删除标记")
+        self.statusBar().showMessage("已标记删除，保存时只删除译文。" if pending_delete else "已取消删除标记。", 3000)
+
     def undo(self) -> None:
+        if self._try_editor_undo():
+            return
         self._commit_typing_operation()
-        operation = self.history.undo(self._apply_operation_text)
+        operation = self.history.undo(self._apply_operation_state)
         if operation:
             self.statusBar().showMessage(f"已撤回：{operation.label}", 2500)
 
     def redo(self) -> None:
+        if self._try_editor_redo():
+            return
         self._commit_typing_operation()
-        operation = self.history.redo(self._apply_operation_text)
+        operation = self.history.redo(self._apply_operation_state)
         if operation:
             self.statusBar().showMessage(f"已重做：{operation.label}", 2500)
 
@@ -1539,6 +1798,9 @@ class TranslatorWindow(QMainWindow):
         units = self._selected_units()
         count = len(units)
         suffix = f" · {count}" if count > 1 else ""
+        can_delete_all = bool(units) and all(item.can_delete_translation() for item in units)
+        can_mark_delete = can_delete_all and any(not item.pending_delete for item in units)
+        can_unmark_delete = any(item.pending_delete for item in units)
         menu = QMenu(self)
         menu.addSection("选中条目")
         copy_translation = menu.addAction(f"复制选中译文{suffix}")
@@ -1549,21 +1811,30 @@ class TranslatorWindow(QMainWindow):
         menu.addSection("AI 服务")
         ai_translate = menu.addAction(f"AI 翻译选中未译条目{suffix}")
         llm_suggestion = menu.addAction("LLM 翻译建议（右键条目）…")
+        menu.addSection("删除与清理")
+        mark_delete = menu.addAction(f"标记删除{suffix}")
+        mark_delete.setEnabled(can_mark_delete)
+        unmark_delete = menu.addAction(f"取消删除标记{suffix}")
+        unmark_delete.setEnabled(can_unmark_delete)
         menu.addSection("条目状态")
         ignored = menu.addAction(f"取消无需翻译{suffix}" if all(item.ignored for item in units) else f"标记为无需翻译{suffix}")
         action = menu.exec(global_point)
         if action == copy_translation:
             self._copy_unit_translations(units)
         elif action == restore:
-            self._replace_units_text(units, {item.uid: item.translate_text for item in units}, "恢复载入译文")
+            self._replace_units_state(units, {item.uid: item.translate_text for item in units}, False, "恢复载入译文")
         elif action == source:
-            self._replace_units_text(units, {item.uid: item.source_text for item in units}, "还原为原文")
+            self._replace_units_state(units, {item.uid: item.source_text for item in units}, False, "还原为原文")
         elif action == clear:
-            self._replace_units_text(units, {item.uid: "" for item in units}, "清空译文")
+            self._replace_units_state(units, {item.uid: "" for item in units}, False, "清空译文")
         elif action == ai_translate:
             self.translate_selected_units(units)
         elif action == llm_suggestion:
             self.request_llm_suggestion(unit.uid)
+        elif action == mark_delete:
+            self._set_units_pending_delete(units, True)
+        elif action == unmark_delete:
+            self._set_units_pending_delete(units, False)
         elif action == ignored:
             self._set_units_ignored(units, not all(item.ignored for item in units))
 
@@ -1708,11 +1979,12 @@ class TranslatorWindow(QMainWindow):
 
     def _apply_suggested_translation(self, text: str) -> None:
         unit = self.model.unit_for_uid(self.suggestion_uid)
-        if unit is None or unit.current_text == text:
+        if unit is None or (unit.current_text == text and not unit.pending_delete):
             return
         before = unit.current_text
-        self._apply_operation_text(unit.uid, text)
-        self.history.push(TranslationOperation("应用 LLM 建议", (UnitChange(unit.uid, before, text),)))
+        before_deleted = unit.pending_delete
+        self._apply_operation_state(unit.uid, text, False)
+        self.history.push(TranslationOperation("应用 LLM 建议", (UnitChange(unit.uid, before, text, before_deleted, False),)))
         self.statusBar().showMessage("已应用 LLM 推荐译文，尚未保存。", 3500)
 
     def _close_suggestion_dialog(self) -> None:
@@ -1780,12 +2052,12 @@ class TranslatorWindow(QMainWindow):
     def _collect_ai_result(self, uid: str, translated: str) -> None:
         self.ai_results[uid] = translated
         unit = self.model.unit_for_uid(uid)
-        if unit is None or unit.current_text == translated:
+        if unit is None or (unit.current_text == translated and not unit.pending_delete):
             return
-        self.ai_changes.append(UnitChange(uid, unit.current_text, translated))
+        self.ai_changes.append(UnitChange(uid, unit.current_text, translated, unit.pending_delete, False))
         # AI signals are delivered on the GUI thread. Apply each completed
         # result immediately, while retaining one combined undo operation.
-        self._apply_operation_text(uid, translated)
+        self._apply_operation_state(uid, translated, False)
         if self.ai_is_batch:
             self._schedule_ai_filter_refresh()
 
@@ -1844,7 +2116,9 @@ class TranslatorWindow(QMainWindow):
         if self.project is None:
             return
         try:
-            result = self.project.save()
+            result = self.project.save(
+                auto_space_before_color_tokens=self.settings.auto_space_before_color_tokens_on_save
+            )
         except SaveValidationError as exc:
             QMessageBox.warning(self, "保存被阻止", "\n".join(exc.messages[:20]))
             return
@@ -1855,26 +2129,26 @@ class TranslatorWindow(QMainWindow):
             if not issue.blocks_save
         )
         if not result.changed_files:
-            if result.cleared_empty_units or result.removed_extra_units:
+            if result.deleted_units:
                 self.load_project(discard_changes=True)
-                self.statusBar().showMessage(
-                    f"已移除 {len(result.cleared_empty_units)} 条译文覆盖，清理 {len(result.removed_extra_units)} 条多余译文。",
-                    4000,
-                )
+                self.statusBar().showMessage(f"已删除 {len(result.deleted_units)} 条译文条目。", 4000)
                 return
             self.statusBar().showMessage("没有需要保存的变更。", 3000)
             return
         commit_note = ""
         try:
-            commit = self.git.commit_saved(result.changed_files, result.saved_units) if self.git is not None else None
+            commit = (
+                self.git.commit_saved(result.changed_files, result.saved_units, result.deleted_units)
+                if self.git is not None
+                else None
+            )
             commit_note = f"，已创建 Git 提交 {commit.short_hash}" if commit else ""
         except GitError as exc:
             commit_note = f"；文件已保存，但 Git 提交失败：{exc}"
         self.load_project(discard_changes=True)
-        cleared_note = f"，已移除 {len(result.cleared_empty_units)} 条译文覆盖" if result.cleared_empty_units else ""
-        extra_note = f"，清理 {len(result.removed_extra_units)} 条多余译文" if result.removed_extra_units else ""
+        delete_note = f"，删除 {len(result.deleted_units)} 条译文条目" if result.deleted_units else ""
         warning_note = f"，格式提示 {format_warning_count} 条" if format_warning_count else ""
-        self.statusBar().showMessage(f"已保存 {len(result.changed_files)} 个文件{cleared_note}{extra_note}{warning_note}{commit_note}", 7000)
+        self.statusBar().showMessage(f"已保存 {len(result.changed_files)} 个文件{delete_note}{warning_note}{commit_note}", 7000)
 
     def retry_commit(self) -> None:
         if self.git is None:
@@ -1936,10 +2210,16 @@ class TranslatorWindow(QMainWindow):
         if unit is None:
             self.issue_label.setText("选择一个条目开始翻译。")
             return
+        if unit.pending_delete:
+            self.issue_label.setText("待删除 · 保存时仅删除译文条目，不会改动原文。")
+            return
         issues = unit.issues()
         errors = [issue.message for issue in issues if issue.blocks_save]
         warnings = [issue.message for issue in issues if not issue.blocks_save]
         parts = []
+        summary = _format_diff_text(unit)
+        if summary != "格式正常":
+            parts.append("摘要：" + summary)
         if errors:
             parts.append("错误：" + "；".join(errors))
         if warnings:
@@ -1953,7 +2233,7 @@ class TranslatorWindow(QMainWindow):
         if self.project is None:
             event.accept()
             return
-        dirty_count = len(self.project.dirty_units())
+        dirty_count = self.project.dirty_count()
         if not dirty_count:
             event.accept()
             return
@@ -1966,7 +2246,7 @@ class TranslatorWindow(QMainWindow):
         )
         if choice == QMessageBox.StandardButton.Save:
             self.save_all()
-            if self.project is None or not self.project.dirty_units():
+            if self.project is None or not self.project.has_dirty_units():
                 event.accept()
             else:
                 event.ignore()
@@ -1988,6 +2268,320 @@ def _clip(text: str, limit: int) -> str:
     return text if len(text) <= limit else text[: limit - 1] + "…"
 
 
+def _history_state_html(title: str, detail: str, *, kind: str = "info") -> str:
+    return f"""
+    <html>
+      <head>
+        <style>
+          body.history-root {{
+            background: #fbf1c7;
+            color: #3c3836;
+            font-family: "Segoe UI", "Microsoft YaHei UI";
+            margin: 0;
+          }}
+          .history-state {{
+            background: #f2e5bc;
+            border: 2px solid #bdae93;
+            border-radius: 10px;
+            padding: 14px 16px;
+          }}
+          .history-state--error {{
+            background: #f2d8d8;
+            border-color: #cc241d;
+          }}
+          .history-state__title {{
+            font-size: 16px;
+            font-weight: 900;
+          }}
+          .history-state__detail {{
+            margin-top: 6px;
+            color: #665c54;
+            font-weight: 600;
+            white-space: pre-wrap;
+          }}
+        </style>
+      </head>
+      <body class="history-root">
+        <div class="history-state history-state--{kind}">
+          <div class="history-state__title">{html.escape(title)}</div>
+          <div class="history-state__detail">{html.escape(detail)}</div>
+        </div>
+      </body>
+    </html>
+    """
+
+
+def _history_text(text: str) -> str:
+    return html.escape(text.replace("\r", ""))
+
+
+def _history_inline_diff_html(before: str, after: str) -> str:
+    parts: list[str] = []
+    for tag, i1, i2, j1, j2 in SequenceMatcher(None, before, after, autojunk=False).get_opcodes():
+        left = _history_text(before[i1:i2])
+        right = _history_text(after[j1:j2])
+        if tag == "equal":
+            parts.append(right)
+        elif tag == "delete":
+            if left:
+                parts.append(f'<span class="diff-del">{left}</span>')
+        elif tag == "insert":
+            if right:
+                parts.append(f'<span class="diff-add">{right}</span>')
+        else:
+            if left:
+                parts.append(f'<span class="diff-del">{left}</span>')
+            if right:
+                parts.append(f'<span class="diff-add">{right}</span>')
+    return "".join(parts) or '<span class="diff-empty">（空）</span>'
+
+
+def _history_files_phrase(file_counts: Counter[str]) -> str:
+    if not file_counts:
+        return "0 个文件"
+    top_files = [Path(file_rel).name for file_rel, _count in file_counts.most_common(2)]
+    if len(file_counts) <= 2:
+        return "、".join(top_files)
+    return f"{'、'.join(top_files)} 等 {len(file_counts)} 个文件"
+
+
+def _history_change_phrase(add_count: int, update_count: int, delete_count: int) -> str:
+    parts: list[str] = []
+    if add_count:
+        parts.append(f"新增 {add_count} 条")
+    if update_count:
+        parts.append(f"修订 {update_count} 条")
+    if delete_count:
+        parts.append(f"删除 {delete_count} 条")
+    return "、".join(parts) if parts else "无变更"
+
+
+def _history_entry_sort_key(entry: TranslationLogEntry) -> tuple[int, int | str, str, str]:
+    if entry.record_id.isdigit():
+        return (0, int(entry.record_id), entry.label, entry.field_name)
+    return (1, entry.record_id, entry.label, entry.field_name)
+
+
+def _history_entry_title(entry: TranslationLogEntry) -> str:
+    title = entry.label if entry.label and entry.label != entry.file_rel else ""
+    if not title:
+        title = f"ID {entry.record_id}" if entry.record_id else Path(entry.file_rel).name
+    hidden_fields = {"body", "text", "translation", "translated", "translator"}
+    if entry.field_name and entry.field_name.lower() not in hidden_fields:
+        title = f"{title} · {entry.field_name}"
+    return title
+
+
+def _history_entry_meta(entry: TranslationLogEntry) -> str:
+    parts = [entry.file_rel]
+    if entry.record_id:
+        parts.append(f"ID {entry.record_id}")
+    return " · ".join(parts)
+
+
+def _render_history_entry(entry: TranslationLogEntry) -> str:
+    if entry.kind == "新增":
+        badge_class = "history-badge--add"
+    elif entry.kind == "删除":
+        badge_class = "history-badge--delete"
+    else:
+        badge_class = "history-badge--update"
+    if entry.kind == "新增":
+        diff_html = f'<span class="diff-add">{_history_text(entry.translated_text)}</span>'
+        source_note = f'<div class="history-entry__source">原文：{_history_text(entry.source_text)}</div>'
+    elif entry.kind == "删除":
+        diff_html = _history_inline_diff_html(entry.before_text, "")
+        source_note = f'<div class="history-entry__source">原文：{_history_text(entry.source_text)}</div>'
+    else:
+        diff_html = _history_inline_diff_html(entry.before_text, entry.translated_text)
+        source_note = ""
+    return f"""
+    <div class="history-entry">
+      <div class="history-entry__head">
+        <span class="history-badge {badge_class}">{html.escape(entry.kind)}</span>
+        <span class="history-entry__title">{html.escape(_history_entry_title(entry))}</span>
+      </div>
+      <div class="history-entry__meta">{html.escape(_history_entry_meta(entry))}</div>
+      <div class="history-entry__diff">{diff_html}</div>
+      {source_note}
+    </div>
+    """
+
+
+def _render_history_html(commits_oldest_first: tuple[GitCommit, ...], entries: list[TranslationLogEntry]) -> str:
+    if not commits_oldest_first:
+        return _history_state_html("没有选中提交", "请从左侧选择一个或多个提交。")
+    if not entries:
+        detail = f"{len(commits_oldest_first)} 次提交在合并后没有留下最终译文差异。"
+        return _history_state_html("所选范围没有最终变更", detail)
+
+    file_counts: Counter[str] = Counter(entry.file_rel for entry in entries)
+    add_count = sum(1 for entry in entries if entry.kind == "新增")
+    delete_count = sum(1 for entry in entries if entry.kind == "删除")
+    update_count = len(entries) - add_count - delete_count
+    top_files = "、".join(f"{Path(file_rel).name} {count}" for file_rel, count in file_counts.most_common(3))
+    note = f"变更：{_history_change_phrase(add_count, update_count, delete_count)}；涉及 {_history_files_phrase(file_counts)}。"
+    if len(commits_oldest_first) == 1:
+        scope = commits_oldest_first[0].short_hash
+    else:
+        scope = f"{commits_oldest_first[0].short_hash} → {commits_oldest_first[-1].short_hash}"
+
+    grouped: dict[str, list[TranslationLogEntry]] = {}
+    for entry in entries:
+        grouped.setdefault(entry.file_rel, []).append(entry)
+    sections: list[str] = []
+    for file_rel, file_entries in sorted(grouped.items(), key=lambda item: (-len(item[1]), item[0].lower())):
+        entry_html = "".join(_render_history_entry(entry) for entry in sorted(file_entries, key=_history_entry_sort_key))
+        sections.append(
+            f"""
+            <section class="history-file">
+              <div class="history-file__name">{html.escape(file_rel)}</div>
+              {entry_html}
+            </section>
+            """
+        )
+
+    title = (
+        f"{len(commits_oldest_first)} 次提交 · {len(entries)} 条最终变更 · "
+        f"新增 {add_count} · 修订 {update_count} · 删除 {delete_count} · {len(file_counts)} 个文件"
+    )
+    return f"""
+    <html>
+      <head>
+        <style>
+          body.history-root {{
+            background: #fbf1c7;
+            color: #3c3836;
+            font-family: "Segoe UI", "Microsoft YaHei UI";
+            margin: 0;
+          }}
+          .history-summary, .history-state {{
+            background: #f2e5bc;
+            border: 2px solid #bdae93;
+            border-radius: 10px;
+            padding: 14px 16px;
+            margin-bottom: 16px;
+          }}
+          .history-state--error {{
+            background: #f2d8d8;
+            border-color: #cc241d;
+          }}
+          .history-state__title, .history-summary__title {{
+            font-size: 16px;
+            font-weight: 900;
+          }}
+          .history-state__detail, .history-summary__meta, .history-summary__note {{
+            margin-top: 6px;
+            color: #665c54;
+            font-weight: 600;
+          }}
+          .history-summary__note {{
+            color: #3c3836;
+          }}
+          .history-file {{
+            margin-top: 14px;
+          }}
+          .history-file__name {{
+            background: #d5c4a1;
+            border: 2px solid #3c3836;
+            border-radius: 8px;
+            font-size: 14px;
+            font-weight: 900;
+            padding: 5px 9px;
+            margin-bottom: 8px;
+          }}
+          .history-entry {{
+            background: #f9efc9;
+            border: 1px solid #d5c4a1;
+            border-radius: 8px;
+            padding: 8px 10px;
+            margin-bottom: 8px;
+          }}
+          .history-entry__head {{
+            display: block;
+            margin-bottom: 2px;
+          }}
+          .history-entry__title {{
+            font-weight: 900;
+            font-size: 13px;
+          }}
+          .history-entry__meta {{
+            color: #7c6f64;
+            font-size: 11px;
+            font-weight: 700;
+            margin-bottom: 6px;
+          }}
+          .history-entry__diff {{
+            background: #fbf1c7;
+            border: 1px solid #d5c4a1;
+            border-radius: 6px;
+            padding: 6px 8px;
+            white-space: pre-wrap;
+            word-break: break-word;
+            line-height: 1.5;
+            font-size: 13px;
+          }}
+          .history-entry__source {{
+            margin-top: 5px;
+            color: #7c6f64;
+            font-size: 11px;
+            font-weight: 600;
+            white-space: pre-wrap;
+            word-break: break-word;
+          }}
+          .history-badge {{
+            display: inline-block;
+            border-radius: 999px;
+            padding: 1px 7px;
+            margin-right: 7px;
+            font-size: 11px;
+            font-weight: 900;
+          }}
+          .history-badge--add {{
+            background: #d8f0d2;
+            color: #076678;
+          }}
+          .history-badge--update {{
+            background: #f5d6d6;
+            color: #9d0006;
+          }}
+          .history-badge--delete {{
+            background: #f5d6d6;
+            color: #9d0006;
+          }}
+          .diff-del {{
+            background: #f5d6d6;
+            color: #9d0006;
+            border-radius: 3px;
+            padding: 0 1px;
+            text-decoration: line-through;
+            text-decoration-thickness: 2px;
+          }}
+          .diff-add {{
+            background: #b8bb26;
+            color: #1d2021;
+            border-radius: 3px;
+            padding: 0 1px;
+          }}
+          .diff-empty {{
+            color: #928374;
+            font-style: italic;
+          }}
+        </style>
+      </head>
+      <body class="history-root">
+        <section class="history-summary">
+          <div class="history-summary__title">{html.escape(title)}</div>
+          <div class="history-summary__note">{html.escape(note)}</div>
+          <div class="history-summary__meta">选中范围：{html.escape(scope)}</div>
+          <div class="history-summary__meta">主要文件：{html.escape(top_files)}</div>
+        </section>
+        {''.join(sections)}
+      </body>
+    </html>
+    """
+
+
 def _issue_badge(unit: TranslationUnit) -> str:
     issues = unit.issues()
     errors = sum(issue.blocks_save for issue in issues)
@@ -1997,22 +2591,25 @@ def _issue_badge(unit: TranslationUnit) -> str:
     return f"!{warnings}" if warnings else "—"
 
 
-def _format_diff_parts(unit: TranslationUnit) -> list[tuple[str, str]]:
-    """Return source-relative format changes in the same visual language as Git."""
+def _format_token_deltas(unit: TranslationUnit) -> tuple[Counter[str], Counter[str], Counter[str], Counter[str]]:
     source_hard, source_color = split_soft_color_tokens(_format_tokens_for_diff(unit.source_text))
     target_hard, target_color = split_soft_color_tokens(_format_tokens_for_diff(unit.current_text))
-    parts: list[tuple[str, str]] = []
-    parts.extend(("!", token) for token in _counter_tokens(source_hard - target_hard))
-    parts.extend(("-", token) for token in _counter_tokens(source_color - target_color))
-    parts.extend(("+", token) for token in _counter_tokens(target_hard - source_hard))
-    parts.extend(("+", token) for token in _counter_tokens(target_color - source_color))
+    return (
+        source_hard - target_hard,
+        target_hard - source_hard,
+        source_color - target_color,
+        target_color - source_color,
+    )
 
-    known_prefixes = ("缺少格式标记", "新增格式标记", "颜色标记不一致")
-    for issue in unit.issues():
-        if issue.message.startswith(known_prefixes):
-            continue
-        marker = "!" if issue.blocks_save else "~"
-        parts.append((marker, _short_issue_name(issue.message)))
+
+def _format_diff_parts(unit: TranslationUnit) -> list[tuple[str, str]]:
+    """Return full token-level differences for tooltips and detail views."""
+    missing, extra, missing_color, extra_color = _format_token_deltas(unit)
+    parts: list[tuple[str, str]] = []
+    parts.extend(("!", token) for token in _counter_tokens(missing))
+    parts.extend(("-", token) for token in _counter_tokens(missing_color))
+    parts.extend(("+", token) for token in _counter_tokens(extra))
+    parts.extend(("+", token) for token in _counter_tokens(extra_color))
     return parts or [("✓", "")]
 
 
@@ -2023,35 +2620,50 @@ def _counter_tokens(counter: Counter[str]) -> list[str]:
     return values
 
 
-def _short_issue_name(message: str) -> str:
-    if "字库缺字" in message:
-        return "FONT"
-    if "双引号" in message:
-        return '"'
-    if "中文引号" in message:
-        return '"'
-    if "单个 %" in message:
-        return "%"
-    if "编码" in message:
-        return "ENC"
-    return "ERR" if "error" in message.lower() else "WARN"
+FORMAT_INFO_CODES = {"source-format-suspect", "format-fallback"}
+FORMAT_ERROR_CODES = {"unknown-format", "dbt-quote"}
 
 
-def _compact_token(token: str) -> str:
-    return token if len(token) <= 11 else token[:10] + "…"
+def _format_indicator(unit: TranslationUnit) -> tuple[str, str]:
+    issues = unit.issues()
+    if not issues:
+        return "✓", "格式正常"
+    if any(issue.blocks_save for issue in issues):
+        return "!", "存在阻止保存的格式问题"
+
+    codes = {issue.code for issue in issues}
+    if (
+        any(code in FORMAT_ERROR_CODES or code.startswith("argument-") for code in codes)
+        or any("编码" in issue.message for issue in issues)
+    ):
+        return "!", "存在高优先级格式风险"
+    if codes and codes.issubset(FORMAT_INFO_CODES):
+        return "~", "原文格式可疑"
+    return "?", "存在格式警告"
 
 
 def _format_diff_text(unit: TranslationUnit) -> str:
-    return " ".join(marker + content for marker, content in _format_diff_parts(unit))
+    return _format_indicator(unit)[1]
 
 
 def _format_diff_tooltip(unit: TranslationUnit) -> str:
     source_tokens = format_counter_items(_format_tokens_for_diff(unit.source_text)) or "（原文无格式标记）"
+    summary = _format_diff_text(unit)
     parts = _format_diff_parts(unit)
+    lines = [f"摘要：{summary}", f"原文格式：{source_tokens}"]
     if parts == [("✓", "")]:
-        return f"原文格式：{source_tokens}\n译文与原文格式一致"
-    difference = " ".join(marker + content for marker, content in parts)
-    return f"按原文格式比较：{source_tokens}\n差异：{difference}"
+        lines.append("格式差异：无")
+    else:
+        difference = " ".join(marker + content for marker, content in parts)
+        lines.append(f"格式差异：{difference}")
+    issue_lines = [
+        issue.message
+        for issue in unit.issues()
+        if issue.code not in {"format-missing", "format-extra", "format-color-missing", "format-color-extra"}
+    ]
+    if issue_lines:
+        lines.append("提示：" + "；".join(issue_lines))
+    return "\n".join(lines)
 
 
 def _format_tokens_for_diff(text: str) -> Counter[str]:
@@ -2101,7 +2713,10 @@ def apply_modern_style(app: QApplication) -> None:
         QTableView::item { background: transparent; border-bottom: 1px solid #d5c4a1; padding: 2px 4px; }
         QTableView::item:selected { background: #b8bb26; color: #3c3836; }
         QHeaderView::section { background: #d79921; color: #3c3836; border: 0; border-right: 2px solid #3c3836; border-bottom: 3px solid #3c3836; padding: 8px; font-weight: 900; }
-        QPlainTextEdit { background: #fbf1c7; border: 0; padding: 8px; selection-background-color: #b8bb26; selection-color: #3c3836; }
+        QPlainTextEdit, QTextBrowser { background: #fbf1c7; border: 0; padding: 8px; selection-background-color: #b8bb26; selection-color: #3c3836; }
+        QListWidget { background: #fbf1c7; border: 3px solid #3c3836; border-radius: 8px; padding: 3px; font-size: 12px; }
+        QListWidget::item { padding: 4px 7px; border-radius: 4px; }
+        QListWidget::item:selected { background: #b8bb26; color: #3c3836; }
         QLineEdit, QComboBox { background: #f2e5bc; border: 2px solid #3c3836; border-radius: 5px; padding: 5px 7px; min-height: 20px; font-weight: 600; }
         QLineEdit:focus, QComboBox:focus { border: 3px solid #458588; }
         QComboBox QAbstractItemView { background: #f2e5bc; border: 2px solid #3c3836; selection-background-color: #b8bb26; selection-color: #3c3836; }
@@ -2118,6 +2733,9 @@ def apply_modern_style(app: QApplication) -> None:
         QMenu::item:selected { background: #b8bb26; color: #3c3836; }
         QMenu::separator { height: 1px; background: #bdae93; margin: 6px 8px; }
         QDialog#suggestionDialog { background: #ebdbb2; border: 3px solid #3c3836; }
+        QDialog#historyDialog { background: #ebdbb2; }
+        #historyHint { color: #665c54; font-weight: 700; padding-bottom: 4px; }
+        #historyContent { border: 3px solid #3c3836; border-radius: 8px; }
         #suggestionStatus { color: #665c54; font-weight: 700; }
         QToolTip { background: #3c3836; color: #fbf1c7; border: 2px solid #d79921; padding: 5px; font-weight: 700; }
         QStatusBar { background: #ebdbb2; color: #3c3836; font-weight: 700; }

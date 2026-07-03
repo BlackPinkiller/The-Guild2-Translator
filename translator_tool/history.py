@@ -9,6 +9,8 @@ class UnitChange:
     uid: str
     before: str
     after: str
+    before_deleted: bool = False
+    after_deleted: bool = False
 
 
 @dataclass(frozen=True)
@@ -44,21 +46,21 @@ class OperationHistory:
         self._undo.append(operation)
         self._redo.clear()
 
-    def undo(self, apply: Callable[[str, str], None]) -> TranslationOperation | None:
+    def undo(self, apply: Callable[[str, str, bool], None]) -> TranslationOperation | None:
         if not self._undo:
             return None
         operation = self._undo.pop()
         for change in operation.changes:
-            apply(change.uid, change.before)
+            apply(change.uid, change.before, change.before_deleted)
         self._redo.append(operation)
         return operation
 
-    def redo(self, apply: Callable[[str, str], None]) -> TranslationOperation | None:
+    def redo(self, apply: Callable[[str, str, bool], None]) -> TranslationOperation | None:
         if not self._redo:
             return None
         operation = self._redo.pop()
         for change in operation.changes:
-            apply(change.uid, change.after)
+            apply(change.uid, change.after, change.after_deleted)
         self._undo.append(operation)
         return operation
 
