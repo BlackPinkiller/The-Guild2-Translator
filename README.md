@@ -1,72 +1,72 @@
 # The Guild 2 Translator
 
-《The Guild 2》文本翻译工具。
+[中文说明](README_zh.md)
 
-这个仓库只跟踪工具代码和编码器相关文件，不跟踪本地翻译数据和临时产物。
+Desktop editor for translating The Guild 2 language files.
 
-## 仓库里有什么
-
-- `translator_tool/`：桌面工具代码
-- `encoder/`：编解码器和数据文件
-- `Translation-Kit.txt`：格式参考
-- 启动脚本和打包脚本
-
-## 仓库里不放什么
-
-- `languages/`：本地原文和译文
-- `sources/`：源数据导出
-- `translation_review/`：临时审校产物
-- 缓存、打包输出、Codex 本地状态
-
-## 运行要求
+## Requirements
 
 - Windows
 - Python `3.12`
-- 根目录下有本地 `languages/` 和 `encoder/` 文件夹
+- A project root that contains `languages/` and `encoder/`
 
-安装依赖：
+Install dependencies:
 
 ```powershell
 py -3.12 -m pip install -r requirements.txt
 ```
 
-## 启动
+## Start
 
-直接运行：
+Recommended:
 
 ```powershell
 run_translator_tool.bat
 ```
 
-或手动启动：
+Manual launch:
 
 ```powershell
 py -3.12 -m translator_tool.app
 ```
 
-## 打包
+## Project Layout
 
-```powershell
-build_translator_tool.bat
-```
-
-打包脚本会把当前本地的 `languages/` 和 `encoder/` 一起打进桌面版构建目录。
-
-## 当前保存逻辑
-
-- `.dbt` 译文文件可以一开始不存在，保存时只写入当前实际翻译过的条目和文件
-- `Guides/*.txt` 按源文件编码和换行风格保存，不做转码
-- 删除条目只会在保存时删除译文侧内容，不会改动原文
-- 历史记录保存在 `languages/.git`
-
-## 最小目录结构
+Open a game or mod project root with this structure:
 
 ```text
-.
+<project root>/
 |-- encoder/
-|-- translator_tool/
-|-- Translation-Kit.txt
-|-- run_translator_tool.bat
-|-- build_translator_tool.bat
-`-- languages/            # 本地自备，不跟踪
+`-- languages/
+    |-- *.dbt
+    |-- Guides/
+    `-- #<language-code>/
 ```
+
+Notes:
+
+- Source `.dbt` files live directly under `languages/`
+- Target `.dbt` files live under `languages/#<language-code>/`
+- `Guides/*.txt` are handled as plain text files
+- The target language folder can start empty
+
+## Basic Workflow
+
+1. Launch the app.
+2. Open the project root.
+3. Enter the target language code, such as `#cn` or `#de`.
+4. Pick a file from the file list.
+5. Edit translations in the lower editor.
+6. Save to write only the current translation-side changes.
+
+## Editing Notes
+
+- `Ctrl+Z` and `Ctrl+Y` work inside the editor and for completed entry changes
+- Right-click a translation entry to mark it for deletion; the source text is never modified
+- `Guides/*.txt` use the document editor view instead of entry rows
+- Missing target files are created only when you save translated content
+- `Guides/*.txt` are saved with the source file's encoding and newline style
+
+## History
+
+The Update Log shows saved changes with inline diffs, so you can see exactly what changed inside each translation entry.
