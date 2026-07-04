@@ -9,7 +9,8 @@ translator_tool_cache.json
 .translator_tool/
 .codex/
 .agents/
-build/
+build*/
+.build*/
 sources/
 translation_review/
 Translation-format-FULL.txt
