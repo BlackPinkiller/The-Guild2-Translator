@@ -32,6 +32,7 @@ class AppSettings:
     auto_space_before_color_tokens_on_save: bool = False
     editor_zoom_steps: int = 0
     last_project_root: str = ""
+    last_game_root: str = ""
     recent_project_roots: list[str] = field(default_factory=list)
 
 

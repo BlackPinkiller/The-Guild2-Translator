@@ -10,7 +10,7 @@ import re
 import sys
 import threading
 import time
-from typing import Iterable
+from typing import Callable, Iterable
 
 from PySide6.QtCore import (
     QAbstractTableModel,
@@ -49,6 +49,7 @@ from PySide6.QtWidgets import (
     QMessageBox,
     QPlainTextEdit,
     QPushButton,
+    QScrollArea,
     QSplitter,
     QStyledItemDelegate,
     QStyle,
@@ -73,33 +74,32 @@ from .ai import (
 from .codec_adapter import Guild2Codec
 from .git_history import GitCommit, GitError, LanguageGit, TranslationLogEntry
 from .history import OperationHistory, TranslationOperation, UnitChange
-from .i18n import current_language, history_kind_text, set_language, status_text, translate, ui_language_options
+from .i18n import current_language, history_kind_text, set_language, status_text, todo_reason_text, translate, ui_language_options
 from .project import (
     ENABLE_FONT_GLYPH_VALIDATION,
     MISSING_WORK_STATUSES,
     Project,
     ProjectError,
-    STATUS_EMPTY,
+    TODO_REASON_SOURCE_CHANGED,
     STATUS_EXTRA,
     STATUS_IGNORED,
-    STATUS_MISSING_ROW,
-    STATUS_MODIFIED,
     STATUS_PENDING_DELETE,
-    STATUS_REVIEW,
-    STATUS_SAME,
+    STATUS_TODO,
     STATUS_TRANSLATED,
-    STATUS_TRANSLATION_ONLY,
     SaveValidationError,
     TranslationUnit,
 )
 from .settings import AppSettings, load_settings, protect_secret, reveal_secret, save_settings
 from .source_sync import (
     DEFAULT_TRANSLATION_LANGUAGE,
+    SourceProjectSpec,
+    discover_game_source_projects,
     ensure_translation_dir,
     game_languages_root,
     has_vanilla_source_entries,
     local_project_roots,
     managed_vanilla_project_root,
+    sync_source_project,
     sync_vanilla_sources,
 )
 from .validation import (
@@ -201,7 +201,10 @@ class UnitTableModel(QAbstractTableModel):
                 return translate("table.ai_tooltip")
             if index.column() == self.STATUS:
                 suffix = translate("table.status.recent_suffix") if unit.uid in self._recently_translated else ""
-                return status_text(unit.display_status()) + suffix
+                detail = ""
+                if unit.filter_status() == STATUS_TODO and unit.todo_reason:
+                    detail = "\n" + translate("issue.todo_reason_prefix", text=todo_reason_text(unit.todo_reason))
+                return status_text(unit.display_status()) + suffix + detail
         if role == Qt.ItemDataRole.BackgroundRole:
             if unit.pending_delete:
                 return QColor("#f2d6d3")
@@ -337,7 +340,7 @@ class UnitFilterProxyModel(QSortFilterProxyModel):
         if self.file_filter != FILE_FILTER_ALL and unit.file_rel != self.file_filter:
             return False
         effective_status = unit.filter_status()
-        keep_visible = source.is_recently_translated(unit) or unit.needs_review
+        keep_visible = source.is_recently_translated(unit)
         if unit.pending_delete:
             keep_visible = True
         if self.status_filter == STATUS_FILTER_TODO and effective_status not in MISSING_WORK_STATUSES and not keep_visible:
@@ -654,17 +657,11 @@ class FormatDiffDelegate(QStyledItemDelegate):
 
 class StatusBadgeDelegate(QStyledItemDelegate):
     STYLES = {
+        STATUS_TODO: ("status.todo", "#d79921", "#3c3836"),
         STATUS_TRANSLATED: ("status.translated", "#98971a", "#fbf1c7"),
-        STATUS_MODIFIED: ("status.modified", "#98971a", "#fbf1c7"),
-        STATUS_REVIEW: ("status.review", "#d79921", "#3c3836"),
-        "待新增": ("status.missing_row", "#d65d0e", "#fbf1c7"),
-        STATUS_MISSING_ROW: ("status.missing_row", "#d65d0e", "#fbf1c7"),
-        STATUS_EMPTY: ("status.empty", "#cc241d", "#fbf1c7"),
         STATUS_PENDING_DELETE: ("status.pending_delete", "#cc241d", "#fbf1c7"),
-        STATUS_SAME: ("status.same", "#d79921", "#3c3836"),
         STATUS_IGNORED: ("status.ignored", "#928374", "#fbf1c7"),
         STATUS_EXTRA: ("status.extra", "#b16286", "#fbf1c7"),
-        STATUS_TRANSLATION_ONLY: ("status.translation_only", "#689d6a", "#fbf1c7"),
     }
 
     def paint(self, painter: QPainter, option: QStyleOptionViewItem, index: QModelIndex) -> None:
@@ -1167,6 +1164,199 @@ class NewLanguageDialog(QDialog):
         return "#" + self.name_edit.text().strip().lstrip("#")
 
 
+class ProjectManagerRow(QFrame):
+    add_requested = Signal(object)
+    update_requested = Signal(object)
+
+    def __init__(self, spec: SourceProjectSpec, parent: QWidget | None = None) -> None:
+        super().__init__(parent)
+        self.setObjectName("projectManagerRow")
+        self.spec = spec
+
+        layout = QHBoxLayout(self)
+        layout.setContentsMargins(12, 10, 12, 10)
+        layout.setSpacing(12)
+
+        action_layout = QVBoxLayout()
+        action_layout.setContentsMargins(0, 0, 0, 0)
+        action_layout.setSpacing(6)
+        self.add_button = QToolButton()
+        self.add_button.setObjectName("projectAddButton")
+        self.add_button.setFixedWidth(36)
+        self.add_button.clicked.connect(lambda: self.add_requested.emit(self.spec))
+        action_layout.addWidget(self.add_button, 0, Qt.AlignmentFlag.AlignTop)
+
+        self.added_check = QCheckBox()
+        self.added_check.setEnabled(False)
+        self.added_check.setChecked(True)
+        self.added_check.setObjectName("projectAddedCheck")
+        action_layout.addWidget(self.added_check, 0, Qt.AlignmentFlag.AlignTop)
+        action_layout.addStretch(1)
+        layout.addLayout(action_layout)
+
+        details_layout = QVBoxLayout()
+        details_layout.setContentsMargins(0, 0, 0, 0)
+        details_layout.setSpacing(5)
+        header_layout = QHBoxLayout()
+        header_layout.setContentsMargins(0, 0, 0, 0)
+        header_layout.setSpacing(8)
+
+        self.name_label = QLabel()
+        self.name_label.setObjectName("projectManagerName")
+        header_layout.addWidget(self.name_label)
+
+        self.kind_badge = QLabel()
+        self.kind_badge.setObjectName("projectKindBadge")
+        header_layout.addWidget(self.kind_badge)
+
+        self.state_badge = QLabel()
+        self.state_badge.setObjectName("projectStateBadge")
+        header_layout.addWidget(self.state_badge)
+        header_layout.addStretch(1)
+        details_layout.addLayout(header_layout)
+
+        self.source_label = QLabel()
+        self.source_label.setWordWrap(True)
+        self.source_label.setObjectName("projectManagerPath")
+        details_layout.addWidget(self.source_label)
+
+        self.project_label = QLabel()
+        self.project_label.setWordWrap(True)
+        self.project_label.setObjectName("projectManagerPath")
+        details_layout.addWidget(self.project_label)
+
+        layout.addLayout(details_layout, 1)
+
+        button_layout = QVBoxLayout()
+        button_layout.setContentsMargins(0, 0, 0, 0)
+        button_layout.setSpacing(6)
+        self.update_button = QPushButton()
+        self.update_button.clicked.connect(lambda: self.update_requested.emit(self.spec))
+        button_layout.addWidget(self.update_button, 0, Qt.AlignmentFlag.AlignTop)
+        button_layout.addStretch(1)
+        layout.addLayout(button_layout)
+        self.refresh(spec)
+
+    def refresh(self, spec: SourceProjectSpec) -> None:
+        self.spec = spec
+        self.name_label.setText(spec.name)
+        self.kind_badge.setProperty("kind", spec.kind)
+        self.kind_badge.style().unpolish(self.kind_badge)
+        self.kind_badge.style().polish(self.kind_badge)
+        self.kind_badge.setText(
+            translate("project.manager.kind.vanilla")
+            if spec.kind == "vanilla"
+            else translate("project.manager.kind.mod")
+        )
+        self.state_badge.setProperty("state", "added" if spec.added else "missing")
+        self.state_badge.style().unpolish(self.state_badge)
+        self.state_badge.style().polish(self.state_badge)
+        self.state_badge.setText(
+            translate("project.manager.state.added")
+            if spec.added
+            else translate("project.manager.state.not_added")
+        )
+        self.source_label.setText(translate("project.manager.source_path", path=str(spec.source_root)))
+        self.project_label.setText(translate("project.manager.project_path", path=str(spec.project_root)))
+        self.add_button.setVisible(not spec.added)
+        self.added_check.setVisible(spec.added)
+        self.update_button.setVisible(spec.added)
+        self.update_button.setEnabled(spec.added)
+        self.add_button.setText(translate("project.manager.add_symbol"))
+        self.add_button.setToolTip(translate("project.manager.add_tooltip", name=spec.name))
+        self.update_button.setText(translate("project.manager.update"))
+        self.update_button.setToolTip(translate("project.manager.update_tooltip", name=spec.name))
+
+
+class ProjectManagerDialog(QDialog):
+    def __init__(
+        self,
+        game_root: Path,
+        app_root: Path,
+        sync_callback: Callable[[SourceProjectSpec], str],
+        parent: QWidget | None = None,
+    ) -> None:
+        super().__init__(parent)
+        self.setObjectName("projectManagerDialog")
+        self.setWindowTitle(translate("dialog.project_manager_title"))
+        self.setMinimumSize(880, 520)
+        self.game_root = game_root
+        self.app_root = app_root
+        self.sync_callback = sync_callback
+        self.rows: list[ProjectManagerRow] = []
+
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(16, 16, 16, 16)
+        layout.setSpacing(10)
+
+        self.summary_label = QLabel()
+        self.summary_label.setObjectName("projectManagerSummary")
+        self.summary_label.setWordWrap(True)
+        layout.addWidget(self.summary_label)
+
+        self.game_root_label = QLabel()
+        self.game_root_label.setObjectName("projectManagerGameRoot")
+        self.game_root_label.setText(translate("project.manager.game_root", path=str(self.game_root)))
+        self.game_root_label.setWordWrap(True)
+        layout.addWidget(self.game_root_label)
+
+        self.scroll = QScrollArea()
+        self.scroll.setWidgetResizable(True)
+        self.scroll.setFrameShape(QFrame.Shape.NoFrame)
+        self.list_container = QWidget()
+        self.list_layout = QVBoxLayout(self.list_container)
+        self.list_layout.setContentsMargins(0, 0, 0, 0)
+        self.list_layout.setSpacing(10)
+        self.scroll.setWidget(self.list_container)
+        layout.addWidget(self.scroll, 1)
+
+        self.feedback_label = QLabel()
+        self.feedback_label.setObjectName("projectManagerFeedback")
+        self.feedback_label.setWordWrap(True)
+        self.feedback_label.hide()
+        layout.addWidget(self.feedback_label)
+        self.refresh_projects()
+
+    def refresh_projects(self) -> None:
+        while self.list_layout.count():
+            item = self.list_layout.takeAt(0)
+            widget = item.widget()
+            if widget is not None:
+                widget.deleteLater()
+        self.rows.clear()
+
+        projects = discover_game_source_projects(self.game_root, self.app_root)
+        added_count = sum(project.added for project in projects)
+        self.summary_label.setText(
+            translate("project.manager.summary", total=len(projects), added=added_count)
+        )
+        if not projects:
+            empty = QLabel(translate("project.manager.empty"))
+            empty.setObjectName("hint")
+            empty.setWordWrap(True)
+            self.list_layout.addWidget(empty)
+            self.list_layout.addStretch(1)
+            return
+
+        for spec in projects:
+            row = ProjectManagerRow(spec, self.list_container)
+            row.add_requested.connect(self._sync_project)
+            row.update_requested.connect(self._sync_project)
+            self.list_layout.addWidget(row)
+            self.rows.append(row)
+        self.list_layout.addStretch(1)
+
+    def _sync_project(self, spec: SourceProjectSpec) -> None:
+        try:
+            message = self.sync_callback(spec)
+        except Exception as exc:
+            QMessageBox.warning(self, translate("dialog.project_manager_title"), str(exc))
+            return
+        self.feedback_label.setText(message)
+        self.feedback_label.show()
+        self.refresh_projects()
+
+
 class SuggestionDialog(QDialog):
     apply_translation = Signal(str)
     dismissed = Signal()
@@ -1338,10 +1528,10 @@ class TranslatorWindow(QMainWindow):
         self.setWindowTitle(translate("window.title.unloaded"))
         self.resize(1480, 920)
         self.project_root = self._startup_project_root()
-        # The active project should reopen exactly where the user left it.
-        # Game-root tracking is reserved for a future explicit update workflow,
-        # so startup should not reactivate it as if it were a separate project.
-        self.game_root = None
+        # The active local project and the source game root are tracked
+        # separately. Reopening a sources project must not forget which game
+        # install the manager should scan for Vanilla and mods.
+        self.game_root = self._startup_game_root()
         self.git: LanguageGit | None = None
         self.git_pending = False
         self.project: Project | None = None
@@ -1426,6 +1616,9 @@ class TranslatorWindow(QMainWindow):
         toolbar_layout.setSpacing(8)
         layout.addWidget(toolbar)
 
+        self.project_manager_button = QToolButton()
+        self.project_manager_button.clicked.connect(self.show_project_manager)
+        title_layout.addWidget(self.project_manager_button)
         self.project_button = QToolButton()
         self.project_button.setPopupMode(QToolButton.ToolButtonPopupMode.MenuButtonPopup)
         self.project_button.clicked.connect(self.choose_project_folder)
@@ -1769,8 +1962,14 @@ class TranslatorWindow(QMainWindow):
         return local_roots[0] if local_roots else None
 
     def _startup_game_root(self) -> Path | None:
-        # Reserved for a future explicit update/sync entry point.
-        return None
+        raw_path = self.settings.last_game_root
+        if not raw_path:
+            return None
+        try:
+            root = Path(raw_path).expanduser().resolve()
+        except OSError:
+            return None
+        return root if self._project_folder_problem(root) is None else None
 
     def _clear_loaded_project(self) -> None:
         self.project = None
@@ -1927,7 +2126,6 @@ class TranslatorWindow(QMainWindow):
                 if answer != QMessageBox.StandardButton.Yes:
                     return
         preferred = self._normalized_language_name(self.language_combo.currentText())
-        self.game_root = None
         self.project_root = root
         self._remember_project_root(root)
         choices = self._load_language_choices(preferred)
@@ -2041,6 +2239,7 @@ class TranslatorWindow(QMainWindow):
             QMessageBox.critical(self, translate("dialog.load_error"), str(exc))
             return
         self.game_root = root
+        self._remember_game_root(root)
         self.project_root = MANAGED_PROJECT_ROOT
         # Selecting a game root feeds the managed Vanilla project, but the
         # active project identity should remain Vanilla rather than the game
@@ -2052,6 +2251,73 @@ class TranslatorWindow(QMainWindow):
             return
         self.load_project(discard_changes=True)
 
+    def _choose_management_game_root(self) -> Path | None:
+        current = self.game_root or APP_ROOT
+        start_dir = current if current.is_dir() else current.parent
+        folder = QFileDialog.getExistingDirectory(self, translate("dialog.choose_project"), str(start_dir))
+        if not folder:
+            return None
+        try:
+            root = Path(folder).expanduser().resolve()
+        except OSError:
+            QMessageBox.warning(self, translate("dialog.open_project_error"), translate("folder_problem.not_dir"))
+            return None
+        problem = self._project_folder_problem(root)
+        if problem is not None:
+            QMessageBox.warning(
+                self,
+                translate("dialog.invalid_project_title"),
+                translate("dialog.invalid_project_detail", problem=problem),
+            )
+            return None
+        self.game_root = root
+        self._remember_game_root(root)
+        self._update_project_button()
+        return root
+
+    def show_project_manager(self) -> None:
+        game_root = self.game_root
+        if game_root is None or self._project_folder_problem(game_root) is not None:
+            game_root = self._choose_management_game_root()
+        if game_root is None:
+            return
+        ProjectManagerDialog(game_root, APP_ROOT, self._sync_scanned_project, self).exec()
+
+    def _sync_scanned_project(self, spec: SourceProjectSpec) -> str:
+        if self.ai_worker is not None:
+            raise RuntimeError(translate("dialog.translating_detail"))
+        active_project = False
+        if self.project_root is not None:
+            try:
+                active_project = self.project_root.resolve() == spec.project_root.resolve()
+            except OSError:
+                active_project = False
+        if active_project and self.project is not None:
+            self._commit_typing_operation()
+            if self.project.has_dirty_units():
+                raise RuntimeError(translate("dialog.project_manager_unsaved_detail", name=spec.name))
+
+        result = sync_source_project(spec.source_root, spec.project_root)
+
+        if active_project:
+            preferred = self.project.language if self.project is not None else self._normalized_language_name(self.language_combo.currentText())
+            choices = self._load_language_choices(preferred)
+            if not choices:
+                self._clear_loaded_project()
+                self._show_language_setup_hint()
+            else:
+                self.load_project(discard_changes=True)
+
+        message = translate(
+            "status.project_manager_synced",
+            name=spec.name,
+            synced=len(result.synced_source_files),
+            removed=len(result.removed_source_files),
+            invalidated=result.invalidated_units,
+        )
+        self.statusBar().showMessage(message, 7000)
+        return message
+
     def _remember_project_root(self, root: Path) -> None:
         value = str(root)
         recent = [value]
@@ -2059,19 +2325,21 @@ class TranslatorWindow(QMainWindow):
         self.settings = replace(self.settings, last_project_root=value, recent_project_roots=recent[:8])
         save_settings(self.settings)
 
+    def _remember_game_root(self, root: Path) -> None:
+        value = str(root)
+        if self.settings.last_game_root == value:
+            return
+        self.settings = replace(self.settings, last_game_root=value)
+        save_settings(self.settings)
+
     def _populate_status_choices(self) -> None:
         current = self.status_combo.currentData() or STATUS_FILTER_ALL
         choices = [
             (translate("filter.all_statuses"), STATUS_FILTER_ALL),
             (translate("filter.needs_translation"), STATUS_FILTER_TODO),
-            (status_text(STATUS_MISSING_ROW), STATUS_MISSING_ROW),
-            (status_text(STATUS_EMPTY), STATUS_EMPTY),
-            (status_text(STATUS_SAME), STATUS_SAME),
             (status_text(STATUS_TRANSLATED), STATUS_TRANSLATED),
-            (status_text(STATUS_PENDING_DELETE), STATUS_PENDING_DELETE),
-            (status_text(STATUS_IGNORED), STATUS_IGNORED),
             (status_text(STATUS_EXTRA), STATUS_EXTRA),
-            (status_text(STATUS_TRANSLATION_ONLY), STATUS_TRANSLATION_ONLY),
+            (status_text(STATUS_IGNORED), STATUS_IGNORED),
         ]
         blocker = QSignalBlocker(self.status_combo)
         self.status_combo.clear()
@@ -2111,7 +2379,14 @@ class TranslatorWindow(QMainWindow):
         self._update_window_title()
 
     def _update_project_button(self) -> None:
-        if self.project_root is not None and self.game_root is None:
+        self.project_manager_button.setText(translate("project.button.manage"))
+        if self.game_root is None:
+            self.project_manager_button.setToolTip(translate("project.button.manage_choose_tooltip"))
+        else:
+            self.project_manager_button.setToolTip(
+                translate("project.button.manage_tooltip", path=str(self.game_root))
+            )
+        if self.project_root is not None:
             self.project_button.setText(translate("project.button.current_project", name=self.project_root.name))
             self.project_button.setToolTip(str(self.project_root))
             return
@@ -2270,9 +2545,9 @@ class TranslatorWindow(QMainWindow):
         )
         git_state = translate("window.git_pending") if self.git_pending else ""
         project_name = (
-            self.game_root.name
-            if self.game_root is not None
-            else (self.project_root.name if self.project_root is not None else translate("window.project_unloaded"))
+            self.project_root.name
+            if self.project_root is not None
+            else (self.game_root.name if self.game_root is not None else translate("window.project_unloaded"))
         )
         self.setWindowTitle(translate("window.title.loaded", project=project_name, location=location, save_state=save_state, git_state=git_state))
 
@@ -2502,6 +2777,8 @@ class TranslatorWindow(QMainWindow):
         unmark_delete = menu.addAction(translate("menu.unmark_delete", suffix=suffix))
         unmark_delete.setEnabled(can_unmark_delete)
         menu.addSection(translate("menu.entry_status"))
+        confirm_current_translation = menu.addAction(translate("menu.confirm_current_translation", suffix=suffix))
+        confirm_current_translation.setEnabled(any(item.review_reason == TODO_REASON_SOURCE_CHANGED for item in units))
         ignored = menu.addAction(
             translate("menu.unmark_ignored", suffix=suffix)
             if all(item.ignored for item in units)
@@ -2529,6 +2806,8 @@ class TranslatorWindow(QMainWindow):
             self._set_units_pending_delete(units, True)
         elif action == unmark_delete:
             self._set_units_pending_delete(units, False)
+        elif action == confirm_current_translation:
+            self._set_units_source_review(units, False)
         elif action == ignored:
             self._set_units_ignored(units, not all(item.ignored for item in units))
 
@@ -2571,6 +2850,20 @@ class TranslatorWindow(QMainWindow):
         self._update_issue_detail(self._current_unit())
         self._update_window_title()
 
+    def _set_units_source_review(self, units: Iterable[TranslationUnit], source_changed: bool) -> None:
+        if self.project is None:
+            return
+        selected = tuple(units)
+        self.project.set_units_source_review(selected, source_changed)
+        for unit in selected:
+            self.model.refresh_unit(unit)
+        self._apply_filters()
+        self._update_counts()
+        self._update_issue_detail(self._current_unit())
+        self._update_window_title()
+        if not source_changed and selected:
+            self.statusBar().showMessage(translate("status.review_confirmed", count=len(selected)), 3500)
+
     def _show_ai_provider_menu(self, global_point: QPoint) -> None:
         menu = QMenu(self)
         menu.setTitle(translate("dialog.ai_service_title"))
@@ -2604,7 +2897,7 @@ class TranslatorWindow(QMainWindow):
         unit = self.model.unit_for_uid(uid)
         if unit is None or not unit.source_text:
             return
-        if unit.filter_status() not in MISSING_WORK_STATUSES and unit.current_text:
+        if unit.current_text and (unit.filter_status() not in MISSING_WORK_STATUSES or unit.requires_manual_review):
             answer = QMessageBox.question(self, translate("dialog.retranslate_title"), translate("dialog.retranslate_detail"))
             if answer != QMessageBox.StandardButton.Yes:
                 return
@@ -2615,7 +2908,7 @@ class TranslatorWindow(QMainWindow):
         units = [
             unit
             for unit in selected
-            if not unit.ignored and unit.source_text and unit.filter_status() in MISSING_WORK_STATUSES
+            if not unit.ignored and not unit.requires_manual_review and unit.source_text and unit.filter_status() in MISSING_WORK_STATUSES
         ]
         if not units:
             QMessageBox.information(
@@ -2701,7 +2994,7 @@ class TranslatorWindow(QMainWindow):
         units: list[TranslationUnit] = []
         for row in range(self.proxy.rowCount()):
             unit = self._unit_from_proxy_index(self.proxy.index(row, 0))
-            if unit and unit.source_text and unit.filter_status() in MISSING_WORK_STATUSES:
+            if unit and not unit.requires_manual_review and unit.source_text and unit.filter_status() in MISSING_WORK_STATUSES:
                 units.append(unit)
         if not units:
             QMessageBox.information(self, translate("dialog.batch_ai_title"), translate("dialog.batch_ai_empty"))
@@ -2832,6 +3125,11 @@ class TranslatorWindow(QMainWindow):
         except SaveValidationError as exc:
             QMessageBox.warning(self, translate("dialog.save_blocked"), "\n".join(exc.messages[:20]))
             return
+        reviewed = tuple(
+            unit for unit in (*result.saved_units, *result.deleted_units) if unit.review_reason == TODO_REASON_SOURCE_CHANGED
+        )
+        if reviewed:
+            self.project.set_units_source_review(reviewed, False)
         format_warning_count = sum(
             1
             for unit in result.saved_units
@@ -2948,6 +3246,8 @@ class TranslatorWindow(QMainWindow):
         summary = _format_diff_text(unit)
         if summary != translate("issue.format_ok"):
             parts.append(translate("issue.summary_prefix", text=summary))
+        if unit.filter_status() == STATUS_TODO and unit.todo_reason:
+            parts.append(translate("issue.todo_reason_prefix", text=todo_reason_text(unit.todo_reason)))
         if errors:
             parts.append(translate("issue.error_prefix", text=_localized_detail_join(errors)))
         if warnings:
@@ -2986,6 +3286,7 @@ class TranslatorWindow(QMainWindow):
 
 
 def _search_blob(unit: TranslationUnit) -> str:
+    todo_reason = todo_reason_text(unit.todo_reason) if unit.todo_reason else ""
     return "\n".join(
         (
             unit.file_rel,
@@ -2995,7 +3296,9 @@ def _search_blob(unit: TranslationUnit) -> str:
             unit.source_text,
             unit.current_text,
             unit.status,
+            unit.filter_status(),
             status_text(unit.display_status()),
+            todo_reason,
         )
     ).lower()
 
@@ -3505,6 +3808,19 @@ def apply_modern_style(app: QApplication) -> None:
         #counts { background: #fbf1c7; border: 2px solid #3c3836; border-radius: 6px; color: #3c3836; font-weight: 800; padding: 5px 8px; }
         #issues { background: #d3869b; border: 3px solid #3c3836; border-radius: 7px; padding: 8px 10px; color: #3c3836; font-weight: 600; }
         #hint { color: #3c3836; padding: 4px 0; font-weight: 600; }
+        #projectManagerDialog { background: #ebdbb2; }
+        #projectManagerSummary { background: #fbf1c7; border: 2px solid #3c3836; border-radius: 8px; padding: 8px 10px; font-weight: 800; }
+        #projectManagerGameRoot { background: #f2e5bc; border: 2px solid #bdae93; border-radius: 8px; padding: 7px 10px; font-weight: 700; }
+        #projectManagerRow { background: #fbf1c7; border: 3px solid #3c3836; border-radius: 10px; }
+        #projectManagerName { font-size: 15px; font-weight: 900; }
+        #projectKindBadge, #projectStateBadge { border-radius: 9px; padding: 3px 9px; font-weight: 900; }
+        #projectKindBadge[kind="vanilla"] { background: #458588; color: #fbf1c7; }
+        #projectKindBadge[kind="mod"] { background: #689d6a; color: #fbf1c7; }
+        #projectStateBadge[state="added"] { background: #b8bb26; color: #3c3836; }
+        #projectStateBadge[state="missing"] { background: #d79921; color: #3c3836; }
+        #projectManagerPath { color: #665c54; font-weight: 600; }
+        #projectManagerFeedback { background: #dce5b5; border: 2px solid #3c3836; border-radius: 8px; padding: 8px 10px; font-weight: 700; }
+        #projectAddButton { font-size: 18px; min-width: 36px; }
         QGroupBox { background: #fbf1c7; border: 3px solid #3c3836; border-radius: 8px; margin-top: 14px; padding-top: 8px; font-weight: 900; color: #3c3836; }
         QGroupBox::title { subcontrol-origin: margin; subcontrol-position: top left; left: 12px; padding: 0 6px; background: #fbf1c7; }
         QTableView { background: #fbf1c7; border: 3px solid #3c3836; border-radius: 8px; gridline-color: #928374; selection-background-color: #b8bb26; selection-color: #3c3836; }

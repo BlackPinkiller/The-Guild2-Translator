@@ -4,7 +4,7 @@ from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Iterable
 
-from .cache import ignored_uids, set_ignored_many
+from .cache import ignored_uids, set_ignored_many, set_source_review_many, source_review_uids
 from .codec_adapter import CodecError, Guild2Codec, load_codec_for_language
 from .format_io import (
     DbtDocument,
@@ -24,17 +24,28 @@ from .validation import ValidationIssue, issue_summary, validate_translation
 from .validation import normalize_color_token_spacing
 
 
-STATUS_MISSING_ROW = "译文缺行"
-STATUS_EMPTY = "译文为空"
-STATUS_SAME = "未翻译(同原文)"
+STATUS_TODO = "待翻译"
 STATUS_TRANSLATED = "已翻译"
-STATUS_MODIFIED = "已修改"
-STATUS_REVIEW = "需审核"
-STATUS_EXTRA = "译文多余"
-STATUS_TRANSLATION_ONLY = "仅译文文件"
+STATUS_EXTRA = "多余"
 STATUS_IGNORED = "无需翻译"
 STATUS_PENDING_DELETE = "待删除"
-MISSING_WORK_STATUSES = {STATUS_MISSING_ROW, STATUS_EMPTY, STATUS_SAME}
+
+TODO_REASON_NONE = ""
+TODO_REASON_MISSING_ROW = "missing_row"
+TODO_REASON_EMPTY = "empty"
+TODO_REASON_SAME_AS_SOURCE = "same_as_source"
+TODO_REASON_SOURCE_CHANGED = "source_changed"
+TODO_REASON_IMPORT_REVIEW = "import_review"
+MANUAL_REVIEW_REASONS = {TODO_REASON_SOURCE_CHANGED, TODO_REASON_IMPORT_REVIEW}
+MISSING_WORK_STATUSES = {STATUS_TODO}
+# Temporary compatibility aliases while the UI and tests finish migrating to
+# the simplified status model.
+STATUS_MISSING_ROW = STATUS_TODO
+STATUS_EMPTY = STATUS_TODO
+STATUS_SAME = STATUS_TODO
+STATUS_MODIFIED = STATUS_TRANSLATED
+STATUS_REVIEW = STATUS_TODO
+STATUS_TRANSLATION_ONLY = STATUS_EXTRA
 NON_TRANSLATION_DBT_FILES = {"tables.dbt"}
 # Internal compatibility switch.  Other game adapters can disable this until
 # they provide a font/character codec with equivalent coverage.
@@ -91,7 +102,7 @@ class TranslationUnit:
     font_codec: Guild2Codec | None = field(default=None, repr=False)
     edited_text: str | None = None
     ignored: bool = False
-    needs_review: bool = False
+    review_reason: str = TODO_REASON_NONE
     pending_delete: bool = False
 
     @property
@@ -100,15 +111,13 @@ class TranslationUnit:
 
     @property
     def is_dirty(self) -> bool:
-        # A label fallback is staged as a new source-row translation. It must
-        # be saved into the source row's own ID, label, and physical position.
-        return self.pending_delete or self.needs_review or (self.edited_text is not None and self.edited_text != self.translate_text)
+        return (
+            self.pending_delete
+            or self.review_reason == TODO_REASON_IMPORT_REVIEW
+            or (self.edited_text is not None and self.edited_text != self.translate_text)
+        )
 
     def set_text(self, text: str) -> None:
-        # Label fallback is a one-time import hint. Once a translator touches
-        # the text, their edit is the review decision and the hint is cleared.
-        if self.needs_review and text != self.current_text:
-            self.needs_review = False
         if self.pending_delete and text != self.current_text:
             self.pending_delete = False
         self.edited_text = None if text == self.translate_text else text
@@ -120,33 +129,48 @@ class TranslationUnit:
         if self.ref.kind == "dbt":
             return self.ref.target_row is not None or self.ref.suggested_row is not None
         if self.ref.kind == "text":
-            return self.ref.target_doc.path.exists() or self.status == STATUS_TRANSLATION_ONLY
+            return self.ref.target_doc.path.exists() or self.status == STATUS_EXTRA
         return False
 
-    def current_status(self) -> str:
-        """Classify the visible translation text, including unsaved edits."""
-        if self.pending_delete:
-            return STATUS_PENDING_DELETE
-        if self.ignored:
-            return STATUS_IGNORED
-        # These entries have no corresponding source entry, so an edit cannot
-        # turn them into a regular translated source entry.
-        if self.status in {STATUS_EXTRA, STATUS_TRANSLATION_ONLY}:
-            return self.status
-        if not self.source_text and self.status == STATUS_IGNORED:
-            return STATUS_IGNORED
-        if self.status == STATUS_MISSING_ROW and not self.is_dirty:
-            return STATUS_MISSING_ROW
+    @property
+    def is_ignored(self) -> bool:
+        return self.ignored or self.status == STATUS_IGNORED
+
+    @property
+    def is_extra(self) -> bool:
+        return self.status == STATUS_EXTRA
+
+    @property
+    def requires_manual_review(self) -> bool:
+        return self.review_reason in MANUAL_REVIEW_REASONS
+
+    @property
+    def todo_reason(self) -> str:
+        if self.is_ignored or self.is_extra:
+            return TODO_REASON_NONE
+        if self.review_reason:
+            return self.review_reason
         if not self.current_text:
-            return STATUS_EMPTY
+            if self.ref.kind == "dbt" and self.ref.target_row is None and self.ref.suggested_row is None and not self.translate_text:
+                return TODO_REASON_MISSING_ROW
+            return TODO_REASON_EMPTY
         if self.current_text == self.source_text:
-            return STATUS_SAME
+            return TODO_REASON_SAME_AS_SOURCE
+        return TODO_REASON_NONE
+
+    def current_status(self) -> str:
+        if self.is_ignored:
+            return STATUS_IGNORED
+        if self.is_extra:
+            return STATUS_EXTRA
+        if self.todo_reason != TODO_REASON_NONE:
+            return STATUS_TODO
         return STATUS_TRANSLATED
 
     def issues(self) -> list[ValidationIssue]:
         if self.pending_delete:
             return self.initial_issues
-        if self.ignored and not self.is_dirty:
+        if self.is_ignored and not self.is_dirty:
             return self.initial_issues
         dbt_field = self.ref.kind == "dbt"
         return self.initial_issues + validate_translation(
@@ -162,13 +186,6 @@ class TranslationUnit:
     def display_status(self) -> str:
         if self.pending_delete:
             return STATUS_PENDING_DELETE
-        # A label-based match can preserve useful existing translations across
-        # modded files whose numeric IDs have shifted. It remains visible as a
-        # review item while retaining its translated filter classification.
-        if self.needs_review:
-            return STATUS_REVIEW
-        if self.is_dirty and self.status == STATUS_TRANSLATED:
-            return STATUS_MODIFIED
         return self.current_status()
 
     def filter_status(self) -> str:
@@ -285,8 +302,11 @@ class Project:
         )
 
         ignored = ignored_uids(root, language)
+        source_review = source_review_uids(root, language)
         for unit in units:
             unit.ignored = unit.uid in ignored
+            if unit.uid in source_review:
+                unit.review_reason = TODO_REASON_SOURCE_CHANGED
 
         unit_index = {unit.uid: unit for unit in units}
         insertion_anchors = {
@@ -342,6 +362,16 @@ class Project:
             unit.ignored = ignored
         if selected:
             set_ignored_many(self.root, self.language, tuple(unit.uid for unit in selected), ignored)
+
+    def set_units_source_review(self, units: Iterable[TranslationUnit], source_changed: bool) -> None:
+        selected = tuple(units)
+        for unit in selected:
+            if source_changed:
+                unit.review_reason = TODO_REASON_SOURCE_CHANGED
+            elif unit.review_reason == TODO_REASON_SOURCE_CHANGED:
+                unit.review_reason = TODO_REASON_NONE
+        if selected:
+            set_source_review_many(self.root, self.language, tuple(unit.uid for unit in selected), source_changed)
 
     def save(
         self, units: Iterable[TranslationUnit] | None = None, *, auto_space_before_color_tokens: bool = False
@@ -550,7 +580,7 @@ def build_dbt_units(
                 status = STATUS_IGNORED
             elif translation_row is None:
                 translate_text = ""
-                status = STATUS_MISSING_ROW
+                status = STATUS_TODO
             else:
                 raw_value = translation_row.get(target_field)
                 if codec is None:
@@ -563,10 +593,8 @@ def build_dbt_units(
                         initial_issues.append(ValidationIssue("error", str(exc)))
                 if source_text == "" and translate_text == "":
                     status = STATUS_IGNORED
-                elif translate_text == "":
-                    status = STATUS_EMPTY
-                elif translate_text == source_text:
-                    status = STATUS_SAME
+                elif translate_text == "" or translate_text == source_text:
+                    status = STATUS_TODO
                 else:
                     status = STATUS_TRANSLATED
             units.append(
@@ -595,7 +623,7 @@ def build_dbt_units(
                     ),
                     initial_issues=initial_issues,
                     font_codec=codec,
-                    needs_review=matched_by_label,
+                    review_reason=TODO_REASON_IMPORT_REVIEW if matched_by_label else TODO_REASON_NONE,
                 )
             )
 
@@ -651,13 +679,11 @@ def build_plain_text_unit(
     translate_text = text_doc.text
     source_text = source_doc.text if source_doc is not None else ""
     if source_doc is None:
-        status = STATUS_TRANSLATION_ONLY
+        status = STATUS_EXTRA
     elif source_text == "" and translate_text == "":
         status = STATUS_IGNORED
-    elif translate_text == "":
-        status = STATUS_EMPTY
-    elif translate_text == source_text:
-        status = STATUS_SAME
+    elif translate_text == "" or translate_text == source_text:
+        status = STATUS_TODO
     else:
         status = STATUS_TRANSLATED
     return TranslationUnit(

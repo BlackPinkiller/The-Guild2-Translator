@@ -13,24 +13,33 @@ import uuid
 from . import project as project_module
 from . import settings as settings_module
 from .ai import GoogleTranslateProvider, OpenAICompatibleProvider, TranslationProviderError
+from .cache import source_review_uids
 from .codec_adapter import Guild2Codec, load_codec_for_language
 from .git_history import GitCommit, LanguageGit, TranslationLogEntry, combine_entries, format_entries
 from .history import OperationHistory, TranslationOperation, UnitChange
 from .i18n import set_language, status_text, translate
-from .format_io import load_dbt, load_plain_text, row_key
+from .format_io import load_dbt, load_plain_text, matching_source_field, row_key
 from .project import (
     MISSING_WORK_STATUSES,
     Project,
-    STATUS_EMPTY,
     STATUS_EXTRA,
-    STATUS_MISSING_ROW,
-    STATUS_MODIFIED,
+    STATUS_IGNORED,
     STATUS_PENDING_DELETE,
-    STATUS_REVIEW,
+    STATUS_TODO,
     STATUS_TRANSLATED,
+    TODO_REASON_EMPTY,
+    TODO_REASON_IMPORT_REVIEW,
+    TODO_REASON_MISSING_ROW,
+    TODO_REASON_SOURCE_CHANGED,
 )
 from .settings import AppSettings, load_settings, save_settings
-from .source_sync import local_project_roots, managed_vanilla_project_root, sync_vanilla_sources
+from .source_sync import (
+    discover_game_source_projects,
+    local_project_roots,
+    managed_vanilla_project_root,
+    sync_source_project,
+    sync_vanilla_sources,
+)
 from .validation import format_tokens, normalize_color_token_spacing, validate_translation
 
 
@@ -62,10 +71,15 @@ def assert_round_trip(root: Path) -> None:
 
 def assert_statuses(root: Path) -> None:
     project = Project.load(root, "#chinese", codec_root=tool_root())
-    if not any(unit.file_rel == "Text.dbt" and unit.status == STATUS_MISSING_ROW for unit in project.units):
-        raise AssertionError("Text.dbt missing rows were not detected")
-    if not any(unit.status in MISSING_WORK_STATUSES for unit in project.units):
-        raise AssertionError("missing-work filter would be empty")
+    if not any(unit.file_rel == "Text.dbt" and unit.filter_status() == STATUS_TRANSLATED for unit in project.units):
+        raise AssertionError("Text.dbt translated rows were not loaded")
+    invalid_statuses = {
+        unit.filter_status()
+        for unit in project.units
+        if unit.filter_status() not in {STATUS_TODO, STATUS_TRANSLATED, STATUS_EXTRA, STATUS_IGNORED}
+    }
+    if invalid_statuses:
+        raise AssertionError(f"unexpected simplified statuses were exposed: {sorted(invalid_statuses)!r}")
     if (root / "languages" / "Guides").exists() and not any(
         unit.file_rel.startswith("Guides/") and unit.source_text for unit in project.units
     ):
@@ -143,12 +157,12 @@ def assert_sync_vanilla_sources_only_imports_originals() -> None:
             raise AssertionError("vanilla DBT source was not copied into the managed project")
         if (languages_root / "Guides" / "Intro.txt").read_text(encoding="utf-8") != "guide-source":
             raise AssertionError("vanilla guide source was not copied into the managed project")
-        if (languages_root / "#manual").exists():
-            raise AssertionError("switching the game root should clear previous translation folders")
+        if not (languages_root / "#manual").exists():
+            raise AssertionError("sync should preserve existing translation folders")
         if (languages_root / "#chinese").exists():
             raise AssertionError("sync should not auto-create a default translation folder")
-        if (languages_root / ".git").exists():
-            raise AssertionError("switching the game root should reset the managed language git repository")
+        if not (languages_root / ".git").exists():
+            raise AssertionError("sync should preserve the managed language git repository")
         if not (languages_root / ".gitignore").exists():
             raise AssertionError("app-side metadata files should be preserved during vanilla sync")
     finally:
@@ -171,6 +185,101 @@ def assert_local_project_roots_detect_sources_projects() -> None:
             raise AssertionError(f"local source projects were not discovered correctly: {names!r}")
     finally:
         safe_rmtree(temp)
+
+
+def assert_discover_game_source_projects_detects_vanilla_and_mods() -> None:
+    temp = Path(tempfile.gettempdir()) / f"translator_tool_smoke_game_projects_{uuid.uuid4().hex[:8]}"
+    try:
+        game_root = temp / "game"
+        (game_root / "DB" / "Languages").mkdir(parents=True, exist_ok=True)
+        (game_root / "DB" / "Languages" / "Text.dbt").write_text("source", encoding="utf-8")
+        (game_root / "mods" / "Reforged" / "DB" / "Languages").mkdir(parents=True, exist_ok=True)
+        (game_root / "mods" / "Reforged" / "DB" / "Languages" / "Text.dbt").write_text("mod-source", encoding="utf-8")
+        (game_root / "mods" / "TranslationOnly" / "DB" / "Languages").mkdir(parents=True, exist_ok=True)
+        (game_root / "mods" / "TranslationOnly" / "DB" / "Languages" / "Text.dbt").write_text("skip", encoding="utf-8")
+        (game_root / "mods" / "TranslationOnly" / "modinfo.txt").write_text("Type=Translation\n", encoding="utf-8")
+        (game_root / "mods" / "NoLanguages").mkdir(parents=True, exist_ok=True)
+        app_root = temp / "app"
+
+        projects = discover_game_source_projects(game_root, app_root)
+        names = [(project.name, project.kind, project.added) for project in projects]
+        if names != [("Vanilla", "vanilla", False), ("Reforged", "mod", False)]:
+            raise AssertionError(f"game project discovery returned unexpected entries: {names!r}")
+
+        (app_root / "sources" / "Reforged" / "languages").mkdir(parents=True, exist_ok=True)
+        (app_root / "sources" / "Reforged" / "languages" / "Text.dbt").write_text("cached", encoding="utf-8")
+        projects = discover_game_source_projects(game_root, app_root)
+        reforged = next(project for project in projects if project.name == "Reforged")
+        if not reforged.added:
+            raise AssertionError("existing local project should be marked as added")
+    finally:
+        safe_rmtree(temp)
+
+
+def assert_sync_source_project_invalidates_changed_translations(root: Path) -> None:
+    temp = Path(tempfile.gettempdir()) / f"translator_tool_smoke_source_update_{uuid.uuid4().hex[:8]}"
+    try:
+        project_root = temp / "app" / "sources" / "Reforged"
+        source_root = temp / "game" / "DB" / "Languages"
+        copy_project_subset(root, project_root)
+        source_root.mkdir(parents=True, exist_ok=True)
+        for name in ["Text.dbt", "Tooltips.dbt"]:
+            shutil.copy2(root / "languages" / name, source_root / name)
+
+        project = Project.load(project_root, "#chinese", codec_root=tool_root())
+        unit = next(
+            item
+            for item in project.units
+            if item.ref.kind == "dbt" and item.status == STATUS_TRANSLATED and item.source_text and item.translate_text
+        )
+        source_doc = load_dbt(source_root / unit.file_rel)
+        target_field = unit.ref.target_field
+        source_field = matching_source_field(target_field, source_doc.string_columns)
+        key = (int(unit.record_id), unit.label)
+        source_row = source_doc.row_index.get(key)
+        if source_row is None:
+            raise AssertionError(f"could not find source row for {unit.uid}")
+        source_row.set_raw(source_field, source_row.get(source_field) + " [updated]")
+        (source_root / unit.file_rel).write_bytes(source_doc.render_bytes())
+        before_bytes = (project_root / "languages" / "#chinese" / unit.file_rel).read_bytes()
+
+        result = sync_source_project(source_root, project_root)
+        if result.invalidated_units < 1:
+            raise AssertionError("source sync did not invalidate any changed translations")
+        after_bytes = (project_root / "languages" / "#chinese" / unit.file_rel).read_bytes()
+        if after_bytes != before_bytes:
+            raise AssertionError("source sync should not rewrite translated files when only marking review")
+        if unit.uid not in source_review_uids(project_root, "#chinese"):
+            raise AssertionError("source sync did not persist the source-change review flag")
+
+        reloaded = Project.load(project_root, "#chinese", codec_root=tool_root())
+        updated = next(item for item in reloaded.units if item.uid == unit.uid)
+        if updated.source_text == unit.source_text:
+            raise AssertionError("source sync did not refresh the updated source text")
+        if updated.current_text != unit.current_text:
+            raise AssertionError("source sync should keep the existing translation text")
+        if updated.review_reason != TODO_REASON_SOURCE_CHANGED:
+            raise AssertionError("changed translation should be flagged for manual confirmation")
+        if updated.filter_status() not in MISSING_WORK_STATUSES:
+            raise AssertionError("changed translation should re-enter the untranslated filter")
+    finally:
+        safe_rmtree(temp)
+
+
+def assert_source_review_cache(root: Path) -> None:
+    temp = make_temp_project(root, "translator_tool_smoke_source_review_")
+    project = Project.load(temp, "#chinese")
+    unit = next(item for item in project.units if item.filter_status() == STATUS_TRANSLATED and item.translate_text)
+    project.set_units_source_review((unit,), True)
+    reloaded = Project.load(temp, "#chinese")
+    reloaded_unit = next(item for item in reloaded.units if item.uid == unit.uid)
+    if reloaded_unit.review_reason != TODO_REASON_SOURCE_CHANGED:
+        raise AssertionError("source review flag was not persisted in cache")
+    reloaded.set_units_source_review((reloaded_unit,), False)
+    reloaded_again = Project.load(temp, "#chinese")
+    if next(item for item in reloaded_again.units if item.uid == unit.uid).review_reason:
+        raise AssertionError("source review flag was not removed from cache")
+    safe_rmtree(temp)
 
 
 def assert_startup_prefers_local_sources_over_game_root() -> None:
@@ -200,7 +309,7 @@ def assert_startup_prefers_local_sources_over_game_root() -> None:
 def assert_save_existing(root: Path) -> None:
     temp = make_temp_project(root, "translator_tool_smoke_existing_")
     project = Project.load(temp, "#chinese")
-    unit = next(unit for unit in project.units if unit.file_rel == "Text.dbt" and unit.status != STATUS_MISSING_ROW)
+    unit = next(unit for unit in project.units if unit.file_rel == "Text.dbt" and unit.filter_status() == STATUS_TRANSLATED)
     target_path = temp / "languages" / "#chinese" / "Text.dbt"
     original = target_path.read_bytes()
     before_doc = load_dbt(target_path)
@@ -226,7 +335,7 @@ def assert_save_auto_formats_color_tokens(root: Path) -> None:
     temp = make_temp_project(root, "translator_tool_smoke_color_spacing_")
     try:
         project = Project.load(temp, "#chinese")
-        unit = next(unit for unit in project.units if unit.file_rel == "Text.dbt" and unit.status != STATUS_MISSING_ROW)
+        unit = next(unit for unit in project.units if unit.file_rel == "Text.dbt" and unit.filter_status() == STATUS_TRANSLATED)
         unit.set_text(
             "$C[10,20,30]句首中$C[225,214,158]测试，$C[255,255,255]恢复#E[NT_NEUTRAL]$C[225,214,158]颜色测试$N$N$C[255,255,255]对齐"
         )
@@ -285,7 +394,7 @@ def assert_save_creates_missing_target_dbt_incrementally(root: Path) -> None:
         if not missing_units:
             raise AssertionError("missing target DBT file did not expose source rows as translatable units")
         unit = missing_units[0]
-        if unit.status != STATUS_MISSING_ROW:
+        if unit.filter_status() != STATUS_TODO or unit.todo_reason != TODO_REASON_MISSING_ROW:
             raise AssertionError("missing target DBT rows were not classified as missing translations")
         unit.set_text("增量保存测试")
         result = project.save([unit])
@@ -338,14 +447,18 @@ def assert_save_removes_extra_target_row(root: Path) -> None:
 def assert_save_missing(root: Path) -> None:
     temp = make_temp_project(root, "translator_tool_smoke_missing_")
     project = Project.load(temp, "#chinese")
-    unit = next(unit for unit in project.units if unit.file_rel == "Text.dbt" and unit.status == STATUS_MISSING_ROW)
+    unit = next(
+        unit
+        for unit in project.units
+        if unit.file_rel == "Text.dbt" and unit.filter_status() == STATUS_TODO and unit.todo_reason == TODO_REASON_MISSING_ROW
+    )
     unit.set_text(unit.source_text or "test")
     result = project.save([unit])
     if not result.changed_files:
         raise AssertionError("save_missing did not write a file")
     reloaded = Project.load(temp, "#chinese")
     saved = [item for item in reloaded.units if item.file_rel == unit.file_rel and item.record_id == unit.record_id and item.label == unit.label]
-    if not saved or saved[0].status == STATUS_MISSING_ROW:
+    if not saved or saved[0].todo_reason == TODO_REASON_MISSING_ROW:
         raise AssertionError("inserted missing row did not reload as an existing row")
     safe_rmtree(temp)
 
@@ -356,7 +469,7 @@ def assert_missing_insertions_follow_file_order(root: Path) -> None:
     missing = [
         unit
         for unit in project.units
-        if unit.file_rel == "Text.dbt" and unit.status == STATUS_MISSING_ROW and unit.source_text
+        if unit.file_rel == "Text.dbt" and unit.filter_status() == STATUS_TODO and unit.todo_reason == TODO_REASON_MISSING_ROW
     ][:2]
     if len(missing) < 2:
         safe_rmtree(temp)
@@ -380,26 +493,30 @@ def assert_missing_insertions_follow_file_order(root: Path) -> None:
 def assert_unsaved_translation_status(root: Path) -> None:
     temp = make_temp_project(root, "translator_tool_smoke_status_")
     project = Project.load(temp, "#chinese")
-    unit = next(item for item in project.units if item.status == STATUS_MISSING_ROW and item.source_text)
-    if unit.display_status() != STATUS_MISSING_ROW:
+    unit = next(
+        item
+        for item in project.units
+        if item.filter_status() == STATUS_TODO and item.todo_reason == TODO_REASON_MISSING_ROW and item.source_text
+    )
+    if unit.display_status() != STATUS_TODO or unit.todo_reason != TODO_REASON_MISSING_ROW:
         raise AssertionError("an untouched missing row no longer reported missing status")
     unit.set_text("AI translated")
-    if unit.display_status() != "已翻译" or unit.filter_status() != "已翻译":
+    if unit.display_status() != STATUS_TRANSLATED or unit.filter_status() != STATUS_TRANSLATED:
         raise AssertionError("an unsaved translated unit did not report translated status")
-    translated = next(item for item in project.units if item.status == STATUS_TRANSLATED)
+    translated = next(item for item in project.units if item.filter_status() == STATUS_TRANSLATED)
     translated.set_text(translated.current_text + "x")
-    if translated.display_status() != STATUS_MODIFIED or translated.filter_status() != STATUS_TRANSLATED:
-        raise AssertionError("an edited translated unit did not keep a translated filter state with a modified marker")
+    if translated.display_status() != STATUS_TRANSLATED or translated.filter_status() != STATUS_TRANSLATED or not translated.is_dirty:
+        raise AssertionError("an edited translated unit did not keep a translated status with a dirty marker")
     translated.set_text("")
     saved_empty = project.save([translated])
     if not saved_empty.changed_files or saved_empty.deleted_units:
         raise AssertionError("an empty translation should save as an empty override instead of deleting it")
     reloaded = Project.load(temp, "#chinese")
     updated = next(item for item in reloaded.units if item.uid == translated.uid)
-    if updated.status != STATUS_EMPTY:
+    if updated.filter_status() != STATUS_TODO or updated.todo_reason != TODO_REASON_EMPTY:
         raise AssertionError("an empty translation did not reload as an empty target override")
     updated.set_pending_delete(True)
-    if updated.display_status() != STATUS_PENDING_DELETE or updated.filter_status() != STATUS_PENDING_DELETE:
+    if updated.display_status() != STATUS_PENDING_DELETE or updated.filter_status() != STATUS_TODO:
         raise AssertionError("a marked deletion did not expose the pending-delete status")
     removed = reloaded.save([updated])
     if not removed.changed_files or [item.uid for item in removed.deleted_units] != [updated.uid]:
@@ -426,7 +543,7 @@ def assert_mod_label_match_inserts_source_formatted_row(root: Path) -> None:
             for item in project.units
             if item.file_rel == "Text.dbt" and item.record_id == str(source_row.row_id) and item.label == original_key[1]
         )
-        if not unit.needs_review or unit.display_status() != STATUS_REVIEW:
+        if unit.review_reason != TODO_REASON_IMPORT_REVIEW or unit.display_status() != STATUS_TODO:
             raise AssertionError("a unique mod label match was not marked for review")
         if unit.ref.target_row is not None or not unit.is_dirty:
             raise AssertionError("label match did not stage a source-row insertion")
@@ -449,8 +566,8 @@ def assert_mod_label_match_inserts_source_formatted_row(root: Path) -> None:
             if item.file_rel == "Text.dbt" and item.record_id == str(source_row.row_id) and item.label == original_key[1]
         )
         unit.set_text(unit.current_text + "x")
-        if unit.needs_review or unit.display_status() != STATUS_MODIFIED:
-            raise AssertionError("editing a review item did not clear its temporary review state")
+        if unit.review_reason != TODO_REASON_IMPORT_REVIEW or unit.display_status() != STATUS_TODO:
+            raise AssertionError("editing a review item should keep the manual-check reason until it is confirmed")
         project.save([unit])
         saved = load_dbt(target_path)
         inserted = saved.row_index.get(original_key)
@@ -1154,7 +1271,7 @@ def assert_git_history(root: Path) -> None:
         git = LanguageGit(temp)
         git.ensure_repository(AppSettings())
         project = Project.load(temp, "#chinese")
-        unit = next(item for item in project.units if item.file_rel == "Text.dbt" and item.status != STATUS_MISSING_ROW)
+        unit = next(item for item in project.units if item.file_rel == "Text.dbt" and item.filter_status() == STATUS_TRANSLATED)
         unit.set_text(unit.current_text + "测试")
         result = project.save([unit])
         commit = git.commit_saved(result.changed_files, result.saved_units, result.deleted_units)
@@ -1321,8 +1438,10 @@ def main() -> int:
     assert_statuses(root)
     assert_loaded_order_matches_file_lines(root)
     assert_local_project_roots_detect_sources_projects()
+    assert_discover_game_source_projects_detects_vanilla_and_mods()
     assert_startup_prefers_local_sources_over_game_root()
     assert_sync_vanilla_sources_only_imports_originals()
+    assert_sync_source_project_invalidates_changed_translations(root)
     assert_save_existing(root)
     assert_save_auto_formats_color_tokens(root)
     assert_save_guides_plain_text_uses_source_profile(root)
@@ -1344,6 +1463,7 @@ def main() -> int:
     assert_chinese_without_codec_uses_plain_text(root)
     assert_validation_warnings_do_not_block()
     assert_ignore_cache(root)
+    assert_source_review_cache(root)
     assert_operation_history()
     assert_ai_token_protection()
     assert_linebreak_format_is_ignored()
