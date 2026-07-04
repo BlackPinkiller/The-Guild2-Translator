@@ -14,6 +14,7 @@ sources/
 translation_review/
 Translation-format-FULL.txt
 encoder/Mare
+AGENTS.md
 
 # Python runtime files.
 __pycache__/
