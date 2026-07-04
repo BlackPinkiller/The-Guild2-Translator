@@ -5,7 +5,7 @@ from pathlib import Path
 from typing import Iterable
 
 from .cache import ignored_uids, set_ignored_many
-from .codec_adapter import CodecError, Guild2Codec, default_codec_path
+from .codec_adapter import CodecError, Guild2Codec, load_codec_for_language
 from .format_io import (
     DbtDocument,
     DbtRow,
@@ -19,6 +19,7 @@ from .format_io import (
     row_key,
     translatable_fields,
 )
+from .i18n import translate
 from .validation import ValidationIssue, issue_summary, validate_translation
 from .validation import normalize_color_token_spacing
 
@@ -179,7 +180,7 @@ class Project:
     root: Path
     languages_root: Path
     language: str
-    codec: Guild2Codec
+    codec: Guild2Codec | None
     source_docs: dict[str, DbtDocument]
     source_text_docs: dict[str, PlainTextDocument]
     target_dbt_docs: dict[str, DbtDocument]
@@ -195,7 +196,7 @@ class Project:
         languages_root = root / "languages"
         if not languages_root.exists():
             raise ProjectError(f"languages directory not found: {languages_root}")
-        codec = Guild2Codec.load(default_codec_path(root, codec_root))
+        codec = load_codec_for_language(codec_root if codec_root is not None else root, language)
 
         source_docs: dict[str, DbtDocument] = {}
         file_order: dict[str, int] = {}
@@ -353,7 +354,7 @@ class Project:
         errors: list[str] = []
         for unit in deleted_units:
             if not unit.can_delete_translation():
-                errors.append(f"{unit.file_rel} #{unit.record_id}: 没有可删除的译文条目")
+                errors.append(translate("project.save.no_deletable_row", file=unit.file_rel, record_id=unit.record_id))
                 continue
             ref = unit.ref
             if ref.kind == "dbt":
@@ -385,7 +386,7 @@ class Project:
                 prepared_values[unit.uid] = text_to_save
                 continue
             try:
-                prepared_values[unit.uid] = self.codec.encode(text_to_save)
+                prepared_values[unit.uid] = self.codec.encode(text_to_save) if self.codec is not None else text_to_save
             except CodecError as exc:
                 errors.append(f"{unit.file_rel} #{unit.record_id} {unit.field_name}: {exc}")
         if errors:
@@ -513,7 +514,7 @@ def build_dbt_units(
     file_name: str,
     source_doc: DbtDocument,
     target_doc: DbtDocument,
-    codec: Guild2Codec,
+    codec: Guild2Codec | None,
     order: dict[tuple[int, str], int],
     *,
     label_match_first: bool = False,
@@ -552,11 +553,14 @@ def build_dbt_units(
                 status = STATUS_MISSING_ROW
             else:
                 raw_value = translation_row.get(target_field)
-                try:
-                    translate_text = codec.decode(raw_value)
-                except CodecError as exc:
+                if codec is None:
                     translate_text = raw_value
-                    initial_issues.append(ValidationIssue("error", str(exc)))
+                else:
+                    try:
+                        translate_text = codec.decode(raw_value)
+                    except CodecError as exc:
+                        translate_text = raw_value
+                        initial_issues.append(ValidationIssue("error", str(exc)))
                 if source_text == "" and translate_text == "":
                     status = STATUS_IGNORED
                 elif translate_text == "":
@@ -601,11 +605,14 @@ def build_dbt_units(
         for field_order, target_field in enumerate(target_fields):
             raw_value = target_row.get(target_field)
             initial_issues = []
-            try:
-                translate_text = codec.decode(raw_value)
-            except CodecError as exc:
+            if codec is None:
                 translate_text = raw_value
-                initial_issues.append(ValidationIssue("error", str(exc)))
+            else:
+                try:
+                    translate_text = codec.decode(raw_value)
+                except CodecError as exc:
+                    translate_text = raw_value
+                    initial_issues.append(ValidationIssue("error", str(exc)))
             units.append(
                 TranslationUnit(
                     uid=f"extra:{file_name}:{key[0]}:{key[1]}:{target_field}",

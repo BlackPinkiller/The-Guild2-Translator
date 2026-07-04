@@ -5,16 +5,21 @@ Global font codec CLI for The Guild 2 Renaissance.
 ## Codec Table
 
 ```text
-data\guild2_codec.json
+data\guild2_write_codec.json
+data\guild2_read_codec.json
 ```
 
-The table is one plain JSON dictionary. It contains encode entries and private-code decode entries.
+Each file is one plain JSON dictionary with one direction only.
 
 ```json
-{"波":"꒯","꒯":"波","꛶":"波","ą":"ç"}
+{"波":"꒯","ą":"ç"}
 ```
 
-Encode uses non-private keys only. Decode uses private keys only, so Polish substitutions do not rewrite normal Unicode such as French `ç`.
+```json
+{"꒯":"波","꛶":"波"}
+```
+
+Unlisted non-CJK Unicode passes through. Korean uses standard Hangul Unicode and does not need conversion.
 
 ## Commands
 
@@ -35,8 +40,10 @@ python guild2_codec.py decode --file encoded.txt --output plain.txt
 ## Missing Characters
 
 ```text
-error     fail on missing CJK/private characters
+error     fail on missing CJK characters during encode
 replace   use --replacement
 keep      keep original character
 drop      remove character
 ```
+
+The read table is for text rendered with the Chinese custom font. Standard Korean text must not be passed to `decode` because `U+AC00..U+ACA7` are also borrowed by that Chinese font.

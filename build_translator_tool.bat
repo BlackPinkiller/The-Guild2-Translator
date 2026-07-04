@@ -5,25 +5,29 @@ cd /d "%~dp0"
 py -3.12 -m pip install "PyInstaller>=6.0"
 if errorlevel 1 goto :failed
 
-if exist build\package-data rmdir /s /q build\package-data
-mkdir build\package-data\languages
-mkdir build\package-data\encoder
+if exist build\dist rmdir /s /q build\dist
+if exist build\work rmdir /s /q build\work
+if exist build\spec rmdir /s /q build\spec
+if exist build\release rmdir /s /q build\release
 
-robocopy languages build\package-data\languages /E /XD .git __pycache__ /XF *.pyc
-if errorlevel 8 goto :failed
-robocopy encoder build\package-data\encoder /E /XD .git __pycache__ /XF *.pyc
+py -3.12 -m PyInstaller --noconfirm --clean --windowed --onedir --name TheGuild2Translator --distpath build\dist --workpath build\work --specpath build\spec --add-data "%CD%\encoder\guild2_codec.py;encoder" --add-data "%CD%\encoder\data;encoder\data" translator_tool_launcher.py
+if errorlevel 1 goto :failed
+
+mkdir build\release\TheGuild2Translator
+robocopy build\dist\TheGuild2Translator build\release\TheGuild2Translator /E
 if errorlevel 8 goto :failed
 
-py -3.12 -m PyInstaller --noconfirm --clean --windowed --onedir --name TheGuild2Translator --distpath build\dist --workpath build\work --specpath build\spec --add-data "%CD%\build\package-data\languages;languages" --add-data "%CD%\build\package-data\encoder;encoder" --add-data "%CD%\Translation-Kit.txt;." translator_tool_launcher.py
+if exist build\TheGuild2Translator-distributable.zip del /f /q build\TheGuild2Translator-distributable.zip
+powershell -NoProfile -Command "Compress-Archive -Path 'build\release\TheGuild2Translator\*' -DestinationPath 'build\TheGuild2Translator-distributable.zip' -Force"
 if errorlevel 1 goto :failed
 
 echo.
-echo Build complete: build\dist\TheGuild2Translator\TheGuild2Translator.exe
-pause
+echo Build complete:
+echo   build\release\TheGuild2Translator\
+echo   build\TheGuild2Translator-distributable.zip
 exit /b 0
 
 :failed
 echo.
 echo Build failed. See the messages above.
-pause
 exit /b 1

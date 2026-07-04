@@ -6,6 +6,7 @@ import re
 import unicodedata
 
 from .codec_adapter import Guild2Codec
+from .i18n import translate
 
 
 ARG_SUFFIXES = (
@@ -328,17 +329,41 @@ def _compare_argument_tokens(
         source_suffixes = matching_source.get(number)
         if not source_suffixes:
             tokens = Counter(token for token in target if (_arg_parts(token) or (0, ""))[0] == number)
-            issues.append(ValidationIssue("warning", f"参数编号不存在: {format_counter_items(tokens)}", code="argument-index"))
+            issues.append(
+                ValidationIssue(
+                    "warning",
+                    translate("validation.argument_index", items=format_counter_items(tokens)),
+                    code="argument-index",
+                )
+            )
             continue
         source_categories = {_arg_category(suffix) for suffix in source_suffixes}
         for suffix in sorted(target_suffixes):
             if _arg_category(suffix) not in source_categories:
-                issues.append(ValidationIssue("warning", f"参数类型不匹配: %{number}{suffix}", code="argument-type"))
+                issues.append(
+                    ValidationIssue(
+                        "warning",
+                        translate("validation.argument_type", token=f"%{number}{suffix}"),
+                        code="argument-type",
+                    )
+                )
             elif suffix not in source_suffixes:
-                issues.append(ValidationIssue("warning", f"参数类型替换: %{number}{suffix}", code="argument-variant"))
+                issues.append(
+                    ValidationIssue(
+                        "warning",
+                        translate("validation.argument_variant", token=f"%{number}{suffix}"),
+                        code="argument-variant",
+                    )
+                )
     for number, source_suffixes in sorted(source_by_index.items()):
         if number not in target_by_index:
-            issues.append(ValidationIssue("warning", f"未使用原文参数: %{number}{'/'.join(sorted(source_suffixes))}", code="argument-omitted"))
+            issues.append(
+                ValidationIssue(
+                    "warning",
+                    translate("validation.argument_omitted", token=f"%{number}{'/'.join(sorted(source_suffixes))}"),
+                    code="argument-omitted",
+                )
+            )
     return issues
 
 
@@ -488,16 +513,20 @@ def compare_tokens(source: str, target: str, *, source_unknown: Counter[str] | N
 
     if missing:
         items = format_counter_items(missing)
-        issues.append(ValidationIssue("warning", f"缺少格式标记: {items}", code="format-missing"))
+        issues.append(ValidationIssue("warning", translate("validation.format_missing", items=items), code="format-missing"))
     if extra:
         items = format_counter_items(extra)
-        issues.append(ValidationIssue("warning", f"新增格式标记: {items}", code="format-extra"))
+        issues.append(ValidationIssue("warning", translate("validation.format_extra", items=items), code="format-extra"))
     if missing_color:
         items = format_counter_items(missing_color)
-        issues.append(ValidationIssue("warning", f"颜色标记不一致(不阻止保存): 缺少 {items}", code="format-color-missing"))
+        issues.append(
+            ValidationIssue("warning", translate("validation.format_color_missing", items=items), code="format-color-missing")
+        )
     if extra_color:
         items = format_counter_items(extra_color)
-        issues.append(ValidationIssue("warning", f"颜色标记不一致(不阻止保存): 新增 {items}", code="format-color-extra"))
+        issues.append(
+            ValidationIssue("warning", translate("validation.format_color_extra", items=items), code="format-color-extra")
+        )
     if source_fallbacks != target_fallbacks:
         issues.append(ValidationIssue("warning", "@T inline fallback count differs", code="format-fallback"))
     return issues, source_suspect
@@ -516,22 +545,38 @@ def validate_translation(
     target_unknown = target_unknown_raw - source_unknown_raw
     issues, source_suspect = compare_tokens(source, target, source_unknown=source_unknown)
     if dbt_field and '"' in target:
-        issues.append(ValidationIssue("error", 'DBT 字段不能包含双引号 "，请使用 >Text<。', code="dbt-quote"))
+        issues.append(ValidationIssue("error", translate("validation.dbt_quote"), code="dbt-quote"))
     if CHINESE_QUOTE_RE.search(target):
         bad = "".join(dict.fromkeys(CHINESE_QUOTE_RE.findall(target)))
-        issues.append(ValidationIssue("warning", f"中文引号可能不符合 Translation-Kit: {bad}", code="quote-style"))
+        issues.append(ValidationIssue("warning", translate("validation.quote_style", text=bad), code="quote-style"))
     if source_suspect:
         issues.append(
-            ValidationIssue("warning", f"原文格式可疑: {format_counter_items(source_suspect)}", code="source-format-suspect")
+            ValidationIssue(
+                "warning",
+                translate("validation.source_suspect", items=format_counter_items(source_suspect)),
+                code="source-format-suspect",
+            )
         )
     if target_unknown:
-        issues.append(ValidationIssue("warning", f"译文包含未知格式: {format_counter_items(target_unknown)}", code="unknown-format"))
+        issues.append(
+            ValidationIssue(
+                "warning",
+                translate("validation.unknown_format", items=format_counter_items(target_unknown)),
+                code="unknown-format",
+            )
+        )
     if font_codec is not None:
         missing = font_codec.unsupported_characters(target)
         if missing:
             chars = "".join(missing)
             points = ", ".join(f"U+{ord(char):04X}" for char in missing)
-            issues.append(ValidationIssue("warning", f"字库缺字: {chars} ({points})", code="font-glyph"))
+            issues.append(
+                ValidationIssue(
+                    "warning",
+                    translate("validation.font_glyph", chars=chars, points=points),
+                    code="font-glyph",
+                )
+            )
     return issues
 
 

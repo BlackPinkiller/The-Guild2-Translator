@@ -5,16 +5,21 @@
 ## 转码表
 
 ```text
-data\guild2_codec.json
+data\guild2_write_codec.json
+data\guild2_read_codec.json
 ```
 
-转码表只有一个纯 JSON 字典，包含编码项和私有码位解码项。
+两个文件都是单向纯 JSON 字典。
 
 ```json
-{"波":"꒯","꒯":"波","꛶":"波","ą":"ç"}
+{"波":"꒯","ą":"ç"}
 ```
 
-编码只使用非 private key；解码只使用 private key，所以波兰替代不会把普通 Unicode，例如法语 `ç`，反向改坏。
+```json
+{"꒯":"波","꛶":"波"}
+```
+
+未列出的非 CJK Unicode 原样通过。韩语使用标准 Hangul Unicode，不需要转换。
 
 ## 命令
 
@@ -35,8 +40,10 @@ python guild2_codec.py decode --file encoded.txt --output plain.txt
 ## 缺失字符
 
 ```text
-error     CJK/private 缺映射时报错
+error     encode 时 CJK 缺映射则报错
 replace   使用 --replacement 替换
 keep      保留原字符
 drop      删除字符
 ```
+
+read 表只用于中文自定义字体文本。标准韩语不能送入 `decode`，因为中文字体也借用了 `U+AC00..U+ACA7`。

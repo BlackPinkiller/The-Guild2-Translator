@@ -12,16 +12,18 @@ from typing import Iterable
 ENTITY_RE = re.compile(r"&#x([0-9a-fA-F]+);|&#([0-9]+);")
 UPLUS_TOKEN_RE = re.compile(r"U\+([0-9a-fA-F]{4,6})")
 SLASH_U_RE = re.compile(r"\\u([0-9a-fA-F]{4})|\\U([0-9a-fA-F]{8})")
-PRIVATE_MIN = 0xA100
-PRIVATE_MAX = 0xACFF
 
 
 def script_dir() -> Path:
     return Path(__file__).resolve().parent
 
 
-def default_codec_path() -> Path:
-    return script_dir() / "data" / "guild2_codec.json"
+def default_write_codec_path() -> Path:
+    return script_dir() / "data" / "guild2_write_codec.json"
+
+
+def default_read_codec_path() -> Path:
+    return script_dir() / "data" / "guild2_read_codec.json"
 
 
 def configure_stdio() -> None:
@@ -32,7 +34,7 @@ def configure_stdio() -> None:
             pass
 
 
-def load_codec(path: Path) -> dict[str, str]:
+def load_codec(path: Path, *, allow_text_values: bool) -> dict[str, str]:
     if not path.exists():
         raise FileNotFoundError(f"codec table not found: {path}")
     raw = json.loads(path.read_text(encoding="utf-8"))
@@ -43,14 +45,19 @@ def load_codec(path: Path) -> dict[str, str]:
     for source, target in raw.items():
         if not isinstance(source, str) or not isinstance(target, str):
             raise ValueError("codec table must be a plain string dictionary")
-        if len(source) != 1 or not target:
-            raise ValueError(f"codec entries must map one source char to text: {source!r} -> {target!r}")
+        if len(source) != 1 or not target or (not allow_text_values and len(target) != 1):
+            requirement = "text" if allow_text_values else "one character"
+            raise ValueError(f"codec entries must map one source char to {requirement}: {source!r} -> {target!r}")
         codec[source] = target
     return codec
 
 
-def is_private_char(char: str) -> bool:
-    return len(char) == 1 and PRIVATE_MIN <= ord(char) <= PRIVATE_MAX
+def load_write_codec(path: Path) -> dict[str, str]:
+    return load_codec(path, allow_text_values=False)
+
+
+def load_read_codec(path: Path) -> dict[str, str]:
+    return load_codec(path, allow_text_values=True)
 
 
 def requires_codec_mapping(char: str) -> bool:
@@ -87,7 +94,7 @@ def normalize_game_input(text: str) -> str:
     return UPLUS_TOKEN_RE.sub(lambda match: chr(int(match.group(1), 16)), text)
 
 
-def apply_missing(char: str, mode: str, replacement: str, direction: str) -> str:
+def apply_missing(char: str, mode: str, replacement: str) -> str:
     if mode == "keep":
         return char
     if mode == "drop":
@@ -95,12 +102,12 @@ def apply_missing(char: str, mode: str, replacement: str, direction: str) -> str
     if mode == "replace":
         return replacement
     if mode == "error":
-        raise ValueError(f"cannot {direction} character {char}")
+        raise ValueError(f"cannot encode character {char}")
     raise ValueError(f"unknown missing mode: {mode}")
 
 
 def encode_replacement(replacement: str, codec: dict[str, str]) -> str:
-    return "".join(codec.get(char, char) if not is_private_char(char) else char for char in replacement)
+    return "".join(codec.get(char, char) for char in replacement)
 
 
 def encode_text(text: str, codec: dict[str, str], missing: str, replacement: str) -> tuple[str, list[str]]:
@@ -108,7 +115,7 @@ def encode_text(text: str, codec: dict[str, str], missing: str, replacement: str
     out: list[str] = []
     missing_chars: list[str] = []
     for char in text:
-        target = codec.get(char) if not is_private_char(char) else None
+        target = codec.get(char)
         if target is not None:
             out.append(target)
             continue
@@ -117,26 +124,20 @@ def encode_text(text: str, codec: dict[str, str], missing: str, replacement: str
             continue
         if char not in missing_chars:
             missing_chars.append(char)
-        out.append(apply_missing(char, missing, encoded_replacement, "encode"))
+        out.append(apply_missing(char, missing, encoded_replacement))
     return "".join(out), missing_chars
 
 
-def decode_text(text: str, codec: dict[str, str], missing: str, replacement: str) -> tuple[str, list[str]]:
+def decode_text(text: str, codec: dict[str, str]) -> tuple[str, list[str]]:
     text = normalize_game_input(text)
     out: list[str] = []
-    missing_chars: list[str] = []
     for char in text:
-        target = codec.get(char) if is_private_char(char) else None
+        target = codec.get(char)
         if target is not None:
             out.append(target)
             continue
-        if not is_private_char(char):
-            out.append(char)
-            continue
-        if char not in missing_chars:
-            missing_chars.append(char)
-        out.append(apply_missing(char, missing, replacement, "decode"))
-    return "".join(out), missing_chars
+        out.append(char)
+    return "".join(out), []
 
 
 def format_output(text: str, output_format: str, missing_chars: list[str]) -> str:
@@ -176,29 +177,31 @@ def write_output(args: argparse.Namespace, text: str) -> None:
     print(text, end="" if text.endswith("\n") else "\n")
 
 
-def lookup_text(text: str, codec: dict[str, str]) -> str:
+def lookup_text(text: str, write_codec: dict[str, str], read_codec: dict[str, str]) -> str:
     rows: list[dict[str, str]] = []
     for char in normalize_game_input(text):
         row = {"char": char, "uplus": f"U+{ord(char):04X}"}
-        if char in codec and not is_private_char(char):
-            game = codec[char]
+        if char in write_codec:
+            game = write_codec[char]
             row["game"] = game
-            row["game_uplus"] = f"U+{ord(game):04X}" if len(game) == 1 else ""
-        if char in codec and is_private_char(char):
-            plain = codec[char]
+            row["game_uplus"] = f"U+{ord(game):04X}"
+        if char in read_codec:
+            plain = read_codec[char]
             row["plain"] = plain
             row["plain_uplus"] = " ".join(f"U+{ord(item):04X}" for item in plain)
         rows.append(row)
     return json.dumps(rows, ensure_ascii=False, indent=2)
 
 
-def stats_text(codec: dict[str, str]) -> str:
+def stats_text(write_codec: dict[str, str], read_codec: dict[str, str]) -> str:
+    canonical_game_chars = set(write_codec.values()) & read_codec.keys()
     return json.dumps(
         {
-            "entries": len(codec),
-            "encode_private": sum(1 for source, target in codec.items() if not is_private_char(source) and len(target) == 1 and is_private_char(target)),
-            "decode_private": sum(1 for source in codec if is_private_char(source)),
-            "substitution": sum(1 for source, target in codec.items() if not is_private_char(source) and not (len(target) == 1 and is_private_char(target))),
+            "write_entries": len(write_codec),
+            "read_entries": len(read_codec),
+            "write_custom": sum(1 for target in write_codec.values() if target in read_codec),
+            "read_aliases": len(read_codec) - len(canonical_game_chars),
+            "substitution": sum(1 for target in write_codec.values() if target not in read_codec),
         },
         ensure_ascii=False,
         indent=2,
@@ -207,7 +210,18 @@ def stats_text(codec: dict[str, str]) -> str:
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Global codec for The Guild 2 Renaissance font encoding.")
-    parser.add_argument("--codec", type=Path, default=default_codec_path(), help="Path to guild2_codec.json.")
+    parser.add_argument(
+        "--write-codec",
+        type=Path,
+        default=default_write_codec_path(),
+        help="Path to guild2_write_codec.json.",
+    )
+    parser.add_argument(
+        "--read-codec",
+        type=Path,
+        default=default_read_codec_path(),
+        help="Path to guild2_read_codec.json.",
+    )
 
     subparsers = parser.add_subparsers(dest="command", required=True)
 
@@ -218,11 +232,14 @@ def build_parser() -> argparse.ArgumentParser:
         sub.add_argument("--input-encoding", default="utf-8-sig")
         sub.add_argument("--output-encoding", default="utf-8")
         sub.add_argument("--format", choices=["raw", "entity", "decimal-entity", "uplus", "json"], default="raw")
-        sub.add_argument("--missing", choices=["replace", "keep", "drop", "error"], default="error")
-        sub.add_argument("--replacement", default="口", help="Replacement character for missing mode 'replace'.")
 
-    add_convert_args(subparsers.add_parser("encode", help="Convert normal text to game font encoding."))
-    add_convert_args(subparsers.add_parser("decode", help="Convert game font encoding back to normal text."))
+    encode = subparsers.add_parser("encode", help="Convert normal text to game font encoding.")
+    add_convert_args(encode)
+    encode.add_argument("--missing", choices=["replace", "keep", "drop", "error"], default="error")
+    encode.add_argument("--replacement", default="口", help="Replacement character for missing mode 'replace'.")
+
+    decode = subparsers.add_parser("decode", help="Convert game font encoding back to normal text.")
+    add_convert_args(decode)
 
     lookup = subparsers.add_parser("lookup", help="Show mapping details for characters.")
     lookup.add_argument("text", nargs="*", help="Characters, U+ tokens, or entities to inspect.")
@@ -237,21 +254,26 @@ def main(argv: Iterable[str] | None = None) -> int:
     configure_stdio()
     parser = build_parser()
     args = parser.parse_args(list(argv) if argv is not None else None)
-    codec = load_codec(args.codec)
 
     if args.command == "stats":
-        print(stats_text(codec))
+        write_codec = load_write_codec(args.write_codec)
+        read_codec = load_read_codec(args.read_codec)
+        print(stats_text(write_codec, read_codec))
         return 0
 
     if args.command == "lookup":
-        print(lookup_text(read_input(args), codec))
+        write_codec = load_write_codec(args.write_codec)
+        read_codec = load_read_codec(args.read_codec)
+        print(lookup_text(read_input(args), write_codec, read_codec))
         return 0
 
     text = read_input(args)
     if args.command == "encode":
-        converted, missing_chars = encode_text(text, codec, args.missing, args.replacement)
+        write_codec = load_write_codec(args.write_codec)
+        converted, missing_chars = encode_text(text, write_codec, args.missing, args.replacement)
     elif args.command == "decode":
-        converted, missing_chars = decode_text(text, codec, args.missing, args.replacement)
+        read_codec = load_read_codec(args.read_codec)
+        converted, missing_chars = decode_text(text, read_codec)
     else:
         parser.error(f"unknown command: {args.command}")
         return 2

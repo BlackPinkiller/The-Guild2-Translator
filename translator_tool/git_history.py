@@ -10,7 +10,7 @@ import threading
 import time
 from typing import Iterable
 
-from .codec_adapter import CodecError, Guild2Codec, default_codec_path
+from .codec_adapter import CodecError, Guild2Codec, load_codec_for_language
 from .format_io import (
     DbtDocument,
     load_dbt_bytes,
@@ -19,6 +19,7 @@ from .format_io import (
     row_key,
     translatable_fields,
 )
+from .i18n import translate
 from .project import MISSING_WORK_STATUSES, TranslationUnit
 from .settings import AppSettings
 
@@ -106,7 +107,7 @@ class LanguageGit:
         self.project_root = project_root.resolve()
         self.repo = self.project_root / "languages"
         self.language = language
-        self.codec = Guild2Codec.load(default_codec_path(self.project_root, codec_root))
+        self.codec = load_codec_for_language(codec_root if codec_root is not None else self.project_root, language)
         self._cache_lock = threading.Lock()
         self._commit_list_cache: tuple[GitCommit, ...] | None = None
         self._entry_cache: dict[str, tuple[TranslationLogEntry, ...]] = {}
@@ -323,6 +324,8 @@ class LanguageGit:
         return [TranslationLogEntry(kind, file_rel, "", file_rel, "body", source, after, previous_text)]
 
     def _decode(self, value: str) -> str:
+        if self.codec is None:
+            return value
         try:
             return self.codec.decode(value)
         except CodecError:
@@ -375,14 +378,10 @@ class LanguageGit:
         try:
             result = subprocess.run(
                 ["git", "-C", str(self.repo), *args],
-                capture_output=True,
-                text=text,
-                encoding="utf-8" if text else None,
-                errors="replace" if text else None,
-                check=False,
+                **self._subprocess_kwargs(text=text),
             )
         except FileNotFoundError as exc:
-            raise GitError("找不到 Git；请安装 Git 并重新打开翻译器。") from exc
+            raise GitError(translate("git.error.not_found")) from exc
         if check and result.returncode != 0:
             stderr = result.stderr.decode("utf-8", "replace") if isinstance(result.stderr, bytes) else result.stderr
             if "index.lock" in stderr and self._clear_stale_index_lock():
@@ -390,17 +389,29 @@ class LanguageGit:
                 # keep or recreate its own lock and report its own error.
                 result = subprocess.run(
                     ["git", "-C", str(self.repo), *args],
-                    capture_output=True,
-                    text=text,
-                    encoding="utf-8" if text else None,
-                    errors="replace" if text else None,
-                    check=False,
+                    **self._subprocess_kwargs(text=text),
                 )
                 if result.returncode == 0:
                     return result
                 stderr = result.stderr.decode("utf-8", "replace") if isinstance(result.stderr, bytes) else result.stderr
-            raise GitError(stderr.strip() or "Git 命令执行失败。")
+            raise GitError(stderr.strip() or translate("git.error.command_failed"))
         return result
+
+    @staticmethod
+    def _subprocess_kwargs(*, text: bool) -> dict[str, object]:
+        kwargs: dict[str, object] = {
+            "capture_output": True,
+            "text": text,
+            "encoding": "utf-8" if text else None,
+            "errors": "replace" if text else None,
+            "check": False,
+        }
+        if hasattr(subprocess, "CREATE_NO_WINDOW") and hasattr(subprocess, "STARTUPINFO"):
+            startupinfo = subprocess.STARTUPINFO()
+            startupinfo.dwFlags |= subprocess.STARTF_USESHOWWINDOW
+            kwargs["startupinfo"] = startupinfo
+            kwargs["creationflags"] = subprocess.CREATE_NO_WINDOW
+        return kwargs
 
     def _clear_stale_index_lock(self) -> bool:
         """Remove only an old, empty repository index lock left after a crash."""
@@ -435,9 +446,9 @@ def combine_entries(entry_groups: Iterable[Iterable[TranslationLogEntry]]) -> li
 
 def _display_subject(subject: str) -> str:
     if subject == "translation: commit pending language changes":
-        return "待处理变更"
+        return translate("history.subject.pending")
     if subject == "chore: import language baseline":
-        return "导入语言基线"
+        return translate("history.subject.baseline")
     match = re.match(r"^translation:\s*(.+?)\s*\((.+)\)$", subject)
     if not match:
         return subject
@@ -449,8 +460,13 @@ def _display_subject(subject: str) -> str:
             parts.append(chunk)
             continue
         kind, count = count_match.groups()
-        parts.append(f"{'新增' if kind == 'add' else '修订' if kind == 'update' else '删除'} {count}")
-    summary = " · ".join(parts) if parts else "变更"
+        if kind == "add":
+            parts.append(translate("history.change.add", count=count))
+        elif kind == "update":
+            parts.append(translate("history.change.update", count=count))
+        else:
+            parts.append(translate("history.change.delete", count=count))
+    summary = " · ".join(parts) if parts else translate("history.subject.summary_default")
     return f"{summary} · {files}"
 
 
@@ -465,12 +481,16 @@ def format_entries(entries: Iterable[TranslationLogEntry]) -> str:
         for entry in file_entries:
             source = entry.source_text.replace("\r", "").replace("\n", " ↵ ")
             before = entry.display_before_text.replace("\r", "").replace("\n", " ↵ ")
-            translated = "[已删除]" if entry.kind == "删除" else entry.translated_text.replace("\r", "").replace("\n", " ↵ ")
+            translated = (
+                translate("history.formatted_entry.deleted")
+                if entry.kind == "删除"
+                else entry.translated_text.replace("\r", "").replace("\n", " ↵ ")
+            )
             lines.extend((f"  {entry.heading}", f"  {before} → {translated}"))
             if entry.kind == "更新" and entry.before_text != entry.source_text:
-                lines.append(f"  原文：{source}")
+                lines.append(translate("history.formatted_entry.source", source=source))
         parts.append("\n".join(lines))
-    return "\n\n".join(parts) or "此提交没有译文条目变化。"
+    return "\n\n".join(parts) or translate("history.formatted_entry.no_changes")
 
 
 def main() -> int:

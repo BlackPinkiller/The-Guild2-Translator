@@ -3,16 +3,20 @@ from __future__ import annotations
 import os
 from pathlib import Path
 import shutil
+import subprocess
 import tempfile
 import time
 from datetime import datetime
+from types import SimpleNamespace
 import uuid
 
 from . import project as project_module
+from . import settings as settings_module
 from .ai import GoogleTranslateProvider, OpenAICompatibleProvider, TranslationProviderError
-from .codec_adapter import Guild2Codec, default_codec_path
+from .codec_adapter import Guild2Codec, load_codec_for_language
 from .git_history import GitCommit, LanguageGit, TranslationLogEntry, combine_entries, format_entries
 from .history import OperationHistory, TranslationOperation, UnitChange
+from .i18n import set_language, status_text, translate
 from .format_io import load_dbt, load_plain_text, row_key
 from .project import (
     MISSING_WORK_STATUSES,
@@ -26,6 +30,7 @@ from .project import (
     STATUS_TRANSLATED,
 )
 from .settings import AppSettings, load_settings, save_settings
+from .source_sync import local_project_roots, managed_vanilla_project_root, sync_vanilla_sources
 from .validation import format_tokens, normalize_color_token_spacing, validate_translation
 
 
@@ -85,7 +90,8 @@ def assert_loaded_order_matches_file_lines(root: Path) -> None:
 def copy_project_subset(src_root: Path, dst_root: Path) -> None:
     (dst_root / "encoder" / "data").mkdir(parents=True)
     shutil.copy2(tool_root() / "encoder" / "guild2_codec.py", dst_root / "encoder")
-    shutil.copy2(tool_root() / "encoder" / "data" / "guild2_codec.json", dst_root / "encoder" / "data")
+    shutil.copy2(tool_root() / "encoder" / "data" / "guild2_write_codec.json", dst_root / "encoder" / "data")
+    shutil.copy2(tool_root() / "encoder" / "data" / "guild2_read_codec.json", dst_root / "encoder" / "data")
     (dst_root / "languages" / "#chinese").mkdir(parents=True)
     for name in ["Text.dbt", "Tooltips.dbt"]:
         shutil.copy2(src_root / "languages" / name, dst_root / "languages" / name)
@@ -104,6 +110,91 @@ def safe_rmtree(path: Path) -> None:
         shutil.rmtree(path)
     except OSError:
         pass
+
+
+def assert_sync_vanilla_sources_only_imports_originals() -> None:
+    temp = Path(tempfile.gettempdir()) / f"translator_tool_smoke_vanilla_sync_{uuid.uuid4().hex[:8]}"
+    try:
+        game_root = temp / "game"
+        source_languages = game_root / "DB" / "Languages"
+        (source_languages / "Guides").mkdir(parents=True, exist_ok=True)
+        (source_languages / "#german").mkdir(parents=True, exist_ok=True)
+        (source_languages / "Text.dbt").write_text("source-text", encoding="utf-8")
+        (source_languages / "Guides" / "Intro.txt").write_text("guide-source", encoding="utf-8")
+        (source_languages / "#german" / "Text.dbt").write_text("translated-text", encoding="utf-8")
+
+        app_root = temp / "app"
+        project_root = managed_vanilla_project_root(app_root)
+        languages_root = project_root / "languages"
+        (languages_root / "#manual").mkdir(parents=True, exist_ok=True)
+        (languages_root / "#manual" / "keep.dbt").write_text("keep", encoding="utf-8")
+        (languages_root / ".git").mkdir(parents=True, exist_ok=True)
+        (languages_root / "Old.dbt").write_text("stale", encoding="utf-8")
+        (languages_root / ".gitignore").write_text("# keep\n", encoding="utf-8")
+
+        synced = sync_vanilla_sources(game_root, project_root)
+        if synced != project_root:
+            raise AssertionError("sync_vanilla_sources did not return the managed project root")
+        if (languages_root / "Old.dbt").exists():
+            raise AssertionError("stale vanilla source files were not replaced during sync")
+        if (languages_root / "#german").exists():
+            raise AssertionError("translation folders from the game install should not be imported")
+        if (languages_root / "Text.dbt").read_text(encoding="utf-8") != "source-text":
+            raise AssertionError("vanilla DBT source was not copied into the managed project")
+        if (languages_root / "Guides" / "Intro.txt").read_text(encoding="utf-8") != "guide-source":
+            raise AssertionError("vanilla guide source was not copied into the managed project")
+        if (languages_root / "#manual").exists():
+            raise AssertionError("switching the game root should clear previous translation folders")
+        if (languages_root / "#chinese").exists():
+            raise AssertionError("sync should not auto-create a default translation folder")
+        if (languages_root / ".git").exists():
+            raise AssertionError("switching the game root should reset the managed language git repository")
+        if not (languages_root / ".gitignore").exists():
+            raise AssertionError("app-side metadata files should be preserved during vanilla sync")
+    finally:
+        safe_rmtree(temp)
+
+
+def assert_local_project_roots_detect_sources_projects() -> None:
+    temp = Path(tempfile.gettempdir()) / f"translator_tool_smoke_local_sources_{uuid.uuid4().hex[:8]}"
+    try:
+        (temp / "sources" / "Reforged" / "languages").mkdir(parents=True, exist_ok=True)
+        (temp / "sources" / "Reforged" / "languages" / "Text.dbt").write_text("source", encoding="utf-8")
+        (temp / "sources" / "Vanilla" / "languages").mkdir(parents=True, exist_ok=True)
+        (temp / "sources" / "Vanilla" / "languages" / "Tooltips.dbt").write_text("source", encoding="utf-8")
+        (temp / "sources" / "Empty" / "languages").mkdir(parents=True, exist_ok=True)
+        (temp / "sources" / "OnlyTranslations" / "languages" / "#chinese").mkdir(parents=True, exist_ok=True)
+
+        roots = local_project_roots(temp)
+        names = [root.name for root in roots]
+        if names != ["Reforged", "Vanilla"]:
+            raise AssertionError(f"local source projects were not discovered correctly: {names!r}")
+    finally:
+        safe_rmtree(temp)
+
+
+def assert_startup_prefers_local_sources_over_game_root() -> None:
+    from . import app as app_module
+    from .app import TranslatorWindow
+
+    temp = Path(tempfile.gettempdir()) / f"translator_tool_smoke_startup_sources_{uuid.uuid4().hex[:8]}"
+    previous_app_root = app_module.APP_ROOT
+    try:
+        (temp / "sources" / "Reforged" / "languages").mkdir(parents=True, exist_ok=True)
+        (temp / "sources" / "Reforged" / "languages" / "Text.dbt").write_text("source", encoding="utf-8")
+        game_root = temp / "Game"
+        (game_root / "DB" / "Languages").mkdir(parents=True, exist_ok=True)
+        (game_root / "DB" / "Languages" / "Text.dbt").write_text("game-source", encoding="utf-8")
+
+        app_module.APP_ROOT = temp
+        window = TranslatorWindow.__new__(TranslatorWindow)
+        window.settings = SimpleNamespace(last_project_root=str(game_root), recent_project_roots=[])
+        startup_root = TranslatorWindow._startup_project_root(window)
+        if startup_root != temp / "sources" / "Reforged":
+            raise AssertionError(f"startup should prefer local sources project, got: {startup_root!r}")
+    finally:
+        app_module.APP_ROOT = previous_app_root
+        safe_rmtree(temp)
 
 
 def assert_save_existing(root: Path) -> None:
@@ -381,16 +472,21 @@ def assert_project_history_settings(root: Path) -> None:
         expected = [str(root / f"project-{number}") for number in range(10)]
         save_settings(
             AppSettings(
+                ui_language="zh-CN",
                 last_project_root=expected[0],
                 recent_project_roots=expected,
                 auto_space_before_color_tokens_on_save=True,
+                editor_zoom_steps=3,
             )
         )
         loaded = load_settings()
         if (
+            loaded.ui_language != "zh-CN"
+            or
             loaded.last_project_root != expected[0]
             or loaded.recent_project_roots != expected[:8]
             or not loaded.auto_space_before_color_tokens_on_save
+            or loaded.editor_zoom_steps != 3
         ):
             raise AssertionError("project folder history was not persisted safely")
     finally:
@@ -399,6 +495,236 @@ def assert_project_history_settings(root: Path) -> None:
         else:
             os.environ["LOCALAPPDATA"] = previous
         safe_rmtree(temp)
+
+
+def assert_git_binding_tracks_project_root() -> None:
+    from .app import TranslatorWindow
+
+    temp = Path(tempfile.gettempdir()) / f"translator_tool_smoke_git_binding_{uuid.uuid4().hex[:8]}"
+    try:
+        vanilla = temp / "sources" / "Vanilla"
+        reforged = temp / "sources" / "Reforged"
+        for project_root in (vanilla, reforged):
+            (project_root / "languages" / "#chinese").mkdir(parents=True, exist_ok=True)
+            (project_root / "languages" / "Text.dbt").write_text("source", encoding="utf-8")
+
+        window = TranslatorWindow.__new__(TranslatorWindow)
+        window.project_root = reforged
+        window.git = LanguageGit(vanilla, "#chinese", codec_root=tool_root())
+        if TranslatorWindow._git_matches_current_project(window, "#chinese"):
+            raise AssertionError("git binding should not match after switching to a different project root")
+
+        window.git = LanguageGit(reforged, "#chinese", codec_root=tool_root())
+        if not TranslatorWindow._git_matches_current_project(window, "#chinese"):
+            raise AssertionError("git binding should match the active project root for the same language")
+    finally:
+        safe_rmtree(temp)
+
+
+def assert_bundled_settings_are_isolated_by_location() -> None:
+    temp = Path(tempfile.gettempdir()) / f"translator_tool_smoke_settings_iso_{uuid.uuid4().hex[:8]}"
+    previous_localappdata = os.environ.get("LOCALAPPDATA")
+    previous_frozen = getattr(settings_module.sys, "frozen", None)
+    previous_executable = settings_module.sys.executable
+    try:
+        os.environ["LOCALAPPDATA"] = str(temp)
+        dev_dir = settings_module.settings_dir()
+        if dev_dir.name != "dev":
+            raise AssertionError("development settings directory no longer uses the dev namespace")
+
+        settings_module.sys.frozen = True  # type: ignore[attr-defined]
+        settings_module.sys.executable = str(temp / "first" / "TheGuild2Translator.exe")
+        first = settings_module.settings_dir()
+        settings_module.sys.executable = str(temp / "second" / "TheGuild2Translator.exe")
+        second = settings_module.settings_dir()
+        if first == second:
+            raise AssertionError("bundled settings directories were not isolated by executable location")
+        if first.parent.name != "bundled" or second.parent.name != "bundled":
+            raise AssertionError("bundled settings directory did not use the bundled namespace")
+    finally:
+        if previous_localappdata is None:
+            os.environ.pop("LOCALAPPDATA", None)
+        else:
+            os.environ["LOCALAPPDATA"] = previous_localappdata
+        settings_module.sys.executable = previous_executable
+        if previous_frozen is None:
+            try:
+                delattr(settings_module.sys, "frozen")
+            except AttributeError:
+                pass
+        else:
+            settings_module.sys.frozen = previous_frozen  # type: ignore[attr-defined]
+        safe_rmtree(temp)
+
+
+def assert_editor_undo_stays_local(root: Path) -> None:
+    os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+    from PySide6.QtCore import Qt
+    from PySide6.QtGui import QTextCursor
+    from PySide6.QtTest import QTest
+    from PySide6.QtWidgets import QApplication
+
+    from . import app as app_module
+    from .app import TYPING_GROUP_DELAY_MS, TranslatorWindow
+
+    temp = make_temp_project(root, "translator_tool_smoke_editor_undo_")
+    settings_dir = Path(tempfile.gettempdir()) / f"translator_tool_smoke_editor_settings_{uuid.uuid4().hex[:8]}"
+    previous_localappdata = os.environ.get("LOCALAPPDATA")
+    previous_managed_root = app_module.MANAGED_PROJECT_ROOT
+    try:
+        guide_source = temp / "languages" / "Guides" / "Intro.txt"
+        guide_source.parent.mkdir(parents=True, exist_ok=True)
+        guide_source.write_bytes("Guide Title\r\nGuide Body\r\n".encode("utf-16"))
+        os.environ["LOCALAPPDATA"] = str(settings_dir)
+        app_module.MANAGED_PROJECT_ROOT = temp
+        save_settings(AppSettings())
+        app = QApplication.instance()
+        created_app = app is None
+        if app is None:
+            app = QApplication([])
+        win = TranslatorWindow()
+
+        unit = next(item for item in win.model.units if item.ref.kind == "dbt" and item.source_text)
+        original = unit.current_text
+        win.current_uid = unit.uid
+        win._set_editor_unit(unit)
+        win.show()
+        app.processEvents()
+
+        win.translation_edit.setFocus(Qt.FocusReason.OtherFocusReason)
+        app.processEvents()
+        cursor = win.translation_edit.textCursor()
+        cursor.movePosition(QTextCursor.MoveOperation.End)
+        win.translation_edit.setTextCursor(cursor)
+        win.translation_edit.insertPlainText("x")
+        app.processEvents()
+        if win.translation_edit.toPlainText() != original + "x":
+            raise AssertionError("editor typing smoke test did not update the translation editor")
+
+        undo_calls = 0
+        original_undo = win.undo
+
+        def wrapped_undo() -> None:
+            nonlocal undo_calls
+            undo_calls += 1
+            original_undo()
+
+        win.undo = wrapped_undo  # type: ignore[method-assign]
+        QTest.keyClick(win.translation_edit, Qt.Key.Key_Z, Qt.KeyboardModifier.ControlModifier)
+        app.processEvents()
+        if undo_calls != 1:
+            raise AssertionError("one Ctrl+Z should trigger only one editor undo")
+        if win.translation_edit.toPlainText() != original or unit.current_text != original:
+            raise AssertionError("editor undo did not restore only the in-progress text edit")
+        if win.current_uid != unit.uid:
+            raise AssertionError("editor undo unexpectedly changed the selected translation unit")
+        if win.translation_edit.textCursor().position() == 0 and original:
+            raise AssertionError("editor undo unexpectedly reset the caret to the start of the text")
+
+        QTest.keyClick(win.translation_edit, Qt.Key.Key_Y, Qt.KeyboardModifier.ControlModifier)
+        app.processEvents()
+        if win.translation_edit.toPlainText() != original + "x" or unit.current_text != original + "x":
+            raise AssertionError("editor redo did not restore the in-progress text edit")
+
+        win.translation_edit.insertPlainText("a")
+        app.processEvents()
+        QTest.qWait(TYPING_GROUP_DELAY_MS + 120)
+        app.processEvents()
+
+        win.translation_edit.insertPlainText("b")
+        app.processEvents()
+        QTest.keyClick(win.translation_edit, Qt.Key.Key_Z, Qt.KeyboardModifier.ControlModifier)
+        app.processEvents()
+        if win.current_uid != unit.uid:
+            raise AssertionError("editor undo unexpectedly changed the selected unit during continued editing")
+        if win.translation_edit.textCursor().position() == 0 and unit.current_text:
+            raise AssertionError("editor undo unexpectedly reset the caret during continued editing")
+
+        second = next(
+            item for item in win.model.units if item.ref.kind == "dbt" and item.source_text and item.uid != unit.uid
+        )
+        second_original = second.current_text
+        win._restore_selected_row(second.uid)
+        app.processEvents()
+        win.current_uid = second.uid
+        win._set_editor_unit(second)
+        win.translation_edit.setFocus(Qt.FocusReason.OtherFocusReason)
+        app.processEvents()
+        cursor = win.translation_edit.textCursor()
+        cursor.movePosition(QTextCursor.MoveOperation.End)
+        win.translation_edit.setTextCursor(cursor)
+        win.translation_edit.insertPlainText("z")
+        app.processEvents()
+        QTest.qWait(TYPING_GROUP_DELAY_MS + 120)
+        app.processEvents()
+        if second.current_text != second_original + "z":
+            raise AssertionError("second unit typing smoke test did not update the translation editor")
+
+        QTest.keyClick(win.translation_edit, Qt.Key.Key_Z, Qt.KeyboardModifier.ControlModifier)
+        app.processEvents()
+        if win.current_uid != second.uid:
+            raise AssertionError("editor undo unexpectedly switched away from the active entry")
+        if unit.current_text != win.model.unit_for_uid(unit.uid).current_text:
+            raise AssertionError("editor undo unexpectedly altered a different entry")
+
+        win.table.setFocus(Qt.FocusReason.OtherFocusReason)
+        app.processEvents()
+        win.undo()
+        app.processEvents()
+        if second.current_text == second_original + "z":
+            raise AssertionError("table-level undo did not restore the latest committed entry edit")
+
+        win._replace_unit_text(second, second_original + "q", "smoke test history")
+        app.processEvents()
+        if second.current_text != second_original + "q":
+            raise AssertionError("dbt edit before document-mode switch did not commit as expected")
+
+        guides_index = win.file_combo.findData("Guides/Intro.txt")
+        if guides_index < 0:
+            raise AssertionError("guide txt smoke test entry is missing from file filter")
+        win.file_combo.setCurrentIndex(guides_index)
+        app.processEvents()
+
+        dbt_index = win.file_combo.findData(second.file_rel)
+        if dbt_index < 0:
+            raise AssertionError("dbt file is missing from file filter after leaving guide txt mode")
+        win.file_combo.setCurrentIndex(dbt_index)
+        app.processEvents()
+        win._restore_selected_row(second.uid)
+        app.processEvents()
+        win.translation_edit.setFocus(Qt.FocusReason.OtherFocusReason)
+        app.processEvents()
+
+        QTest.keyClick(win.translation_edit, Qt.Key.Key_Z, Qt.KeyboardModifier.ControlModifier)
+        app.processEvents()
+        if second.current_text != second_original:
+            raise AssertionError("editor undo did not fall back to entry history after returning from guide txt mode")
+
+        win.close()
+        app.processEvents()
+    finally:
+        app_module.MANAGED_PROJECT_ROOT = previous_managed_root
+        if previous_localappdata is None:
+            os.environ.pop("LOCALAPPDATA", None)
+        else:
+            os.environ["LOCALAPPDATA"] = previous_localappdata
+        safe_rmtree(settings_dir)
+        safe_rmtree(temp)
+        if "created_app" in locals() and created_app:
+            app.quit()
+
+
+def assert_ui_language_switching() -> None:
+    previous = set_language("en")
+    try:
+        set_language("en")
+        if translate("button.save") != "Save" or status_text(STATUS_TRANSLATED) != "Translated":
+            raise AssertionError("English UI localization did not resolve expected labels")
+        set_language("zh-CN")
+        if translate("button.save") != "保存" or status_text(STATUS_TRANSLATED) != "已翻译":
+            raise AssertionError("Chinese UI localization did not resolve expected labels")
+    finally:
+        set_language(previous)
 
 
 def assert_external_project_uses_tool_codec(root: Path) -> None:
@@ -413,6 +739,99 @@ def assert_external_project_uses_tool_codec(root: Path) -> None:
         raise AssertionError("external project did not load with the tool codec")
     LanguageGit(temp, codec_root=tool_root())
     safe_rmtree(temp)
+
+
+def assert_packaged_runtime_finds_sibling_codec(root: Path) -> None:
+    temp = make_temp_project(root, "translator_tool_smoke_packaged_codec_")
+    try:
+        runtime_root = temp / "_internal"
+        runtime_root.mkdir(parents=True, exist_ok=True)
+        codec = load_codec_for_language(runtime_root, "#chinese")
+        if codec is None:
+            raise AssertionError("packaged runtime did not find a sibling Chinese codec directory")
+        if codec.decode(codec.encode("测试")) != "测试":
+            raise AssertionError("packaged runtime sibling codec did not round-trip")
+    finally:
+        safe_rmtree(temp)
+
+
+def assert_non_chinese_language_bypasses_codec(root: Path) -> None:
+    temp = make_temp_project(root, "translator_tool_smoke_non_chinese_codec_")
+    try:
+        korean_root = temp / "languages" / "#korean"
+        korean_root.mkdir(parents=True, exist_ok=True)
+        git = LanguageGit(temp, "#korean")
+        git.ensure_repository(AppSettings())
+
+        project = Project.load(temp, "#korean")
+        if project.codec is not None:
+            raise AssertionError("non-Chinese language unexpectedly loaded the Chinese codec")
+        unit = next(item for item in project.units if item.file_rel == "Text.dbt" and item.source_text)
+        if unit.font_codec is not None:
+            raise AssertionError("non-Chinese DBT units unexpectedly enabled glyph-codec validation")
+        unit.set_text("건강:")
+        result = project.save([unit])
+
+        target_path = korean_root / "Text.dbt"
+        if not result.changed_files or target_path not in result.changed_files:
+            raise AssertionError("non-Chinese DBT save did not write the target file")
+        saved = load_dbt(target_path)
+        saved_row = saved.row_index.get((int(unit.record_id), unit.label))
+        if saved_row is None or saved_row.get("korean") != "건강:":
+            raise AssertionError("non-Chinese DBT save incorrectly codec-encoded raw text")
+
+        reloaded = Project.load(temp, "#korean")
+        updated = next(item for item in reloaded.units if item.uid == unit.uid)
+        if updated.current_text != "건강:":
+            raise AssertionError("non-Chinese DBT reload incorrectly decoded raw text")
+
+        commit = git.commit_saved(result.changed_files, result.saved_units, result.deleted_units)
+        if commit is None:
+            raise AssertionError("non-Chinese save did not create a Git commit")
+        entries = git.entries_for_commit(commit.full_hash)
+        if not entries or entries[0].translated_text != "건강:":
+            raise AssertionError("non-Chinese Git history incorrectly decoded raw text")
+    finally:
+        safe_rmtree(temp)
+
+
+def assert_chinese_without_codec_uses_plain_text(root: Path) -> None:
+    temp = make_temp_project(root, "translator_tool_smoke_missing_chinese_codec_")
+    try:
+        safe_rmtree(temp / "encoder")
+        git = LanguageGit(temp, "#chinese")
+        git.ensure_repository(AppSettings())
+
+        project = Project.load(temp, "#chinese")
+        if project.codec is not None:
+            raise AssertionError("Chinese project unexpectedly loaded a missing codec")
+        unit = next(item for item in project.units if item.file_rel == "Text.dbt" and item.source_text)
+        if unit.font_codec is not None:
+            raise AssertionError("Chinese DBT units unexpectedly enabled glyph-codec validation without a codec")
+        unit.set_text("测试")
+        result = project.save([unit])
+
+        target_path = temp / "languages" / "#chinese" / "Text.dbt"
+        if not result.changed_files or target_path not in result.changed_files:
+            raise AssertionError("Chinese save without codec did not write the target file")
+        saved = load_dbt(target_path)
+        saved_row = saved.row_index.get((int(unit.record_id), unit.label))
+        if saved_row is None or saved_row.get("chinese") != "测试":
+            raise AssertionError("Chinese save without codec did not preserve plain text")
+
+        reloaded = Project.load(temp, "#chinese")
+        updated = next(item for item in reloaded.units if item.uid == unit.uid)
+        if updated.current_text != "测试":
+            raise AssertionError("Chinese reload without codec did not preserve plain text")
+
+        commit = git.commit_saved(result.changed_files, result.saved_units, result.deleted_units)
+        if commit is None:
+            raise AssertionError("Chinese save without codec did not create a Git commit")
+        entries = git.entries_for_commit(commit.full_hash)
+        if not entries or entries[0].translated_text != "测试":
+            raise AssertionError("Chinese Git history without codec did not preserve plain text")
+    finally:
+        safe_rmtree(temp)
 
 
 def assert_validation_warnings_do_not_block() -> None:
@@ -444,7 +863,7 @@ def assert_ignore_cache(root: Path) -> None:
 
 
 def assert_codec(root: Path) -> None:
-    codec = Guild2Codec.load(default_codec_path(tool_root()))
+    codec = Guild2Codec.load(tool_root())
     text = "测试"
     if codec.decode(codec.encode(text)) != text:
         raise AssertionError("codec encode/decode did not round-trip")
@@ -554,6 +973,13 @@ def assert_guild2_format_grammar() -> None:
     )
     if any(issue.code == "unknown-format" for issue in tooltip_macros):
         raise AssertionError("tooltip macros or @N gender tags were not recognized")
+    guide_tip = validate_translation(
+        "<text>\nCombat in the world is dangerous. Defend your {tip:CART}carts{/tip}.\n</text>",
+        "<text>\n战斗很危险。保护你的{TIP : CART }货车{/ TIP}。\n</text>",
+        dbt_field=False,
+    )
+    if not any(issue.code in {"format-missing", "format-extra"} for issue in guide_tip):
+        raise AssertionError("guide tip tags should remain case-sensitive and spacing-sensitive in txt files")
     literal_percent = validate_translation(
         "Weak beer has 3-6% of alcohol and costs 50%.",
         "淡啤酒酒精度为 3-6%，价格是 50%。",
@@ -715,10 +1141,19 @@ def assert_git_history(root: Path) -> None:
         if delete_entries[0].previous_text != deleted_text or delete_entries[0].translated_text != "":
             raise AssertionError("Git delete history did not preserve the removed translation text")
         delete_rendered = format_entries(delete_entries)
-        if "[已删除]" not in delete_rendered:
+        if translate("history.formatted_entry.deleted") not in delete_rendered:
             raise AssertionError("Git history text output did not label deleted entries")
     finally:
         safe_rmtree(temp)
+
+
+def assert_git_subprocess_hides_console() -> None:
+    kwargs = LanguageGit._subprocess_kwargs(text=True)
+    if hasattr(subprocess, "CREATE_NO_WINDOW"):
+        if kwargs.get("creationflags") != subprocess.CREATE_NO_WINDOW:
+            raise AssertionError("Git subprocesses did not request CREATE_NO_WINDOW on Windows")
+        if "startupinfo" not in kwargs:
+            raise AssertionError("Git subprocesses did not provide hidden-window startup info on Windows")
 
 
 def assert_git_pending_is_scoped_to_active_language(root: Path) -> None:
@@ -787,13 +1222,17 @@ def assert_git_commit_display() -> None:
     display = commit.display
     if "translation:" in display:
         raise AssertionError("commit list display should not expose the raw translation prefix")
-    if "新增 3" not in display or "修订 2" not in display or "Text.dbt, Tooltips.dbt" not in display:
+    if (
+        translate("history.change.add", count=3) not in display
+        or translate("history.change.update", count=2) not in display
+        or "Text.dbt, Tooltips.dbt" not in display
+    ):
         raise AssertionError("commit list display did not summarize translation commits correctly")
     delete_commit = GitCommit("c" * 40, "89abcde", timestamp, "translation: delete 4 (Text.dbt)")
-    if "删除 4" not in delete_commit.display or "Text.dbt" not in delete_commit.display:
+    if translate("history.change.delete", count=4) not in delete_commit.display or "Text.dbt" not in delete_commit.display:
         raise AssertionError("delete-only translation commits were not summarized correctly")
     pending = GitCommit("b" * 40, "1234567", timestamp, "translation: commit pending language changes")
-    if "待处理变更" not in pending.display:
+    if translate("history.subject.pending") not in pending.display:
         raise AssertionError("pending translation commit display was not simplified")
 
 
@@ -804,6 +1243,9 @@ def main() -> int:
     assert_round_trip(root)
     assert_statuses(root)
     assert_loaded_order_matches_file_lines(root)
+    assert_local_project_roots_detect_sources_projects()
+    assert_startup_prefers_local_sources_over_game_root()
+    assert_sync_vanilla_sources_only_imports_originals()
     assert_save_existing(root)
     assert_save_auto_formats_color_tokens(root)
     assert_save_guides_plain_text_uses_source_profile(root)
@@ -814,7 +1256,14 @@ def main() -> int:
     assert_unsaved_translation_status(root)
     assert_mod_label_match_inserts_source_formatted_row(root)
     assert_project_history_settings(root)
+    assert_git_binding_tracks_project_root()
+    assert_bundled_settings_are_isolated_by_location()
+    assert_editor_undo_stays_local(root)
+    assert_ui_language_switching()
     assert_external_project_uses_tool_codec(root)
+    assert_packaged_runtime_finds_sibling_codec(root)
+    assert_non_chinese_language_bypasses_codec(root)
+    assert_chinese_without_codec_uses_plain_text(root)
     assert_validation_warnings_do_not_block()
     assert_ignore_cache(root)
     assert_operation_history()
@@ -823,6 +1272,7 @@ def main() -> int:
     assert_guild2_format_grammar()
     assert_llm_suggestion_stream()
     assert_git_history(root)
+    assert_git_subprocess_hides_console()
     assert_git_commit_display()
     assert_git_pending_is_scoped_to_active_language(root)
     assert_git_recovers_stale_index_lock(root)
