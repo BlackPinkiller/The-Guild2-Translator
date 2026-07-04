@@ -178,7 +178,7 @@ class LanguageGit:
             cached = self._commit_list_cache
         if cached is not None and limit <= 100:
             return list(cached[:limit])
-        result = self._run("log", f"-n{limit}", "--format=%H%x1f%h%x1f%ct%x1f%s")
+        result = self._run("log", f"-n{limit}", "--format=%H%x1f%h%x1f%ct%x1f%s", "--", self._language_pathspec())
         commits: list[GitCommit] = []
         for line in result.stdout.splitlines():
             parts = line.split("\x1f", 3)
@@ -199,7 +199,7 @@ class LanguageGit:
         if parent is None:
             return []
         changed = self._run("diff-tree", "--no-commit-id", "--name-only", "-r", commit).stdout.splitlines()
-        prefix = self.language.rstrip("/") + "/"
+        prefix = self._language_pathspec()
         entries: list[TranslationLogEntry] = []
         for target_rel in changed:
             if not target_rel.startswith(prefix):
@@ -354,7 +354,7 @@ class LanguageGit:
         return self._run(*args, check=False).returncode != 0
 
     def _pending_target_paths(self) -> list[str]:
-        prefix = self.language.rstrip("/") + "/"
+        prefix = self._language_pathspec()
         raw = self._run("status", "--porcelain", "-z").stdout
         paths: list[str] = []
         for record in raw.split("\0"):
@@ -427,6 +427,9 @@ class LanguageGit:
         except OSError:
             return False
         return True
+
+    def _language_pathspec(self) -> str:
+        return self.language.rstrip("/") + "/"
 
     def _invalidate_history_cache(self) -> None:
         with self._cache_lock:

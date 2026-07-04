@@ -27,7 +27,7 @@ from PySide6.QtCore import (
     QRectF,
     Signal,
 )
-from PySide6.QtGui import QAction, QCloseEvent, QColor, QFont, QKeyEvent, QKeySequence, QPainter, QPalette, QPen, QSyntaxHighlighter, QTextCharFormat, QTextCursor, QWheelEvent
+from PySide6.QtGui import QAction, QCloseEvent, QColor, QFont, QKeyEvent, QKeySequence, QPainter, QPalette, QPen, QStandardItemModel, QSyntaxHighlighter, QTextCharFormat, QTextCursor, QWheelEvent
 from PySide6.QtWidgets import (
     QApplication,
     QAbstractItemView,
@@ -121,6 +121,8 @@ TYPING_GROUP_DELAY_MS = 750
 FILE_FILTER_ALL = "__all_files__"
 STATUS_FILTER_ALL = "__all_statuses__"
 STATUS_FILTER_TODO = "__needs_translation__"
+LANGUAGE_ACTION_NEW = "__new_language__"
+LANGUAGE_ACTION_SEPARATOR = "__language_separator__"
 
 
 class UnitTableModel(QAbstractTableModel):
@@ -368,6 +370,84 @@ class RowTintDelegate(QStyledItemDelegate):
             painter.restore()
             return
         super().paint(painter, option, index)
+
+
+class PopupHighlightDelegate(QStyledItemDelegate):
+    """Keep the combo's current value visibly marked inside the popup."""
+
+    def __init__(self, combo: QComboBox) -> None:
+        super().__init__(combo.view())
+        self.combo = combo
+
+    def paint(self, painter: QPainter, option: QStyleOptionViewItem, index: QModelIndex) -> None:
+        data = index.data(Qt.ItemDataRole.UserRole)
+        if data == LANGUAGE_ACTION_SEPARATOR:
+            painter.save()
+            painter.setPen(QPen(QColor("#bdae93"), 1))
+            y = option.rect.center().y()
+            painter.drawLine(option.rect.left() + 8, y, option.rect.right() - 8, y)
+            painter.restore()
+            return
+        is_current_value = index.row() == self.combo.currentIndex()
+        is_hovered = bool(option.state & QStyle.StateFlag.State_MouseOver)
+        is_selected = bool(option.state & QStyle.StateFlag.State_Selected)
+
+        if is_current_value:
+            painter.save()
+            painter.fillRect(option.rect, QColor("#b8bb26"))
+            painter.restore()
+            option.palette.setColor(QPalette.ColorRole.Highlight, QColor("#b8bb26"))
+            option.palette.setColor(QPalette.ColorRole.HighlightedText, QColor("#3c3836"))
+            option.palette.setColor(QPalette.ColorRole.Text, QColor("#3c3836"))
+        elif is_hovered or is_selected:
+            painter.save()
+            painter.fillRect(option.rect, QColor("#d5c4a1"))
+            painter.restore()
+            option.palette.setColor(QPalette.ColorRole.Highlight, QColor("#d5c4a1"))
+            option.palette.setColor(QPalette.ColorRole.HighlightedText, QColor("#3c3836"))
+            option.palette.setColor(QPalette.ColorRole.Text, QColor("#3c3836"))
+
+        super().paint(painter, option, index)
+
+
+class PopupSelectionComboBox(QComboBox):
+    """Keep the popup view aligned with the combo's current item."""
+
+    def __init__(self, parent: QWidget | None = None) -> None:
+        super().__init__(parent)
+        self.view().setItemDelegate(PopupHighlightDelegate(self))
+        self.view().setStyleSheet(
+            """
+            QAbstractItemView {
+                background: #f2e5bc;
+                border: 2px solid #3c3836;
+                selection-background-color: #b8bb26;
+                selection-color: #3c3836;
+            }
+            """
+        )
+
+    def showPopup(self) -> None:  # noqa: N802
+        super().showPopup()
+        QTimer.singleShot(0, self._sync_popup_selection)
+
+    def _sync_popup_selection(self) -> None:
+        row = self.currentIndex()
+        if row < 0:
+            return
+        model_index = self.model().index(row, self.modelColumn(), self.rootModelIndex())
+        if not model_index.isValid():
+            return
+        view = self.view()
+        view.setCurrentIndex(model_index)
+        view.setFocus(Qt.FocusReason.PopupFocusReason)
+        selection_model = view.selectionModel()
+        if selection_model is not None:
+            selection_model.setCurrentIndex(
+                model_index,
+                selection_model.SelectionFlag.ClearAndSelect,
+            )
+        view.scrollTo(model_index)
 
 
 def _paint_review_background(painter: QPainter, option: QStyleOptionViewItem, index: QModelIndex) -> bool:
@@ -1047,6 +1127,46 @@ class SettingsDialog(QDialog):
         )
 
 
+class NewLanguageDialog(QDialog):
+    def __init__(self, parent: QWidget | None = None) -> None:
+        super().__init__(parent)
+        self.setModal(True)
+        self.setWindowTitle(translate("dialog.new_language_title"))
+        self.setMinimumWidth(420)
+        layout = QVBoxLayout(self)
+        hint = QLabel(translate("dialog.new_language_detail"))
+        hint.setWordWrap(True)
+        hint.setObjectName("hint")
+        layout.addWidget(hint)
+
+        row = QHBoxLayout()
+        self.prefix = QLineEdit("#")
+        self.prefix.setReadOnly(True)
+        self.prefix.setFixedWidth(42)
+        self.prefix.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        row.addWidget(self.prefix)
+
+        self.name_edit = QLineEdit()
+        self.name_edit.setPlaceholderText(translate("dialog.new_language_placeholder"))
+        self.name_edit.returnPressed.connect(self.accept)
+        row.addWidget(self.name_edit, 1)
+        layout.addLayout(row)
+
+        self.buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel)
+        self.buttons.accepted.connect(self.accept)
+        self.buttons.rejected.connect(self.reject)
+        ok_button = self.buttons.button(QDialogButtonBox.StandardButton.Ok)
+        if ok_button is not None:
+            ok_button.setText(translate("dialog.new_language_confirm"))
+        cancel_button = self.buttons.button(QDialogButtonBox.StandardButton.Cancel)
+        if cancel_button is not None:
+            cancel_button.setText(translate("dialog.cancel"))
+        layout.addWidget(self.buttons)
+
+    def result_language(self) -> str:
+        return "#" + self.name_edit.text().strip().lstrip("#")
+
+
 class SuggestionDialog(QDialog):
     apply_translation = Signal(str)
     dismissed = Signal()
@@ -1315,22 +1435,18 @@ class TranslatorWindow(QMainWindow):
         title_layout.addWidget(self.project_button)
         self.language_label = QLabel()
         toolbar_layout.addWidget(self.language_label)
-        self.language_combo = QComboBox()
-        self.language_combo.setEditable(True)
-        self.language_combo.setInsertPolicy(QComboBox.InsertPolicy.NoInsert)
+        self.language_combo = PopupSelectionComboBox()
         self.language_combo.setMinimumWidth(160)
-        self.language_combo.currentIndexChanged.connect(lambda _value: self.load_project())
-        if self.language_combo.lineEdit() is not None:
-            self.language_combo.lineEdit().returnPressed.connect(self.load_project)
+        self.language_combo.activated.connect(self._on_language_combo_activated)
         toolbar_layout.addWidget(self.language_combo)
         self.status_label = QLabel()
         toolbar_layout.addWidget(self.status_label)
-        self.status_combo = QComboBox()
+        self.status_combo = PopupSelectionComboBox()
         self.status_combo.currentTextChanged.connect(self._apply_filters)
         toolbar_layout.addWidget(self.status_combo)
         self.file_label = QLabel()
         toolbar_layout.addWidget(self.file_label)
-        self.file_combo = QComboBox()
+        self.file_combo = PopupSelectionComboBox()
         self.file_combo.setMinimumWidth(190)
         self.file_combo.currentTextChanged.connect(self._apply_filters)
         toolbar_layout.addWidget(self.file_combo)
@@ -1676,11 +1792,8 @@ class TranslatorWindow(QMainWindow):
         self._update_window_title()
 
     def _update_language_input_prompt(self) -> None:
-        example = DEFAULT_TRANSLATION_LANGUAGE
-        self.language_combo.setToolTip(translate("toolbar.language_tooltip", example=example))
-        line_edit = self.language_combo.lineEdit()
-        if line_edit is not None:
-            line_edit.setPlaceholderText(translate("toolbar.language_placeholder", example=example))
+        self.language_combo.setToolTip(translate("toolbar.language_tooltip"))
+        self.language_combo.setPlaceholderText(translate("toolbar.language_placeholder"))
 
     @staticmethod
     def _normalized_language_name(raw: str) -> str:
@@ -1707,16 +1820,80 @@ class TranslatorWindow(QMainWindow):
         self.language_combo.clear()
         for choice in choices:
             self.language_combo.addItem(choice)
+        if choices:
+            self.language_combo.addItem("", LANGUAGE_ACTION_SEPARATOR)
+        self.language_combo.addItem(translate("toolbar.language_create"), LANGUAGE_ACTION_NEW)
+        model = self.language_combo.model()
+        if isinstance(model, QStandardItemModel):
+            separator_index = self.language_combo.findData(LANGUAGE_ACTION_SEPARATOR)
+            if separator_index >= 0:
+                item = model.item(separator_index)
+                if item is not None:
+                    item.setEnabled(False)
         selected = self._normalized_language_name(preferred or "")
         if selected in choices:
             self.language_combo.setCurrentText(selected)
         elif choices:
             self.language_combo.setCurrentText(choices[0])
         else:
-            self.language_combo.setEditText(selected)
+            self.language_combo.setCurrentIndex(-1)
         del blocker
         self._update_language_input_prompt()
         return choices
+
+    def _restore_language_selection(self) -> None:
+        preferred = self.project.language if self.project is not None else ""
+        self._load_language_choices(preferred)
+
+    def _confirm_language_switch(self) -> bool:
+        if self.project is None:
+            return True
+        self._commit_typing_operation()
+        if not self.project.has_dirty_units():
+            return True
+        answer = QMessageBox.question(self, translate("dialog.reload_title"), translate("dialog.reload_discard"))
+        return answer == QMessageBox.StandardButton.Yes
+
+    def _apply_language_selection(self, language: str, *, create: bool = False) -> None:
+        if not create and self.project is not None and language == self.project.language:
+            self._restore_language_selection()
+            return
+        problem = self._language_name_problem(language)
+        if problem is not None:
+            QMessageBox.warning(self, translate("dialog.invalid_language_title"), problem)
+            self._restore_language_selection()
+            return
+        if not self._confirm_language_switch():
+            self._restore_language_selection()
+            return
+        if create and self.project_root is not None:
+            ensure_translation_dir(self.project_root, language)
+        self._load_language_choices(language)
+        self.load_project(discard_changes=True)
+
+    def _create_new_language(self) -> None:
+        if self.project_root is None:
+            self._restore_language_selection()
+            return
+        dialog = NewLanguageDialog(self)
+        if dialog.exec() != QDialog.DialogCode.Accepted:
+            self._restore_language_selection()
+            return
+        self._apply_language_selection(dialog.result_language(), create=True)
+
+    def _on_language_combo_activated(self, index: int) -> None:
+        data = self.language_combo.itemData(index)
+        if data == LANGUAGE_ACTION_SEPARATOR or not self.language_combo.itemText(index).strip() and data != LANGUAGE_ACTION_NEW:
+            self._restore_language_selection()
+            return
+        if data == LANGUAGE_ACTION_NEW:
+            self._create_new_language()
+            return
+        language = self._normalized_language_name(str(data or self.language_combo.itemText(index)))
+        if not language:
+            self._restore_language_selection()
+            return
+        self._apply_language_selection(language)
 
     def _git_matches_current_project(self, language: str) -> bool:
         if self.git is None or self.project_root is None:
@@ -1907,6 +2084,8 @@ class TranslatorWindow(QMainWindow):
     def _retranslate_ui(self) -> None:
         self.workspace_subtitle.setText(translate("workspace.subtitle"))
         self.language_label.setText(translate("toolbar.language"))
+        current_language = self.project.language if self.project is not None else self._normalized_language_name(str(self.language_combo.currentData() or ""))
+        self._load_language_choices(current_language)
         self.status_label.setText(translate("toolbar.status"))
         self.file_label.setText(translate("toolbar.file"))
         self.search_label.setText(translate("toolbar.search"))
@@ -1922,7 +2101,6 @@ class TranslatorWindow(QMainWindow):
         self.source_edit.setPlaceholderText(translate("editor.placeholder"))
         self.translation_edit.setPlaceholderText(translate("editor.placeholder"))
         self.batch_ai_button._update_presentation()
-        self._update_language_input_prompt()
         self._populate_status_choices()
         self._update_project_button()
         self._update_file_choices()

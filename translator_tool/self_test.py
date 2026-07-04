@@ -521,6 +521,48 @@ def assert_git_binding_tracks_project_root() -> None:
         safe_rmtree(temp)
 
 
+def assert_language_combo_offers_create_action() -> None:
+    os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+    from PySide6.QtWidgets import QApplication
+
+    from PySide6.QtGui import QStandardItemModel
+
+    from .app import LANGUAGE_ACTION_NEW, LANGUAGE_ACTION_SEPARATOR, PopupSelectionComboBox, TranslatorWindow
+
+    temp = Path(tempfile.gettempdir()) / f"translator_tool_smoke_language_combo_{uuid.uuid4().hex[:8]}"
+    try:
+        (temp / "languages" / "#chinese").mkdir(parents=True, exist_ok=True)
+        (temp / "languages" / "Text.dbt").write_text("source", encoding="utf-8")
+        app = QApplication.instance()
+        created_app = app is None
+        if app is None:
+            app = QApplication([])
+        window = TranslatorWindow.__new__(TranslatorWindow)
+        window.project_root = temp
+        window.project = None
+        window.language_combo = PopupSelectionComboBox()
+        choices = TranslatorWindow._load_language_choices(window, "#chinese")
+        if choices != ["#chinese"]:
+            raise AssertionError(f"language choices should only return real translation folders: {choices!r}")
+        if window.language_combo.isEditable():
+            raise AssertionError("language combo should no longer be editable")
+        separator_index = window.language_combo.findData(LANGUAGE_ACTION_SEPARATOR)
+        if separator_index < 0:
+            raise AssertionError("language combo is missing the separator before the create action")
+        action_index = window.language_combo.findData(LANGUAGE_ACTION_NEW)
+        if action_index < 0:
+            raise AssertionError("language combo is missing the create-new-language action")
+        model = window.language_combo.model()
+        if isinstance(model, QStandardItemModel):
+            separator_item = model.item(separator_index)
+            if separator_item is None or separator_item.isEnabled():
+                raise AssertionError("language separator should be disabled")
+        if created_app:
+            app.quit()
+    finally:
+        safe_rmtree(temp)
+
+
 def assert_bundled_settings_are_isolated_by_location() -> None:
     temp = Path(tempfile.gettempdir()) / f"translator_tool_smoke_settings_iso_{uuid.uuid4().hex[:8]}"
     previous_localappdata = os.environ.get("LOCALAPPDATA")
@@ -1171,6 +1213,41 @@ def assert_git_pending_is_scoped_to_active_language(root: Path) -> None:
     safe_rmtree(temp)
 
 
+def assert_git_history_list_is_scoped_to_active_language(root: Path) -> None:
+    temp = make_temp_project(root, "translator_tool_smoke_git_history_scope_")
+    try:
+        git_chinese = LanguageGit(temp, "#chinese")
+        git_chinese.ensure_repository(AppSettings())
+
+        chinese_target = temp / "languages" / "#chinese" / "Text.dbt"
+        chinese_target.write_bytes(chinese_target.read_bytes() + b"\n")
+        chinese_commit = git_chinese.commit_pending()
+        if chinese_commit is None:
+            raise AssertionError("Chinese history scope test did not create a pending-language commit")
+
+        korean_root = temp / "languages" / "#korean"
+        korean_root.mkdir(parents=True, exist_ok=True)
+        korean_target = korean_root / "Text.dbt"
+        korean_target.write_bytes((temp / "languages" / "Text.dbt").read_bytes())
+        git_korean = LanguageGit(temp, "#korean")
+        korean_commit = git_korean.commit_pending()
+        if korean_commit is None:
+            raise AssertionError("Korean history scope test did not create a pending-language commit")
+
+        chinese_hashes = {commit.full_hash for commit in git_chinese.list_commits()}
+        korean_hashes = {commit.full_hash for commit in git_korean.list_commits()}
+        if chinese_commit.full_hash not in chinese_hashes:
+            raise AssertionError("Chinese history list did not include the active Chinese commit")
+        if korean_commit.full_hash in chinese_hashes:
+            raise AssertionError("Chinese history list unexpectedly included a Korean-only commit")
+        if korean_commit.full_hash not in korean_hashes:
+            raise AssertionError("Korean history list did not include the active Korean commit")
+        if chinese_commit.full_hash in korean_hashes:
+            raise AssertionError("Korean history list unexpectedly included a Chinese-only commit")
+    finally:
+        safe_rmtree(temp)
+
+
 def assert_git_recovers_stale_index_lock(root: Path) -> None:
     temp = make_temp_project(root, "translator_tool_smoke_git_lock_")
     try:
@@ -1257,6 +1334,7 @@ def main() -> int:
     assert_mod_label_match_inserts_source_formatted_row(root)
     assert_project_history_settings(root)
     assert_git_binding_tracks_project_root()
+    assert_language_combo_offers_create_action()
     assert_bundled_settings_are_isolated_by_location()
     assert_editor_undo_stays_local(root)
     assert_ui_language_switching()
@@ -1275,6 +1353,7 @@ def main() -> int:
     assert_git_subprocess_hides_console()
     assert_git_commit_display()
     assert_git_pending_is_scoped_to_active_language(root)
+    assert_git_history_list_is_scoped_to_active_language(root)
     assert_git_recovers_stale_index_lock(root)
     assert_combined_git_history_format()
     print("translator_tool self-test ok")
