@@ -2,7 +2,7 @@
 
 [English](README.md)
 
-用于 The Guild 2 翻译项目的桌面编辑器。
+用于 The Guild 2 版本4.6+ 翻译项目的桌面编辑器。
 
 ## 环境要求
 

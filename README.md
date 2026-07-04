@@ -2,7 +2,7 @@
 
 [简体中文](README_zh.md)
 
-Desktop editor for The Guild 2 translation projects.
+Desktop editor for The Guild 2 version 4.6+ translation projects.
 
 ## Requirements
 
