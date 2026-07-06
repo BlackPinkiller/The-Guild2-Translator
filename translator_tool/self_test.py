@@ -12,7 +12,13 @@ import uuid
 
 from . import project as project_module
 from . import settings as settings_module
-from .ai import GoogleTranslateProvider, OpenAICompatibleProvider, TranslationProviderError
+from .ai import (
+    GoogleTranslateProvider,
+    LlmNeighborContext,
+    LlmSuggestionContext,
+    OpenAICompatibleProvider,
+    TranslationProviderError,
+)
 from .cache import source_review_uids
 from .codec_adapter import Guild2Codec, load_codec_for_language
 from .git_history import GitCommit, LanguageGit, TranslationLogEntry, combine_entries, format_entries
@@ -592,6 +598,7 @@ def assert_project_history_settings(root: Path) -> None:
                 ui_language="zh-CN",
                 last_project_root=expected[0],
                 recent_project_roots=expected,
+                enable_chinese_codec=True,
                 auto_space_before_color_tokens_on_save=True,
                 editor_zoom_steps=3,
             )
@@ -602,6 +609,7 @@ def assert_project_history_settings(root: Path) -> None:
             or
             loaded.last_project_root != expected[0]
             or loaded.recent_project_roots != expected[:8]
+            or not loaded.enable_chinese_codec
             or not loaded.auto_space_before_color_tokens_on_save
             or loaded.editor_zoom_steps != 3
         ):
@@ -627,6 +635,7 @@ def assert_git_binding_tracks_project_root() -> None:
 
         window = TranslatorWindow.__new__(TranslatorWindow)
         window.project_root = reforged
+        window.settings = AppSettings(enable_chinese_codec=True)
         window.git = LanguageGit(vanilla, "#chinese", codec_root=tool_root())
         if TranslatorWindow._git_matches_current_project(window, "#chinese"):
             raise AssertionError("git binding should not match after switching to a different project root")
@@ -989,6 +998,46 @@ def assert_chinese_without_codec_uses_plain_text(root: Path) -> None:
         entries = git.entries_for_commit(commit.full_hash)
         if not entries or entries[0].translated_text != "测试":
             raise AssertionError("Chinese Git history without codec did not preserve plain text")
+    finally:
+        safe_rmtree(temp)
+
+
+def assert_chinese_setting_can_disable_codec(root: Path) -> None:
+    temp = make_temp_project(root, "translator_tool_smoke_disabled_chinese_codec_")
+    try:
+        git = LanguageGit(temp, "#chinese", codec_root=tool_root(), enable_codec=False)
+        git.ensure_repository(AppSettings(enable_chinese_codec=False))
+
+        project = Project.load(temp, "#chinese", codec_root=tool_root(), enable_codec=False)
+        if project.codec is not None:
+            raise AssertionError("Chinese project unexpectedly loaded the codec while the setting was disabled")
+        unit = next(item for item in project.units if item.file_rel == "Text.dbt" and item.source_text)
+        if unit.font_codec is not None:
+            raise AssertionError("Chinese DBT units unexpectedly kept glyph validation while the setting was disabled")
+        unit.set_text("测试")
+        if any(issue.code == "font-glyph" for issue in unit.issues()):
+            raise AssertionError("disabled Chinese codec setting should skip glyph validation")
+        result = project.save([unit])
+
+        target_path = temp / "languages" / "#chinese" / "Text.dbt"
+        if not result.changed_files or target_path not in result.changed_files:
+            raise AssertionError("disabled Chinese codec save did not write the target file")
+        saved = load_dbt(target_path)
+        saved_row = saved.row_index.get((int(unit.record_id), unit.label))
+        if saved_row is None or saved_row.get("chinese") != "测试":
+            raise AssertionError("disabled Chinese codec save did not preserve plain Chinese text")
+
+        reloaded = Project.load(temp, "#chinese", codec_root=tool_root(), enable_codec=False)
+        updated = next(item for item in reloaded.units if item.uid == unit.uid)
+        if updated.current_text != "测试":
+            raise AssertionError("disabled Chinese codec reload did not preserve plain Chinese text")
+
+        commit = git.commit_saved(result.changed_files, result.saved_units, result.deleted_units)
+        if commit is None:
+            raise AssertionError("disabled Chinese codec save did not create a Git commit")
+        entries = git.entries_for_commit(commit.full_hash)
+        if not entries or entries[0].translated_text != "测试":
+            raise AssertionError("disabled Chinese codec Git history did not preserve plain Chinese text")
     finally:
         safe_rmtree(temp)
 
@@ -1430,6 +1479,42 @@ def assert_git_commit_display() -> None:
         raise AssertionError("pending translation commit display was not simplified")
 
 
+class CaptureStreamingTransport:
+    def __init__(self) -> None:
+        self.payload = None
+
+    def get_json(self, url: str):
+        raise AssertionError("LLM suggestion must not issue a GET request")
+
+    def post_json(self, url: str, payload, headers):
+        self.payload = payload
+        return {"choices": [{"message": {"content": "ok"}}]}
+
+
+def assert_llm_suggestion_context_prompt() -> None:
+    transport = CaptureStreamingTransport()
+    provider = OpenAICompatibleProvider("https://example.invalid/v1", "test-model", "test-key", transport)
+    context = LlmSuggestionContext(
+        file_rel="Text.dbt",
+        record_id="100",
+        label="OfficeTitle",
+        neighbors=(
+            LlmNeighborContext("前1条", "OfficeDesc", "The office of the town clerk.", "99"),
+            LlmNeighborContext("后1条", "OfficeButton", "Open the office.", "101"),
+        ),
+    )
+    response = "".join(provider.stream_suggestion_with_context("Town Clerk", "", context))
+    if response != "ok":
+        raise AssertionError("context fallback response was not returned")
+    payload = transport.payload
+    if payload is None:
+        raise AssertionError("context suggestion did not issue a request")
+    prompt = payload["messages"][1]["content"]
+    for snippet in ("Label：OfficeTitle", "前1条", "OfficeDesc", "The office of the town clerk.", "后1条", "OfficeButton"):
+        if snippet not in prompt:
+            raise AssertionError(f"LLM suggestion prompt missed context snippet: {snippet}")
+
+
 def main() -> int:
     root = project_root()
     assert_codec(root)
@@ -1461,6 +1546,7 @@ def main() -> int:
     assert_packaged_runtime_finds_sibling_codec(root)
     assert_non_chinese_language_bypasses_codec(root)
     assert_chinese_without_codec_uses_plain_text(root)
+    assert_chinese_setting_can_disable_codec(root)
     assert_validation_warnings_do_not_block()
     assert_ignore_cache(root)
     assert_source_review_cache(root)
@@ -1469,6 +1555,7 @@ def main() -> int:
     assert_linebreak_format_is_ignored()
     assert_guild2_format_grammar()
     assert_llm_suggestion_stream()
+    assert_llm_suggestion_context_prompt()
     assert_git_history(root)
     assert_git_subprocess_hides_console()
     assert_git_commit_display()

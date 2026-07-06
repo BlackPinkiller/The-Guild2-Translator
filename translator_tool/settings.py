@@ -29,6 +29,7 @@ class AppSettings:
     target_language: str = "zh-CN"
     git_author_name: str = "The Guild 2 Translator"
     git_author_email: str = "translator@local"
+    enable_chinese_codec: bool = False
     auto_space_before_color_tokens_on_save: bool = False
     editor_zoom_steps: int = 0
     last_project_root: str = ""

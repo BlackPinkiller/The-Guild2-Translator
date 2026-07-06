@@ -65,13 +65,15 @@ from PySide6.QtWidgets import (
 )
 
 from .ai import (
+    LlmNeighborContext,
+    LlmSuggestionContext,
     OpenAICompatibleProvider,
     TranslationProvider,
     TranslationProviderError,
     llm_provider_from_settings,
     provider_from_settings,
 )
-from .codec_adapter import Guild2Codec
+from .codec_adapter import Guild2Codec, language_uses_codec
 from .git_history import GitCommit, GitError, LanguageGit, TranslationLogEntry
 from .history import OperationHistory, TranslationOperation, UnitChange
 from .i18n import current_language, history_kind_text, set_language, status_text, todo_reason_text, translate, ui_language_options
@@ -870,18 +872,22 @@ class LlmSuggestionWorker(QRunnable):
         provider: OpenAICompatibleProvider,
         source_text: str,
         current_translation: str,
+        context: LlmSuggestionContext | None,
         cancel_event: threading.Event,
     ) -> None:
         super().__init__()
         self.provider = provider
         self.source_text = source_text
         self.current_translation = current_translation
+        self.context = context
         self.cancel_event = cancel_event
         self.signals = SuggestionWorkerSignals()
 
     def run(self) -> None:
         try:
-            for chunk in self.provider.stream_suggestion(self.source_text, self.current_translation):
+            for chunk in self.provider.stream_suggestion_with_context(
+                self.source_text, self.current_translation, self.context
+            ):
                 if self.cancel_event.is_set():
                     break
                 self.signals.chunk.emit(chunk)
@@ -1025,6 +1031,13 @@ class SettingsDialog(QDialog):
         layout = QVBoxLayout(tab)
         self.save_group = QGroupBox()
         save_layout = QVBoxLayout(self.save_group)
+        self.enable_chinese_codec = QCheckBox()
+        self.enable_chinese_codec.setChecked(self.settings.enable_chinese_codec)
+        save_layout.addWidget(self.enable_chinese_codec)
+        self.codec_hint = QLabel()
+        self.codec_hint.setObjectName("hint")
+        self.codec_hint.setWordWrap(True)
+        save_layout.addWidget(self.codec_hint)
         self.auto_space_before_color_tokens = QCheckBox()
         self.auto_space_before_color_tokens.setChecked(self.settings.auto_space_before_color_tokens_on_save)
         save_layout.addWidget(self.auto_space_before_color_tokens)
@@ -1088,6 +1101,8 @@ class SettingsDialog(QDialog):
         self.openai_key_label.setText(translate("settings.api_key", locale=locale))
         self.git_name_label.setText(translate("settings.author_name", locale=locale))
         self.git_email_label.setText(translate("settings.email", locale=locale))
+        self.enable_chinese_codec.setText(translate("settings.enable_chinese_codec", locale=locale))
+        self.codec_hint.setText(translate("settings.codec_hint", locale=locale))
         self.auto_space_before_color_tokens.setText(translate("settings.auto_space_before_color_tokens", locale=locale))
         self.save_hint.setText(translate("settings.save_hint", locale=locale))
         self.translation_note.setText(translate("settings.note", locale=locale))
@@ -1120,6 +1135,7 @@ class SettingsDialog(QDialog):
             openai_api_key_protected=protect_secret(self.openai_key.text().strip()),
             git_author_name=self.git_name.text().strip() or "The Guild 2 Translator",
             git_author_email=self.git_email.text().strip() or "translator@local",
+            enable_chinese_codec=self.enable_chinese_codec.isChecked(),
             auto_space_before_color_tokens_on_save=self.auto_space_before_color_tokens.isChecked(),
         )
 
@@ -2098,7 +2114,11 @@ class TranslatorWindow(QMainWindow):
         if self.git is None or self.project_root is None:
             return False
         try:
-            return self.git.language == language and self.git.project_root == self.project_root.resolve()
+            return (
+                self.git.language == language
+                and self.git.project_root == self.project_root.resolve()
+                and self.git.enable_codec == self.settings.enable_chinese_codec
+            )
         except OSError:
             return False
 
@@ -2164,12 +2184,18 @@ class TranslatorWindow(QMainWindow):
                 created_language_dir = True
                 self._load_language_choices(language)
             if not self._git_matches_current_project(language):
-                self.git = LanguageGit(self.project_root, language, codec_root=DEFAULT_PROJECT_ROOT)
+                self.git = LanguageGit(
+                    self.project_root,
+                    language,
+                    codec_root=DEFAULT_PROJECT_ROOT,
+                    enable_codec=self.settings.enable_chinese_codec,
+                )
             self.git.ensure_repository(self.settings)
             project = Project.load(
                 self.project_root,
                 language,
                 codec_root=DEFAULT_PROJECT_ROOT,
+                enable_codec=self.settings.enable_chinese_codec,
             )
         except (ProjectError, GitError, OSError, ValueError) as exc:
             QMessageBox.critical(self, translate("dialog.load_error"), str(exc))
@@ -2948,12 +2974,56 @@ class TranslatorWindow(QMainWindow):
         dialog.move(self.mapToGlobal(QPoint(max(24, self.width() - dialog.width() - 36), 72)))
         dialog.show()
         dialog.raise_()
-        worker = LlmSuggestionWorker(provider, unit.source_text, unit.current_text, self.suggestion_cancel_event)
+        worker = LlmSuggestionWorker(
+            provider,
+            unit.source_text,
+            unit.current_text,
+            self._build_llm_suggestion_context(unit),
+            self.suggestion_cancel_event,
+        )
         worker.signals.chunk.connect(self._append_suggestion_chunk)
         worker.signals.failed.connect(self._show_suggestion_failure)
         worker.signals.finished.connect(self._finish_suggestion)
         self.suggestion_worker = worker
         self.thread_pool.start(worker)
+
+    def _build_llm_suggestion_context(self, unit: TranslationUnit) -> LlmSuggestionContext:
+        project = self.model.project
+        if project is None:
+            return LlmSuggestionContext(unit.file_rel, unit.record_id, unit.label)
+        index = next((i for i, candidate in enumerate(project.units) if candidate.uid == unit.uid), -1)
+        if index < 0:
+            return LlmSuggestionContext(unit.file_rel, unit.record_id, unit.label)
+        neighbors: list[LlmNeighborContext] = []
+        previous_units = [
+            candidate
+            for candidate in project.units[:index]
+            if candidate.file_rel == unit.file_rel and candidate.source_text and candidate.uid != unit.uid
+        ]
+        next_units = [
+            candidate
+            for candidate in project.units[index + 1 :]
+            if candidate.file_rel == unit.file_rel and candidate.source_text and candidate.uid != unit.uid
+        ]
+        for offset, candidate in enumerate(previous_units[-2:], start=max(1, len(previous_units) - 1)):
+            neighbors.append(
+                LlmNeighborContext(
+                    relation=f"前{len(previous_units) - offset + 1}条",
+                    label=candidate.label,
+                    source_text=candidate.source_text,
+                    record_id=candidate.record_id,
+                )
+            )
+        for offset, candidate in enumerate(next_units[:2], start=1):
+            neighbors.append(
+                LlmNeighborContext(
+                    relation=f"后{offset}条",
+                    label=candidate.label,
+                    source_text=candidate.source_text,
+                    record_id=candidate.record_id,
+                )
+            )
+        return LlmSuggestionContext(unit.file_rel, unit.record_id, unit.label, tuple(neighbors))
 
     def _append_suggestion_chunk(self, chunk: str) -> None:
         if self.suggestion_cancel_event is None or self.suggestion_cancel_event.is_set():
@@ -3208,12 +3278,19 @@ class TranslatorWindow(QMainWindow):
         if dialog.exec() != QDialog.DialogCode.Accepted:
             return
         previous_language = self.settings.ui_language
+        previous_codec = self.settings.enable_chinese_codec
         self.settings = dialog.result_settings()
         save_settings(self.settings)
         if self.settings.ui_language != previous_language:
             set_language(self.settings.ui_language)
             self._retranslate_ui()
         self.ai_delegate.set_provider(self.settings.provider)
+        if (
+            self.settings.enable_chinese_codec != previous_codec
+            and self.project is not None
+            and language_uses_codec(self.project.language)
+        ):
+            self.load_project(discard_changes=False)
         if self.git is None:
             return
         try:

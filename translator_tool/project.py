@@ -208,12 +208,19 @@ class Project:
     insertion_anchors: dict[str, dict[tuple[int, str], int | None]]
 
     @classmethod
-    def load(cls, root: Path, language: str = "#chinese", codec_root: Path | None = None) -> "Project":
+    def load(
+        cls,
+        root: Path,
+        language: str = "#chinese",
+        codec_root: Path | None = None,
+        *,
+        enable_codec: bool = True,
+    ) -> "Project":
         root = root.resolve()
         languages_root = root / "languages"
         if not languages_root.exists():
             raise ProjectError(f"languages directory not found: {languages_root}")
-        codec = load_codec_for_language(codec_root if codec_root is not None else root, language)
+        codec = load_codec_for_language(codec_root if codec_root is not None else root, language) if enable_codec else None
 
         source_docs: dict[str, DbtDocument] = {}
         file_order: dict[str, int] = {}

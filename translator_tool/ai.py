@@ -72,6 +72,51 @@ class ProtectedText:
     tokens: tuple[tuple[str, str], ...]
 
 
+@dataclass(frozen=True)
+class LlmNeighborContext:
+    relation: str
+    label: str
+    source_text: str
+    record_id: str = ""
+
+
+@dataclass(frozen=True)
+class LlmSuggestionContext:
+    file_rel: str
+    record_id: str
+    label: str
+    neighbors: tuple[LlmNeighborContext, ...] = ()
+
+
+def _build_llm_suggestion_prompt(
+    source: str, current_translation: str, context: LlmSuggestionContext | None = None
+) -> str:
+    lines = [
+        f"原文：\n{source}",
+        f"当前译文：\n{current_translation or '（空）'}",
+    ]
+    if context is None:
+        return "\n\n".join(lines)
+    lines.extend(
+        (
+            "条目上下文：",
+            f"- 文件：{context.file_rel or '（未知）'}",
+            f"- ID：{context.record_id or '（空）'}",
+            f"- Label：{context.label or '（空）'}",
+        )
+    )
+    if context.neighbors:
+        lines.append("前后邻近条目（用于帮助理解当前条目语义，不要把它们拼进当前译文）：")
+        for neighbor in context.neighbors:
+            identity = neighbor.relation
+            if neighbor.record_id:
+                identity += f" · ID={neighbor.record_id}"
+            lines.append(f"- {identity}")
+            lines.append(f"  Label: {neighbor.label or '（空）'}")
+            lines.append(f"  原文: {neighbor.source_text or '（空）'}")
+    return "\n\n".join(lines)
+
+
 def protect_tokens(text: str) -> ProtectedText:
     tokens: list[tuple[str, str]] = []
     pieces: list[str] = []
@@ -194,6 +239,59 @@ class OpenAICompatibleProvider:
         stream = getattr(self.transport, "post_sse", None)
         if not callable(stream):
             # Custom transports used by tests or simple relays may not support SSE.
+            payload["stream"] = False
+            response = self.transport.post_json(url, payload, headers)
+            try:
+                content = response["choices"][0]["message"]["content"]
+            except (IndexError, KeyError, TypeError) as exc:
+                raise TranslationProviderError("LLM 没有返回可显示的建议。") from exc
+            if not isinstance(content, str):
+                raise TranslationProviderError("LLM 没有返回文本建议。")
+            yield content
+            return
+        for event in stream(url, payload, headers):
+            try:
+                content = event["choices"][0]["delta"].get("content", "")
+            except (IndexError, KeyError, TypeError) as exc:
+                raise TranslationProviderError("LLM 流式响应缺少内容。") from exc
+            if isinstance(content, str) and content:
+                yield content
+
+    def stream_suggestion_with_context(
+        self,
+        source: str,
+        current_translation: str,
+        context: LlmSuggestionContext | None = None,
+    ) -> Iterator[str]:
+        """Yield reviewer advice with additional entry context when available."""
+        if context is None:
+            yield from self.stream_suggestion(source, current_translation)
+            return
+        if not self.api_key:
+            raise TranslationProviderError("请先在设置中填写 OpenAI 兼容接口的 API Key。")
+        instruction = (
+            "You are a Chinese game-localization reviewer for The Guild 2. Reply in Simplified Chinese using Markdown. "
+            "Explain the source meaning, tone, ambiguity, placeholders, and any key localization choices in useful detail. "
+            "Use the entry label and nearby source entries as disambiguation context when they are provided, but only translate the current source text. "
+            "Then provide exactly one recommended translation in this final section and no other code blocks: "
+            "## 推荐译文\n```text\n<translation only>\n```. "
+            "Preserve placeholders and game formatting tokens exactly in the recommended translation. "
+            "Do not modify files; this is advice only."
+        )
+        prompt = _build_llm_suggestion_prompt(source, current_translation, context)
+        payload = {
+            "model": self.model,
+            "temperature": 0.25,
+            "stream": True,
+            "messages": [
+                {"role": "system", "content": instruction},
+                {"role": "user", "content": prompt},
+            ],
+        }
+        url = _chat_completions_url(self.base_url)
+        headers = {"Authorization": f"Bearer {self.api_key}"}
+        stream = getattr(self.transport, "post_sse", None)
+        if not callable(stream):
             payload["stream"] = False
             response = self.transport.post_json(url, payload, headers)
             try:

@@ -103,11 +103,23 @@ class LanguageGit:
     # those may still belong to a live Git operation.
     STALE_INDEX_LOCK_SECONDS = 5
 
-    def __init__(self, project_root: Path, language: str = "#chinese", codec_root: Path | None = None) -> None:
+    def __init__(
+        self,
+        project_root: Path,
+        language: str = "#chinese",
+        codec_root: Path | None = None,
+        *,
+        enable_codec: bool = True,
+    ) -> None:
         self.project_root = project_root.resolve()
         self.repo = self.project_root / "languages"
         self.language = language
-        self.codec = load_codec_for_language(codec_root if codec_root is not None else self.project_root, language)
+        self.enable_codec = enable_codec
+        self.codec = (
+            load_codec_for_language(codec_root if codec_root is not None else self.project_root, language)
+            if enable_codec
+            else None
+        )
         self._cache_lock = threading.Lock()
         self._commit_list_cache: tuple[GitCommit, ...] | None = None
         self._entry_cache: dict[str, tuple[TranslationLogEntry, ...]] = {}
