@@ -20,7 +20,7 @@ from .format_io import (
     translatable_fields,
 )
 from .i18n import translate
-from .validation import ValidationIssue, issue_summary, validate_translation
+from .validation import ValidationIssue, format_dialect, issue_summary, validate_translation
 from .validation import normalize_color_token_spacing
 
 
@@ -178,6 +178,7 @@ class TranslationUnit:
             self.current_text,
             dbt_field=dbt_field,
             font_codec=self.font_codec if ENABLE_FONT_GLYPH_VALIDATION else None,
+            dialect=format_dialect(self.file_rel, self.ref.kind),
         )
 
     def issue_text(self) -> str:

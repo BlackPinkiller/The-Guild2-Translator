@@ -2,7 +2,6 @@ from __future__ import annotations
 
 from collections import Counter
 from dataclasses import replace
-from difflib import SequenceMatcher
 import html
 import math
 from pathlib import Path
@@ -18,6 +17,8 @@ from PySide6.QtCore import (
     QModelIndex,
     QObject,
     QPoint,
+    QPointF,
+    QRect,
     QRunnable,
     QSignalBlocker,
     QSortFilterProxyModel,
@@ -25,9 +26,10 @@ from PySide6.QtCore import (
     QThreadPool,
     QTimer,
     QRectF,
+    QUrl,
     Signal,
 )
-from PySide6.QtGui import QAction, QCloseEvent, QColor, QFont, QKeyEvent, QKeySequence, QPainter, QPalette, QPen, QStandardItemModel, QSyntaxHighlighter, QTextCharFormat, QTextCursor, QWheelEvent
+from PySide6.QtGui import QAction, QCloseEvent, QColor, QCursor, QFont, QFontMetrics, QImage, QKeyEvent, QKeySequence, QPainter, QPalette, QPen, QStandardItemModel, QSyntaxHighlighter, QTextCharFormat, QTextCursor, QTextDocument, QTextImageFormat, QWheelEvent
 from PySide6.QtWidgets import (
     QApplication,
     QAbstractItemView,
@@ -44,6 +46,7 @@ from PySide6.QtWidgets import (
     QLabel,
     QLineEdit,
     QListWidget,
+    QListWidgetItem,
     QMainWindow,
     QMenu,
     QMessageBox,
@@ -73,7 +76,9 @@ from .ai import (
     llm_provider_from_settings,
     provider_from_settings,
 )
-from .codec_adapter import Guild2Codec, language_uses_codec
+from .code_index import CodeReference, CodeReferenceIndex, CodeReferenceSet, build_code_reference_index
+from .code_open import open_code_reference
+from .codec_adapter import CodecError, Guild2Codec, load_codec_for_language, language_uses_codec
 from .git_history import GitCommit, GitError, LanguageGit, TranslationLogEntry
 from .history import OperationHistory, TranslationOperation, UnitChange
 from .i18n import current_language, history_kind_text, set_language, status_text, todo_reason_text, translate, ui_language_options
@@ -91,10 +96,12 @@ from .project import (
     SaveValidationError,
     TranslationUnit,
 )
+from .preview import GLYPH_MARK, PREVIEW_MARK, PreviewAtom, PreviewDocument, PreviewService
 from .settings import AppSettings, load_settings, protect_secret, reveal_secret, save_settings
 from .source_sync import (
     DEFAULT_TRANSLATION_LANGUAGE,
     SourceProjectSpec,
+    VANILLA_PROJECT_NAME,
     discover_game_source_projects,
     ensure_translation_dir,
     game_languages_root,
@@ -107,11 +114,13 @@ from .source_sync import (
 from .validation import (
     COLOR_TOKEN_RE,
     CHINESE_QUOTE_RE,
-    HIGHLIGHT_RE,
-    TOKEN_RE,
+    FORMAT_GUILD2,
     format_counter_items,
+    format_dialect,
     format_tokens,
+    highlight_re_for,
     split_soft_color_tokens,
+    token_re_for,
 )
 
 
@@ -377,6 +386,318 @@ class RowTintDelegate(QStyledItemDelegate):
         super().paint(painter, option, index)
 
 
+class DelayedToolTipFilter(QObject):
+    """Give one widget its own tooltip delay instead of Qt's shared wake-up state."""
+
+    def __init__(
+        self,
+        widget: QWidget,
+        delay_ms: int,
+        content_at: Callable[[QPoint], tuple[object, str, object] | None],
+    ) -> None:
+        super().__init__(widget)
+        self.widget = widget
+        self.content_at = content_at
+        self.timer = QTimer(self)
+        self.timer.setSingleShot(True)
+        self.timer.setInterval(delay_ms)
+        self.timer.timeout.connect(self._show)
+        self.pending_key: object | None = None
+        self.pending_text = ""
+        self.pending_rect = widget.rect()
+        widget.setMouseTracking(True)
+        widget.installEventFilter(self)
+
+    def eventFilter(self, watched: QObject, event: QEvent) -> bool:  # noqa: N802
+        if watched is not self.widget:
+            return False
+        event_type = event.type()
+        if event_type == QEvent.Type.ToolTip:
+            return True
+        if event_type in {QEvent.Type.Enter, QEvent.Type.MouseMove}:
+            if event_type == QEvent.Type.MouseMove:
+                point = event.position().toPoint()
+            else:
+                point = self.widget.mapFromGlobal(QCursor.pos())
+            self._schedule(point)
+        elif event_type in {
+            QEvent.Type.Leave,
+            QEvent.Type.MouseButtonPress,
+            QEvent.Type.Wheel,
+            QEvent.Type.Hide,
+        }:
+            self.cancel()
+        return False
+
+    def _schedule(self, point: QPoint) -> None:
+        content = self.content_at(point)
+        if content is None or not content[1]:
+            self.cancel()
+            return
+        key, text, rect = content
+        if key == self.pending_key and (self.timer.isActive() or QToolTip.isVisible()):
+            return
+        QToolTip.hideText()
+        self.timer.stop()
+        self.pending_key = key
+        self.pending_text = text
+        self.pending_rect = rect
+        self.timer.start()
+
+    def _show(self) -> None:
+        if not self.pending_text or not self.widget.underMouse():
+            return
+        point = self.widget.mapFromGlobal(QCursor.pos())
+        content = self.content_at(point)
+        if content is None or content[0] != self.pending_key or content[1] != self.pending_text:
+            self.cancel()
+            return
+        QToolTip.showText(QCursor.pos(), self.pending_text, self.widget, self.pending_rect)
+
+    def cancel(self) -> None:
+        self.timer.stop()
+        self.pending_key = None
+        self.pending_text = ""
+        QToolTip.hideText()
+
+
+class GamePreviewPopup(QWidget):
+    def __init__(self) -> None:
+        super().__init__(None, Qt.WindowType.ToolTip | Qt.WindowType.FramelessWindowHint)
+        self._image = QImage()
+        self.setAttribute(Qt.WidgetAttribute.WA_ShowWithoutActivating)
+        self.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents)
+        self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground)
+        self.setAttribute(Qt.WidgetAttribute.WA_NoSystemBackground)
+
+    def show_image(self, image: QImage, anchor: QPoint, avoid: QRect) -> None:
+        self._image = image
+        self.setFixedSize(image.size())
+        screen = QApplication.screenAt(anchor) or QApplication.primaryScreen()
+        position = QPoint(avoid.right() - self.width(), avoid.top() - self.height() - 8)
+        if screen is not None:
+            available = screen.availableGeometry()
+            if position.y() < available.top():
+                position.setY(avoid.bottom() + 8)
+            if position.y() + self.height() > available.bottom():
+                position.setX(avoid.left() - self.width() - 8)
+                position.setY(anchor.y() - self.height() // 2)
+            if position.x() < available.left():
+                position.setX(avoid.right() + 8)
+            position.setX(max(available.left(), min(position.x(), available.right() - self.width())))
+            position.setY(max(available.top(), min(position.y(), available.bottom() - self.height())))
+        self.move(position)
+        self.show()
+        self.raise_()
+        self.update()
+
+    def paintEvent(self, event) -> None:  # noqa: N802
+        painter = QPainter(self)
+        painter.drawImage(self.rect(), self._image)
+
+
+class GamePreviewHoverFilter(QObject):
+    def __init__(
+        self,
+        button: QToolButton,
+        popup: GamePreviewPopup,
+        image_provider: Callable[[], QImage | None],
+        delay_ms: int = 250,
+    ) -> None:
+        super().__init__(button)
+        self.button = button
+        self.popup = popup
+        self.image_provider = image_provider
+        self.timer = QTimer(self)
+        self.timer.setSingleShot(True)
+        self.timer.setInterval(delay_ms)
+        self.timer.timeout.connect(self._show)
+        self.hovered = False
+        button.setMouseTracking(True)
+        button.installEventFilter(self)
+
+    def eventFilter(self, watched: QObject, event: QEvent) -> bool:  # noqa: N802
+        if watched is not self.button:
+            return False
+        event_type = event.type()
+        if event_type == QEvent.Type.ToolTip:
+            return True
+        if event_type in {QEvent.Type.Enter, QEvent.Type.MouseMove}:
+            self.hovered = True
+            if not self.button.isChecked() and not self.timer.isActive() and not self.popup.isVisible():
+                self.timer.start()
+        elif event_type in {
+            QEvent.Type.Leave,
+            QEvent.Type.MouseButtonPress,
+            QEvent.Type.Hide,
+        }:
+            self.cancel()
+        return False
+
+    def _show(self) -> None:
+        if self.button.isChecked() or not self.hovered:
+            return
+        image = self.image_provider()
+        if image is None or image.isNull():
+            return
+        top_left = self.button.mapToGlobal(self.button.rect().topLeft())
+        avoid = QRect(top_left, self.button.size())
+        self.popup.show_image(image, QCursor.pos(), avoid)
+
+    def cancel(self) -> None:
+        self.hovered = False
+        self.timer.stop()
+        self.popup.hide()
+
+
+class EditorGroupBox(QGroupBox):
+    """Place the preview toggle in the title line without consuming editor space."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.code_button = QToolButton(self)
+        self.code_button.setObjectName("codeReferenceButton")
+        self.code_button.setAutoRaise(False)
+        self.code_button.hide()
+        self.reference_label = QLabel(self)
+        self.reference_label.setObjectName("codeReferenceCount")
+        self.reference_label.hide()
+        self.preview_button = QToolButton(self)
+        self.preview_button.setObjectName("previewToggle")
+        self.preview_button.setCheckable(True)
+        self.preview_button.setAutoRaise(False)
+
+    def resizeEvent(self, event: QEvent) -> None:  # noqa: N802
+        super().resizeEvent(event)
+        self.position_preview_button()
+
+    def position_preview_button(self) -> None:
+        height = self.fontMetrics().height() + 4
+        width = max(36, self.preview_button.fontMetrics().horizontalAdvance(self.preview_button.text()) + 16)
+        self.preview_button.setFixedSize(width, height)
+        self.preview_button.move(max(8, self.width() - width - 12), 1)
+        if self.code_button.isVisible():
+            title_width = self.fontMetrics().horizontalAdvance(self.title())
+            code_width = max(36, self.code_button.fontMetrics().horizontalAdvance(self.code_button.text()) + 14)
+            code_x = 18 + title_width + 8
+            self.code_button.setFixedSize(code_width, height)
+            self.code_button.move(code_x, 1)
+            label_width = max(62, self.reference_label.fontMetrics().horizontalAdvance(self.reference_label.text()) + 8)
+            self.reference_label.setFixedSize(label_width, height)
+            self.reference_label.move(code_x + code_width + 6, 1)
+
+
+def _single_line_preview_text(text: str) -> str:
+    return (
+        text.replace(PREVIEW_MARK, "")
+        .replace("\r\n", "↵")
+        .replace("\r", "↵")
+        .replace("\n", "↵")
+        .replace("\t", "⇥")
+    )
+
+
+class PreviewTextDelegate(RowTintDelegate):
+    """Render a non-editable table cell from the shared format preview model."""
+
+    def __init__(
+        self,
+        parent: QTableView,
+        *,
+        target: bool,
+        enabled: Callable[[], bool],
+        render_preview: Callable[[TranslationUnit, bool], PreviewDocument],
+        glyph_image: Callable[[int, bool], object | None],
+    ) -> None:
+        super().__init__(parent)
+        self.target = target
+        self.enabled = enabled
+        self.render_preview = render_preview
+        self.glyph_image = glyph_image
+
+    def paint(self, painter: QPainter, option: QStyleOptionViewItem, index: QModelIndex) -> None:
+        unit = _unit_from_model_index(index)
+        if not self.enabled() or not isinstance(unit, TranslationUnit):
+            super().paint(painter, option, index)
+            return
+
+        if not _paint_review_background(painter, option, index):
+            background = QStyleOptionViewItem(option)
+            background.text = ""
+            style = option.widget.style() if option.widget else QApplication.style()
+            style.drawControl(QStyle.ControlElement.CE_ItemViewItem, background, painter, option.widget)
+
+        document = self.render_preview(unit, self.target)
+        painter.save()
+        painter.setClipRect(option.rect)
+        font = option.font
+        if unit.pending_delete:
+            font.setStrikeOut(True)
+        painter.setFont(font)
+        metrics = painter.fontMetrics()
+        x = option.rect.left() + 5
+        baseline = option.rect.center().y() + (metrics.ascent() - metrics.descent()) // 2
+        right = option.rect.right() - 5
+        default_color = QColor("#9d0006") if unit.pending_delete else QColor("#3c3836")
+
+        for atom in document.atoms:
+            if x >= right:
+                break
+            text = _single_line_preview_text(atom.text)
+            if atom.glyph_id is not None:
+                image = self.glyph_image(atom.glyph_id, self.target)
+                if image is not None and hasattr(image, "isNull") and not image.isNull():
+                    height = max(8.0, min(float(option.rect.height() - 6), float(metrics.height())))
+                    width = max(1.0, image.width() * height / max(image.height(), 1))
+                    if x + width > right:
+                        break
+                    marker_rect = QRectF(
+                        float(x),
+                        option.rect.center().y() - height / 2.0,
+                        width,
+                        height,
+                    )
+                    painter.drawImage(marker_rect, image)
+                    x += math.ceil(width) + 1
+                    continue
+                text = f"□{atom.glyph_id}"
+            if not text:
+                continue
+            remaining = right - x
+            rendered = metrics.elidedText(text, Qt.TextElideMode.ElideRight, remaining)
+            width = metrics.horizontalAdvance(rendered)
+            underline_y = float(baseline + 2)
+            if atom.replacement and atom.text not in {"\n", "\t", PREVIEW_MARK}:
+                marker_rect = QRectF(
+                    float(x),
+                    float(baseline - metrics.ascent()),
+                    float(width),
+                    float(metrics.height()),
+                )
+                style = Qt.PenStyle.DashLine if atom.color is not None else Qt.PenStyle.SolidLine
+                underline_color = QColor(*atom.color) if atom.color is not None else QColor("#79740e")
+                painter.setPen(QPen(underline_color, 2, style))
+                painter.drawLine(marker_rect.bottomLeft(), marker_rect.bottomRight())
+                underline_y = float(marker_rect.bottom())
+            painter.setPen(default_color)
+            painter.drawText(x, baseline, rendered)
+            if atom.color is not None and not (
+                atom.replacement and atom.text not in {"\n", "\t", PREVIEW_MARK}
+            ):
+                painter.setPen(QPen(QColor(*atom.color), 2, Qt.PenStyle.SolidLine))
+                painter.drawLine(
+                    QPointF(float(x), underline_y),
+                    QPointF(float(x + width), underline_y),
+                )
+            x += width
+            if rendered != text:
+                break
+
+        painter.setPen(QColor("#d5c4a1"))
+        painter.drawLine(option.rect.bottomLeft(), option.rect.bottomRight())
+        painter.restore()
+
+
 class PopupHighlightDelegate(QStyledItemDelegate):
     """Keep the combo's current value visibly marked inside the popup."""
 
@@ -399,9 +720,9 @@ class PopupHighlightDelegate(QStyledItemDelegate):
 
         if is_current_value:
             painter.save()
-            painter.fillRect(option.rect, QColor("#b8bb26"))
+            painter.fillRect(option.rect, QColor("#c6a15b"))
             painter.restore()
-            option.palette.setColor(QPalette.ColorRole.Highlight, QColor("#b8bb26"))
+            option.palette.setColor(QPalette.ColorRole.Highlight, QColor("#c6a15b"))
             option.palette.setColor(QPalette.ColorRole.HighlightedText, QColor("#3c3836"))
             option.palette.setColor(QPalette.ColorRole.Text, QColor("#3c3836"))
         elif is_hovered or is_selected:
@@ -426,7 +747,7 @@ class PopupSelectionComboBox(QComboBox):
             QAbstractItemView {
                 background: #f2e5bc;
                 border: 2px solid #3c3836;
-                selection-background-color: #b8bb26;
+                selection-background-color: #c6a15b;
                 selection-color: #3c3836;
             }
             """
@@ -785,10 +1106,316 @@ class BatchTranslateButton(QPushButton):
         self.update()
 
 
+class PreviewPlainTextEdit(QTextEdit):
+    """Editable raw text with a reversible, localized preview presentation."""
+
+    previewRendered = Signal()
+
+    def __init__(self, parent: QWidget | None = None) -> None:
+        super().__init__(parent)
+        self._raw_text = ""
+        self._preview_enabled = False
+        self._editing_raw = False
+        self._preview_builder: Callable[[str], PreviewDocument] | None = None
+        self._glyph_provider: Callable[[int], object | None] | None = None
+        self._text_glyph_provider: Callable[[str, tuple[int, int, int, int] | None], object | None] | None = None
+        self._game_font_enabled = False
+        self._preview_document = PreviewDocument.from_atoms("", [])
+        self._base_zoom_point_size: float | None = None
+
+    @property
+    def preview_enabled(self) -> bool:
+        return self._preview_enabled
+
+    @property
+    def rendered_preview(self) -> PreviewDocument:
+        return self._preview_document
+
+    def set_preview_builder(
+        self,
+        builder: Callable[[str], PreviewDocument],
+        glyph_provider: Callable[[int], object | None],
+    ) -> None:
+        self._preview_builder = builder
+        self._glyph_provider = glyph_provider
+        if self._preview_enabled:
+            self.refresh_preview()
+
+    def set_game_font_builder(
+        self,
+        enabled: bool,
+        provider: Callable[[str, tuple[int, int, int, int] | None], object | None],
+    ) -> None:
+        self._game_font_enabled = enabled
+        self._text_glyph_provider = provider
+        if self._preview_enabled:
+            self.refresh_preview()
+
+    def set_preview_enabled(self, enabled: bool) -> None:
+        if enabled == self._preview_enabled:
+            return
+        if self._editing_raw:
+            self._finish_raw_edit()
+        if enabled:
+            self._raw_text = QTextEdit.toPlainText(self)
+            raw_position = self.textCursor().position()
+            self._preview_enabled = True
+            self.setUndoRedoEnabled(False)
+            self._render_preview(raw_position)
+        else:
+            raw_position = self._preview_document.raw_position(self.textCursor().position())
+            self._preview_enabled = False
+            blocker = QSignalBlocker(self)
+            self._set_unformatted_plain_text(self._raw_text)
+            cursor = self.textCursor()
+            cursor.setPosition(min(raw_position, len(self._raw_text)))
+            self.setTextCursor(cursor)
+            del blocker
+            self.setUndoRedoEnabled(not self.isReadOnly())
+            self.document().clearUndoRedoStacks()
+        self.previewRendered.emit()
+
+    def refresh_preview(self) -> None:
+        if not self._preview_enabled or self._editing_raw:
+            return
+        raw_position = self._preview_document.raw_position(self.textCursor().position())
+        self._render_preview(raw_position)
+        self.previewRendered.emit()
+
+    def setPlainText(self, text: str) -> None:  # noqa: N802
+        self._raw_text = text
+        if self._preview_enabled and not self._editing_raw:
+            self._render_preview(0)
+            return
+        self._set_unformatted_plain_text(text)
+
+    def toPlainText(self) -> str:  # noqa: N802
+        if self._preview_enabled and not self._editing_raw:
+            return self._raw_text
+        return QTextEdit.toPlainText(self)
+
+    def map_raw_range(self, start: int, end: int) -> tuple[int, int]:
+        if not self._preview_enabled or self._editing_raw:
+            return start, end
+        return self._preview_document.display_range(start, end)
+
+    def set_zoom_factor(self, factor: float) -> None:
+        if self._base_zoom_point_size is None:
+            font = self.font()
+            if font.pointSizeF() > 0:
+                self._base_zoom_point_size = font.pointSizeF()
+            else:
+                self._base_zoom_point_size = font.pixelSize() * 72.0 / max(1, self.logicalDpiY())
+        font = QFont(self.font())
+        font.setPointSizeF(max(1.0, self._base_zoom_point_size * factor))
+        self.document().setDefaultFont(font)
+        cursor = QTextCursor(self.document())
+        cursor.select(QTextCursor.SelectionType.Document)
+        char_format = QTextCharFormat()
+        char_format.setFont(font)
+        cursor.mergeCharFormat(char_format)
+        self.setCurrentCharFormat(char_format)
+
+    @staticmethod
+    def _is_edit_key(event: QKeyEvent) -> bool:
+        if event.key() in {
+            Qt.Key.Key_Backspace,
+            Qt.Key.Key_Delete,
+            Qt.Key.Key_Return,
+            Qt.Key.Key_Enter,
+            Qt.Key.Key_Tab,
+        }:
+            return True
+        if event.matches(QKeySequence.StandardKey.Paste) or event.matches(QKeySequence.StandardKey.Cut):
+            return True
+        return bool(event.text()) and not (
+            event.modifiers() & Qt.KeyboardModifier.ControlModifier and not event.modifiers() & Qt.KeyboardModifier.AltModifier
+        )
+
+    def _begin_raw_edit(self) -> None:
+        if not self._preview_enabled or self._editing_raw:
+            return
+        display_cursor = self.textCursor()
+        raw_anchor = self._preview_document.raw_position(display_cursor.anchor())
+        raw_position = self._preview_document.raw_position(display_cursor.position())
+        self._editing_raw = True
+        blocker = QSignalBlocker(self)
+        self._set_unformatted_plain_text(self._raw_text)
+        raw_cursor = self.textCursor()
+        raw_cursor.setPosition(raw_anchor)
+        raw_cursor.setPosition(raw_position, QTextCursor.MoveMode.KeepAnchor)
+        self.setTextCursor(raw_cursor)
+        del blocker
+
+    def _finish_raw_edit(self) -> None:
+        if not self._editing_raw:
+            return
+        raw_cursor = self.textCursor()
+        raw_anchor = raw_cursor.anchor()
+        raw_position = raw_cursor.position()
+        self._raw_text = QTextEdit.toPlainText(self)
+        self._editing_raw = False
+        self._render_preview(raw_position, raw_anchor)
+        self.previewRendered.emit()
+
+    def _render_preview(self, raw_position: int, raw_anchor: int | None = None) -> None:
+        builder = self._preview_builder
+        document = builder(self._raw_text) if builder is not None else PreviewDocument.from_atoms(
+            self._raw_text,
+            [PreviewAtom(self._raw_text, 0, len(self._raw_text))] if self._raw_text else [],
+        )
+        self._preview_document = document
+        blocker = QSignalBlocker(self)
+        self._set_unformatted_plain_text(document.display_text)
+        for span in document.spans:
+            atom = span.atom
+            if (
+                self._game_font_enabled
+                and self._text_glyph_provider is not None
+                and atom.glyph_id is None
+            ):
+                for offset, char in enumerate(atom.text):
+                    if char in {"\n", "\r", "\t", PREVIEW_MARK}:
+                        continue
+                    image = self._text_glyph_provider(char, atom.color)
+                    if image is None or not hasattr(image, "isNull") or image.isNull():
+                        continue
+                    glyph_cursor = QTextCursor(self.document())
+                    glyph_cursor.setPosition(span.display_start + offset)
+                    glyph_cursor.movePosition(
+                        QTextCursor.MoveOperation.NextCharacter,
+                        QTextCursor.MoveMode.KeepAnchor,
+                    )
+                    height = max(8, QFontMetrics(self.document().defaultFont()).height() - 2)
+                    width = max(1.0, image.width() * height / max(image.height(), 1))
+                    resource_url = QUrl(
+                        f"preview-font-{ord(char)}-{span.display_start + offset}-{height}.png"
+                    )
+                    self.document().addResource(
+                        QTextDocument.ResourceType.ImageResource,
+                        resource_url,
+                        image,
+                    )
+                    image_format = QTextImageFormat()
+                    image_format.setName(resource_url.toString())
+                    image_format.setWidth(width)
+                    image_format.setHeight(height)
+                    image_format.setVerticalAlignment(
+                        QTextCharFormat.VerticalAlignment.AlignMiddle
+                    )
+                    glyph_cursor.insertImage(image_format)
+                continue
+            cursor = QTextCursor(self.document())
+            cursor.setPosition(span.display_start)
+            cursor.setPosition(span.display_end, QTextCursor.MoveMode.KeepAnchor)
+            char_format = QTextCharFormat()
+            has_visible_replacement = atom.replacement and atom.text not in {"\n", "\t", PREVIEW_MARK}
+            if atom.color is not None:
+                char_format.setUnderlineColor(QColor(*atom.color))
+                char_format.setUnderlineStyle(
+                    QTextCharFormat.UnderlineStyle.DashUnderline
+                    if has_visible_replacement
+                    else QTextCharFormat.UnderlineStyle.SingleUnderline
+                )
+            elif has_visible_replacement:
+                char_format.setUnderlineStyle(QTextCharFormat.UnderlineStyle.DashUnderline)
+                char_format.setUnderlineColor(QColor("#79740e"))
+            if atom.replacement and atom.text not in {"\n", "\t", PREVIEW_MARK}:
+                char_format.setFontWeight(QFont.Weight.Normal)
+            if atom.glyph_id is not None and self._glyph_provider is not None:
+                image = self._glyph_provider(atom.glyph_id)
+                if image is not None and hasattr(image, "isNull") and not image.isNull():
+                    height = max(8, QFontMetrics(self.document().defaultFont()).height() - 2)
+                    width = max(1.0, image.width() * height / max(image.height(), 1))
+                    resource_url = QUrl(
+                        f"preview-glyph-{atom.glyph_id}-{span.display_start}-{height}.png"
+                    )
+                    self.document().addResource(
+                        QTextDocument.ResourceType.ImageResource,
+                        resource_url,
+                        image,
+                    )
+                    glyph_format = QTextImageFormat()
+                    glyph_format.setName(resource_url.toString())
+                    glyph_format.setWidth(width)
+                    glyph_format.setHeight(height)
+                    glyph_format.setVerticalAlignment(
+                        QTextCharFormat.VerticalAlignment.AlignMiddle
+                    )
+                    cursor.insertImage(glyph_format)
+                    continue
+            cursor.mergeCharFormat(char_format)
+        display_anchor = document.display_position(raw_anchor if raw_anchor is not None else raw_position)
+        display_position = document.display_position(raw_position)
+        cursor = self.textCursor()
+        cursor.setPosition(display_anchor)
+        cursor.setPosition(display_position, QTextCursor.MoveMode.KeepAnchor)
+        self.setTextCursor(cursor)
+        del blocker
+        self.viewport().update()
+
+    def _set_unformatted_plain_text(self, text: str) -> None:
+        self.setCurrentCharFormat(QTextCharFormat())
+        QTextEdit.setPlainText(self, text)
+        self.setCurrentCharFormat(QTextCharFormat())
+
+    def keyPressEvent(self, event: QKeyEvent) -> None:  # noqa: N802
+        if self._preview_enabled and self._is_edit_key(event):
+            self._begin_raw_edit()
+            QTextEdit.keyPressEvent(self, event)
+            self._finish_raw_edit()
+            return
+        QTextEdit.keyPressEvent(self, event)
+
+    def inputMethodEvent(self, event) -> None:  # noqa: N802
+        if self._preview_enabled:
+            self._begin_raw_edit()
+            QTextEdit.inputMethodEvent(self, event)
+            if not event.preeditString():
+                self._finish_raw_edit()
+            return
+        QTextEdit.inputMethodEvent(self, event)
+
+    def insertPlainText(self, text: str) -> None:  # noqa: N802
+        if self._preview_enabled and not self._editing_raw:
+            self._begin_raw_edit()
+            QTextEdit.insertPlainText(self, text)
+            self._finish_raw_edit()
+            return
+        QTextEdit.insertPlainText(self, text)
+
+    def insertFromMimeData(self, source) -> None:  # noqa: N802
+        if self._preview_enabled and not self._editing_raw:
+            self._begin_raw_edit()
+            QTextEdit.insertFromMimeData(self, source)
+            self._finish_raw_edit()
+            return
+        QTextEdit.insertFromMimeData(self, source)
+
+    def cut(self) -> None:
+        if self._preview_enabled and not self._editing_raw:
+            self._begin_raw_edit()
+            QTextEdit.cut(self)
+            self._finish_raw_edit()
+            return
+        QTextEdit.cut(self)
+
+    def focusOutEvent(self, event) -> None:  # noqa: N802
+        if self._editing_raw:
+            self._finish_raw_edit()
+        super().focusOutEvent(event)
+
+
 class TokenHighlighter(QSyntaxHighlighter):
-    def __init__(self, document, glyph_codec: Guild2Codec | None = None) -> None:
+    def __init__(
+        self,
+        document,
+        glyph_codec: Guild2Codec | None = None,
+        dialect: str = FORMAT_GUILD2,
+    ) -> None:
         super().__init__(document)
         self.glyph_codec = glyph_codec
+        self.dialect = dialect
         self.format_token = _text_format("#075a9c")
         self.color_token = _text_format("#7a3e9d")
         self.markup_token = _text_format("#6b6b00")
@@ -801,8 +1428,14 @@ class TokenHighlighter(QSyntaxHighlighter):
         self.glyph_codec = glyph_codec
         self.rehighlight()
 
+    def set_dialect(self, dialect: str) -> None:
+        if dialect == self.dialect:
+            return
+        self.dialect = dialect
+        self.rehighlight()
+
     def highlightBlock(self, text: str) -> None:  # noqa: N802
-        for match in HIGHLIGHT_RE.finditer(text):
+        for match in highlight_re_for(self.dialect).finditer(text):
             token = match.group(0)
             fmt = self.format_token
             if token.startswith("$C") or token.startswith("$S") or token == "$N":
@@ -817,7 +1450,7 @@ class TokenHighlighter(QSyntaxHighlighter):
         if self.glyph_codec is not None:
             position = 0
             for char in text:
-                if self.glyph_codec.unsupported_characters(char):
+                if char != GLYPH_MARK and self.glyph_codec.unsupported_characters(char):
                     self.setFormat(position, 2 if ord(char) > 0xFFFF else 1, self.glyph_token)
                 position += 2 if ord(char) > 0xFFFF else 1
 
@@ -858,6 +1491,33 @@ class AiWorker(QRunnable):
                 self.signals.failed.emit(unit.uid, translate("error.unexpected", error=exc))
             self.signals.progress.emit(number, total)
         self.signals.finished.emit()
+
+
+class CodeIndexWorkerSignals(QObject):
+    ready = Signal(int, object)
+    failed = Signal(int, str)
+
+
+class CodeIndexWorker(QRunnable):
+    def __init__(self, token: int, game_root: Path | None, project_root: Path | None) -> None:
+        super().__init__()
+        self.setAutoDelete(False)
+        self.token = token
+        self.game_root = game_root
+        self.project_root = project_root
+        self.signals = CodeIndexWorkerSignals()
+
+    def run(self) -> None:
+        try:
+            index = build_code_reference_index(
+                self.game_root,
+                self.project_root,
+                vanilla_project_name=VANILLA_PROJECT_NAME,
+            )
+        except Exception as exc:
+            self.signals.failed.emit(self.token, str(exc))
+            return
+        self.signals.ready.emit(self.token, index)
 
 
 class SuggestionWorkerSignals(QObject):
@@ -958,7 +1618,43 @@ class SettingsDialog(QDialog):
         self.ui_language = QComboBox()
         self.ui_language_label = QLabel()
         interface_form.addRow(self.ui_language_label, self.ui_language)
+        self.preview_scope = QComboBox()
+        self.preview_scope_label = QLabel()
+        interface_form.addRow(self.preview_scope_label, self.preview_scope)
+        self.preview_scope_hint = QLabel()
+        self.preview_scope_hint.setObjectName("hint")
+        self.preview_scope_hint.setWordWrap(True)
+        interface_form.addRow(self.preview_scope_hint)
         layout.addWidget(self.interface_group)
+
+        self.preview_assets_group = QGroupBox()
+        preview_assets_form = QFormLayout(self.preview_assets_group)
+        self.preview_translation_font_dir = QLineEdit(self.settings.preview_translation_font_dir)
+        self.preview_ui_assets_dir = QLineEdit(self.settings.preview_ui_assets_dir)
+        self.preview_translation_font_label = QLabel()
+        self.preview_ui_assets_label = QLabel()
+        self.preview_path_buttons: list[QToolButton] = []
+        for label, line_edit in (
+            (self.preview_translation_font_label, self.preview_translation_font_dir),
+            (self.preview_ui_assets_label, self.preview_ui_assets_dir),
+        ):
+            row = QWidget()
+            row_layout = QHBoxLayout(row)
+            row_layout.setContentsMargins(0, 0, 0, 0)
+            row_layout.addWidget(line_edit, 1)
+            browse = QToolButton()
+            browse.clicked.connect(lambda _checked=False, field=line_edit: self._choose_preview_path(field))
+            row_layout.addWidget(browse)
+            self.preview_path_buttons.append(browse)
+            preview_assets_form.addRow(label, row)
+        self.preview_game_font_in_editors = QCheckBox()
+        self.preview_game_font_in_editors.setChecked(self.settings.preview_game_font_in_editors)
+        preview_assets_form.addRow(self.preview_game_font_in_editors)
+        self.preview_assets_hint = QLabel()
+        self.preview_assets_hint.setObjectName("hint")
+        self.preview_assets_hint.setWordWrap(True)
+        preview_assets_form.addRow(self.preview_assets_hint)
+        layout.addWidget(self.preview_assets_group)
 
         self.service_group = QGroupBox()
         service_form = QFormLayout(self.service_group)
@@ -1069,6 +1765,19 @@ class SettingsDialog(QDialog):
         self.provider.setCurrentIndex(index if index >= 0 else 0)
         del blocker
 
+    def _populate_preview_scope_combo(self) -> None:
+        current = str(self.preview_scope.currentData() or self.settings.preview_scope or "off")
+        blocker = QSignalBlocker(self.preview_scope)
+        self.preview_scope.clear()
+        for value in ("off", "source", "translation", "all"):
+            self.preview_scope.addItem(
+                translate(f"settings.preview.{value}", locale=self._preview_language),
+                value,
+            )
+        index = self.preview_scope.findData(current)
+        self.preview_scope.setCurrentIndex(index if index >= 0 else 0)
+        del blocker
+
     def _on_language_changed(self) -> None:
         self._preview_language = str(self.ui_language.currentData() or self._preview_language)
         self._retranslate_ui()
@@ -1078,6 +1787,7 @@ class SettingsDialog(QDialog):
         self.setWindowTitle(translate("settings.title", locale=locale))
         self._populate_ui_language_combo()
         self._populate_provider_combo()
+        self._populate_preview_scope_combo()
 
         self.tabs.setTabText(0, translate("settings.tab.general", locale=locale))
         self.tabs.setTabText(1, translate("settings.tab.translation", locale=locale))
@@ -1090,8 +1800,24 @@ class SettingsDialog(QDialog):
         self.openai_group.setTitle(translate("settings.group.openai", locale=locale))
         self.git_group.setTitle(translate("settings.group.git", locale=locale))
         self.save_group.setTitle(translate("settings.group.save", locale=locale))
+        self.preview_assets_group.setTitle(translate("settings.preview_assets_group", locale=locale))
 
         self.ui_language_label.setText(translate("settings.ui_language", locale=locale))
+        self.preview_scope_label.setText(translate("settings.preview_scope", locale=locale))
+        self.preview_scope_hint.setText(translate("settings.preview_scope_hint", locale=locale))
+        self.preview_translation_font_label.setText(translate("settings.preview_translation_font_dir", locale=locale))
+        self.preview_ui_assets_label.setText(translate("settings.preview_ui_assets_dir", locale=locale))
+        self.preview_game_font_in_editors.setText(
+            translate("settings.preview_game_font_in_editors", locale=locale)
+        )
+        self.preview_assets_hint.setText(translate("settings.preview_assets_hint", locale=locale))
+        for field in (
+            self.preview_translation_font_dir,
+            self.preview_ui_assets_dir,
+        ):
+            field.setPlaceholderText(translate("settings.preview_path_auto", locale=locale))
+        for button in self.preview_path_buttons:
+            button.setText(translate("settings.preview_path_browse", locale=locale))
         self.provider_label.setText(translate("settings.provider", locale=locale))
         self.google_endpoint_label.setText(translate("settings.endpoint", locale=locale))
         self.source_language_label.setText(translate("settings.source_language", locale=locale))
@@ -1122,6 +1848,18 @@ class SettingsDialog(QDialog):
         else:
             self.provider_note.setText(translate("settings.provider_note.google", locale=locale))
 
+    def _choose_preview_path(self, field: QLineEdit) -> None:
+        current = Path(field.text().strip()).expanduser() if field.text().strip() else Path.home()
+        if current.is_file():
+            current = current.parent
+        selected = QFileDialog.getExistingDirectory(
+            self,
+            translate("settings.preview_assets_group", locale=self._preview_language),
+            str(current),
+        )
+        if selected:
+            field.setText(selected)
+
     def result_settings(self) -> AppSettings:
         return replace(
             self.settings,
@@ -1137,6 +1875,10 @@ class SettingsDialog(QDialog):
             git_author_email=self.git_email.text().strip() or "translator@local",
             enable_chinese_codec=self.enable_chinese_codec.isChecked(),
             auto_space_before_color_tokens_on_save=self.auto_space_before_color_tokens.isChecked(),
+            preview_scope=str(self.preview_scope.currentData() or "off"),
+            preview_translation_font_dir=self.preview_translation_font_dir.text().strip(),
+            preview_ui_assets_dir=self.preview_ui_assets_dir.text().strip(),
+            preview_game_font_in_editors=self.preview_game_font_in_editors.isChecked(),
         )
 
 
@@ -1548,6 +2290,28 @@ class TranslatorWindow(QMainWindow):
         # separately. Reopening a sources project must not forget which game
         # install the manager should scan for Vanilla and mods.
         self.game_root = self._startup_game_root()
+        if self.game_root is not None:
+            discovered_translation = self.game_root / "Textures" / "Hud" / "chinese"
+            discovered_ui = self.game_root / "Textures" / "Hud"
+            updated = self.settings
+            if (
+                not updated.preview_translation_font_dir
+                and (discovered_translation / "Sets.dat").is_file()
+            ):
+                updated = replace(
+                    updated,
+                    preview_translation_font_dir=str(discovered_translation),
+                )
+            if not updated.preview_ui_assets_dir and (discovered_ui / "Sets.dat").is_file():
+                updated = replace(updated, preview_ui_assets_dir=str(discovered_ui))
+            if updated != self.settings:
+                self.settings = updated
+                save_settings(self.settings)
+        self.preview_service = PreviewService(
+            self.game_root,
+            translation_font_dir=self.settings.preview_translation_font_dir,
+            ui_assets_dir=self.settings.preview_ui_assets_dir,
+        )
         self.git: LanguageGit | None = None
         self.git_pending = False
         self.project: Project | None = None
@@ -1556,6 +2320,7 @@ class TranslatorWindow(QMainWindow):
         self.proxy.setSourceModel(self.model)
         self.history = OperationHistory()
         self.current_uid = ""
+        self._game_preview_cache: dict[tuple[object, ...], QImage] = {}
         self.last_applied_query = ""
         self.loading_editor = False
         self.typing_uid = ""
@@ -1721,6 +2486,11 @@ class TranslatorWindow(QMainWindow):
         self.table.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
         self.table.customContextMenuRequested.connect(self._show_table_menu)
         self.table.viewport().installEventFilter(self)
+        self.table_tooltip_filter = DelayedToolTipFilter(
+            self.table.viewport(),
+            700,
+            self._table_tooltip_content,
+        )
         self.table.selectionModel().currentRowChanged.connect(self._on_row_selected)
         self.table.verticalHeader().setVisible(False)
         self.table.verticalHeader().setDefaultSectionSize(30)
@@ -1738,18 +2508,85 @@ class TranslatorWindow(QMainWindow):
         self.table.setItemDelegateForColumn(UnitTableModel.FORMAT, self.format_delegate)
         self.status_delegate = StatusBadgeDelegate(self.table)
         self.table.setItemDelegateForColumn(UnitTableModel.STATUS, self.status_delegate)
+        self.source_preview_delegate = PreviewTextDelegate(
+            self.table,
+            target=False,
+            enabled=lambda: self._table_preview_enabled(False),
+            render_preview=self._render_unit_preview,
+            glyph_image=self.preview_service.glyph_image,
+        )
+        self.translation_preview_delegate = PreviewTextDelegate(
+            self.table,
+            target=True,
+            enabled=lambda: self._table_preview_enabled(True),
+            render_preview=self._render_unit_preview,
+            glyph_image=self.preview_service.glyph_image,
+        )
+        self.table.setItemDelegateForColumn(UnitTableModel.SOURCE, self.source_preview_delegate)
+        self.table.setItemDelegateForColumn(UnitTableModel.TRANSLATION, self.translation_preview_delegate)
         table_layout.addWidget(self.table)
         self.main_splitter.addWidget(self.table_frame)
 
         self.editors_splitter = QSplitter(Qt.Orientation.Horizontal)
-        self.source_box, self.source_edit = self._editor_group(True)
-        self.translation_box, self.translation_edit = self._editor_group(False)
+        self.source_box, self.source_edit, self.source_preview_button = self._editor_group(True)
+        self.translation_box, self.translation_edit, self.translation_preview_button = self._editor_group(False)
+        self.source_box.code_button.show()
+        self.source_box.reference_label.show()
+        self.source_code_button = self.source_box.code_button
+        self.code_reference_label = self.source_box.reference_label
+        self.code_reference_popup = QListWidget()
+        self.code_reference_popup.setWindowFlags(Qt.WindowType.Popup | Qt.WindowType.FramelessWindowHint)
+        self.code_reference_popup.setMouseTracking(True)
+        self.code_reference_popup.installEventFilter(self)
+        self.source_code_button.installEventFilter(self)
+        self.code_button_hold_timer = QTimer(self)
+        self.code_button_hold_timer.setSingleShot(True)
+        self.code_button_hold_timer.setInterval(260)
+        self.code_button_hold_timer.timeout.connect(self._show_code_reference_popup)
+        self.code_reference_index: CodeReferenceIndex | None = None
+        self.code_reference_index_token = 0
+        self.code_reference_workers: list[CodeIndexWorker] = []
+        self.source_preview_button.toggled.connect(
+            lambda checked: self._on_editor_preview_toggled(False, checked)
+        )
+        self.translation_preview_button.toggled.connect(
+            lambda checked: self._on_editor_preview_toggled(True, checked)
+        )
+        self.game_preview_popup = GamePreviewPopup()
+        self.source_preview_tooltip_filter = GamePreviewHoverFilter(
+            self.source_preview_button,
+            self.game_preview_popup,
+            lambda: self._game_preview_image(False),
+        )
+        self.translation_preview_tooltip_filter = GamePreviewHoverFilter(
+            self.translation_preview_button,
+            self.game_preview_popup,
+            lambda: self._game_preview_image(True),
+        )
+        self.source_edit.set_preview_builder(
+            lambda text: self._render_editor_preview(text, False),
+            lambda glyph_id: self.preview_service.glyph_image(glyph_id, False),
+        )
+        self.translation_edit.set_preview_builder(
+            lambda text: self._render_editor_preview(text, True),
+            lambda glyph_id: self.preview_service.glyph_image(glyph_id, True),
+        )
+        self.source_edit.set_game_font_builder(
+            self.settings.preview_game_font_in_editors,
+            lambda char, color: self.preview_service.text_glyph_image(char, False, color),
+        )
+        self.translation_edit.set_game_font_builder(
+            self.settings.preview_game_font_in_editors,
+            lambda char, color: self.preview_service.text_glyph_image(char, True, color),
+        )
         self.translation_edit.setUndoRedoEnabled(True)
         self.source_edit.installEventFilter(self)
         self.source_edit.viewport().installEventFilter(self)
         self.translation_edit.installEventFilter(self)
         self.translation_edit.viewport().installEventFilter(self)
         self.translation_edit.textChanged.connect(self._on_editor_changed)
+        self.source_edit.previewRendered.connect(self._refresh_editor_highlights)
+        self.translation_edit.previewRendered.connect(self._refresh_editor_highlights)
         self.source_highlighter = TokenHighlighter(self.source_edit.document())
         self.translation_highlighter = TokenHighlighter(self.translation_edit.document())
         self.editors_splitter.addWidget(self.source_box)
@@ -1783,8 +2620,12 @@ class TranslatorWindow(QMainWindow):
             self.addAction(action)
 
     def eventFilter(self, watched: QObject, event: QEvent) -> bool:  # noqa: N802
+        if watched is getattr(self, "source_code_button", None):
+            return self._handle_code_button_event(event)
+        if watched is getattr(self, "code_reference_popup", None):
+            return self._handle_code_popup_event(event)
         editor = self._watched_editor(watched)
-        if isinstance(editor, QPlainTextEdit):
+        if isinstance(editor, PreviewPlainTextEdit):
             if event.type() == QEvent.Type.ShortcutOverride and isinstance(event, QKeyEvent):
                 if event.matches(QKeySequence.StandardKey.Undo) or event.matches(QKeySequence.StandardKey.Redo) or self._is_ctrl_shift_z(event):
                     event.accept()
@@ -1832,26 +2673,26 @@ class TranslatorWindow(QMainWindow):
             Qt.KeyboardModifier.ControlModifier | Qt.KeyboardModifier.ShiftModifier
         )
 
-    def _focused_editor(self) -> QPlainTextEdit | None:
+    def _focused_editor(self) -> PreviewPlainTextEdit | None:
         focus = QApplication.focusWidget()
         for editor in self._editor_widgets():
             if focus is editor or (focus is not None and editor.isAncestorOf(focus)):
                 return editor
         return None
 
-    def _watched_editor(self, watched: QObject) -> QPlainTextEdit | None:
+    def _watched_editor(self, watched: QObject) -> PreviewPlainTextEdit | None:
         for editor in self._editor_widgets():
             if watched is editor or watched is editor.viewport():
                 return editor
         return None
 
-    def _editor_widgets(self) -> tuple[QPlainTextEdit, ...]:
-        editors: list[QPlainTextEdit] = []
+    def _editor_widgets(self) -> tuple[PreviewPlainTextEdit, ...]:
+        editors: list[PreviewPlainTextEdit] = []
         source = getattr(self, "source_edit", None)
         translation = getattr(self, "translation_edit", None)
-        if isinstance(source, QPlainTextEdit):
+        if isinstance(source, PreviewPlainTextEdit):
             editors.append(source)
-        if isinstance(translation, QPlainTextEdit):
+        if isinstance(translation, PreviewPlainTextEdit):
             editors.append(translation)
         return tuple(editors)
 
@@ -1888,13 +2729,9 @@ class TranslatorWindow(QMainWindow):
         return True
 
     def _apply_editor_zoom(self) -> None:
+        factor = max(0.2, 1.0 + self.editor_zoom_steps * 0.1)
         for editor in self._editor_widgets():
-            current = int(editor.property("zoomSteps") or 0)
-            delta = self.editor_zoom_steps - current
-            if delta > 0:
-                editor.zoomIn(delta)
-            elif delta < 0:
-                editor.zoomOut(-delta)
+            editor.set_zoom_factor(factor)
             editor.setProperty("zoomSteps", self.editor_zoom_steps)
 
     def _change_editor_zoom(self, delta: int) -> None:
@@ -1923,15 +2760,301 @@ class TranslatorWindow(QMainWindow):
         self.typing_before = ""
         self.typing_before_deleted = False
 
-    def _editor_group(self, read_only: bool) -> tuple[QGroupBox, QPlainTextEdit]:
-        box = QGroupBox()
+    def _editor_group(self, read_only: bool) -> tuple[QGroupBox, PreviewPlainTextEdit, QToolButton]:
+        box = EditorGroupBox()
         layout = QVBoxLayout(box)
         layout.setContentsMargins(8, 12, 8, 8)
-        editor = QPlainTextEdit()
+        editor = PreviewPlainTextEdit()
         editor.setReadOnly(read_only)
-        editor.setLineWrapMode(QPlainTextEdit.LineWrapMode.WidgetWidth)
+        editor.setLineWrapMode(QTextEdit.LineWrapMode.WidgetWidth)
         layout.addWidget(editor)
-        return box, editor
+        return box, editor, box.preview_button
+
+    def _start_code_reference_index(self) -> None:
+        self.code_reference_index = None
+        self.code_reference_index_token += 1
+        token = self.code_reference_index_token
+        self._update_code_reference_display()
+        worker = CodeIndexWorker(token, self.game_root, self.project_root)
+        worker.signals.ready.connect(self._code_reference_index_ready)
+        worker.signals.failed.connect(self._code_reference_index_failed)
+        self.code_reference_workers.append(worker)
+        self.thread_pool.start(worker)
+
+    def _code_reference_index_ready(self, token: int, index: object) -> None:
+        if token != self.code_reference_index_token or not isinstance(index, CodeReferenceIndex):
+            return
+        self.code_reference_workers = [
+            worker for worker in self.code_reference_workers if worker.token != token
+        ]
+        self.code_reference_index = index
+        self._update_code_reference_display()
+
+    def _code_reference_index_failed(self, token: int, message: str) -> None:
+        if token != self.code_reference_index_token:
+            return
+        self.code_reference_workers = [
+            worker for worker in self.code_reference_workers if worker.token != token
+        ]
+        self.code_reference_index = CodeReferenceIndex()
+        self._update_code_reference_display()
+        self.statusBar().showMessage(translate("status.code_index_failed", error=message), 4000)
+
+    def _current_code_reference_set(self) -> CodeReferenceSet:
+        unit = self._current_unit()
+        if unit is None or not unit.label or unit.ref.kind != "dbt" or self.code_reference_index is None:
+            return CodeReferenceSet()
+        return self.code_reference_index.references_for(unit.label)
+
+    def _project_is_mod(self) -> bool:
+        return self.project_root is not None and self.project_root.name.casefold() != VANILLA_PROJECT_NAME.casefold()
+
+    def _update_code_reference_display(self) -> None:
+        if not hasattr(self, "code_reference_label"):
+            return
+        unit = self._current_unit()
+        if unit is None or unit.ref.kind != "dbt":
+            self.code_reference_label.setText("")
+            self.source_code_button.setEnabled(False)
+            if isinstance(self.source_box, EditorGroupBox):
+                self.source_box.position_preview_button()
+            return
+        if self.code_reference_index is None:
+            self.code_reference_label.setText(translate("code.references.loading"))
+            self.source_code_button.setEnabled(False)
+        else:
+            references = self._current_code_reference_set()
+            if references.project_count:
+                self.code_reference_label.setText(translate("code.references.count", count=references.project_count))
+                self.source_code_button.setEnabled(True)
+            elif self._project_is_mod() and references.vanilla_count:
+                self.code_reference_label.setText(translate("code.references.vanilla_count", count=references.vanilla_count))
+                self.source_code_button.setEnabled(True)
+            else:
+                self.code_reference_label.setText(translate("code.references.zero"))
+                self.source_code_button.setEnabled(False)
+        self.source_code_button.setToolTip(self.code_reference_label.text())
+        if isinstance(self.source_box, EditorGroupBox):
+            self.source_box.position_preview_button()
+
+    def _handle_code_button_event(self, event: QEvent) -> bool:
+        if event.type() == QEvent.Type.MouseButtonPress and event.button() == Qt.MouseButton.LeftButton:
+            references = self._current_code_reference_set().active
+            if not references:
+                return True
+            self.code_button_hold_timer.stop()
+            if len(references) > 1:
+                self.code_button_hold_timer.start()
+            return True
+        if event.type() == QEvent.Type.MouseButtonRelease and event.button() == Qt.MouseButton.LeftButton:
+            if self.code_button_hold_timer.isActive():
+                self.code_button_hold_timer.stop()
+                self._open_first_code_reference()
+            elif not self.code_reference_popup.isVisible():
+                self._open_first_code_reference()
+            return True
+        return False
+
+    def _handle_code_popup_event(self, event: QEvent) -> bool:
+        if event.type() == QEvent.Type.MouseMove:
+            item = self.code_reference_popup.itemAt(event.position().toPoint())
+            self.code_reference_popup.setCurrentItem(item)
+            return False
+        if event.type() == QEvent.Type.Leave:
+            self.code_reference_popup.setCurrentItem(None)
+            return False
+        if event.type() == QEvent.Type.MouseButtonRelease and event.button() == Qt.MouseButton.LeftButton:
+            item = self.code_reference_popup.itemAt(event.position().toPoint())
+            self.code_reference_popup.hide()
+            if item is not None:
+                reference = item.data(Qt.ItemDataRole.UserRole)
+                if isinstance(reference, CodeReference):
+                    self._open_code_reference(reference)
+            return True
+        return False
+
+    def _show_code_reference_popup(self) -> None:
+        references = self._current_code_reference_set().active
+        if len(references) <= 1:
+            return
+        self.code_reference_popup.clear()
+        for reference in references:
+            prefix = f"{reference.call_name} · " if reference.call_name else ""
+            item = QListWidgetItem(f"{prefix}{reference.display_name}")
+            item.setToolTip(str(reference.path))
+            item.setData(Qt.ItemDataRole.UserRole, reference)
+            self.code_reference_popup.addItem(item)
+        width = max(
+            240,
+            min(520, max(self.code_reference_popup.fontMetrics().horizontalAdvance(self.code_reference_popup.item(row).text()) for row in range(self.code_reference_popup.count())) + 36),
+        )
+        row_height = max(24, self.code_reference_popup.sizeHintForRow(0))
+        height = min(260, row_height * min(10, self.code_reference_popup.count()) + 8)
+        self.code_reference_popup.setFixedSize(width, height)
+        point = self.source_code_button.mapToGlobal(QPoint(0, self.source_code_button.height() + 4))
+        self.code_reference_popup.move(point)
+        self.code_reference_popup.show()
+        self.code_reference_popup.raise_()
+
+    def _open_first_code_reference(self) -> None:
+        references = self._current_code_reference_set().active
+        if references:
+            self._open_code_reference(references[0])
+
+    def _open_code_reference(self, reference: CodeReference) -> None:
+        if open_code_reference(reference):
+            self.statusBar().showMessage(
+                translate("status.code_reference_opened", file=reference.path.name, line=reference.line),
+                2500,
+            )
+        else:
+            self.statusBar().showMessage(
+                translate("status.code_reference_open_failed", file=str(reference.path)),
+                4000,
+            )
+
+    def _table_tooltip_content(self, point: QPoint) -> tuple[object, str, object] | None:
+        index = self.table.indexAt(point)
+        if not index.isValid():
+            return None
+        if index.column() in {UnitTableModel.SOURCE, UnitTableModel.TRANSLATION}:
+            unit = self._unit_from_proxy_index(index)
+            if unit is None:
+                return None
+            target = index.column() == UnitTableModel.TRANSLATION
+            text = self.preview_service.tooltip_html(
+                self._render_unit_preview(unit, target),
+                target=target,
+            )
+        else:
+            text = str(index.data(Qt.ItemDataRole.ToolTipRole) or "")
+        if not text:
+            return None
+        return (index.row(), index.column()), text, self.table.visualRect(index)
+
+    def _table_preview_enabled(self, target: bool) -> bool:
+        scope = self.settings.preview_scope
+        return scope == "all" or scope == ("translation" if target else "source")
+
+    def _render_unit_preview(self, unit: TranslationUnit, target: bool) -> PreviewDocument:
+        return self.preview_service.render(
+            unit.current_text if target else unit.source_text,
+            unit_key=unit.uid,
+            file_rel=unit.file_rel,
+            kind=unit.ref.kind,
+            target=target,
+        )
+
+    def _render_editor_preview(self, text: str, target: bool) -> PreviewDocument:
+        unit = self._current_unit()
+        if unit is None:
+            atoms = [PreviewAtom(text, 0, len(text))] if text else []
+            return PreviewDocument.from_atoms(text, atoms)
+        return self.preview_service.render(
+            text,
+            unit_key=unit.uid,
+            file_rel=unit.file_rel,
+            kind=unit.ref.kind,
+            target=target,
+        )
+
+    def _on_editor_preview_toggled(self, target: bool, checked: bool) -> None:
+        if target:
+            self._commit_typing_operation()
+            editor = self.translation_edit
+        else:
+            editor = self.source_edit
+        editor.set_preview_enabled(checked)
+        self._update_preview_tooltips()
+        self._refresh_editor_highlights()
+
+    def _update_preview_tooltips(self) -> None:
+        unit = self._current_unit()
+        for target, button in (
+            (False, self.source_preview_button),
+            (True, self.translation_preview_button),
+        ):
+            if button.isChecked():
+                button.setToolTip("")
+                continue
+            if unit is None:
+                button.setToolTip(translate("editor.preview_empty"))
+                continue
+            document = self._render_unit_preview(unit, target)
+            button.setToolTip(self.preview_service.tooltip_html(document, target=target))
+
+    def _game_preview_image(self, target: bool) -> QImage | None:
+        unit = self._current_unit()
+        if unit is None:
+            return None
+        header_unit, body_unit = self._paired_preview_units(unit)
+        cache_key = (
+            target,
+            unit.uid,
+            header_unit.uid if header_unit is not None else "",
+            header_unit.current_text if target and header_unit is not None else (
+                header_unit.source_text if header_unit is not None else ""
+            ),
+            body_unit.uid if body_unit is not None else "",
+            body_unit.current_text if target and body_unit is not None else (
+                body_unit.source_text if body_unit is not None else ""
+            ),
+        )
+        cached = self._game_preview_cache.get(cache_key)
+        if cached is not None:
+            return cached
+
+        def render(candidate: TranslationUnit | None) -> PreviewDocument | None:
+            if candidate is None:
+                return None
+            return self.preview_service.render(
+                candidate.current_text if target else candidate.source_text,
+                unit_key=candidate.uid,
+                file_rel=candidate.file_rel,
+                kind=candidate.ref.kind,
+                target=target,
+            )
+
+        image = self.preview_service.game_window_image(
+            render(header_unit),
+            render(body_unit),
+            target=target,
+        )
+        if len(self._game_preview_cache) >= 24:
+            self._game_preview_cache.clear()
+        self._game_preview_cache[cache_key] = image
+        return image
+
+    def _paired_preview_units(
+        self,
+        unit: TranslationUnit,
+    ) -> tuple[TranslationUnit | None, TranslationUnit | None]:
+        match = re.match(r"^(.*?)(HEAD|BODY)(_[+]\d+)?$", unit.label, re.IGNORECASE)
+        if match is None:
+            return None, unit
+        prefix, kind, suffix = match.groups()
+        head_suffix = "_+0" if suffix else ""
+        body_suffix = suffix if kind.casefold() == "body" else head_suffix
+        labels = {
+            "head": f"{prefix}HEAD{head_suffix}".casefold(),
+            "body": f"{prefix}BODY{body_suffix}".casefold(),
+        }
+        paired: dict[str, TranslationUnit | None] = {"head": None, "body": None}
+        for candidate in self.model.units:
+            if candidate.file_rel != unit.file_rel:
+                continue
+            normalized = candidate.label.casefold()
+            for role, label in labels.items():
+                if normalized == label:
+                    paired[role] = candidate
+        paired[kind.casefold()] = unit
+        return paired["head"], paired["body"]
+
+    def _refresh_preview_presentations(self) -> None:
+        self.source_edit.refresh_preview()
+        self.translation_edit.refresh_preview()
+        self._update_preview_tooltips()
+        self.table.viewport().update()
 
     @staticmethod
     def _local_project_problem(root: Path) -> str | None:
@@ -2211,6 +3334,12 @@ class TranslatorWindow(QMainWindow):
 
     def _activate_project(self, project: Project) -> None:
         self.project = project
+        self.preview_service.configure(
+            self.game_root,
+            project.language,
+            self.settings.preview_translation_font_dir,
+            self.settings.preview_ui_assets_dir,
+        )
         self.history.clear()
         self.typing_uid = ""
         self.typing_before = ""
@@ -2218,6 +3347,7 @@ class TranslatorWindow(QMainWindow):
         self.current_uid = ""
         self.model.set_project(self.project)
         self.translation_highlighter.set_glyph_codec(self.project.codec if ENABLE_FONT_GLYPH_VALIDATION else None)
+        self._start_code_reference_index()
         self._update_file_choices()
         self._apply_filters()
         if not self._is_document_file_selected():
@@ -2298,6 +3428,14 @@ class TranslatorWindow(QMainWindow):
             return None
         self.game_root = root
         self._remember_game_root(root)
+        if self.project is not None:
+            self.preview_service.configure(
+                root,
+                self.project.language,
+                self.settings.preview_translation_font_dir,
+                self.settings.preview_ui_assets_dir,
+            )
+            self._refresh_preview_presentations()
         self._update_project_button()
         return root
 
@@ -2392,6 +3530,14 @@ class TranslatorWindow(QMainWindow):
         self.retry_button.setToolTip(translate("button.retry_commit_tooltip"))
         self.source_box.setTitle(translate("editor.source_title"))
         self.translation_box.setTitle(translate("editor.translation_title"))
+        self.source_code_button.setText(translate("editor.code_button"))
+        self.source_preview_button.setText(translate("editor.preview_toggle"))
+        self.translation_preview_button.setText(translate("editor.preview_toggle"))
+        self._update_code_reference_display()
+        if isinstance(self.source_box, EditorGroupBox):
+            self.source_box.position_preview_button()
+        if isinstance(self.translation_box, EditorGroupBox):
+            self.translation_box.position_preview_button()
         self.source_edit.setPlaceholderText(translate("editor.placeholder"))
         self.translation_edit.setPlaceholderText(translate("editor.placeholder"))
         self.batch_ai_button._update_presentation()
@@ -2403,6 +3549,7 @@ class TranslatorWindow(QMainWindow):
         self._update_counts()
         self._update_issue_detail(self._current_unit())
         self._update_window_title()
+        self._refresh_preview_presentations()
 
     def _update_project_button(self) -> None:
         self.project_manager_button.setText(translate("project.button.manage"))
@@ -2588,6 +3735,9 @@ class TranslatorWindow(QMainWindow):
 
     def _set_editor_unit(self, unit: TranslationUnit | None) -> None:
         self.loading_editor = True
+        dialect = format_dialect(unit.file_rel, unit.ref.kind) if unit is not None else FORMAT_GUILD2
+        self.source_highlighter.set_dialect(dialect)
+        self.translation_highlighter.set_dialect(dialect)
         source_blocker = QSignalBlocker(self.source_edit)
         translation_blocker = QSignalBlocker(self.translation_edit)
         self.source_edit.setPlainText(unit.source_text if unit else "")
@@ -2597,7 +3747,9 @@ class TranslatorWindow(QMainWindow):
         self.loading_editor = False
         self._cancel_pending_typing_operation()
         self._update_issue_detail(unit)
+        self._update_preview_tooltips()
         self._refresh_editor_highlights()
+        self._update_code_reference_display()
 
     def _search_ranges(self, text: str) -> list[tuple[int, int]]:
         query = self.search_edit.text()
@@ -2621,14 +3773,28 @@ class TranslatorWindow(QMainWindow):
         translation_selections: list[QTextEdit.ExtraSelection] = []
 
         for start, end in self._search_ranges(self.source_edit.toPlainText()):
-            source_selections.append(_make_editor_selection(self.source_edit, start, end, background="#f6e58d"))
+            display_start, display_end = self.source_edit.map_raw_range(start, end)
+            source_selections.append(
+                _make_editor_selection(self.source_edit, display_start, display_end, background="#f6e58d")
+            )
         for start, end in self._search_ranges(self.translation_edit.toPlainText()):
-            translation_selections.append(_make_editor_selection(self.translation_edit, start, end, background="#f6e58d"))
+            display_start, display_end = self.translation_edit.map_raw_range(start, end)
+            translation_selections.append(
+                _make_editor_selection(self.translation_edit, display_start, display_end, background="#f6e58d")
+            )
 
         if unit is not None:
-            for start, end in _missing_source_token_ranges(unit.source_text, unit.current_text):
+            dialect = format_dialect(unit.file_rel, unit.ref.kind)
+            for start, end in _missing_source_token_ranges(unit.source_text, unit.current_text, dialect=dialect):
+                display_start, display_end = self.source_edit.map_raw_range(start, end)
                 source_selections.append(
-                    _make_editor_selection(self.source_edit, start, end, background="#f5c2c7", foreground="#7f1d1d")
+                    _make_editor_selection(
+                        self.source_edit,
+                        display_start,
+                        display_end,
+                        background="#f5c2c7",
+                        foreground="#7f1d1d",
+                    )
                 )
 
         self.source_edit.setExtraSelections(source_selections)
@@ -2656,6 +3822,7 @@ class TranslatorWindow(QMainWindow):
         self.model.refresh_unit(unit)
         self._update_recent_translation_marker(unit, before_status)
         self._update_issue_detail(unit)
+        self._update_preview_tooltips()
         self._refresh_editor_highlights()
         self._update_counts()
         self._update_window_title()
@@ -3279,12 +4446,40 @@ class TranslatorWindow(QMainWindow):
             return
         previous_language = self.settings.ui_language
         previous_codec = self.settings.enable_chinese_codec
+        previous_preview_scope = self.settings.preview_scope
+        previous_game_font = self.settings.preview_game_font_in_editors
+        previous_preview_resources = (
+            self.settings.preview_translation_font_dir,
+            self.settings.preview_ui_assets_dir,
+        )
         self.settings = dialog.result_settings()
         save_settings(self.settings)
         if self.settings.ui_language != previous_language:
             set_language(self.settings.ui_language)
             self._retranslate_ui()
         self.ai_delegate.set_provider(self.settings.provider)
+        if self.settings.preview_scope != previous_preview_scope:
+            self.table.viewport().update()
+        current_preview_resources = (
+            self.settings.preview_translation_font_dir,
+            self.settings.preview_ui_assets_dir,
+        )
+        if current_preview_resources != previous_preview_resources:
+            self.preview_service.configure(
+                self.game_root,
+                self.project.language if self.project is not None else "#chinese",
+                *current_preview_resources,
+            )
+            self._refresh_preview_presentations()
+        if self.settings.preview_game_font_in_editors != previous_game_font:
+            self.source_edit.set_game_font_builder(
+                self.settings.preview_game_font_in_editors,
+                lambda char, color: self.preview_service.text_glyph_image(char, False, color),
+            )
+            self.translation_edit.set_game_font_builder(
+                self.settings.preview_game_font_in_editors,
+                lambda char, color: self.preview_service.text_glyph_image(char, True, color),
+            )
         if (
             self.settings.enable_chinese_codec != previous_codec
             and self.project is not None
@@ -3334,6 +4529,9 @@ class TranslatorWindow(QMainWindow):
         self.issue_label.setText("   ·   ".join(parts) if parts else translate("issue.format_ok"))
 
     def closeEvent(self, event: QCloseEvent) -> None:  # noqa: N802
+        popup = getattr(self, "game_preview_popup", None)
+        if isinstance(popup, GamePreviewPopup):
+            popup.hide()
         self._commit_typing_operation()
         if self.project is None:
             event.accept()
@@ -3397,25 +4595,30 @@ def _diff_token_key(token: str) -> str:
     return re.sub(r"\s+", "", token) if COLOR_TOKEN_RE.fullmatch(token) else token
 
 
-def _format_token_occurrences(text: str) -> list[tuple[str, int, int]]:
+def _format_token_occurrences(text: str, dialect: str = FORMAT_GUILD2) -> list[tuple[str, int, int]]:
     occurrences: list[tuple[str, int, int]] = []
-    for match in TOKEN_RE.finditer(text):
+    for match in token_re_for(dialect).finditer(text):
         token = match.group(0)
-        if token == "$N" or token.startswith("$["):
+        if dialect == FORMAT_GUILD2 and (token == "$N" or token.startswith("$[")):
             continue
         occurrences.append((_diff_token_key(token), match.start(), match.end()))
     return occurrences
 
 
-def _missing_source_token_ranges(source_text: str, target_text: str) -> list[tuple[int, int]]:
-    source_occurrences = _format_token_occurrences(source_text)
-    target_occurrences = _format_token_occurrences(target_text)
-    source_keys = [key for key, _start, _end in source_occurrences]
-    target_keys = [key for key, _start, _end in target_occurrences]
+def _missing_source_token_ranges(
+    source_text: str,
+    target_text: str,
+    *,
+    dialect: str = FORMAT_GUILD2,
+) -> list[tuple[int, int]]:
+    source_occurrences = _format_token_occurrences(source_text, dialect)
+    target_counts = Counter(key for key, _start, _end in _format_token_occurrences(target_text, dialect))
     ranges: list[tuple[int, int]] = []
-    for tag, i1, i2, _j1, _j2 in SequenceMatcher(None, source_keys, target_keys, autojunk=False).get_opcodes():
-        if tag in {"delete", "replace"}:
-            ranges.extend((start, end) for _key, start, end in source_occurrences[i1:i2])
+    for key, start, end in source_occurrences:
+        if target_counts[key]:
+            target_counts[key] -= 1
+        else:
+            ranges.append((start, end))
     return ranges
 
 
@@ -3733,7 +4936,7 @@ def _render_history_html(commits_oldest_first: tuple[GitCommit, ...], entries: l
             text-decoration-thickness: 2px;
           }}
           .diff-add {{
-            background: #b8bb26;
+            background: #c6a15b;
             color: #1d2021;
             border-radius: 3px;
             padding: 0 1px;
@@ -3767,8 +4970,9 @@ def _issue_badge(unit: TranslationUnit) -> str:
 
 
 def _format_token_deltas(unit: TranslationUnit) -> tuple[Counter[str], Counter[str], Counter[str], Counter[str]]:
-    source_hard, source_color = split_soft_color_tokens(_format_tokens_for_diff(unit.source_text))
-    target_hard, target_color = split_soft_color_tokens(_format_tokens_for_diff(unit.current_text))
+    dialect = format_dialect(unit.file_rel, unit.ref.kind)
+    source_hard, source_color = split_soft_color_tokens(_format_tokens_for_diff(unit.source_text, dialect))
+    target_hard, target_color = split_soft_color_tokens(_format_tokens_for_diff(unit.current_text, dialect))
     return (
         source_hard - target_hard,
         target_hard - source_hard,
@@ -3822,7 +5026,10 @@ def _format_diff_text(unit: TranslationUnit) -> str:
 
 
 def _format_diff_tooltip(unit: TranslationUnit) -> str:
-    source_tokens = format_counter_items(_format_tokens_for_diff(unit.source_text)) or translate("format.tooltip.source_tokens_empty")
+    dialect = format_dialect(unit.file_rel, unit.ref.kind)
+    source_tokens = format_counter_items(
+        _format_tokens_for_diff(unit.source_text, dialect)
+    ) or translate("format.tooltip.source_tokens_empty")
     summary = _format_diff_text(unit)
     parts = _format_diff_parts(unit)
     lines = [
@@ -3844,9 +5051,12 @@ def _format_diff_tooltip(unit: TranslationUnit) -> str:
     return "\n".join(lines)
 
 
-def _format_tokens_for_diff(text: str) -> Counter[str]:
-    tokens = format_tokens(text)
-    tokens.pop("$N", None)
+def _format_tokens_for_diff(text: str, dialect: str = FORMAT_GUILD2) -> Counter[str]:
+    tokens = format_tokens(text, dialect=dialect)
+    if dialect == FORMAT_GUILD2:
+        tokens.pop("$N", None)
+        for token in [value for value in tokens if value.startswith("$[")]:
+            del tokens[token]
     return tokens
 
 
@@ -3870,7 +5080,7 @@ def apply_modern_style(app: QApplication) -> None:
     palette.setColor(QPalette.ColorRole.AlternateBase, QColor("#ebdbb2"))
     palette.setColor(QPalette.ColorRole.Text, QColor("#3c3836"))
     palette.setColor(QPalette.ColorRole.Button, QColor("#d79921"))
-    palette.setColor(QPalette.ColorRole.Highlight, QColor("#b8bb26"))
+    palette.setColor(QPalette.ColorRole.Highlight, QColor("#c6a15b"))
     palette.setColor(QPalette.ColorRole.HighlightedText, QColor("#3c3836"))
     app.setPalette(palette)
     app.setStyleSheet(
@@ -3893,26 +5103,35 @@ def apply_modern_style(app: QApplication) -> None:
         #projectKindBadge, #projectStateBadge { border-radius: 9px; padding: 3px 9px; font-weight: 900; }
         #projectKindBadge[kind="vanilla"] { background: #458588; color: #fbf1c7; }
         #projectKindBadge[kind="mod"] { background: #689d6a; color: #fbf1c7; }
-        #projectStateBadge[state="added"] { background: #b8bb26; color: #3c3836; }
+        #projectStateBadge[state="added"] { background: #c6a15b; color: #3c3836; }
         #projectStateBadge[state="missing"] { background: #d79921; color: #3c3836; }
         #projectManagerPath { color: #665c54; font-weight: 600; }
         #projectManagerFeedback { background: #dce5b5; border: 2px solid #3c3836; border-radius: 8px; padding: 8px 10px; font-weight: 700; }
         #projectAddButton { font-size: 18px; min-width: 36px; }
         QGroupBox { background: #fbf1c7; border: 3px solid #3c3836; border-radius: 8px; margin-top: 14px; padding-top: 8px; font-weight: 900; color: #3c3836; }
         QGroupBox::title { subcontrol-origin: margin; subcontrol-position: top left; left: 12px; padding: 0 6px; background: #fbf1c7; }
-        QTableView { background: #fbf1c7; border: 3px solid #3c3836; border-radius: 8px; gridline-color: #928374; selection-background-color: #b8bb26; selection-color: #3c3836; }
+        QTableView { background: #fbf1c7; border: 3px solid #3c3836; border-radius: 8px; gridline-color: #928374; selection-background-color: #c6a15b; selection-color: #3c3836; }
         QTableView::item { background: transparent; border-bottom: 1px solid #d5c4a1; padding: 2px 4px; }
-        QTableView::item:selected { background: #b8bb26; color: #3c3836; }
+        QTableView::item:selected { background: #c6a15b; color: #3c3836; }
         QHeaderView::section { background: #d79921; color: #3c3836; border: 0; border-right: 2px solid #3c3836; border-bottom: 3px solid #3c3836; padding: 8px; font-weight: 900; }
-        QPlainTextEdit, QTextBrowser { background: #fbf1c7; border: 0; padding: 8px; selection-background-color: #b8bb26; selection-color: #3c3836; }
+        QPlainTextEdit, QTextEdit, QTextBrowser { background: #fbf1c7; border: 0; padding: 8px; selection-background-color: #c6a15b; selection-color: #3c3836; }
         QListWidget { background: #fbf1c7; border: 3px solid #3c3836; border-radius: 8px; padding: 3px; font-size: 12px; }
         QListWidget::item { padding: 4px 7px; border-radius: 4px; }
-        QListWidget::item:selected { background: #b8bb26; color: #3c3836; }
+        QListWidget::item:selected { background: #c6a15b; color: #3c3836; }
         QLineEdit, QComboBox { background: #f2e5bc; border: 2px solid #3c3836; border-radius: 5px; padding: 5px 7px; min-height: 20px; font-weight: 600; }
         QLineEdit:focus, QComboBox:focus { border: 3px solid #458588; }
-        QComboBox QAbstractItemView { background: #f2e5bc; border: 2px solid #3c3836; selection-background-color: #b8bb26; selection-color: #3c3836; }
+        QComboBox QAbstractItemView { background: #f2e5bc; border: 2px solid #3c3836; selection-background-color: #c6a15b; selection-color: #3c3836; }
         QPushButton, QToolButton { background: #d79921; color: #3c3836; border: 2px solid #3c3836; border-bottom: 5px solid #3c3836; border-radius: 5px; padding: 5px 10px 3px 10px; font-weight: 900; }
         QPushButton:hover, QToolButton:hover { background: #e8b75d; }
+        QToolButton#codeReferenceButton { border: 2px solid #3c3836; border-radius: 4px; padding: 0 6px; }
+        QToolButton#codeReferenceButton:disabled { background: #d5c4a1; color: #7c6f64; }
+        QLabel#codeReferenceCount { color: #665c54; font-weight: 800; }
+        QListWidget { background: #fbf1c7; border: 3px solid #3c3836; border-radius: 8px; padding: 3px; font-size: 12px; }
+        QListWidget::item { padding: 4px 7px; border-radius: 4px; }
+        QListWidget::item:selected { background: #c6a15b; color: #3c3836; }
+        QToolButton#previewToggle { border: 2px solid #3c3836; border-radius: 4px; padding: 0 6px; }
+        QToolButton#previewToggle:pressed { border: 2px solid #3c3836; padding: 1px 5px 0 7px; }
+        QToolButton#previewToggle:checked { background: #689d6a; color: #fbf1c7; }
         QPushButton:pressed, QToolButton:pressed { border-top: 5px solid #3c3836; border-bottom: 2px solid #3c3836; padding: 8px 8px 2px 12px; }
         QPushButton#primary { background: #458588; color: #fbf1c7; }
         QPushButton#primary:hover { background: #689d6a; }
@@ -3921,7 +5140,7 @@ def apply_modern_style(app: QApplication) -> None:
         QPushButton#batchAi[mode="cancelling"] { background: #d65d0e; color: #fbf1c7; }
         QMenu { background: #fbf1c7; border: 3px solid #3c3836; padding: 4px; }
         QMenu::item { padding: 7px 22px 7px 10px; font-weight: 700; }
-        QMenu::item:selected { background: #b8bb26; color: #3c3836; }
+        QMenu::item:selected { background: #c6a15b; color: #3c3836; }
         QMenu::separator { height: 1px; background: #bdae93; margin: 6px 8px; }
         QDialog#suggestionDialog { background: #ebdbb2; border: 3px solid #3c3836; }
         QDialog#historyDialog { background: #ebdbb2; }

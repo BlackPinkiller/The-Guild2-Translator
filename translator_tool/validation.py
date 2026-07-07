@@ -38,6 +38,10 @@ ARG_SUFFIXES = (
     "s",
     "l",
 )
+FORMAT_GUILD2 = "guild2"
+FORMAT_GUIDE = "guide"
+FORMAT_TOOLTIP = "tooltip"
+
 KNOWN_GENDER_SUFFIXES = ("Male", "Female")
 ARG_SUFFIX = "(?:" + "|".join(re.escape(suffix) for suffix in ARG_SUFFIXES) + ")"
 ARG_PLAIN_TOKEN = r"%\d+(?![A-Za-z0-9_:])"
@@ -48,7 +52,7 @@ ARG_TOKEN = rf"(?:{ARG_PLAIN_TOKEN}|%\d+{ARG_SUFFIX})"
 PRINTF_TOKEN = r"%(?:\d+\$)?[-+#0]*(?:\d+|\*)?(?:\.(?:\d+|\*))?[diufFeEgGxXos](?![A-Za-z0-9])"
 NAMED_PERCENT_TOKEN = r"%[A-Za-z][A-Za-z0-9_:-]*%"
 LITERAL_PERCENT_TOKEN = r"%(?=$|[\s$.,:;!?()\[\]{}\"'”’<>]|[^\x00-\x7F])|(?<=\d)%(?![A-Za-z0-9_:])"
-PERCENT_TOKEN = rf"%%|%[<>]|{ARG_TOKEN}|{NAMED_PERCENT_TOKEN}|{PRINTF_TOKEN}|{LITERAL_PERCENT_TOKEN}"
+PERCENT_TOKEN = rf"%%|%[<>]|{ARG_TOKEN}|{PRINTF_TOKEN}|{LITERAL_PERCENT_TOKEN}"
 
 BYTE_TOKEN = r"(?:0|[1-9]\d?|1\d\d|2[0-4]\d|25[0-5])"
 COLOR_TOKEN = rf"\$C\s*\[\s*{BYTE_TOKEN}(?:\s*,\s*{BYTE_TOKEN}){{2,3}}\s*\]"
@@ -69,7 +73,7 @@ LOCALIZATION_TOKEN = r"@L_[A-Za-z0-9_]+_\+[A-Za-z0-9]+"
 INLINE_FALLBACK_TOKEN = r'@T"(?:[^"\\\r\n]|\\.)*"'
 
 GUIDE_TAG_TOKEN = r"</?(?:header|text|separator|list|item|table|row|cell)\b[^>\r\n]*>"
-GUIDE_INLINE_TOKEN = r"\{tip:[A-Za-z0-9_]+\}|\{/tip\}"
+GUIDE_INLINE_TOKEN = r"\{/?[A-Za-z_]+(?::[A-Za-z0-9_:-]+)*\}"
 GUIDE_ATTR_TOKEN = (
     r"\[(?:"
     r'type="(?:bullet|numbered)"|'
@@ -83,7 +87,7 @@ GUIDE_TOC_TOKEN = r"\[(?:Category|Page|SubCategory|AutoPages)\]"
 
 QUOTE_STYLE_TOKEN = r"(?<!<)>[^<>\r\n]{1,160}<(?!/?[A-Za-z][^>]*>)"
 
-TOKEN_RE = re.compile(
+GUILD2_TOKEN_RE = re.compile(
     "|".join(
         [
             PERCENT_TOKEN,
@@ -98,6 +102,13 @@ TOKEN_RE = re.compile(
             NAME_SUFFIX_TOKEN,
             LOCALIZATION_TOKEN,
             INLINE_FALLBACK_TOKEN,
+            QUOTE_STYLE_TOKEN,
+        ]
+    )
+)
+GUIDE_TOKEN_RE = re.compile(
+    "|".join(
+        [
             GUIDE_TAG_TOKEN,
             GUIDE_INLINE_TOKEN,
             GUIDE_ATTR_TOKEN,
@@ -105,7 +116,9 @@ TOKEN_RE = re.compile(
         ]
     )
 )
-HIGHLIGHT_RE = re.compile(
+TOOLTIP_TOKEN_RE = re.compile("|".join((NAMED_PERCENT_TOKEN, SYMBOL_TOKEN)))
+
+GUILD2_HIGHLIGHT_RE = re.compile(
     "|".join(
         [
             PERCENT_TOKEN,
@@ -120,13 +133,28 @@ HIGHLIGHT_RE = re.compile(
             NAME_SUFFIX_TOKEN,
             LOCALIZATION_TOKEN,
             INLINE_FALLBACK_TOKEN,
+            QUOTE_STYLE_TOKEN,
+        ]
+    )
+)
+GUIDE_HIGHLIGHT_RE = re.compile(
+    "|".join(
+        [
             GUIDE_TAG_TOKEN,
             GUIDE_INLINE_TOKEN,
             GUIDE_ATTR_TOKEN,
             GUIDE_TOC_TOKEN,
-            QUOTE_STYLE_TOKEN,
         ]
     )
+)
+TOOLTIP_HIGHLIGHT_RE = TOOLTIP_TOKEN_RE
+
+# Existing callers that explicitly handle ordinary Guild 2 DBT syntax can keep
+# importing these aliases.
+TOKEN_RE = GUILD2_TOKEN_RE
+HIGHLIGHT_RE = GUILD2_HIGHLIGHT_RE
+PROTECTED_TOKEN_RE = re.compile(
+    "|".join((GUILD2_TOKEN_RE.pattern, TOOLTIP_TOKEN_RE.pattern, GUIDE_TOKEN_RE.pattern))
 )
 
 CHINESE_QUOTE_RE = re.compile(r"[\u201C\u201D\u2018\u2019]")
@@ -146,8 +174,33 @@ class ValidationIssue:
         return self.severity == "error"
 
 
-def format_tokens(text: str) -> Counter[str]:
-    return Counter(match.group(0) for match in TOKEN_RE.finditer(text))
+def format_dialect(file_rel: str, kind: str = "dbt") -> str:
+    normalized = file_rel.replace("\\", "/").casefold()
+    if kind == "text" or normalized.startswith("guides/"):
+        return FORMAT_GUIDE
+    if normalized.rsplit("/", 1)[-1] == "tooltips.dbt":
+        return FORMAT_TOOLTIP
+    return FORMAT_GUILD2
+
+
+def token_re_for(dialect: str) -> re.Pattern[str]:
+    if dialect == FORMAT_GUIDE:
+        return GUIDE_TOKEN_RE
+    if dialect == FORMAT_TOOLTIP:
+        return TOOLTIP_TOKEN_RE
+    return GUILD2_TOKEN_RE
+
+
+def highlight_re_for(dialect: str) -> re.Pattern[str]:
+    if dialect == FORMAT_GUIDE:
+        return GUIDE_HIGHLIGHT_RE
+    if dialect == FORMAT_TOOLTIP:
+        return TOOLTIP_HIGHLIGHT_RE
+    return GUILD2_HIGHLIGHT_RE
+
+
+def format_tokens(text: str, *, dialect: str = FORMAT_GUILD2) -> Counter[str]:
+    return Counter(match.group(0) for match in token_re_for(dialect).finditer(text))
 
 
 def normalize_color_token_spacing(text: str) -> str:
@@ -381,7 +434,9 @@ def _literal_percent_end(text: str, position: int) -> int | None:
     return None
 
 
-def unknown_syntax_tokens(text: str) -> list[str]:
+def unknown_syntax_tokens(text: str, *, dialect: str = FORMAT_GUILD2) -> list[str]:
+    if dialect != FORMAT_GUILD2:
+        return []
     unknown: list[str] = []
     position = 0
     while position < len(text):
@@ -478,10 +533,36 @@ def _match_source_unknown_repairs(
     return matched, suspect
 
 
-def compare_tokens(source: str, target: str, *, source_unknown: Counter[str] | None = None) -> tuple[list[ValidationIssue], Counter[str]]:
+def compare_tokens(
+    source: str,
+    target: str,
+    *,
+    source_unknown: Counter[str] | None = None,
+    dialect: str = FORMAT_GUILD2,
+) -> tuple[list[ValidationIssue], Counter[str]]:
     issues: list[ValidationIssue] = []
-    source_tokens = format_tokens(source)
-    target_tokens = format_tokens(target)
+    source_tokens = format_tokens(source, dialect=dialect)
+    target_tokens = format_tokens(target, dialect=dialect)
+    if dialect != FORMAT_GUILD2:
+        missing = source_tokens - target_tokens
+        extra = target_tokens - source_tokens
+        if missing:
+            issues.append(
+                ValidationIssue(
+                    "warning",
+                    translate("validation.format_missing", items=format_counter_items(missing)),
+                    code="format-missing",
+                )
+            )
+        if extra:
+            issues.append(
+                ValidationIssue(
+                    "warning",
+                    translate("validation.format_extra", items=format_counter_items(extra)),
+                    code="format-extra",
+                )
+            )
+        return issues, Counter()
     # $N is a cosmetic line-break directive. Translators may legitimately reflow
     # Chinese text, so it must not produce a format mismatch warning.
     source_tokens.pop("$N", None)
@@ -538,12 +619,18 @@ def validate_translation(
     *,
     dbt_field: bool,
     font_codec: Guild2Codec | None = None,
+    dialect: str = FORMAT_GUILD2,
 ) -> list[ValidationIssue]:
-    source_unknown_raw = Counter(unknown_syntax_tokens(source))
-    target_unknown_raw = Counter(unknown_syntax_tokens(target))
+    source_unknown_raw = Counter(unknown_syntax_tokens(source, dialect=dialect))
+    target_unknown_raw = Counter(unknown_syntax_tokens(target, dialect=dialect))
     source_unknown = source_unknown_raw - target_unknown_raw
     target_unknown = target_unknown_raw - source_unknown_raw
-    issues, source_suspect = compare_tokens(source, target, source_unknown=source_unknown)
+    issues, source_suspect = compare_tokens(
+        source,
+        target,
+        source_unknown=source_unknown,
+        dialect=dialect,
+    )
     if dbt_field and '"' in target:
         issues.append(ValidationIssue("error", translate("validation.dbt_quote"), code="dbt-quote"))
     if CHINESE_QUOTE_RE.search(target):

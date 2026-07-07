@@ -31,6 +31,10 @@ class AppSettings:
     git_author_email: str = "translator@local"
     enable_chinese_codec: bool = False
     auto_space_before_color_tokens_on_save: bool = False
+    preview_scope: str = "off"
+    preview_translation_font_dir: str = ""
+    preview_ui_assets_dir: str = ""
+    preview_game_font_in_editors: bool = False
     editor_zoom_steps: int = 0
     last_project_root: str = ""
     last_game_root: str = ""

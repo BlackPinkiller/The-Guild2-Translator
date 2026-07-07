@@ -14,6 +14,7 @@ build*/
 sources/
 translation_review/
 Translation-format-FULL.txt
+local_docs/
 encoder/Mare
 AGENTS.md
 

@@ -8,7 +8,7 @@ from urllib.parse import urlencode
 from urllib.request import Request, urlopen
 
 from .settings import AppSettings, reveal_secret
-from .validation import TOKEN_RE, validate_translation
+from .validation import PROTECTED_TOKEN_RE, validate_translation
 
 
 class TranslationProviderError(RuntimeError):
@@ -121,7 +121,7 @@ def protect_tokens(text: str) -> ProtectedText:
     tokens: list[tuple[str, str]] = []
     pieces: list[str] = []
     cursor = 0
-    for index, match in enumerate(TOKEN_RE.finditer(text)):
+    for index, match in enumerate(PROTECTED_TOKEN_RE.finditer(text)):
         placeholder = f"__TG_FMT_{index:04d}__"
         pieces.extend((text[cursor : match.start()], placeholder))
         tokens.append((placeholder, match.group(0)))

@@ -20,11 +20,13 @@ from .ai import (
     TranslationProviderError,
 )
 from .cache import source_review_uids
+from .code_index import build_code_reference_index
 from .codec_adapter import Guild2Codec, load_codec_for_language
 from .git_history import GitCommit, LanguageGit, TranslationLogEntry, combine_entries, format_entries
 from .history import OperationHistory, TranslationOperation, UnitChange
 from .i18n import set_language, status_text, translate
 from .format_io import load_dbt, load_plain_text, matching_source_field, row_key
+from .preview import GLYPH_MARK, PreviewService
 from .project import (
     MISSING_WORK_STATUSES,
     Project,
@@ -46,7 +48,13 @@ from .source_sync import (
     sync_source_project,
     sync_vanilla_sources,
 )
-from .validation import format_tokens, normalize_color_token_spacing, validate_translation
+from .validation import (
+    FORMAT_GUIDE,
+    FORMAT_TOOLTIP,
+    format_tokens,
+    normalize_color_token_spacing,
+    validate_translation,
+)
 
 
 def tool_root() -> Path:
@@ -218,6 +226,56 @@ def assert_discover_game_source_projects_detects_vanilla_and_mods() -> None:
         reforged = next(project for project in projects if project.name == "Reforged")
         if not reforged.added:
             raise AssertionError("existing local project should be marked as added")
+    finally:
+        safe_rmtree(temp)
+
+
+def assert_code_reference_index_scans_only_scripts_and_uses_vanilla_fallback() -> None:
+    temp = Path(tempfile.gettempdir()) / f"translator_tool_smoke_code_refs_{uuid.uuid4().hex[:8]}"
+    try:
+        game_root = temp / "game"
+        (game_root / "Scripts").mkdir(parents=True, exist_ok=True)
+        (game_root / "DB" / "Languages").mkdir(parents=True, exist_ok=True)
+        (game_root / "Scripts" / "Mission.lua").write_text(
+            'MsgBox("Actor", nil, "@L_TRIAL_REMINDER_HEAD", "@L_TRIAL_REMINDER_BODY", var1)\n',
+            encoding="utf-8",
+        )
+        (game_root / "Scripts" / "Dynamic.lua").write_text(
+            'MsgQuick("", "@L_DYNAMIC_BRANCH_+"..choice)\n',
+            encoding="utf-8",
+        )
+        (game_root / "DB" / "Languages" / "Text.dbt").write_text(
+            'MsgBox("Actor", nil, "@L_SHOULD_NOT_BE_SCANNED")\n',
+            encoding="utf-8",
+        )
+        vanilla_project = temp / "sources" / "Vanilla"
+        vanilla_project.mkdir(parents=True, exist_ok=True)
+        vanilla_index = build_code_reference_index(game_root, vanilla_project)
+        vanilla_refs = vanilla_index.references_for("TRIAL_REMINDER_HEAD")
+        if vanilla_refs.project_count != 1 or vanilla_refs.project[0].call_name != "MsgBox":
+            raise AssertionError("vanilla code reference was not indexed from Scripts")
+        if vanilla_index.references_for("SHOULD_NOT_BE_SCANNED").project_count:
+            raise AssertionError("code reference index scanned DB unexpectedly")
+        dynamic_refs = vanilla_index.references_for("DYNAMIC_BRANCH_+1")
+        if dynamic_refs.project_count != 1 or dynamic_refs.project[0].path.name != "Dynamic.lua":
+            raise AssertionError("dynamic _+n code reference fallback was not indexed")
+        underscore_refs = vanilla_index.references_for("_TRIAL_REMINDER_HEAD")
+        if underscore_refs.project_count != 1 or underscore_refs.project[0].path.name != "Mission.lua":
+            raise AssertionError("leading underscore label fallback was not indexed")
+
+        mod_project = temp / "sources" / "Reforged"
+        mod_project.mkdir(parents=True, exist_ok=True)
+        (game_root / "mods" / "Reforged" / "Scripts").mkdir(parents=True, exist_ok=True)
+        (game_root / "mods" / "Reforged" / "Scripts" / "Mod.lua").write_text(
+            'MsgQuick("", "@L_MOD_ONLY_+0")\n',
+            encoding="utf-8",
+        )
+        mod_index = build_code_reference_index(game_root, mod_project)
+        if mod_index.references_for("MOD_ONLY_+0").project_count != 1:
+            raise AssertionError("mod code reference was not indexed from mod Scripts")
+        fallback = mod_index.references_for("TRIAL_REMINDER_HEAD")
+        if fallback.project_count != 0 or fallback.vanilla_count != 1:
+            raise AssertionError("mod code reference index did not keep vanilla fallback")
     finally:
         safe_rmtree(temp)
 
@@ -600,6 +658,9 @@ def assert_project_history_settings(root: Path) -> None:
                 recent_project_roots=expected,
                 enable_chinese_codec=True,
                 auto_space_before_color_tokens_on_save=True,
+                preview_scope="all",
+                preview_translation_font_dir="C:/game/Hud/chinese",
+                preview_ui_assets_dir="C:/game/Hud/Sets.dat",
                 editor_zoom_steps=3,
             )
         )
@@ -611,6 +672,9 @@ def assert_project_history_settings(root: Path) -> None:
             or loaded.recent_project_roots != expected[:8]
             or not loaded.enable_chinese_codec
             or not loaded.auto_space_before_color_tokens_on_save
+            or loaded.preview_scope != "all"
+            or loaded.preview_translation_font_dir != "C:/game/Hud/chinese"
+            or loaded.preview_ui_assets_dir != "C:/game/Hud/Sets.dat"
             or loaded.editor_zoom_steps != 3
         ):
             raise AssertionError("project folder history was not persisted safely")
@@ -1140,7 +1204,6 @@ def assert_guild2_format_grammar() -> None:
         "%1NAME %2n %3i %4f %5t %6c %7z %8j %9s %10l "
         "%11GG %12GN %13GT %% %> %< %14SN %15Sn %16SV %17Sv %18SZ %19Sz "
         "%20SK %21ST %22SA %23SD %24SB %25SL %26DN %27DS "
-        "%gold_icon% %measure:LevelUpCity:name% %officer:guildmaster:rogue% "
         "$N $Z $L $R $T $> $< $C[1,2,3,255] $F[Body] $S[12] $B[label] "
         "$[ornament$] #E[NT_NEUTRAL] #SP+ #SP- @NMale @L_TEST_KEY_+n @T\"fallback\""
     )
@@ -1149,8 +1212,6 @@ def assert_guild2_format_grammar() -> None:
         "%1NAME",
         "%11GG",
         "%14SN",
-        "%gold_icon%",
-        "%measure:LevelUpCity:name%",
         "$C[1,2,3,255]",
         "$[ornament$]",
         "#SP+",
@@ -1178,6 +1239,7 @@ def assert_guild2_format_grammar() -> None:
         "%gold_icon%%n%%char_name% @NMale",
         "%gold_icon%%n%%char_name% @NMale",
         dbt_field=True,
+        dialect=FORMAT_TOOLTIP,
     )
     if any(issue.code == "unknown-format" for issue in tooltip_macros):
         raise AssertionError("tooltip macros or @N gender tags were not recognized")
@@ -1185,6 +1247,7 @@ def assert_guild2_format_grammar() -> None:
         "<text>\nCombat in the world is dangerous. Defend your {tip:CART}carts{/tip}.\n</text>",
         "<text>\n战斗很危险。保护你的{TIP : CART }货车{/ TIP}。\n</text>",
         dbt_field=False,
+        dialect=FORMAT_GUIDE,
     )
     if not any(issue.code in {"format-missing", "format-extra"} for issue in guide_tip):
         raise AssertionError("guide tip tags should remain case-sensitive and spacing-sensitive in txt files")
@@ -1255,6 +1318,207 @@ def assert_guild2_format_grammar() -> None:
     unknown = validate_translation("Plain text", "未知 %A", dbt_field=True)
     if any(issue.blocks_save for issue in unknown) or not any(issue.code == "unknown-format" for issue in unknown):
         raise AssertionError("unknown format token was not reduced to a non-blocking warning")
+
+
+def assert_format_dialects_are_isolated() -> None:
+    tooltip = "%gold_icon%%n%%char_name%"
+    tooltip_tokens = format_tokens(tooltip, dialect=FORMAT_TOOLTIP)
+    if tooltip_tokens != {"%gold_icon%": 1, "%n%": 1, "%char_name%": 1}:
+        raise AssertionError("Tooltips.dbt named placeholders were not parsed by their own dialect")
+    if any(token in format_tokens(tooltip) for token in tooltip_tokens):
+        raise AssertionError("Tooltips.dbt named placeholders leaked into the ordinary DBT dialect")
+
+    guide = '<header>Title</header><text>{key:CURSOR_UP}{tip:CART}cart{/tip}</text>'
+    guide_tokens = format_tokens(guide, dialect=FORMAT_GUIDE)
+    required = {"<header>", "</header>", "<text>", "</text>", "{key:CURSOR_UP}", "{tip:CART}", "{/tip}"}
+    if not required.issubset(guide_tokens):
+        raise AssertionError("Guide XML-like tokens were not parsed by the Guide dialect")
+    if any(token in format_tokens(guide) for token in required):
+        raise AssertionError("Guide tokens leaked into the ordinary DBT dialect")
+
+
+def assert_reordered_tokens_are_not_highlighted_as_missing() -> None:
+    from .app import _missing_source_token_ranges
+
+    source = "%1SN owns %2GG and has %3t."
+    target = "%3t：%2GG，所有者 %1SN。"
+    if _missing_source_token_ranges(source, target):
+        raise AssertionError("reordered placeholders were still highlighted as missing")
+    missing = _missing_source_token_ranges(source, "%2GG，所有者 %1SN。")
+    expected_start = source.index("%3t")
+    if missing != [(expected_start, expected_start + len("%3t"))]:
+        raise AssertionError("counter-based missing-placeholder highlighting selected the wrong occurrence")
+
+
+def assert_preview_i18n_and_symbol_mapping() -> None:
+    temp = Path(tempfile.gettempdir()) / f"translator_tool_smoke_preview_{uuid.uuid4().hex[:8]}"
+    try:
+        source_root = temp / "DB" / "Languages"
+        target_root = source_root / "#chinese"
+        target_root.mkdir(parents=True)
+        header_source = (
+            "// Table File\n"
+            "Table Description:\n"
+            '"id" INT 0 | "label" STRING 0 | "english" STRING 0 |\n'
+            "Data:\n"
+        )
+        header_target = (
+            "// Table File\n"
+            "Table Description:\n"
+            '"id" INT 0 | "label" STRING 0 | "chinese" STRING 0 |\n'
+            "Data:\n"
+        )
+        rows_source = (
+            '1 "_NAMES_ENGLISH_MALE_+0" "Jack" |\n'
+            '2 "_NAMES_ENGLISH_SURNAMES_+0" "Smith" |\n'
+            '3 "_PREVIEW_LABEL_+0" "Preview label" |\n'
+        )
+        rows_target = (
+            '1 "_NAMES_ENGLISH_MALE_+0" "杰克" |\n'
+            '2 "_NAMES_ENGLISH_SURNAMES_+0" "史密斯" |\n'
+            '3 "_PREVIEW_LABEL_+0" "预览标签" |\n'
+        )
+        (source_root / "Text.dbt").write_text(header_source + rows_source, encoding="utf-8")
+        (target_root / "Text.dbt").write_text(header_target + rows_target, encoding="utf-8")
+
+        service = PreviewService(temp, "#chinese")
+        raw = "%1SN $S[2012] %2t @L_PREVIEW_LABEL_+0"
+        source = service.render(raw, unit_key="same-entry", file_rel="Text.dbt", kind="dbt", target=False)
+        target = service.render(raw, unit_key="same-entry", file_rel="Text.dbt", kind="dbt", target=True)
+        if "Jack Smith" not in source.display_text or "杰克 史密斯" not in target.display_text:
+            raise AssertionError("the same preview identity was not localized independently on both sides")
+        if "Preview label" not in source.display_text or "预览标签" not in target.display_text:
+            raise AssertionError("@L localization preview did not use matching source and target labels")
+        if not any(atom.glyph_id == 2012 and atom.text == GLYPH_MARK for atom in source.atoms):
+            raise AssertionError("$S[2012] was not routed to the live glyph preview")
+        if not any(atom.glyph_id == 2002 for atom in source.atoms):
+            raise AssertionError("%2t did not preview the game's coin symbol")
+
+        header = service.render(
+            "$[Header text$]",
+            unit_key="same-entry",
+            file_rel="Text.dbt",
+            kind="dbt",
+            target=False,
+        )
+        if "Header text" not in header.display_text or any(atom.glyph_id is not None for atom in header.atoms):
+            raise AssertionError("$[...$] header decoration was confused with $S[...] symbol syntax")
+
+        tooltip = service.render(
+            "%gold% %gold_icon%%n%%char_name% $S[2012]",
+            unit_key="same-entry",
+            file_rel="Tooltips.dbt",
+            kind="dbt",
+            target=True,
+        )
+        if (
+            "\n" not in tooltip.display_text
+            or not any(atom.glyph_id == 2002 for atom in tooltip.atoms)
+            or not any(atom.glyph_id == 2012 for atom in tooltip.atoms)
+        ):
+            raise AssertionError("Tooltips.dbt named macros did not produce a localized preview")
+
+        guide = service.render(
+            "<header>Controls</header><text>{key:CURSOR_UP}</text>",
+            unit_key="same-entry",
+            file_rel="Guides/Controls.txt",
+            kind="text",
+            target=True,
+        )
+        if "CURSOR UP" not in guide.display_text or "<header>" in guide.display_text:
+            raise AssertionError("Guide markup did not use the Guide preview dialect")
+    finally:
+        safe_rmtree(temp)
+
+
+def assert_preview_editor_restores_raw_placeholder_on_edit() -> None:
+    os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+    from PySide6.QtCore import Qt
+    from PySide6.QtGui import QImage, QTextCharFormat, QTextCursor, QTextImageFormat
+    from PySide6.QtTest import QTest
+    from PySide6.QtWidgets import QApplication
+
+    from .app import PreviewPlainTextEdit
+
+    app = QApplication.instance()
+    created_app = app is None
+    if app is None:
+        app = QApplication([])
+    service = PreviewService(None, "#chinese")
+    editor = PreviewPlainTextEdit()
+    editor.set_preview_builder(
+        lambda text: service.render(
+            text,
+            unit_key="editor-entry",
+            file_rel="Text.dbt",
+            kind="dbt",
+            target=False,
+        ),
+        lambda _glyph_id: None,
+    )
+    editor.setPlainText("%1SN")
+    editor.set_preview_enabled(True)
+    if editor.toPlainText() != "%1SN" or editor.rendered_preview.display_text == "%1SN":
+        raise AssertionError("input preview did not preserve raw placeholder text behind the visual replacement")
+    cursor = editor.textCursor()
+    cursor.movePosition(QTextCursor.MoveOperation.End)
+    editor.setTextCursor(cursor)
+    QTest.keyClick(editor, Qt.Key.Key_Backspace)
+    app.processEvents()
+    if editor.toPlainText() != "%1S" or editor.rendered_preview.display_text != "%1S":
+        raise AssertionError("editing preview content did not immediately fall back to the edited raw placeholder")
+    editor.setPlainText("hello %1SN world")
+    preview_text = editor.rendered_preview.display_text
+    cursor = editor.textCursor()
+    cursor.setPosition(preview_text.index("Character") + 2)
+    editor.setTextCursor(cursor)
+    QTest.keyClick(editor, Qt.Key.Key_Backspace)
+    app.processEvents()
+    document_cursor = QTextCursor(editor.document())
+    document_cursor.select(QTextCursor.SelectionType.Document)
+    char_format = document_cursor.charFormat()
+    if char_format.background().style() != Qt.BrushStyle.NoBrush:
+        raise AssertionError("editing inside a placeholder leaked its preview background to the entire editor")
+    if char_format.underlineStyle() != QTextCharFormat.UnderlineStyle.NoUnderline:
+        raise AssertionError("editing inside a placeholder leaked its preview underline to the entire editor")
+    editor.set_zoom_factor(1.0)
+    base_size = editor.document().defaultFont().pointSizeF()
+    editor.set_zoom_factor(1.1)
+    zoomed_size = editor.document().defaultFont().pointSizeF()
+    if abs(zoomed_size / base_size - 1.1) > 0.01:
+        raise AssertionError("editor zoom did not apply the requested percentage")
+    editor.setPlainText("zoom %1SN")
+    if abs(editor.document().defaultFont().pointSizeF() - zoomed_size) > 0.01:
+        raise AssertionError("rebuilding a preview lost the editor zoom")
+    glyph = QImage(10, 20, QImage.Format.Format_RGBA8888)
+    glyph.fill(0xFFFFFFFF)
+    editor.set_preview_builder(
+        lambda text: service.render(
+            text,
+            unit_key="editor-entry",
+            file_rel="Text.dbt",
+            kind="dbt",
+            target=False,
+        ),
+        lambda _glyph_id: glyph,
+    )
+    editor.setPlainText("$S[2012]OBJ")
+    glyph_span = next(span for span in editor.rendered_preview.spans if span.atom.glyph_id is not None)
+    glyph_cursor = QTextCursor(editor.document())
+    glyph_cursor.setPosition(glyph_span.display_start)
+    glyph_cursor.movePosition(QTextCursor.MoveOperation.NextCharacter, QTextCursor.MoveMode.KeepAnchor)
+    glyph_format = QTextImageFormat(glyph_cursor.charFormat())
+    glyph_width = glyph_format.width()
+    glyph_height = glyph_format.height()
+    if (
+        not glyph_format.isValid()
+        or glyph_height <= 0
+        or abs(glyph_width / glyph_height - 0.5) > 0.01
+    ):
+        raise AssertionError("inline game glyph did not preserve its aspect ratio")
+    editor.close()
+    if created_app:
+        app.quit()
 
 
 class FakeStreamingTransport:
@@ -1524,6 +1788,7 @@ def main() -> int:
     assert_loaded_order_matches_file_lines(root)
     assert_local_project_roots_detect_sources_projects()
     assert_discover_game_source_projects_detects_vanilla_and_mods()
+    assert_code_reference_index_scans_only_scripts_and_uses_vanilla_fallback()
     assert_startup_prefers_local_sources_over_game_root()
     assert_sync_vanilla_sources_only_imports_originals()
     assert_sync_source_project_invalidates_changed_translations(root)
@@ -1554,6 +1819,10 @@ def main() -> int:
     assert_ai_token_protection()
     assert_linebreak_format_is_ignored()
     assert_guild2_format_grammar()
+    assert_format_dialects_are_isolated()
+    assert_reordered_tokens_are_not_highlighted_as_missing()
+    assert_preview_i18n_and_symbol_mapping()
+    assert_preview_editor_restores_raw_placeholder_on_edit()
     assert_llm_suggestion_stream()
     assert_llm_suggestion_context_prompt()
     assert_git_history(root)
