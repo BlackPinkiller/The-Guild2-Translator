@@ -11,10 +11,15 @@ LABEL_RE = re.compile(
     r"@L_[A-Za-z0-9_]+_\+[A-Za-z0-9]+|"
     r"@L_[A-Za-z0-9_]+"
 )
-DYNAMIC_LABEL_RE = re.compile(
-    r"@L_(?P<prefix>[A-Za-z0-9_]+)_\s*\"\s*\.\.\s*.+?\s*\.\.\s*\"\s*_\+(?P<suffix>[A-Za-z0-9]*)",
-    re.DOTALL,
+LABEL_EXPRESSION_TOKEN = (
+    r"(?:\"[^\"\\]*(?:\\.[^\"\\]*)*\"|'[^'\\]*(?:\\.[^'\\]*)*'|"
+    r"@L_[A-Za-z0-9_+*]*|_[A-Za-z0-9_+*]*|"
+    r"[A-Za-z_][A-Za-z0-9_]*(?:\([^()\r\n]*\))?)"
 )
+CONCAT_LABEL_EXPRESSION_RE = re.compile(
+    rf"(?P<expr>{LABEL_EXPRESSION_TOKEN}\s*(?:\.\.\s*{LABEL_EXPRESSION_TOKEN}\s*)+)"
+)
+STRING_LITERAL_RE = re.compile(r"""^(?:"([^"\\]*(?:\\.[^"\\]*)*)"|'([^'\\]*(?:\\.[^'\\]*)*)')$""")
 CODE_SUFFIXES = {".lua", ".ms", ".gui"}
 
 
@@ -125,11 +130,9 @@ def scan_scripts_root(root: Path, *, source: str = "project") -> dict[str, tuple
             group_label = label_group_key(label)
             if group_label is not None and group_label != label:
                 grouped.setdefault(group_label, []).append(reference)
-        for match in DYNAMIC_LABEL_RE.finditer(text):
-            line_number, column = _line_column(line_starts, match.start())
-            suffix = match.group("suffix") or "*"
-            label = normalize_label(f"{match.group('prefix')}_*_+{suffix}")
-            call_name, argument_index, arguments = _call_context(text, match.start())
+        for label, position in dynamic_label_matches(text):
+            line_number, column = _line_column(line_starts, position)
+            call_name, argument_index, arguments = _call_context(text, position)
             reference = CodeReference(
                 label=label,
                 path=path,
@@ -141,7 +144,87 @@ def scan_scripts_root(root: Path, *, source: str = "project") -> dict[str, tuple
                 source=source,
             )
             grouped.setdefault(label, []).append(reference)
-    return {label: tuple(items) for label, items in grouped.items()}
+    return {label: _dedupe_references(items) for label, items in grouped.items()}
+
+
+def _dedupe_references(references: list[CodeReference]) -> tuple[CodeReference, ...]:
+    values: list[CodeReference] = []
+    seen: set[tuple[Path, int, str | None, int | None, tuple[str, ...]]] = set()
+    for reference in references:
+        key = (
+            reference.path,
+            reference.line,
+            reference.call_name,
+            reference.argument_index,
+            reference.arguments,
+        )
+        if key in seen:
+            continue
+        seen.add(key)
+        values.append(reference)
+    return tuple(values)
+
+
+def dynamic_label_matches(text: str) -> tuple[tuple[str, int], ...]:
+    values: list[tuple[str, int]] = []
+    seen: set[tuple[str, int]] = set()
+    for match in CONCAT_LABEL_EXPRESSION_RE.finditer(text):
+        label = _dynamic_label_from_expression(match.group("expr"), normalized=True)
+        if not label:
+            continue
+        value = (label, match.start("expr"))
+        if value not in seen:
+            seen.add(value)
+            values.append(value)
+    return tuple(values)
+
+
+def dynamic_label_patterns(text: str, *, normalized: bool = True) -> tuple[str, ...]:
+    values: list[str] = []
+    for match in CONCAT_LABEL_EXPRESSION_RE.finditer(text):
+        label = _dynamic_label_from_expression(match.group("expr"), normalized=normalized)
+        if label and label not in values:
+            values.append(label)
+    return tuple(values)
+
+
+def _dynamic_label_from_expression(expression: str, *, normalized: bool) -> str:
+    parts = [part.strip() for part in expression.split("..") if part.strip()]
+    if len(parts) < 2:
+        return ""
+    fragments: list[str] = []
+    has_wildcard = False
+    for part in parts:
+        literal = _string_literal_text(part)
+        if literal is None and _looks_like_unquoted_label_fragment(part):
+            literal = part
+        if literal is None:
+            fragments.append("*")
+            has_wildcard = True
+        else:
+            fragments.append(literal)
+    if not has_wildcard:
+        return ""
+    label = "".join(fragments)
+    if label.endswith("_+"):
+        label += "*"
+    if not (label.startswith("@L_") or label.startswith("_")):
+        return ""
+    if "_+" not in label:
+        return ""
+    return normalize_label(label) if normalized else label
+
+
+def _string_literal_text(value: str) -> str | None:
+    match = STRING_LITERAL_RE.match(value.strip())
+    if match is None:
+        return None
+    return match.group(1) if match.group(1) is not None else match.group(2) or ""
+
+
+def _looks_like_unquoted_label_fragment(value: str) -> bool:
+    stripped = value.strip()
+    return bool(re.match(r"^(?:@L_[A-Za-z0-9_+*]*|_[A-Za-z0-9_+*]*)$", stripped))
 
 
 def normalize_label(label: str) -> str:

@@ -3197,6 +3197,11 @@ class TranslatorWindow(QMainWindow):
             labels.append(label[1:])
         else:
             labels.append("_" + label)
+        wildcard_patterns = [
+            re.compile("^" + re.escape(candidate).replace("\\*", "[a-z0-9_]+") + "$")
+            for candidate in labels
+            if "*" in candidate
+        ]
         label_groups = {group for candidate in labels if (group := label_group_key(candidate)) is not None}
         fallback: TranslationUnit | None = None
         for candidate in self.model.units:
@@ -3205,6 +3210,8 @@ class TranslatorWindow(QMainWindow):
             normalized = normalize_label(candidate.label)
             if normalized in labels:
                 return candidate
+            if any(pattern.match(normalized) for pattern in wildcard_patterns):
+                return candidate
             if fallback is None and label_group_key(normalized) in label_groups:
                 fallback = candidate
         if fallback is not None:
@@ -3212,6 +3219,8 @@ class TranslatorWindow(QMainWindow):
         for candidate in self.model.units:
             normalized = normalize_label(candidate.label)
             if normalized in labels:
+                return candidate
+            if any(pattern.match(normalized) for pattern in wildcard_patterns):
                 return candidate
             if fallback is None and label_group_key(normalized) in label_groups:
                 fallback = candidate

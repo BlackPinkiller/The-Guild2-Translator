@@ -871,7 +871,7 @@ class PreviewService:
         button_height = 36
         x = (canvas_width - button_width) // 2
         y = top
-        for button in buttons[:4]:
+        for button in buttons:
             if not self._draw_game_button_background(painter, QRect(x, y, button_width, button_height)):
                 painter.fillRect(x, y, button_width, button_height, QColor(44, 72, 28, 230))
                 painter.setPen(QColor(180, 160, 80, 230))

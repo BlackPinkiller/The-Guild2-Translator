@@ -1,13 +1,16 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from functools import lru_cache
 import re
 from typing import Protocol
 
+from .code_index import dynamic_label_patterns
 from .i18n import translate
 
 
 GLYPH_MARK = "\ufffc"
+_NESTED_PLACEHOLDER_RE = re.compile(r"%(\d+)([A-Za-z]*)")
 
 
 class PlaceholderLocalization(Protocol):
@@ -55,6 +58,7 @@ class PlaceholderValueBuilder:
         number: int,
         suffix: str,
         context: PlaceholderContext,
+        _depth: int = 0,
     ) -> PlaceholderValue:
         if suffix in {"SN", "Sn", "SZ", "Sz"}:
             return PlaceholderValue(
@@ -77,6 +81,8 @@ class PlaceholderValueBuilder:
         if suffix in {"", "l", "s"}:
             localized = _localized_argument_value(self.localization, number, context)
             if localized:
+                if _depth < 3:
+                    localized = self._resolve_nested_placeholders(localized, number, suffix, context, _depth + 1)
                 return PlaceholderValue(_clean_sample_text(localized))
             semantic = _semantic_kind(number, context)
             if semantic == "character":
@@ -105,6 +111,23 @@ class PlaceholderValueBuilder:
         }
         key = values.get(suffix, "preview.value.argument")
         return PlaceholderValue(translate(key, locale=context.locale, number=number))
+
+    def _resolve_nested_placeholders(
+        self,
+        text: str,
+        current_number: int,
+        current_suffix: str,
+        context: PlaceholderContext,
+        depth: int,
+    ) -> str:
+        def replace(match: re.Match[str]) -> str:
+            number = int(match.group(1))
+            suffix = match.group(2) or ""
+            if number == current_number and suffix == current_suffix:
+                return match.group(0)
+            return self.argument_value(number, suffix, context, depth).text
+
+        return _NESTED_PLACEHOLDER_RE.sub(replace, text)
 
     def _explicit_argument_value(
         self,
@@ -251,7 +274,7 @@ def _placeholder_expression(reference: object, number: int) -> str:
     base = argument_index + 1
     current_argument = str(arguments[argument_index]) if 0 <= argument_index < len(arguments) else ""
     if _is_button_argument(current_argument):
-        while base < len(arguments) and _is_localization_text_argument(str(arguments[base])):
+        while base < len(arguments) and _is_window_text_argument(str(arguments[base])):
             base += 1
     elif _is_localization_text_argument(current_argument):
         current_label = _localization_text_label(current_argument)
@@ -321,26 +344,23 @@ def _is_localization_text_argument(expression: str) -> bool:
     return bool(_localization_text_label(expression))
 
 
+def _is_window_text_argument(expression: str) -> bool:
+    return _looks_like_window_text_label(_localization_text_label(expression))
+
+
+def _looks_like_window_text_label(label: str) -> bool:
+    value = label.casefold()
+    return bool(re.search(r"(^|_)(head|header|body|text|question|answer)(_|$)", value))
+
+
 def _localization_text_label(expression: str) -> str:
     literal = _literal_localization_label(expression)
     if literal:
         return literal
-    dynamic = _DYNAMIC_LOCALIZATION_RE.search(expression.strip())
+    dynamic = dynamic_label_patterns(expression)
     if dynamic:
-        prefix, suffix = dynamic.groups()
-        return f"{prefix}_+{suffix}".lstrip("_")
-    dynamic_suffix = _DYNAMIC_SUFFIX_LOCALIZATION_RE.search(expression.strip())
-    if dynamic_suffix:
-        return f"{dynamic_suffix.group(1)}_+*".lstrip("_")
+        return dynamic[0].lstrip("_")
     return ""
-
-
-_DYNAMIC_LOCALIZATION_RE = re.compile(
-    r"@L_([A-Za-z0-9_]+)_['\"]?\s*\.\..*?\.\.\s*['\"]_\+([A-Za-z0-9]+)"
-)
-_DYNAMIC_SUFFIX_LOCALIZATION_RE = re.compile(
-    r"@L_([A-Za-z0-9_]+)_\+\s*['\"]?\s*\.\."
-)
 
 
 def _localized_argument_value(
@@ -350,26 +370,120 @@ def _localized_argument_value(
 ) -> str:
     for reference in context.references:
         expression = _placeholder_expression(reference, number)
-        literal = _literal_localization_label(expression)
-        if literal:
-            value = localization.localized(f"_{literal}", context.target)
-            if value and value != f"_{literal}":
-                return value
-            continue
-        dynamic = _DYNAMIC_LOCALIZATION_RE.search(expression.strip())
-        if not dynamic:
-            continue
-        prefix, suffix = dynamic.groups()
-        value = localization.sample_label(
-            f"_{prefix}_",
-            f"_+{suffix}",
-            context.seed_key,
-            number,
-            context.target,
-        )
+        value = _localized_expression_value(localization, expression, number, context)
+        if not value:
+            value = _localized_variable_value(localization, reference, expression, number, context)
         if value:
             return value
     return ""
+
+
+def _localized_expression_value(
+    localization: PlaceholderLocalization,
+    expression: str,
+    number: int,
+    context: PlaceholderContext,
+) -> str:
+    labels = _literal_label_candidates(expression)
+    if labels:
+        label = labels[_stable_index(f"{context.seed_key}:{number}:{expression}:label", len(labels))]
+        value = localization.localized(label, context.target)
+        if value and value != label:
+            return value
+    for prefix, suffix in _dynamic_sample_candidates(expression):
+        value = localization.sample_label(prefix, suffix, context.seed_key, number, context.target)
+        if value:
+            return value
+    return ""
+
+
+def _localized_variable_value(
+    localization: PlaceholderLocalization,
+    reference: object,
+    expression: str,
+    number: int,
+    context: PlaceholderContext,
+) -> str:
+    variable = expression.strip()
+    if not re.match(r"^[A-Za-z_][A-Za-z0-9_]*$", variable):
+        return ""
+    path = getattr(reference, "path", None)
+    line = getattr(reference, "line", None)
+    if path is None or not isinstance(line, int):
+        return ""
+    labels, dynamic_samples = _variable_label_sources(str(path), line, variable)
+    values: list[str] = []
+    for label in labels:
+        value = localization.localized(label, context.target)
+        if value and value != label:
+            values.append(value)
+    for prefix, suffix in dynamic_samples:
+        value = localization.sample_label(prefix, suffix, context.seed_key, number, context.target)
+        if value:
+            values.append(value)
+    if not values:
+        return ""
+    return values[_stable_index(f"{context.seed_key}:{number}:{variable}:variable-label", len(values))]
+
+
+@lru_cache(maxsize=2048)
+def _variable_label_sources(path: str, line: int, variable: str) -> tuple[tuple[str, ...], tuple[tuple[str, str], ...]]:
+    try:
+        text = open(path, "r", encoding="utf-8", errors="ignore").read()
+    except OSError:
+        return (), ()
+    prefix = "\n".join(text.splitlines()[: max(0, line - 1)])
+    assignment_re = re.compile(
+        rf"(?:^|\n)\s*(?:local\s+)?{re.escape(variable)}\s*=\s*(?P<expr>[^\n\r]*)",
+        re.IGNORECASE,
+    )
+    labels: list[str] = []
+    dynamic_samples: list[tuple[str, str]] = []
+    for match in assignment_re.finditer(prefix):
+        expr = match.group("expr")
+        for label in _literal_label_candidates(expr):
+            if label not in labels:
+                labels.append(label)
+        for sample in _dynamic_sample_candidates(expr):
+            if sample not in dynamic_samples:
+                dynamic_samples.append(sample)
+    return tuple(labels), tuple(dynamic_samples)
+
+
+def _dynamic_sample_candidates(expression: str) -> tuple[tuple[str, str], ...]:
+    samples: list[tuple[str, str]] = []
+    for label in dynamic_label_patterns(expression, normalized=False):
+        if label.startswith("@L_"):
+            label = "_" + label[3:].lstrip("_")
+        if label.endswith("_+"):
+            label += "*"
+        star_index = label.find("*")
+        if star_index < 0:
+            continue
+        sample = (label[:star_index], label[star_index + 1 :])
+        if sample not in samples:
+            samples.append(sample)
+    return tuple(samples)
+
+
+def _literal_label_candidates(expression: str) -> tuple[str, ...]:
+    labels: list[str] = []
+    for match in _LABEL_LITERAL_RE.finditer(expression):
+        label = match.group(1) or match.group(2)
+        if not label:
+            continue
+        if label.startswith("@L_"):
+            label = "_" + label[3:].lstrip("_")
+        elif not label.startswith("_"):
+            label = "_" + label
+        if label not in labels:
+            labels.append(label)
+    return tuple(labels)
+
+
+_LABEL_LITERAL_RE = re.compile(
+    r"(@L_[A-Za-z0-9_]+_\+[A-Za-z0-9*]+)|(?<![A-Za-z0-9])(_[A-Za-z0-9_]+_\+[A-Za-z0-9*]+)"
+)
 
 
 def _city_value(localization: PlaceholderLocalization, number: int, context: PlaceholderContext) -> str:

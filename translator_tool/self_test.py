@@ -27,7 +27,7 @@ from .git_history import GitCommit, LanguageGit, TranslationLogEntry, combine_en
 from .history import OperationHistory, TranslationOperation, UnitChange
 from .i18n import set_language, status_text, translate
 from .format_io import load_dbt, load_plain_text, matching_source_field, row_key
-from .preview import GLYPH_MARK, PreviewService
+from .preview import GLYPH_MARK, PreviewAtom, PreviewDocument, PreviewService
 from .project import (
     MISSING_WORK_STATUSES,
     Project,
@@ -339,6 +339,18 @@ def assert_code_window_context_extracts_window_labels_and_buttons() -> None:
                     '    "@L_MEASURE_WUERDENTRAGEREMPFANGEN_HEAD_+0",',
                     '    "@L_MEASURE_WUERDENTRAGEREMPFANGEN_BODY_+1",stimmung,ort)',
                     'MsgQuick("", "@L_SHORT_NOTICE_+0", GetID("Owner"))',
+                    'local dynamicButtons = ""',
+                    'local enemy1 = "@L_SCENARIO_WAR_"..enemy.."_+0"',
+                    'local enemy2 = "@L_SCENARIO_WAR_"..enemy.."_+0"',
+                    'local enemy3 = "@L_SCENARIO_WAR_"..enemy.."_+0"',
+                    'local enemy4 = "@L_SCENARIO_WAR_"..enemy.."_+0"',
+                    'dynamicButtons = dynamicButtons.."@B[1,"..enemy1.."]"',
+                    'dynamicButtons = dynamicButtons.."@B[2,"..enemy2.."]"',
+                    'dynamicButtons = dynamicButtons.."@B[3,"..enemy3.."]"',
+                    'dynamicButtons = dynamicButtons.."@B[4,"..enemy4.."]"',
+                    'MsgBox("", "", "@P"..dynamicButtons.."@B[5,@L_MEASURE_WUERDENTRAGEREMPFANGEN_NONE_+0]",',
+                    '    "@L_MEASURE_WUERDENTRAGEREMPFANGEN_HEAD_+0",',
+                    '    "@L_MEASURE_WUERDENTRAGEREMPFANGEN_BODY_+0")',
                     'MsgNewsNoWait("All","","@C[@L_KONTOR_MISSIONS_OFFER_ITEMS_COOLDOWN_+0,%5i,%6l]","economie",-1,',
                     '    "@L_KONTOR_MISSIONS_OFFER_ITEMS_HEAD_+"..random,',
                     '    "@L_KONTOR_MISSIONS_OFFER_ITEMS_TEXT_+"..random,',
@@ -346,6 +358,13 @@ def assert_code_window_context_extracts_window_labels_and_buttons() -> None:
                     'MsgBoxNoWait("","", "@L_MEASURE_SHOWWARFACTORS_HEAD_+0",',
                     '    "@L_MEASURE_SHOWWARFACTORS_BODY_+1",',
                     '    "@L_SCENARIO_WAR_"..land.."_+1", "@L_SCENARIO_WAR_"..enemy.."_+1")',
+                    'MsgBox("", "", "@P@B[1,@L_CONTRACTARSENAL_HIRE_OPTION_+0]"..',
+                    '    "@B[5,@L_CONTRACTARSENAL_HIRE_OPTION_+1]"..',
+                    '    "@B[10,@L_CONTRACTARSENAL_HIRE_OPTION_+2]"..',
+                    '    "@B[0,@L_REPLACEMENTS_BUTTONS_CANCEL_+0]",',
+                    '    "@L_CONTRACTARSENAL_HIRE_MAIN_HEAD_+0",',
+                    '    "@L_CONTRACTARSENAL_HIRE_MAIN_BODY_+1",',
+                    '    "_WAR_MERC_"..label.."_MALE_+0","_WAR_MERC_"..label.."_MORE_+0",cost,cost*5,cost*10)',
                     'MsgSayInteraction("","Child","",',
                     '    "@B[0,@L_MEASURE_BUYGOLDRING_OPTION_+0]"..',
                     '    "@B[1,@L_MEASURE_BUYGOLDRING_OPTION_+1]",',
@@ -379,6 +398,18 @@ def assert_code_window_context_extracts_window_labels_and_buttons() -> None:
             raise AssertionError(f"MsgQuick should use the dark panel preview profile: {short_context!r}")
         if short_context.default_color != DARK_PANEL_TEXT:
             raise AssertionError(f"dark panel default text color should be white: {short_context!r}")
+        variable_button_refs = index.references_for("MEASURE_WUERDENTRAGEREMPFANGEN_BODY_+0").project
+        variable_button_context = best_window_context(variable_button_refs, "_MEASURE_WUERDENTRAGEREMPFANGEN_BODY_+0")
+        if variable_button_context is None:
+            raise AssertionError("variable-built MsgBox buttons did not produce a window context")
+        if tuple((button.identifier, button.label) for button in variable_button_context.buttons) != (
+            ("1", "scenario_war_*_+0"),
+            ("2", "scenario_war_*_+0"),
+            ("3", "scenario_war_*_+0"),
+            ("4", "scenario_war_*_+0"),
+            ("5", "measure_wuerdentragerempfangen_none_+0"),
+        ):
+            raise AssertionError(f"variable-built buttons were not extracted: {variable_button_context.buttons!r}")
         news_refs = index.references_for("KONTOR_MISSIONS_OFFER_ITEMS_TEXT_+2").project
         news_context = best_window_context(news_refs, "KONTOR_MISSIONS_OFFER_ITEMS_TEXT_+2")
         if news_context is None:
@@ -389,8 +420,20 @@ def assert_code_window_context_extracts_window_labels_and_buttons() -> None:
             raise AssertionError(f"dynamic MsgNews body should ignore cooldown/control labels: {news_context!r}")
         argument_refs = index.references_for("SCENARIO_WAR_*_+1").project
         argument_context = best_window_context(argument_refs, "SCENARIO_WAR_*_+1")
-        if argument_context is not None:
-            raise AssertionError(f"argument-only labels should not borrow the surrounding message window: {argument_context!r}")
+        if argument_context is None:
+            raise AssertionError("runtime argument labels should reuse the surrounding message window")
+        if argument_context.header_label != "measure_showwarfactors_head_+0":
+            raise AssertionError(f"runtime argument context used the wrong head label: {argument_context!r}")
+        if argument_context.body_label != "measure_showwarfactors_body_+1":
+            raise AssertionError(f"runtime argument context used the wrong body label: {argument_context!r}")
+        merc_refs = index.references_for("WAR_MERC_TROOPER_MORE_+0").project
+        if not merc_refs:
+            raise AssertionError("dynamic non-@L DB labels were not indexed")
+        merc_context = best_window_context(merc_refs, "_WAR_MERC_TROOPER_MORE_+0")
+        if merc_context is None:
+            raise AssertionError("dynamic DB label arguments should reuse the surrounding message window")
+        if merc_context.body_label != "contractarsenal_hire_main_body_+1":
+            raise AssertionError(f"dynamic DB label context used the wrong body label: {merc_context!r}")
         interaction_refs = index.references_for("MEASURE_BUYGOLDRING_OPTION_+0").project
         interaction_context = best_window_context(interaction_refs, "MEASURE_BUYGOLDRING_OPTION_+0")
         if interaction_context is None:
@@ -412,12 +455,36 @@ def assert_code_preview_unit_lookup_accepts_leading_underscore_labels() -> None:
                 SimpleNamespace(file_rel="languages/Text.dbt", label="_MEASURE_HEAD_+0"),
                 SimpleNamespace(file_rel="languages/Text.dbt", label="_MEASURE_BODY_+1"),
                 SimpleNamespace(file_rel="languages/Text.dbt", label="_MEASURE_ASK_+0"),
+                SimpleNamespace(file_rel="languages/Text.dbt", label="_SCENARIO_WAR_GERMANY_+0"),
             )
         )
     )
     found = TranslatorWindow._unit_for_normalized_label(window, "languages/Text.dbt", "measure_ask_+0")
     if found is None or found.label != "_MEASURE_ASK_+0":
         raise AssertionError("code preview unit lookup did not accept the DB leading underscore label")
+    wildcard = TranslatorWindow._unit_for_normalized_label(window, "languages/Text.dbt", "scenario_war_*_+0")
+    if wildcard is None or wildcard.label != "_SCENARIO_WAR_GERMANY_+0":
+        raise AssertionError("code preview unit lookup did not resolve dynamic wildcard labels")
+
+
+def assert_game_preview_draws_all_buttons() -> None:
+    service = PreviewService()
+    buttons = tuple(
+        PreviewDocument.from_atoms(f"Button {index}", [PreviewAtom(f"Button {index}", 0, 8)])
+        for index in range(5)
+    )
+    drawn: list[str] = []
+
+    def fake_draw_document(_painter: object, document: PreviewDocument, **kwargs: object) -> int:
+        drawn.append(document.display_text)
+        top = kwargs.get("top", 0)
+        return int(top) + 1 if isinstance(top, int) else 1
+
+    service._draw_game_document = fake_draw_document  # type: ignore[method-assign]
+    service._draw_game_button_background = lambda _painter, _rect: True  # type: ignore[method-assign]
+    service.game_window_image(None, None, target=False, buttons=buttons)
+    if drawn != [button.display_text for button in buttons]:
+        raise AssertionError(f"game preview should draw every button without truncation: {drawn!r}")
 
 
 def assert_onscreen_help_preview_pairs_name_and_description() -> None:
@@ -1552,6 +1619,10 @@ def assert_preview_i18n_and_symbol_mapping() -> None:
             '10 "_CHARACTERS_3_OFFICES_NAME_Mayor_+0" "Mayor" |\n'
             '11 "_CHARACTERS_3_TITLES_NAME_+0" "Serf" |\n'
             '12 "_SCENARIO_WAR_GERMANY_+0" "The German Empire" |\n'
+            '13 "_WAR_MERC_TROOPER_MORE_+0" "Pikeman" |\n'
+            '14 "_MEASURE_WUERDENTRAGEREMPFANGEN_BODY_+2" "The diplomat from %2l is impressed." |\n'
+            '15 "_DIPLOMAT_NAME_DENMARK_+0" "Denmark" |\n'
+            '16 "_WAR_MERC_TROOPER_MALE_+0" "Trooper" |\n'
         )
         rows_target = (
             '1 "_NAMES_ENGLISH_MALE_+0" "杰克" |\n'
@@ -1763,6 +1834,128 @@ def assert_preview_i18n_and_symbol_mapping() -> None:
             raise AssertionError(f"MsgSayInteraction button placeholders should start after head/body labels: {interaction_button.display_text!r}")
         if not any(atom.glyph_id == 2002 for atom in interaction_question.atoms):
             raise AssertionError("MsgSayInteraction body placeholders did not map %2t to the second runtime argument")
+        contract_args = (
+            '""',
+            '""',
+            '"@P@B[1,@L_CONTRACTARSENAL_HIRE_OPTION_+0]"',
+            '"@L_CONTRACTARSENAL_HIRE_MAIN_HEAD_+0"',
+            '"@L_CONTRACTARSENAL_HIRE_MAIN_BODY_+1"',
+            '"_WAR_MERC_"..label.."_MALE_+0"',
+            '"_WAR_MERC_"..label.."_MORE_+0"',
+            "cost",
+            "cost*5",
+            "cost*10",
+        )
+        contract_button = service.render(
+            "%1l %2l %3t",
+            unit_key="same-entry",
+            label="CONTRACTARSENAL_HIRE_OPTION_+0",
+            file_rel="Text.dbt",
+            kind="dbt",
+            target=False,
+            references=(
+                CodeReference(
+                    "CONTRACTARSENAL_HIRE_OPTION_+0",
+                    temp / "Scripts" / "ContractArsenal.lua",
+                    1,
+                    1,
+                    "MsgBox",
+                    2,
+                    contract_args,
+                ),
+            ),
+        )
+        contract_body = service.render(
+            "%1l %2l %3t",
+            unit_key="same-entry",
+            label="CONTRACTARSENAL_HIRE_MAIN_BODY_+1",
+            file_rel="Text.dbt",
+            kind="dbt",
+            target=False,
+            references=(
+                CodeReference(
+                    "CONTRACTARSENAL_HIRE_MAIN_BODY_+1",
+                    temp / "Scripts" / "ContractArsenal.lua",
+                    1,
+                    1,
+                    "MsgBox",
+                    4,
+                    contract_args,
+                ),
+            ),
+        )
+        for document in (contract_button, contract_body):
+            if "Trooper" not in document.display_text or "Pikeman" not in document.display_text:
+                raise AssertionError(f"dynamic DB label concatenation did not resolve mercenary labels: {document.display_text!r}")
+            if not any(atom.glyph_id == 2002 for atom in document.atoms):
+                raise AssertionError("dynamic DB label argument mapping skipped the cost argument")
+        scripts_root = temp / "Scripts"
+        scripts_root.mkdir(exist_ok=True)
+        variable_labels_path = scripts_root / "VariableLabels.lua"
+        variable_labels_path.write_text(
+            "\n".join(
+                (
+                    'local trooperlabel',
+                    'trooperlabel = "_WAR_MERC_TROOPER_MORE_+0"',
+                    'local ort = "@L_DIPLOMAT_NAME_"..enemy.."_+0"',
+                    'local stimmung = ""',
+                    'stimmung = stimmung.."@L_MEASURE_WUERDENTRAGEREMPFANGEN_BODY_+2"',
+                    'MsgBox("", "", "", "@L_VARIABLE_HEAD_+0", "@L_VARIABLE_BODY_+0", trooperlabel)',
+                    'MsgBox("", "", "", "@L_MEASURE_WUERDENTRAGEREMPFANGEN_HEAD_+0", "@L_MEASURE_WUERDENTRAGEREMPFANGEN_BODY_+1", stimmung, ort)',
+                )
+            ),
+            encoding="utf-8",
+        )
+        variable_label = service.render(
+            "%1l",
+            unit_key="same-entry",
+            label="VARIABLE_BODY_+0",
+            file_rel="Text.dbt",
+            kind="dbt",
+            target=False,
+            references=(
+                CodeReference(
+                    "VARIABLE_BODY_+0",
+                    variable_labels_path,
+                    6,
+                    1,
+                    "MsgBox",
+                    4,
+                    ('""', '""', '""', '"@L_VARIABLE_HEAD_+0"', '"@L_VARIABLE_BODY_+0"', "trooperlabel"),
+                ),
+            ),
+        )
+        nested_variable_label = service.render(
+            "%1l",
+            unit_key="same-entry",
+            label="MEASURE_WUERDENTRAGEREMPFANGEN_BODY_+1",
+            file_rel="Text.dbt",
+            kind="dbt",
+            target=False,
+            references=(
+                CodeReference(
+                    "MEASURE_WUERDENTRAGEREMPFANGEN_BODY_+1",
+                    variable_labels_path,
+                    7,
+                    1,
+                    "MsgBox",
+                    4,
+                    (
+                        '""',
+                        '""',
+                        '""',
+                        '"@L_MEASURE_WUERDENTRAGEREMPFANGEN_HEAD_+0"',
+                        '"@L_MEASURE_WUERDENTRAGEREMPFANGEN_BODY_+1"',
+                        "stimmung",
+                        "ort",
+                    ),
+                ),
+            ),
+        )
+        if "Pikeman" not in variable_label.display_text:
+            raise AssertionError(f"label variables should resolve through simple code assignments: {variable_label.display_text!r}")
+        if "The diplomat from Denmark is impressed" not in nested_variable_label.display_text:
+            raise AssertionError(f"nested label variables should reuse the same runtime arguments: {nested_variable_label.display_text!r}")
         suffix_priority = service.render(
             "%1SA %1SN",
             unit_key="same-entry",
@@ -2296,6 +2489,7 @@ def main() -> int:
     assert_code_reference_index_avoids_db_and_uses_vanilla_fallback()
     assert_code_window_context_extracts_window_labels_and_buttons()
     assert_code_preview_unit_lookup_accepts_leading_underscore_labels()
+    assert_game_preview_draws_all_buttons()
     assert_onscreen_help_preview_pairs_name_and_description()
     assert_startup_prefers_local_sources_over_game_root()
     assert_sync_vanilla_sources_only_imports_originals()
