@@ -2013,6 +2013,43 @@ def assert_combined_git_history_format() -> None:
         raise AssertionError("history format did not render the final translation")
 
 
+def assert_git_history_keeps_selected_commit_entries(root: Path) -> None:
+    temp = make_temp_project(root, "translator_tool_smoke_git_selected_entries_")
+    try:
+        git = LanguageGit(temp)
+        git.ensure_repository(AppSettings())
+        project = Project.load(temp, "#chinese")
+        unit = next(item for item in project.units if item.file_rel == "Text.dbt" and item.source_text)
+        first = "A %1s, %3s %4n B"
+        second = "A %1s, %4n %3s B"
+        unit.set_text(first)
+        first_result = project.save([unit])
+        first_commit = git.commit_saved(first_result.changed_files, first_result.saved_units, first_result.deleted_units)
+        if first_commit is None:
+            raise AssertionError("first selected-entry history commit was not created")
+        project = Project.load(temp, "#chinese")
+        unit = next(item for item in project.units if item.uid == unit.uid)
+        unit.set_text(second)
+        second_result = project.save([unit])
+        second_commit = git.commit_saved(second_result.changed_files, second_result.saved_units, second_result.deleted_units)
+        if second_commit is None:
+            raise AssertionError("second selected-entry history commit was not created")
+        project = Project.load(temp, "#chinese")
+        unit = next(item for item in project.units if item.uid == unit.uid)
+        unit.set_text(unit.source_text)
+        revert_result = project.save([unit])
+        revert_commit = git.commit_saved(revert_result.changed_files, revert_result.saved_units, revert_result.deleted_units)
+        if revert_commit is None:
+            raise AssertionError("revert selected-entry history commit was not created")
+        entries = git.entries_for_commits((first_commit.full_hash, second_commit.full_hash, revert_commit.full_hash))
+        if not entries:
+            raise AssertionError("history returned an empty net result even though selected commits changed text")
+        if not any(entry.translated_text == second for entry in entries):
+            raise AssertionError("history did not preserve the placeholder reorder update")
+    finally:
+        safe_rmtree(temp)
+
+
 def assert_git_commit_display() -> None:
     timestamp = datetime.fromtimestamp(1_700_000_000)
     commit = GitCommit("a" * 40, "abcdef1", timestamp, "translation: add 3, update 2 (Text.dbt, Tooltips.dbt)")
@@ -2124,6 +2161,7 @@ def main() -> int:
     assert_git_history_list_is_scoped_to_active_language(root)
     assert_git_recovers_stale_index_lock(root)
     assert_combined_git_history_format()
+    assert_git_history_keeps_selected_commit_entries(root)
     print("translator_tool self-test ok")
     return 0
 

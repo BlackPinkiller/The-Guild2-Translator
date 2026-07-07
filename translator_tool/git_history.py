@@ -235,13 +235,7 @@ class LanguageGit:
         return list(cached)
 
     def entries_for_commits(self, commits_oldest_first: Iterable[str]) -> list[TranslationLogEntry]:
-        """Return the net translation changes across several commits.
-
-        The caller supplies commits from oldest to newest.  If one entry was
-        edited more than once in the selected range, its last translation is
-        retained so the log describes the combined result rather than showing
-        several noisy intermediate revisions.
-        """
+        """Return translation changes for the selected commits in commit order."""
         commit_list = tuple(commits_oldest_first)
         if not commit_list:
             return []
@@ -249,7 +243,8 @@ class LanguageGit:
             cached = self._combined_cache.get(commit_list)
         if cached is not None:
             return list(cached)
-        combined = tuple(combine_entries(self.entries_for_commit(commit) for commit in commit_list))
+        entry_groups = tuple(tuple(self.entries_for_commit(commit)) for commit in commit_list)
+        combined = tuple(entry for group in entry_groups for entry in group)
         with self._cache_lock:
             self._combined_cache.setdefault(commit_list, combined)
             cached = self._combined_cache[commit_list]
