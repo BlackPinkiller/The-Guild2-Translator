@@ -3158,6 +3158,8 @@ class TranslatorWindow(QMainWindow):
                 button_units.append(candidate)
             elif button.text:
                 button_units.append(button.text)
+            elif button.identifier:
+                button_units.append(button.identifier)
         if header_unit is None and body_unit is None and not button_units:
             header_unit, body_unit = self._paired_preview_units(unit)
         if header_unit is None and body_unit is None:
@@ -3167,15 +3169,28 @@ class TranslatorWindow(QMainWindow):
     def _unit_for_normalized_label(self, file_rel: str, label: str) -> TranslationUnit | None:
         if not label:
             return None
-        label_group = label_group_key(label)
+        labels = [label]
+        if label.startswith("_"):
+            labels.append(label[1:])
+        else:
+            labels.append("_" + label)
+        label_groups = {group for candidate in labels if (group := label_group_key(candidate)) is not None}
         fallback: TranslationUnit | None = None
         for candidate in self.model.units:
             if candidate.file_rel != file_rel:
                 continue
             normalized = normalize_label(candidate.label)
-            if normalized == label:
+            if normalized in labels:
                 return candidate
-            if fallback is None and label_group is not None and label_group_key(normalized) == label_group:
+            if fallback is None and label_group_key(normalized) in label_groups:
+                fallback = candidate
+        if fallback is not None:
+            return fallback
+        for candidate in self.model.units:
+            normalized = normalize_label(candidate.label)
+            if normalized in labels:
+                return candidate
+            if fallback is None and label_group_key(normalized) in label_groups:
                 fallback = candidate
         if fallback is not None:
             return fallback

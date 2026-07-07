@@ -362,6 +362,23 @@ def assert_code_window_context_extracts_window_labels_and_buttons() -> None:
         safe_rmtree(temp)
 
 
+def assert_code_preview_unit_lookup_accepts_leading_underscore_labels() -> None:
+    from .app import TranslatorWindow
+
+    window = SimpleNamespace(
+        model=SimpleNamespace(
+            units=(
+                SimpleNamespace(file_rel="languages/Text.dbt", label="_MEASURE_HEAD_+0"),
+                SimpleNamespace(file_rel="languages/Text.dbt", label="_MEASURE_BODY_+1"),
+                SimpleNamespace(file_rel="languages/Text.dbt", label="_MEASURE_ASK_+0"),
+            )
+        )
+    )
+    found = TranslatorWindow._unit_for_normalized_label(window, "languages/Text.dbt", "measure_ask_+0")
+    if found is None or found.label != "_MEASURE_ASK_+0":
+        raise AssertionError("code preview unit lookup did not accept the DB leading underscore label")
+
+
 def assert_sync_source_project_invalidates_changed_translations(root: Path) -> None:
     temp = Path(tempfile.gettempdir()) / f"translator_tool_smoke_source_update_{uuid.uuid4().hex[:8]}"
     try:
@@ -2063,6 +2080,7 @@ def main() -> int:
     assert_discover_game_source_projects_detects_vanilla_and_mods()
     assert_code_reference_index_avoids_db_and_uses_vanilla_fallback()
     assert_code_window_context_extracts_window_labels_and_buttons()
+    assert_code_preview_unit_lookup_accepts_leading_underscore_labels()
     assert_startup_prefers_local_sources_over_game_root()
     assert_sync_vanilla_sources_only_imports_originals()
     assert_sync_source_project_invalidates_changed_translations(root)
