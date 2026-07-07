@@ -11,6 +11,10 @@ LABEL_RE = re.compile(
     r"@L_[A-Za-z0-9_]+_\+[A-Za-z0-9]+|"
     r"@L_[A-Za-z0-9_]+"
 )
+DYNAMIC_LABEL_RE = re.compile(
+    r"@L_(?P<prefix>[A-Za-z0-9_]+)_\s*\"\s*\.\.\s*.+?\s*\.\.\s*\"\s*_\+(?P<suffix>[A-Za-z0-9]*)",
+    re.DOTALL,
+)
 CODE_SUFFIXES = {".lua", ".ms", ".gui"}
 
 
@@ -121,6 +125,22 @@ def scan_scripts_root(root: Path, *, source: str = "project") -> dict[str, tuple
             group_label = label_group_key(label)
             if group_label is not None and group_label != label:
                 grouped.setdefault(group_label, []).append(reference)
+        for match in DYNAMIC_LABEL_RE.finditer(text):
+            line_number, column = _line_column(line_starts, match.start())
+            suffix = match.group("suffix") or "*"
+            label = normalize_label(f"{match.group('prefix')}_*_+{suffix}")
+            call_name, argument_index, arguments = _call_context(text, match.start())
+            reference = CodeReference(
+                label=label,
+                path=path,
+                line=line_number,
+                column=column,
+                call_name=call_name,
+                argument_index=argument_index,
+                arguments=arguments,
+                source=source,
+            )
+            grouped.setdefault(label, []).append(reference)
     return {label: tuple(items) for label, items in grouped.items()}
 
 
@@ -149,6 +169,7 @@ def lookup_labels(label: str) -> tuple[str, ...]:
     group = label_group_key(normalized)
     if group is not None and group != normalized:
         candidates.append(group)
+    candidates.extend(dynamic_label_keys(normalized))
     if normalized.startswith("_"):
         alternate = normalized[1:]
         candidates.append(alternate)
@@ -158,11 +179,30 @@ def lookup_labels(label: str) -> tuple[str, ...]:
     alternate_group = label_group_key(alternate)
     if alternate_group is not None and alternate_group != alternate:
         candidates.append(alternate_group)
+    candidates.extend(dynamic_label_keys(alternate))
     unique: list[str] = []
     for candidate in candidates:
         if candidate and candidate not in unique:
             unique.append(candidate)
     return tuple(unique)
+
+
+def dynamic_label_keys(label: str) -> tuple[str, ...]:
+    normalized = normalize_label(label)
+    match = re.match(r"^(?P<body>.+)_\+(?P<suffix>[A-Za-z0-9*]+)$", normalized)
+    if match is None:
+        return ()
+    parts = match.group("body").split("_")
+    if len(parts) < 2:
+        return ()
+    suffix = match.group("suffix")
+    keys: list[str] = []
+    for index in range(1, len(parts)):
+        candidate_parts = list(parts)
+        candidate_parts[index] = "*"
+        keys.append("_".join(candidate_parts) + "_+" + suffix)
+        keys.append("_".join(candidate_parts) + "_+*")
+    return tuple(keys)
 
 
 def _first_references(

@@ -265,8 +265,6 @@ class LanguageGit:
         for row in after_doc.rows:
             key = row_key(file_name, row)
             source_row = source_rows.get(key)
-            if source_row is None:
-                continue
             before_row = before_rows.get(key)
             for field_name in fields:
                 after_value = row.get(field_name)
@@ -274,7 +272,7 @@ class LanguageGit:
                 if before_value == after_value:
                     continue
                 source_field = matching_source_field(field_name, source_doc.string_columns)
-                source_text = source_row.get(source_field)
+                source_text = source_row.get(source_field) if source_row is not None else ""
                 previous_text = self._decode(before_value) if before_value is not None else None
                 kind = "新增" if previous_text in {None, "", source_text} else "更新"
                 entries.append(
@@ -293,14 +291,12 @@ class LanguageGit:
             if key in after_rows:
                 continue
             source_row = source_rows.get(key)
-            if source_row is None:
-                continue
             for field_name in fields:
                 before_value = before_row.get(field_name)
                 if before_value is None:
                     continue
                 source_field = matching_source_field(field_name, source_doc.string_columns)
-                source_text = source_row.get(source_field)
+                source_text = source_row.get(source_field) if source_row is not None else ""
                 entries.append(
                     TranslationLogEntry(
                         "删除",

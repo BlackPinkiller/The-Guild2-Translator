@@ -243,7 +243,12 @@ def assert_code_reference_index_avoids_db_and_uses_vanilla_fallback() -> None:
             encoding="utf-8",
         )
         (game_root / "Scripts" / "Dynamic.lua").write_text(
-            'MsgQuick("", "@L_DYNAMIC_BRANCH_+"..choice)\n',
+            "\n".join(
+                (
+                    'MsgQuick("", "@L_DYNAMIC_BRANCH_+"..choice)',
+                    'MsgBoxNoWait("All", nil, "@L_WAR_END_LOOSE_HEAD_+0", "@L_WAR_END_LOOSE_BODY_+0", "@L_SCENARIO_LORD_"..enemy.."_+1")',
+                )
+            ),
             encoding="utf-8",
         )
         (game_root / "Scripts" / "Multiline.lua").write_text(
@@ -277,6 +282,9 @@ def assert_code_reference_index_avoids_db_and_uses_vanilla_fallback() -> None:
         dynamic_refs = vanilla_index.references_for("DYNAMIC_BRANCH_+1")
         if dynamic_refs.project_count != 1 or dynamic_refs.project[0].path.name != "Dynamic.lua":
             raise AssertionError("dynamic _+n code reference fallback was not indexed")
+        concatenated_refs = vanilla_index.references_for("SCENARIO_LORD_ENEMY_+1")
+        if concatenated_refs.project_count != 1 or concatenated_refs.project[0].path.name != "Dynamic.lua":
+            raise AssertionError("concatenated dynamic label code reference fallback was not indexed")
         underscore_refs = vanilla_index.references_for("_TRIAL_REMINDER_HEAD")
         if underscore_refs.project_count != 1 or underscore_refs.project[0].path.name != "Mission.lua":
             raise AssertionError("leading underscore label fallback was not indexed")
@@ -377,6 +385,21 @@ def assert_code_preview_unit_lookup_accepts_leading_underscore_labels() -> None:
     found = TranslatorWindow._unit_for_normalized_label(window, "languages/Text.dbt", "measure_ask_+0")
     if found is None or found.label != "_MEASURE_ASK_+0":
         raise AssertionError("code preview unit lookup did not accept the DB leading underscore label")
+
+
+def assert_onscreen_help_preview_pairs_name_and_description() -> None:
+    from .app import TranslatorWindow
+
+    name = SimpleNamespace(file_rel="Text.dbt", label="ONSCREENHELP_9_ACTION_IMPACT_CoId_NAME_+0")
+    description = SimpleNamespace(file_rel="Text.dbt", label="ONSCREENHELP_9_ACTION_IMPACT_CoId_DESCRIPTION_+0")
+    tooltip = SimpleNamespace(file_rel="Text.dbt", label="ONSCREENHELP_9_ACTION_IMPACT_CoId_TOOLTIP_+0")
+    window = SimpleNamespace(model=SimpleNamespace(units=(name, description, tooltip)))
+    paired_name, paired_description = TranslatorWindow._paired_preview_units(window, description)
+    if paired_name is not name or paired_description is not description:
+        raise AssertionError("ONSCREENHELP DESCRIPTION did not pair with NAME")
+    tooltip_head, tooltip_body = TranslatorWindow._paired_preview_units(window, tooltip)
+    if tooltip_head is not None or tooltip_body is not tooltip:
+        raise AssertionError("ONSCREENHELP TOOLTIP should not be paired into the help window body")
 
 
 def assert_sync_source_project_invalidates_changed_translations(root: Path) -> None:
@@ -2013,6 +2036,35 @@ def assert_combined_git_history_format() -> None:
         raise AssertionError("history format did not render the final translation")
 
 
+def assert_git_history_keeps_dbt_changes_without_source_row() -> None:
+    temp = Path(tempfile.gettempdir()) / f"translator_tool_smoke_git_missing_source_{uuid.uuid4().hex[:8]}"
+    try:
+        temp.mkdir(parents=True, exist_ok=True)
+        git = LanguageGit(temp)
+        source = (
+            b"Table Description:\n"
+            b'"id" INT 0 |"label" STRING 0 |"english" STRING 0 |\n'
+            b'2 "_OTHER_+0" "Source" |\n'
+        )
+        before = (
+            b"Table Description:\n"
+            b'"id" INT 0 |"label" STRING 0 |"chinese" STRING 0 |\n'
+            b'1 "_WOA_CREATEDBY_+0" "A %1s, %3s %4n B" |\n'
+        )
+        after = (
+            b"Table Description:\n"
+            b'"id" INT 0 |"label" STRING 0 |"chinese" STRING 0 |\n'
+            b'1 "_WOA_CREATEDBY_+0" "A %1s, %4n %3s B" |\n'
+        )
+        entries = git._dbt_entries("Text.dbt", source, before, after)
+        if len(entries) != 1:
+            raise AssertionError(f"history dropped a DBT change whose source row was missing: {entries!r}")
+        if entries[0].label != "_WOA_CREATEDBY_+0" or entries[0].translated_text != "A %1s, %4n %3s B":
+            raise AssertionError("history did not preserve the DBT target diff when source row was missing")
+    finally:
+        safe_rmtree(temp)
+
+
 def assert_git_history_keeps_selected_commit_entries(root: Path) -> None:
     temp = make_temp_project(root, "translator_tool_smoke_git_selected_entries_")
     try:
@@ -2118,6 +2170,7 @@ def main() -> int:
     assert_code_reference_index_avoids_db_and_uses_vanilla_fallback()
     assert_code_window_context_extracts_window_labels_and_buttons()
     assert_code_preview_unit_lookup_accepts_leading_underscore_labels()
+    assert_onscreen_help_preview_pairs_name_and_description()
     assert_startup_prefers_local_sources_over_game_root()
     assert_sync_vanilla_sources_only_imports_originals()
     assert_sync_source_project_invalidates_changed_translations(root)
@@ -2161,6 +2214,7 @@ def main() -> int:
     assert_git_history_list_is_scoped_to_active_language(root)
     assert_git_recovers_stale_index_lock(root)
     assert_combined_git_history_format()
+    assert_git_history_keeps_dbt_changes_without_source_row()
     assert_git_history_keeps_selected_commit_entries(root)
     print("translator_tool self-test ok")
     return 0

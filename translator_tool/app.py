@@ -78,7 +78,7 @@ from .ai import (
     provider_from_settings,
 )
 from .code_index import CodeReference, CodeReferenceIndex, CodeReferenceSet, build_code_reference_index, label_group_key, normalize_label
-from .code_window_context import PreviewWindowContext, best_window_context
+from .code_window_context import DARK_PANEL_TEXT, PreviewWindowContext, best_window_context
 from .code_open import open_code_reference
 from .codec_adapter import CodecError, Guild2Codec, load_codec_for_language, language_uses_codec
 from .git_history import GitCommit, GitError, LanguageGit, TranslationLogEntry
@@ -3146,7 +3146,15 @@ class TranslatorWindow(QMainWindow):
         context = best_window_context(self._code_references_for_unit(unit), unit.label)
         if context is None:
             header_unit, body_unit = self._paired_preview_units(unit)
-            return None, header_unit, body_unit, ()
+            if self._is_onscreen_help_label(unit.label):
+                context = PreviewWindowContext(
+                    kind="onscreen_help",
+                    background="dark_panel",
+                    default_color=DARK_PANEL_TEXT,
+                    header_label=normalize_label(header_unit.label) if header_unit is not None else "",
+                    body_label=normalize_label(body_unit.label) if body_unit is not None else "",
+                )
+            return context, header_unit, body_unit, ()
         header_unit = self._unit_for_normalized_label(unit.file_rel, context.header_label)
         body_unit = self._unit_for_normalized_label(unit.file_rel, context.body_label)
         current_label = normalize_label(unit.label)
@@ -3203,6 +3211,28 @@ class TranslatorWindow(QMainWindow):
         self,
         unit: TranslationUnit,
     ) -> tuple[TranslationUnit | None, TranslationUnit | None]:
+        onscreen = re.match(r"^(.*?)(NAME|DESCRIPTION|TOOLTIP)(_[+]\d+)?$", unit.label, re.IGNORECASE)
+        if onscreen is not None and "ONSCREENHELP" in unit.label.upper():
+            prefix, kind, suffix = onscreen.groups()
+            suffix = suffix or ""
+            labels = {
+                "name": f"{prefix}NAME{suffix}".casefold(),
+                "description": f"{prefix}DESCRIPTION{suffix}".casefold(),
+            }
+            paired: dict[str, TranslationUnit | None] = {"name": None, "description": None}
+            for candidate in self.model.units:
+                if candidate.file_rel != unit.file_rel:
+                    continue
+                normalized = candidate.label.casefold()
+                for role, label in labels.items():
+                    if normalized == label:
+                        paired[role] = candidate
+            role = kind.casefold()
+            if role in paired:
+                paired[role] = unit
+            if role == "tooltip":
+                return None, unit
+            return paired["name"], paired["description"]
         match = re.match(r"^(.*?)(HEAD|BODY)(_[+]\d+)?$", unit.label, re.IGNORECASE)
         if match is None:
             return None, unit
@@ -3223,6 +3253,10 @@ class TranslatorWindow(QMainWindow):
                     paired[role] = candidate
         paired[kind.casefold()] = unit
         return paired["head"], paired["body"]
+
+    @staticmethod
+    def _is_onscreen_help_label(label: str) -> bool:
+        return bool(re.match(r"^.*ONSCREENHELP.*(?:NAME|DESCRIPTION|TOOLTIP)(_[+]\d+)?$", label, re.IGNORECASE))
 
     def _refresh_preview_presentations(self) -> None:
         self.source_edit.refresh_preview()
