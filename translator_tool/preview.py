@@ -10,7 +10,7 @@ import struct
 import unicodedata
 
 from PySide6.QtCore import QBuffer, QIODevice, QRect, Qt
-from PySide6.QtGui import QColor, QImage, QPainter, qRgba
+from PySide6.QtGui import QColor, QFont, QFontMetrics, QImage, QPainter, qRgba
 
 from .code_window_context import PreviewWindowContext
 from .format_io import load_dbt, translatable_fields
@@ -459,6 +459,7 @@ class PreviewService:
         self._ui_image_cache: dict[str, QImage | None] = {}
         self._render_cache: dict[tuple[str, str, str, str, bool, tuple[object, ...], str], PreviewDocument] = {}
         self._scaled_glyph_cache: dict[tuple[int, float, int], QImage] = {}
+        self._system_glyph_cache: dict[tuple[str, float, int], QImage] = {}
 
     def configure(
         self,
@@ -484,6 +485,7 @@ class PreviewService:
         self._ui_image_cache.clear()
         self._render_cache.clear()
         self._scaled_glyph_cache.clear()
+        self._system_glyph_cache.clear()
 
     @property
     def localization(self) -> GameLocalization:
@@ -771,8 +773,6 @@ class PreviewService:
         default_color: tuple[int, int, int, int] = (55, 38, 24, 255),
     ) -> int:
         atlas = self._atlas(target)
-        if atlas is None:
-            return top
         lines: list[list[QImage]] = [[]]
         widths = [0]
         line_height = max(12, round(25 * scale))
@@ -791,7 +791,7 @@ class PreviewService:
 
         for atom in document.atoms:
             if atom.glyph_id is not None:
-                glyph = atlas.glyph(atom.glyph_id)
+                glyph = atlas.glyph(atom.glyph_id) if atlas is not None else None
                 if glyph is not None:
                     image = self._scaled_game_glyph(glyph, scale, None)
                     if not append_image(image):
@@ -809,8 +809,12 @@ class PreviewService:
                 if char == "\t":
                     char = " "
                 for codepoint in self._game_codepoints(char, target):
-                    glyph = atlas.glyph(codepoint)
+                    glyph = atlas.glyph(codepoint) if atlas is not None else None
                     if glyph is None:
+                        image = self._system_text_glyph(char, scale, color)
+                        if not append_image(image):
+                            stopped = True
+                            break
                         continue
                     image = self._scaled_game_glyph(glyph, scale, color)
                     if not append_image(image):
@@ -828,6 +832,28 @@ class PreviewService:
                 x += image.width()
             y += line_height
         return y
+
+    def _system_text_glyph(self, char: str, scale: float, color: QColor) -> QImage:
+        cache_key = (char, scale, color.rgba())
+        cached = self._system_glyph_cache.get(cache_key)
+        if cached is not None:
+            return cached
+        font = QFont("Microsoft YaHei UI")
+        font.setPixelSize(max(12, round(24 * scale)))
+        metrics = QFontMetrics(font)
+        width = max(1, metrics.horizontalAdvance(char))
+        height = max(1, metrics.height())
+        image = QImage(width, height, QImage.Format.Format_ARGB32)
+        image.fill(Qt.GlobalColor.transparent)
+        painter = QPainter(image)
+        painter.setFont(font)
+        painter.setPen(color)
+        painter.drawText(0, metrics.ascent(), char)
+        painter.end()
+        if len(self._system_glyph_cache) >= 2048:
+            self._system_glyph_cache.clear()
+        self._system_glyph_cache[cache_key] = image
+        return image
 
     def _draw_game_buttons(
         self,

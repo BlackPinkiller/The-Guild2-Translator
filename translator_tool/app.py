@@ -3114,8 +3114,11 @@ class TranslatorWindow(QMainWindow):
                     target=target,
                     references=self._code_references_for_unit(unit),
                 )
+            text = candidate.current_text if target else candidate.source_text
+            if target and not text:
+                text = candidate.source_text
             return self.preview_service.render(
-                candidate.current_text if target else candidate.source_text,
+                text,
                 unit_key=candidate.uid,
                 label=candidate.label,
                 file_rel=candidate.file_rel,
