@@ -30,7 +30,7 @@ from PySide6.QtCore import (
     QUrl,
     Signal,
 )
-from PySide6.QtGui import QAction, QCloseEvent, QColor, QCursor, QFont, QFontMetrics, QImage, QKeyEvent, QKeySequence, QPainter, QPalette, QPen, QStandardItemModel, QSyntaxHighlighter, QTextBlockFormat, QTextCharFormat, QTextCursor, QTextDocument, QTextImageFormat, QWheelEvent
+from PySide6.QtGui import QAction, QCloseEvent, QColor, QCursor, QFont, QFontMetrics, QIcon, QImage, QKeyEvent, QKeySequence, QPainter, QPalette, QPen, QStandardItemModel, QSyntaxHighlighter, QTextBlockFormat, QTextCharFormat, QTextCursor, QTextDocument, QTextImageFormat, QWheelEvent
 from PySide6.QtWidgets import (
     QApplication,
     QAbstractItemView,
@@ -129,6 +129,7 @@ from .validation import (
 BUNDLED_ROOT = Path(getattr(sys, "_MEIPASS", Path(__file__).resolve().parents[1])).resolve()
 APP_ROOT = Path(sys.executable).resolve().parent if getattr(sys, "frozen", False) else BUNDLED_ROOT
 DEFAULT_PROJECT_ROOT = BUNDLED_ROOT
+APP_ICON_PATH = BUNDLED_ROOT / "assets" / "app-icon.ico"
 MANAGED_PROJECT_ROOT = managed_vanilla_project_root(APP_ROOT)
 TYPING_GROUP_DELAY_MS = 750
 FILE_FILTER_ALL = "__all_files__"
@@ -2958,8 +2959,19 @@ class TranslatorWindow(QMainWindow):
             for row in range(self.code_reference_popup.count())
         )
         width = min(max(220, content_width + 34), max(220, available.width() - 36))
-        row_height = max(24, self.code_reference_popup.sizeHintForRow(0))
-        desired_height = row_height * self.code_reference_popup.count() + 10
+        row_heights = [
+            max(24, self.code_reference_popup.sizeHintForRow(row))
+            for row in range(self.code_reference_popup.count())
+        ]
+        margins = self.code_reference_popup.contentsMargins()
+        desired_height = (
+            sum(row_heights)
+            + max(0, self.code_reference_popup.count() - 1) * self.code_reference_popup.spacing()
+            + margins.top()
+            + margins.bottom()
+            + self.code_reference_popup.frameWidth() * 2
+            + 18
+        )
         button_top = self.source_code_button.mapToGlobal(QPoint(0, 0)).y()
         space_above = max(0, button_top - available.top() - 8)
         space_below = max(0, available.bottom() - button_top - self.source_code_button.height() - 8)
@@ -5367,8 +5379,12 @@ def apply_modern_style(app: QApplication) -> None:
 def main() -> None:
     app = QApplication([])
     app.setApplicationName("The Guild 2 Translator")
+    if APP_ICON_PATH.exists():
+        app.setWindowIcon(QIcon(str(APP_ICON_PATH)))
     apply_modern_style(app)
     window = TranslatorWindow()
+    if APP_ICON_PATH.exists():
+        window.setWindowIcon(QIcon(str(APP_ICON_PATH)))
     window.show()
     app.exec()
 

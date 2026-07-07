@@ -29,11 +29,13 @@ python -m PyInstaller ^
   --windowed ^
   --onefile ^
   --name TheGuild2Translator ^
+  --icon "%CD%\assets\app-icon.ico" ^
   --distpath build\dist ^
   --workpath build\work ^
   --specpath build\spec ^
   --add-data "%CD%\encoder\guild2_codec.py;encoder" ^
   --add-data "%CD%\encoder\data;encoder\data" ^
+  --add-data "%CD%\assets\app-icon.ico;assets" ^
   --exclude-module PySide6.QtBluetooth ^
   --exclude-module PySide6.QtCharts ^
   --exclude-module PySide6.QtLocation ^

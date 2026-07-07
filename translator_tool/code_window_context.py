@@ -3,7 +3,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 import re
 
-from .code_index import CodeReference, LABEL_RE, normalize_label
+from .code_index import CodeReference, DYNAMIC_LABEL_RE, LABEL_RE, normalize_label
 
 
 PARCHMENT_TEXT = (55, 38, 24, 255)
@@ -72,6 +72,8 @@ def best_window_context(references: tuple[CodeReference, ...], current_label: st
         context = window_context_for_reference(reference, normalized)
         if context is not None and (not normalized or normalized in context.labels):
             return context
+    if normalized:
+        return None
     for reference in references:
         context = window_context_for_reference(reference, normalized)
         if context is not None:
@@ -119,7 +121,11 @@ def _background_for_call(call_name: str) -> str:
 def _labels_by_argument(arguments: tuple[str, ...]) -> list[tuple[int, tuple[str, ...]]]:
     labels: list[tuple[int, tuple[str, ...]]] = []
     for index, argument in enumerate(arguments):
-        found = tuple(normalize_label(match.group(0)) for match in LABEL_RE.finditer(argument))
+        dynamic = tuple(
+            normalize_label(f"@L_{match.group('prefix')}_+*")
+            for match in DYNAMIC_LABEL_RE.finditer(argument)
+        )
+        found = dynamic or tuple(normalize_label(match.group(0)) for match in LABEL_RE.finditer(argument))
         if found:
             labels.append((index, found))
     return labels
@@ -197,12 +203,16 @@ def _header_body_labels(
     if not candidates:
         return "", ""
     if call_name.startswith("feedback_message"):
-        return _labels_from_first_two(candidates)
-    if call_name in {"msgquick", "msgsay", "msgsaynowait", "msgsayinteraction", "msgmeasure"}:
-        return "", _nearest_or_first_label(candidates, current_label)
-    if call_name in {"msgbox", "msgboxnowait", "msgnews", "msgnewsnowait", "msgquest", "showtutorialboxnowait"}:
-        return _labels_from_first_two(candidates)
-    return _labels_from_first_two(candidates)
+        return _labels_from_first_two(_specialize_candidates(candidates, current_label, minimum_argument_index=1))
+    if call_name == "msgsayinteraction":
+        return _labels_from_first_two(_specialize_candidates(candidates, current_label, minimum_argument_index=4))
+    if call_name in {"msgquick", "msgsay", "msgsaynowait", "msgmeasure"}:
+        return "", _nearest_or_first_label(_specialize_candidates(candidates, current_label, minimum_argument_index=0), current_label)
+    if call_name in {"msgnews", "msgnewsnowait"}:
+        return _labels_from_first_two(_specialize_candidates(candidates, current_label, minimum_argument_index=5))
+    if call_name in {"msgbox", "msgboxnowait", "msgquest", "showtutorialboxnowait"}:
+        return _labels_from_first_two(_specialize_candidates(candidates, current_label, minimum_argument_index=2))
+    return _labels_from_first_two(_specialize_candidates(candidates, current_label, minimum_argument_index=0))
 
 
 def _labels_from_first_two(candidates: list[tuple[int, str]]) -> tuple[str, str]:
@@ -217,6 +227,28 @@ def _labels_from_first_two(candidates: list[tuple[int, str]]) -> tuple[str, str]
             return unique[0], ""
         return "", unique[0]
     return unique[0], unique[1]
+
+
+def _specialize_candidates(
+    candidates: list[tuple[int, str]],
+    current_label: str,
+    *,
+    minimum_argument_index: int,
+) -> list[tuple[int, str]]:
+    suffix = _numeric_suffix(current_label)
+    narrowed: list[tuple[int, str]] = []
+    for argument_index, label in candidates:
+        if argument_index < minimum_argument_index:
+            continue
+        if suffix and label.endswith("_+*"):
+            label = f"{label[:-3]}{suffix}"
+        narrowed.append((argument_index, label))
+    return narrowed or candidates
+
+
+def _numeric_suffix(label: str) -> str:
+    match = re.search(r"_\+\d+$", label)
+    return match.group(0) if match is not None else ""
 
 
 def _nearest_or_first_label(candidates: list[tuple[int, str]], current_label: str) -> str:

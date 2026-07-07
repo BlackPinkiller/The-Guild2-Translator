@@ -339,6 +339,19 @@ def assert_code_window_context_extracts_window_labels_and_buttons() -> None:
                     '    "@L_MEASURE_WUERDENTRAGEREMPFANGEN_HEAD_+0",',
                     '    "@L_MEASURE_WUERDENTRAGEREMPFANGEN_BODY_+1",stimmung,ort)',
                     'MsgQuick("", "@L_SHORT_NOTICE_+0", GetID("Owner"))',
+                    'MsgNewsNoWait("All","","@C[@L_KONTOR_MISSIONS_OFFER_ITEMS_COOLDOWN_+0,%5i,%6l]","economie",-1,',
+                    '    "@L_KONTOR_MISSIONS_OFFER_ITEMS_HEAD_+"..random,',
+                    '    "@L_KONTOR_MISSIONS_OFFER_ITEMS_TEXT_+"..random,',
+                    '    GetID("City"), Offering, ItemLabel, Gametime, DestTime, ID)',
+                    'MsgBoxNoWait("","", "@L_MEASURE_SHOWWARFACTORS_HEAD_+0",',
+                    '    "@L_MEASURE_SHOWWARFACTORS_BODY_+1",',
+                    '    "@L_SCENARIO_WAR_"..land.."_+1", "@L_SCENARIO_WAR_"..enemy.."_+1")',
+                    'MsgSayInteraction("","Child","",',
+                    '    "@B[0,@L_MEASURE_BUYGOLDRING_OPTION_+0]"..',
+                    '    "@B[1,@L_MEASURE_BUYGOLDRING_OPTION_+1]",',
+                    '    "@L_MEASURE_BUYGOLDRING_HEAD_+0",',
+                    '    "@L_MEASURE_BUYGOLDRING_QUESTION_+0",',
+                    '    GetID(""), Cost)',
                 )
             ),
             encoding="utf-8",
@@ -366,6 +379,26 @@ def assert_code_window_context_extracts_window_labels_and_buttons() -> None:
             raise AssertionError(f"MsgQuick should use the dark panel preview profile: {short_context!r}")
         if short_context.default_color != DARK_PANEL_TEXT:
             raise AssertionError(f"dark panel default text color should be white: {short_context!r}")
+        news_refs = index.references_for("KONTOR_MISSIONS_OFFER_ITEMS_TEXT_+2").project
+        news_context = best_window_context(news_refs, "KONTOR_MISSIONS_OFFER_ITEMS_TEXT_+2")
+        if news_context is None:
+            raise AssertionError("code window context was not built for dynamic MsgNewsNoWait labels")
+        if news_context.header_label != "kontor_missions_offer_items_head_+2":
+            raise AssertionError(f"dynamic MsgNews head should follow the current concrete suffix: {news_context!r}")
+        if news_context.body_label != "kontor_missions_offer_items_text_+2":
+            raise AssertionError(f"dynamic MsgNews body should ignore cooldown/control labels: {news_context!r}")
+        argument_refs = index.references_for("SCENARIO_WAR_*_+1").project
+        argument_context = best_window_context(argument_refs, "SCENARIO_WAR_*_+1")
+        if argument_context is not None:
+            raise AssertionError(f"argument-only labels should not borrow the surrounding message window: {argument_context!r}")
+        interaction_refs = index.references_for("MEASURE_BUYGOLDRING_OPTION_+0").project
+        interaction_context = best_window_context(interaction_refs, "MEASURE_BUYGOLDRING_OPTION_+0")
+        if interaction_context is None:
+            raise AssertionError("MsgSayInteraction context was not built for button labels")
+        if interaction_context.header_label != "measure_buygoldring_head_+0":
+            raise AssertionError(f"MsgSayInteraction head label was not extracted: {interaction_context!r}")
+        if interaction_context.body_label != "measure_buygoldring_question_+0":
+            raise AssertionError(f"MsgSayInteraction body label was not extracted: {interaction_context!r}")
     finally:
         safe_rmtree(temp)
 
@@ -1670,6 +1703,66 @@ def assert_preview_i18n_and_symbol_mapping() -> None:
                 "dynamic @L arguments after BODY should be used as placeholder values, "
                 f"got {dynamic_label_argument.display_text!r}"
             )
+        interaction_button = service.render(
+            "%1SV",
+            unit_key="same-entry",
+            label="MEASURE_BUYGOLDRING_OPTION_+0",
+            file_rel="Text.dbt",
+            kind="dbt",
+            target=False,
+            references=(
+                CodeReference(
+                    "MEASURE_BUYGOLDRING_OPTION_+0",
+                    temp / "Scripts" / "Interaction.lua",
+                    1,
+                    1,
+                    "MsgSayInteraction",
+                    3,
+                    (
+                        '""',
+                        '"Child"',
+                        '""',
+                        '"@B[0,@L_MEASURE_BUYGOLDRING_OPTION_+0]".."@B[1,@L_MEASURE_BUYGOLDRING_OPTION_+1]"',
+                        '"@L_MEASURE_BUYGOLDRING_HEAD_+0"',
+                        '"@L_MEASURE_BUYGOLDRING_QUESTION_+0"',
+                        'GetID("")',
+                        "Cost",
+                    ),
+                ),
+            ),
+        )
+        interaction_question = service.render(
+            "%2t",
+            unit_key="same-entry",
+            label="MEASURE_BUYGOLDRING_QUESTION_+0",
+            file_rel="Text.dbt",
+            kind="dbt",
+            target=False,
+            references=(
+                CodeReference(
+                    "MEASURE_BUYGOLDRING_QUESTION_+0",
+                    temp / "Scripts" / "Interaction.lua",
+                    1,
+                    1,
+                    "MsgSayInteraction",
+                    5,
+                    (
+                        '""',
+                        '"Child"',
+                        '""',
+                        '"@B[0,@L_MEASURE_BUYGOLDRING_OPTION_+0]".."@B[1,@L_MEASURE_BUYGOLDRING_OPTION_+1]"',
+                        '"@L_MEASURE_BUYGOLDRING_HEAD_+0"',
+                        '"@L_MEASURE_BUYGOLDRING_QUESTION_+0"',
+                        'GetID("")',
+                        "Cost",
+                    ),
+                ),
+            ),
+        )
+        if "Jack" not in interaction_button.display_text:
+            raise AssertionError(f"MsgSayInteraction button placeholders should start after head/body labels: {interaction_button.display_text!r}")
+        if not any(atom.glyph_id == 2002 for atom in interaction_question.atoms):
+            raise AssertionError("MsgSayInteraction body placeholders did not map %2t to the second runtime argument")
         suffix_priority = service.render(
             "%1SA %1SN",
             unit_key="same-entry",

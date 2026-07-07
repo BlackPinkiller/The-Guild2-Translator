@@ -249,8 +249,18 @@ def _placeholder_expression(reference: object, number: int) -> str:
     if not isinstance(argument_index, int) or not isinstance(arguments, tuple):
         return ""
     base = argument_index + 1
-    if base < len(arguments) and _is_paired_body_argument(reference, str(arguments[base])):
-        base += 1
+    current_argument = str(arguments[argument_index]) if 0 <= argument_index < len(arguments) else ""
+    if _is_button_argument(current_argument):
+        while base < len(arguments) and _is_localization_text_argument(str(arguments[base])):
+            base += 1
+    elif _is_localization_text_argument(current_argument):
+        current_label = _localization_text_label(current_argument)
+        while (
+            current_label
+            and base < len(arguments)
+            and _is_related_window_text_label(current_label, _localization_text_label(str(arguments[base])))
+        ):
+            base += 1
     index = base + number - 1
     if 0 <= index < len(arguments):
         return str(arguments[index])
@@ -259,7 +269,7 @@ def _placeholder_expression(reference: object, number: int) -> str:
 
 def _is_paired_body_argument(reference: object, expression: str) -> bool:
     current = str(getattr(reference, "label", "") or "").strip().lstrip("_").casefold()
-    next_label = _literal_localization_label(expression)
+    next_label = _localization_text_label(expression)
     if not current or not next_label:
         return False
     paired = _paired_body_label(current)
@@ -274,6 +284,25 @@ def _paired_body_label(label: str) -> str:
     return ""
 
 
+def _is_related_window_text_label(current_label: str, next_label: str) -> bool:
+    if not current_label or not next_label:
+        return False
+    current = current_label.casefold()
+    next_value = next_label.casefold()
+    paired = _paired_body_label(current)
+    if paired and paired == next_value:
+        return True
+    match = re.match(r"^(.*_)(head|header)(_\+.*)?$", current)
+    if match is None:
+        return False
+    prefix, _, suffix = match.groups()
+    suffix = suffix or ""
+    suffix_join = f"{prefix[:-1]}{suffix}" if suffix.startswith("_+") and prefix.endswith("_") else f"{prefix}{suffix}"
+    if next_value == suffix_join:
+        return True
+    return bool(re.match(rf"^{re.escape(prefix)}(body|text|question|answer){re.escape(suffix)}$", next_value))
+
+
 def _literal_localization_label(expression: str) -> str:
     stripped = expression.strip()
     if ".." in stripped:
@@ -284,8 +313,33 @@ def _literal_localization_label(expression: str) -> str:
     return value[3:].lstrip("_")
 
 
+def _is_button_argument(expression: str) -> bool:
+    return "@B[" in expression
+
+
+def _is_localization_text_argument(expression: str) -> bool:
+    return bool(_localization_text_label(expression))
+
+
+def _localization_text_label(expression: str) -> str:
+    literal = _literal_localization_label(expression)
+    if literal:
+        return literal
+    dynamic = _DYNAMIC_LOCALIZATION_RE.search(expression.strip())
+    if dynamic:
+        prefix, suffix = dynamic.groups()
+        return f"{prefix}_+{suffix}".lstrip("_")
+    dynamic_suffix = _DYNAMIC_SUFFIX_LOCALIZATION_RE.search(expression.strip())
+    if dynamic_suffix:
+        return f"{dynamic_suffix.group(1)}_+*".lstrip("_")
+    return ""
+
+
 _DYNAMIC_LOCALIZATION_RE = re.compile(
     r"@L_([A-Za-z0-9_]+)_['\"]?\s*\.\..*?\.\.\s*['\"]_\+([A-Za-z0-9]+)"
+)
+_DYNAMIC_SUFFIX_LOCALIZATION_RE = re.compile(
+    r"@L_([A-Za-z0-9_]+)_\+\s*['\"]?\s*\.\."
 )
 
 
