@@ -9,7 +9,7 @@ import re
 import struct
 import unicodedata
 
-from PySide6.QtCore import QBuffer, QIODevice, Qt
+from PySide6.QtCore import QBuffer, QIODevice, QRect, Qt
 from PySide6.QtGui import QColor, QImage, QPainter, qRgba
 
 from .code_window_context import PreviewWindowContext
@@ -731,7 +731,7 @@ class PreviewService:
                 painter,
                 buttons,
                 target=target,
-                top=max(top + 10, canvas.height() - 34 * len(buttons) - 22),
+                top=max(top + 10, canvas.height() - 42 * len(buttons) - 22),
                 default_color=(235, 225, 175, 255),
             )
         painter.end()
@@ -842,13 +842,14 @@ class PreviewService:
             return
         canvas_width = painter.device().width()
         button_width = min(250, max(150, canvas_width - 92))
-        button_height = 28
+        button_height = 36
         x = (canvas_width - button_width) // 2
         y = top
         for button in buttons[:4]:
-            painter.fillRect(x, y, button_width, button_height, QColor(44, 72, 28, 230))
-            painter.setPen(QColor(180, 160, 80, 230))
-            painter.drawRect(x, y, button_width, button_height)
+            if not self._draw_game_button_background(painter, QRect(x, y, button_width, button_height)):
+                painter.fillRect(x, y, button_width, button_height, QColor(44, 72, 28, 230))
+                painter.setPen(QColor(180, 160, 80, 230))
+                painter.drawRect(x, y, button_width, button_height)
             self._draw_game_document(
                 painter,
                 button,
@@ -860,7 +861,14 @@ class PreviewService:
                 centered=True,
                 default_color=default_color,
             )
-            y += button_height + 5
+            y += button_height + 6
+
+    def _draw_game_button_background(self, painter: QPainter, rect: QRect) -> bool:
+        base = self.ui_image("startmenuebutton1.tga") or self.ui_image("startmenuebutton.tga")
+        if base is None or base.isNull():
+            return False
+        painter.drawImage(rect, base)
+        return True
 
     def _game_codepoints(self, char: str, target: bool) -> tuple[int, ...]:
         return (ord(char),)
