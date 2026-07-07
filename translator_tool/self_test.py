@@ -1518,6 +1518,7 @@ def assert_preview_i18n_and_symbol_mapping() -> None:
             '9 "_CHARACTERS_2_PROFESSIONS_baker_NAME_+0" "Baker" |\n'
             '10 "_CHARACTERS_3_OFFICES_NAME_Mayor_+0" "Mayor" |\n'
             '11 "_CHARACTERS_3_TITLES_NAME_+0" "Serf" |\n'
+            '12 "_SCENARIO_WAR_GERMANY_+0" "The German Empire" |\n'
         )
         rows_target = (
             '1 "_NAMES_ENGLISH_MALE_+0" "杰克" |\n'
@@ -1637,6 +1638,38 @@ def assert_preview_i18n_and_symbol_mapping() -> None:
         )
         if "Jack Smith" not in head_body_semantic.display_text:
             raise AssertionError("head/body paired labels did not skip the body label when mapping placeholders")
+        dynamic_label_argument = service.render(
+            "%1l hereby demands %3t from %2DN. signed %4l",
+            unit_key="same-entry",
+            label="WAR_END_LOOSE_BODY_+1",
+            file_rel="Text.dbt",
+            kind="dbt",
+            target=False,
+            references=(
+                CodeReference(
+                    "WAR_END_LOOSE_BODY_+1",
+                    temp / "Scripts" / "War.lua",
+                    1,
+                    1,
+                    "feedback_MessagePolitics",
+                    2,
+                    (
+                        '"family"',
+                        '"@L_WAR_END_LOOSE_HEAD_+1"',
+                        '"@L_WAR_END_LOOSE_BODY_+1"',
+                        '"@L_SCENARIO_WAR_"..enemy.."_+0"',
+                        'GetDynastyID("family")',
+                        "dynmoney",
+                        '"@L_SCENARIO_LORD_"..enemy.."_+1"',
+                    ),
+                ),
+            ),
+        )
+        if "The German Empire" not in dynamic_label_argument.display_text:
+            raise AssertionError(
+                "dynamic @L arguments after BODY should be used as placeholder values, "
+                f"got {dynamic_label_argument.display_text!r}"
+            )
         suffix_priority = service.render(
             "%1SA %1SN",
             unit_key="same-entry",

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+import re
 from typing import Protocol
 
 from .i18n import translate
@@ -22,6 +23,8 @@ class PlaceholderLocalization(Protocol):
     ) -> str: ...
 
     def sample_label(self, prefix: str, suffix: str, seed_key: str, number: int, target: bool) -> str: ...
+
+    def localized(self, label: str, target: bool) -> str: ...
 
 
 @dataclass(frozen=True)
@@ -72,6 +75,9 @@ class PlaceholderValueBuilder:
         if explicit is not None:
             return explicit
         if suffix in {"", "l", "s"}:
+            localized = _localized_argument_value(self.localization, number, context)
+            if localized:
+                return PlaceholderValue(_clean_sample_text(localized))
             semantic = _semantic_kind(number, context)
             if semantic == "character":
                 return PlaceholderValue(
@@ -243,7 +249,7 @@ def _placeholder_expression(reference: object, number: int) -> str:
     if not isinstance(argument_index, int) or not isinstance(arguments, tuple):
         return ""
     base = argument_index + 1
-    while base < len(arguments) and _is_localization_argument(str(arguments[base])):
+    if base < len(arguments) and _is_paired_body_argument(reference, str(arguments[base])):
         base += 1
     index = base + number - 1
     if 0 <= index < len(arguments):
@@ -251,9 +257,65 @@ def _placeholder_expression(reference: object, number: int) -> str:
     return ""
 
 
-def _is_localization_argument(expression: str) -> bool:
-    value = expression.strip().strip('"').strip("'")
-    return value.startswith("@L_")
+def _is_paired_body_argument(reference: object, expression: str) -> bool:
+    current = str(getattr(reference, "label", "") or "").strip().lstrip("_").casefold()
+    next_label = _literal_localization_label(expression)
+    if not current or not next_label:
+        return False
+    paired = _paired_body_label(current)
+    return bool(paired and paired == next_label.casefold())
+
+
+def _paired_body_label(label: str) -> str:
+    if "_head_" in label:
+        return label.replace("_head_", "_body_", 1)
+    if label.endswith("_head"):
+        return f"{label[:-5]}_body"
+    return ""
+
+
+def _literal_localization_label(expression: str) -> str:
+    stripped = expression.strip()
+    if ".." in stripped:
+        return ""
+    value = stripped.strip('"').strip("'")
+    if not value.startswith("@L_"):
+        return ""
+    return value[3:].lstrip("_")
+
+
+_DYNAMIC_LOCALIZATION_RE = re.compile(
+    r"@L_([A-Za-z0-9_]+)_['\"]?\s*\.\..*?\.\.\s*['\"]_\+([A-Za-z0-9]+)"
+)
+
+
+def _localized_argument_value(
+    localization: PlaceholderLocalization,
+    number: int,
+    context: PlaceholderContext,
+) -> str:
+    for reference in context.references:
+        expression = _placeholder_expression(reference, number)
+        literal = _literal_localization_label(expression)
+        if literal:
+            value = localization.localized(f"_{literal}", context.target)
+            if value and value != f"_{literal}":
+                return value
+            continue
+        dynamic = _DYNAMIC_LOCALIZATION_RE.search(expression.strip())
+        if not dynamic:
+            continue
+        prefix, suffix = dynamic.groups()
+        value = localization.sample_label(
+            f"_{prefix}_",
+            f"_+{suffix}",
+            context.seed_key,
+            number,
+            context.target,
+        )
+        if value:
+            return value
+    return ""
 
 
 def _city_value(localization: PlaceholderLocalization, number: int, context: PlaceholderContext) -> str:
