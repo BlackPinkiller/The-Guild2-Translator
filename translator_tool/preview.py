@@ -854,7 +854,7 @@ class PreviewService:
                 painter,
                 button,
                 target=target,
-                top=y + 3,
+                top=y + 10,
                 left=x + 10,
                 right=x + button_width - 10,
                 scale=0.72,
