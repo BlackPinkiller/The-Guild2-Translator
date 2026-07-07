@@ -16,11 +16,11 @@ def open_code_reference(reference: CodeReference) -> bool:
         return False
     if _open_with_default_editor(path, line):
         return True
-    if _run_editor(("code", "-g", f"{path}:{line}")):
+    if _run_known_editor("code", ("-g", f"{path}:{line}")):
         return True
-    if _run_editor(("cursor", "-g", f"{path}:{line}")):
+    if _run_known_editor("cursor", ("-g", f"{path}:{line}")):
         return True
-    if _run_editor(("notepad++", str(path), f"-n{line}")):
+    if _run_known_editor("notepad++", (str(path), f"-n{line}")):
         return True
     try:
         os.startfile(path)  # type: ignore[attr-defined]
@@ -76,3 +76,51 @@ def _run_editor(args: tuple[str, ...]) -> bool:
         return True
     except OSError:
         return False
+
+
+def _run_known_editor(name: str, args: tuple[str, ...]) -> bool:
+    for executable in _known_editor_executables(name):
+        if _run_editor((executable, *args)):
+            return True
+    return False
+
+
+def _known_editor_executables(name: str) -> tuple[str, ...]:
+    found: list[str] = []
+    resolved = shutil.which(name)
+    if resolved:
+        found.append(resolved)
+    for path in _known_editor_paths(name):
+        if path.is_file():
+            found.append(str(path))
+    if name not in found:
+        found.append(name)
+    unique: list[str] = []
+    for executable in found:
+        if executable and executable not in unique:
+            unique.append(executable)
+    return tuple(unique)
+
+
+def _known_editor_paths(name: str) -> tuple[Path, ...]:
+    local = Path(os.environ.get("LOCALAPPDATA", ""))
+    program_files = Path(os.environ.get("ProgramFiles", ""))
+    program_files_x86 = Path(os.environ.get("ProgramFiles(x86)", ""))
+    if name == "code":
+        return (
+            local / "Programs" / "Microsoft VS Code" / "Code.exe",
+            program_files / "Microsoft VS Code" / "Code.exe",
+            program_files_x86 / "Microsoft VS Code" / "Code.exe",
+        )
+    if name == "cursor":
+        return (
+            local / "Programs" / "Cursor" / "Cursor.exe",
+            program_files / "Cursor" / "Cursor.exe",
+            program_files_x86 / "Cursor" / "Cursor.exe",
+        )
+    if name == "notepad++":
+        return (
+            program_files / "Notepad++" / "notepad++.exe",
+            program_files_x86 / "Notepad++" / "notepad++.exe",
+        )
+    return ()

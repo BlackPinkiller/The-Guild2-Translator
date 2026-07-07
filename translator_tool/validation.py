@@ -116,7 +116,7 @@ GUIDE_TOKEN_RE = re.compile(
         ]
     )
 )
-TOOLTIP_TOKEN_RE = re.compile("|".join((NAMED_PERCENT_TOKEN, SYMBOL_TOKEN)))
+TOOLTIP_TOKEN_RE = re.compile("|".join((ARG_TOKEN, NAMED_PERCENT_TOKEN, SYMBOL_TOKEN)))
 
 GUILD2_HIGHLIGHT_RE = re.compile(
     "|".join(
@@ -471,6 +471,16 @@ def unknown_syntax_tokens(text: str, *, dialect: str = FORMAT_GUILD2) -> list[st
     return unknown
 
 
+def guide_plain_double_quotes(text: str) -> int:
+    if '"' not in text:
+        return 0
+    protected = [False] * len(text)
+    for match in GUIDE_TOKEN_RE.finditer(text):
+        for index in range(match.start(), match.end()):
+            protected[index] = True
+    return sum(1 for index, char in enumerate(text) if char == '"' and not protected[index])
+
+
 def _arg_suffix_repair_candidates(raw_suffix: str) -> list[str]:
     normalized = raw_suffix.lower()
     if len(normalized) < 2:
@@ -633,6 +643,16 @@ def validate_translation(
     )
     if dbt_field and '"' in target:
         issues.append(ValidationIssue("error", translate("validation.dbt_quote"), code="dbt-quote"))
+    if dialect == FORMAT_GUIDE:
+        quote_count = guide_plain_double_quotes(target)
+        if quote_count:
+            issues.append(
+                ValidationIssue(
+                    "warning",
+                    translate("validation.guide_quote", count=quote_count),
+                    code="guide-quote",
+                )
+            )
     if CHINESE_QUOTE_RE.search(target):
         bad = "".join(dict.fromkeys(CHINESE_QUOTE_RE.findall(target)))
         issues.append(ValidationIssue("warning", translate("validation.quote_style", text=bad), code="quote-style"))

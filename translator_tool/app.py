@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from collections import Counter
 from dataclasses import replace
+from difflib import SequenceMatcher
 import html
 import math
 from pathlib import Path
@@ -29,7 +30,7 @@ from PySide6.QtCore import (
     QUrl,
     Signal,
 )
-from PySide6.QtGui import QAction, QCloseEvent, QColor, QCursor, QFont, QFontMetrics, QImage, QKeyEvent, QKeySequence, QPainter, QPalette, QPen, QStandardItemModel, QSyntaxHighlighter, QTextCharFormat, QTextCursor, QTextDocument, QTextImageFormat, QWheelEvent
+from PySide6.QtGui import QAction, QCloseEvent, QColor, QCursor, QFont, QFontMetrics, QImage, QKeyEvent, QKeySequence, QPainter, QPalette, QPen, QStandardItemModel, QSyntaxHighlighter, QTextBlockFormat, QTextCharFormat, QTextCursor, QTextDocument, QTextImageFormat, QWheelEvent
 from PySide6.QtWidgets import (
     QApplication,
     QAbstractItemView,
@@ -76,7 +77,8 @@ from .ai import (
     llm_provider_from_settings,
     provider_from_settings,
 )
-from .code_index import CodeReference, CodeReferenceIndex, CodeReferenceSet, build_code_reference_index
+from .code_index import CodeReference, CodeReferenceIndex, CodeReferenceSet, build_code_reference_index, label_group_key, normalize_label
+from .code_window_context import PreviewWindowContext, best_window_context
 from .code_open import open_code_reference
 from .codec_adapter import CodecError, Guild2Codec, load_codec_for_language, language_uses_codec
 from .git_history import GitCommit, GitError, LanguageGit, TranslationLogEntry
@@ -572,19 +574,22 @@ class EditorGroupBox(QGroupBox):
         self.position_preview_button()
 
     def position_preview_button(self) -> None:
-        height = self.fontMetrics().height() + 4
+        height = self.fontMetrics().height() + 6
         width = max(36, self.preview_button.fontMetrics().horizontalAdvance(self.preview_button.text()) + 16)
         self.preview_button.setFixedSize(width, height)
         self.preview_button.move(max(8, self.width() - width - 12), 1)
         if self.code_button.isVisible():
             title_width = self.fontMetrics().horizontalAdvance(self.title())
-            code_width = max(36, self.code_button.fontMetrics().horizontalAdvance(self.code_button.text()) + 14)
-            code_x = 18 + title_width + 8
+            code_width = max(52, self.code_button.fontMetrics().horizontalAdvance(self.code_button.text()) + 24)
+            code_x = 16 + title_width + 12
             self.code_button.setFixedSize(code_width, height)
-            self.code_button.move(code_x, 1)
-            label_width = max(62, self.reference_label.fontMetrics().horizontalAdvance(self.reference_label.text()) + 8)
+            self.code_button.move(code_x, 0)
+            label_width = max(74, self.reference_label.fontMetrics().horizontalAdvance(self.reference_label.text()) + 14)
+            max_label_width = max(0, self.preview_button.x() - code_x - code_width - 12)
+            if max_label_width:
+                label_width = min(label_width, max_label_width)
             self.reference_label.setFixedSize(label_width, height)
-            self.reference_label.move(code_x + code_width + 6, 1)
+            self.reference_label.move(code_x + code_width + 6, 0)
 
 
 def _single_line_preview_text(text: str) -> str:
@@ -667,7 +672,8 @@ class PreviewTextDelegate(RowTintDelegate):
             rendered = metrics.elidedText(text, Qt.TextElideMode.ElideRight, remaining)
             width = metrics.horizontalAdvance(rendered)
             underline_y = float(baseline + 2)
-            if atom.replacement and atom.text not in {"\n", "\t", PREVIEW_MARK}:
+            text_color = QColor(*atom.color) if atom.final_style and atom.color is not None else default_color
+            if atom.replacement and not atom.final_style and atom.text not in {"\n", "\t", PREVIEW_MARK}:
                 marker_rect = QRectF(
                     float(x),
                     float(baseline - metrics.ascent()),
@@ -679,9 +685,9 @@ class PreviewTextDelegate(RowTintDelegate):
                 painter.setPen(QPen(underline_color, 2, style))
                 painter.drawLine(marker_rect.bottomLeft(), marker_rect.bottomRight())
                 underline_y = float(marker_rect.bottom())
-            painter.setPen(default_color)
+            painter.setPen(text_color)
             painter.drawText(x, baseline, rendered)
-            if atom.color is not None and not (
+            if atom.color is not None and not atom.final_style and not (
                 atom.replacement and atom.text not in {"\n", "\t", PREVIEW_MARK}
             ):
                 painter.setPen(QPen(QColor(*atom.color), 2, Qt.PenStyle.SolidLine))
@@ -1267,6 +1273,7 @@ class PreviewPlainTextEdit(QTextEdit):
         self._preview_document = document
         blocker = QSignalBlocker(self)
         self._set_unformatted_plain_text(document.display_text)
+        self._apply_preview_line_height(document.line_height_percent)
         for span in document.spans:
             atom = span.atom
             if (
@@ -1310,14 +1317,16 @@ class PreviewPlainTextEdit(QTextEdit):
             cursor.setPosition(span.display_end, QTextCursor.MoveMode.KeepAnchor)
             char_format = QTextCharFormat()
             has_visible_replacement = atom.replacement and atom.text not in {"\n", "\t", PREVIEW_MARK}
-            if atom.color is not None:
+            if atom.final_style and atom.color is not None:
+                char_format.setForeground(QColor(*atom.color))
+            elif atom.color is not None:
                 char_format.setUnderlineColor(QColor(*atom.color))
                 char_format.setUnderlineStyle(
                     QTextCharFormat.UnderlineStyle.DashUnderline
                     if has_visible_replacement
                     else QTextCharFormat.UnderlineStyle.SingleUnderline
                 )
-            elif has_visible_replacement:
+            elif has_visible_replacement and not atom.final_style:
                 char_format.setUnderlineStyle(QTextCharFormat.UnderlineStyle.DashUnderline)
                 char_format.setUnderlineColor(QColor("#79740e"))
             if atom.replacement and atom.text not in {"\n", "\t", PREVIEW_MARK}:
@@ -1358,6 +1367,15 @@ class PreviewPlainTextEdit(QTextEdit):
         self.setCurrentCharFormat(QTextCharFormat())
         QTextEdit.setPlainText(self, text)
         self.setCurrentCharFormat(QTextCharFormat())
+
+    def _apply_preview_line_height(self, percent: int) -> None:
+        cursor = QTextCursor(self.document())
+        cursor.select(QTextCursor.SelectionType.Document)
+        block_format = QTextBlockFormat()
+        block_format.setLineHeight(percent, QTextBlockFormat.LineHeightTypes.ProportionalHeight.value)
+        block_format.setTopMargin(0)
+        block_format.setBottomMargin(0)
+        cursor.mergeBlockFormat(block_format)
 
     def keyPressEvent(self, event: QKeyEvent) -> None:  # noqa: N802
         if self._preview_enabled and self._is_edit_key(event):
@@ -1515,9 +1533,15 @@ class CodeIndexWorker(QRunnable):
                 vanilla_project_name=VANILLA_PROJECT_NAME,
             )
         except Exception as exc:
-            self.signals.failed.emit(self.token, str(exc))
+            try:
+                self.signals.failed.emit(self.token, str(exc))
+            except RuntimeError:
+                pass
             return
-        self.signals.ready.emit(self.token, index)
+        try:
+            self.signals.ready.emit(self.token, index)
+        except RuntimeError:
+            pass
 
 
 class SuggestionWorkerSignals(QObject):
@@ -1650,6 +1674,9 @@ class SettingsDialog(QDialog):
         self.preview_game_font_in_editors = QCheckBox()
         self.preview_game_font_in_editors.setChecked(self.settings.preview_game_font_in_editors)
         preview_assets_form.addRow(self.preview_game_font_in_editors)
+        self.preview_use_code_context = QCheckBox()
+        self.preview_use_code_context.setChecked(self.settings.preview_use_code_context)
+        preview_assets_form.addRow(self.preview_use_code_context)
         self.preview_assets_hint = QLabel()
         self.preview_assets_hint.setObjectName("hint")
         self.preview_assets_hint.setWordWrap(True)
@@ -1810,6 +1837,9 @@ class SettingsDialog(QDialog):
         self.preview_game_font_in_editors.setText(
             translate("settings.preview_game_font_in_editors", locale=locale)
         )
+        self.preview_use_code_context.setText(
+            translate("settings.preview_use_code_context", locale=locale)
+        )
         self.preview_assets_hint.setText(translate("settings.preview_assets_hint", locale=locale))
         for field in (
             self.preview_translation_font_dir,
@@ -1879,6 +1909,7 @@ class SettingsDialog(QDialog):
             preview_translation_font_dir=self.preview_translation_font_dir.text().strip(),
             preview_ui_assets_dir=self.preview_ui_assets_dir.text().strip(),
             preview_game_font_in_editors=self.preview_game_font_in_editors.isChecked(),
+            preview_use_code_context=self.preview_use_code_context.isChecked(),
         )
 
 
@@ -2537,7 +2568,11 @@ class TranslatorWindow(QMainWindow):
         self.code_reference_popup = QListWidget()
         self.code_reference_popup.setWindowFlags(Qt.WindowType.Popup | Qt.WindowType.FramelessWindowHint)
         self.code_reference_popup.setMouseTracking(True)
+        self.code_reference_popup.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        self.code_reference_popup.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
         self.code_reference_popup.installEventFilter(self)
+        self.code_reference_popup.viewport().installEventFilter(self)
+        self.code_reference_popup.itemClicked.connect(self._open_code_reference_item)
         self.source_code_button.installEventFilter(self)
         self.code_button_hold_timer = QTimer(self)
         self.code_button_hold_timer.setSingleShot(True)
@@ -2546,6 +2581,7 @@ class TranslatorWindow(QMainWindow):
         self.code_reference_index: CodeReferenceIndex | None = None
         self.code_reference_index_token = 0
         self.code_reference_workers: list[CodeIndexWorker] = []
+        self.code_reference_cache: dict[str, CodeReferenceSet] = {}
         self.source_preview_button.toggled.connect(
             lambda checked: self._on_editor_preview_toggled(False, checked)
         )
@@ -2622,7 +2658,8 @@ class TranslatorWindow(QMainWindow):
     def eventFilter(self, watched: QObject, event: QEvent) -> bool:  # noqa: N802
         if watched is getattr(self, "source_code_button", None):
             return self._handle_code_button_event(event)
-        if watched is getattr(self, "code_reference_popup", None):
+        code_popup = getattr(self, "code_reference_popup", None)
+        if watched is code_popup or (code_popup is not None and watched is code_popup.viewport()):
             return self._handle_code_popup_event(event)
         editor = self._watched_editor(watched)
         if isinstance(editor, PreviewPlainTextEdit):
@@ -2772,6 +2809,7 @@ class TranslatorWindow(QMainWindow):
 
     def _start_code_reference_index(self) -> None:
         self.code_reference_index = None
+        self.code_reference_cache.clear()
         self.code_reference_index_token += 1
         token = self.code_reference_index_token
         self._update_code_reference_display()
@@ -2788,6 +2826,7 @@ class TranslatorWindow(QMainWindow):
             worker for worker in self.code_reference_workers if worker.token != token
         ]
         self.code_reference_index = index
+        self.code_reference_cache.clear()
         self._update_code_reference_display()
 
     def _code_reference_index_failed(self, token: int, message: str) -> None:
@@ -2797,6 +2836,7 @@ class TranslatorWindow(QMainWindow):
             worker for worker in self.code_reference_workers if worker.token != token
         ]
         self.code_reference_index = CodeReferenceIndex()
+        self.code_reference_cache.clear()
         self._update_code_reference_display()
         self.statusBar().showMessage(translate("status.code_index_failed", error=message), 4000)
 
@@ -2804,7 +2844,22 @@ class TranslatorWindow(QMainWindow):
         unit = self._current_unit()
         if unit is None or not unit.label or unit.ref.kind != "dbt" or self.code_reference_index is None:
             return CodeReferenceSet()
-        return self.code_reference_index.references_for(unit.label)
+        cached = self.code_reference_cache.get(unit.label)
+        if cached is None:
+            cached = self.code_reference_index.references_for(unit.label)
+            self.code_reference_cache[unit.label] = cached
+        return cached
+
+    def _code_references_for_unit(self, unit: TranslationUnit) -> tuple[CodeReference, ...]:
+        if not self.settings.preview_use_code_context:
+            return ()
+        if not unit.label or unit.ref.kind != "dbt" or self.code_reference_index is None:
+            return ()
+        cached = self.code_reference_cache.get(unit.label)
+        if cached is None:
+            cached = self.code_reference_index.references_for(unit.label)
+            self.code_reference_cache[unit.label] = cached
+        return cached.active
 
     def _project_is_mod(self) -> bool:
         return self.project_root is not None and self.project_root.name.casefold() != VANILLA_PROJECT_NAME.casefold()
@@ -2850,7 +2905,10 @@ class TranslatorWindow(QMainWindow):
             if self.code_button_hold_timer.isActive():
                 self.code_button_hold_timer.stop()
                 self._open_first_code_reference()
-            elif not self.code_reference_popup.isVisible():
+            elif self.code_reference_popup.isVisible():
+                self._open_code_reference_under_cursor()
+                self.code_reference_popup.hide()
+            else:
                 self._open_first_code_reference()
             return True
         return False
@@ -2867,11 +2925,21 @@ class TranslatorWindow(QMainWindow):
             item = self.code_reference_popup.itemAt(event.position().toPoint())
             self.code_reference_popup.hide()
             if item is not None:
-                reference = item.data(Qt.ItemDataRole.UserRole)
-                if isinstance(reference, CodeReference):
-                    self._open_code_reference(reference)
+                self._open_code_reference_item(item)
             return True
         return False
+
+    def _open_code_reference_under_cursor(self) -> None:
+        popup = self.code_reference_popup
+        point = popup.viewport().mapFromGlobal(QCursor.pos())
+        item = popup.itemAt(point)
+        if item is not None:
+            self._open_code_reference_item(item)
+
+    def _open_code_reference_item(self, item: QListWidgetItem) -> None:
+        reference = item.data(Qt.ItemDataRole.UserRole)
+        if isinstance(reference, CodeReference):
+            self._open_code_reference(reference)
 
     def _show_code_reference_popup(self) -> None:
         references = self._current_code_reference_set().active
@@ -2879,19 +2947,30 @@ class TranslatorWindow(QMainWindow):
             return
         self.code_reference_popup.clear()
         for reference in references:
-            prefix = f"{reference.call_name} · " if reference.call_name else ""
-            item = QListWidgetItem(f"{prefix}{reference.display_name}")
+            item = QListWidgetItem(reference.display_name)
             item.setToolTip(str(reference.path))
             item.setData(Qt.ItemDataRole.UserRole, reference)
             self.code_reference_popup.addItem(item)
-        width = max(
-            240,
-            min(520, max(self.code_reference_popup.fontMetrics().horizontalAdvance(self.code_reference_popup.item(row).text()) for row in range(self.code_reference_popup.count())) + 36),
+        screen = self.source_code_button.screen() or QApplication.primaryScreen()
+        available = screen.availableGeometry() if screen is not None else self.geometry()
+        content_width = max(
+            self.code_reference_popup.fontMetrics().horizontalAdvance(self.code_reference_popup.item(row).text())
+            for row in range(self.code_reference_popup.count())
         )
+        width = min(max(220, content_width + 34), max(220, available.width() - 36))
         row_height = max(24, self.code_reference_popup.sizeHintForRow(0))
-        height = min(260, row_height * min(10, self.code_reference_popup.count()) + 8)
+        desired_height = row_height * self.code_reference_popup.count() + 10
+        button_top = self.source_code_button.mapToGlobal(QPoint(0, 0)).y()
+        space_above = max(0, button_top - available.top() - 8)
+        space_below = max(0, available.bottom() - button_top - self.source_code_button.height() - 8)
+        popup_above = space_above >= min(desired_height, 180) or space_above >= space_below
+        max_height = max(80, space_above if popup_above else space_below)
+        height = min(desired_height, max_height)
         self.code_reference_popup.setFixedSize(width, height)
-        point = self.source_code_button.mapToGlobal(QPoint(0, self.source_code_button.height() + 4))
+        point = self.source_code_button.mapToGlobal(
+            QPoint(0, -height - 4) if popup_above else QPoint(0, self.source_code_button.height() + 4)
+        )
+        point.setX(min(max(available.left() + 8, point.x()), available.right() - width - 8))
         self.code_reference_popup.move(point)
         self.code_reference_popup.show()
         self.code_reference_popup.raise_()
@@ -2940,9 +3019,11 @@ class TranslatorWindow(QMainWindow):
         return self.preview_service.render(
             unit.current_text if target else unit.source_text,
             unit_key=unit.uid,
+            label=unit.label,
             file_rel=unit.file_rel,
             kind=unit.ref.kind,
             target=target,
+            references=self._code_references_for_unit(unit),
         )
 
     def _render_editor_preview(self, text: str, target: bool) -> PreviewDocument:
@@ -2953,9 +3034,11 @@ class TranslatorWindow(QMainWindow):
         return self.preview_service.render(
             text,
             unit_key=unit.uid,
+            label=unit.label,
             file_rel=unit.file_rel,
             kind=unit.ref.kind,
             target=target,
+            references=self._code_references_for_unit(unit),
         )
 
     def _on_editor_preview_toggled(self, target: bool, checked: bool) -> None:
@@ -2987,10 +3070,15 @@ class TranslatorWindow(QMainWindow):
         unit = self._current_unit()
         if unit is None:
             return None
-        header_unit, body_unit = self._paired_preview_units(unit)
+        context, header_unit, body_unit, button_units = self._game_preview_parts(unit)
         cache_key = (
             target,
             unit.uid,
+            context.kind if context is not None else "",
+            context.background if context is not None else "",
+            context.header_label if context is not None else "",
+            context.body_label if context is not None else "",
+            tuple((button.label, button.text) for button in context.buttons) if context is not None else (),
             header_unit.uid if header_unit is not None else "",
             header_unit.current_text if target and header_unit is not None else (
                 header_unit.source_text if header_unit is not None else ""
@@ -2999,31 +3087,95 @@ class TranslatorWindow(QMainWindow):
             body_unit.current_text if target and body_unit is not None else (
                 body_unit.source_text if body_unit is not None else ""
             ),
+            tuple(
+                (
+                    button.uid if isinstance(button, TranslationUnit) else "",
+                    button.current_text if target and isinstance(button, TranslationUnit) else (
+                        button.source_text if isinstance(button, TranslationUnit) else str(button)
+                    ),
+                )
+                for button in button_units
+            ),
         )
         cached = self._game_preview_cache.get(cache_key)
         if cached is not None:
             return cached
 
-        def render(candidate: TranslationUnit | None) -> PreviewDocument | None:
+        def render(candidate: TranslationUnit | str | None) -> PreviewDocument | None:
             if candidate is None:
                 return None
+            if isinstance(candidate, str):
+                return self.preview_service.render(
+                    candidate,
+                    unit_key=f"{unit.uid}:button:{candidate}",
+                    label=unit.label,
+                    file_rel=unit.file_rel,
+                    kind=unit.ref.kind,
+                    target=target,
+                    references=self._code_references_for_unit(unit),
+                )
             return self.preview_service.render(
                 candidate.current_text if target else candidate.source_text,
                 unit_key=candidate.uid,
+                label=candidate.label,
                 file_rel=candidate.file_rel,
                 kind=candidate.ref.kind,
                 target=target,
+                references=self._code_references_for_unit(candidate),
             )
 
         image = self.preview_service.game_window_image(
             render(header_unit),
             render(body_unit),
             target=target,
+            context=context,
+            buttons=tuple(document for button in button_units if (document := render(button)) is not None),
         )
         if len(self._game_preview_cache) >= 24:
             self._game_preview_cache.clear()
         self._game_preview_cache[cache_key] = image
         return image
+
+    def _game_preview_parts(
+        self,
+        unit: TranslationUnit,
+    ) -> tuple[PreviewWindowContext | None, TranslationUnit | None, TranslationUnit | None, tuple[TranslationUnit | str, ...]]:
+        context = best_window_context(self._code_references_for_unit(unit), unit.label)
+        if context is None:
+            header_unit, body_unit = self._paired_preview_units(unit)
+            return None, header_unit, body_unit, ()
+        header_unit = self._unit_for_normalized_label(unit.file_rel, context.header_label)
+        body_unit = self._unit_for_normalized_label(unit.file_rel, context.body_label)
+        current_label = normalize_label(unit.label)
+        if current_label == context.header_label:
+            header_unit = unit
+        if current_label == context.body_label:
+            body_unit = unit
+        button_units: list[TranslationUnit | str] = []
+        for button in context.buttons:
+            candidate = self._unit_for_normalized_label(unit.file_rel, button.label)
+            if candidate is not None:
+                button_units.append(candidate)
+            elif button.text:
+                button_units.append(button.text)
+        return context, header_unit, body_unit, tuple(button_units)
+
+    def _unit_for_normalized_label(self, file_rel: str, label: str) -> TranslationUnit | None:
+        if not label:
+            return None
+        label_group = label_group_key(label)
+        fallback: TranslationUnit | None = None
+        for candidate in self.model.units:
+            if candidate.file_rel != file_rel:
+                continue
+            normalized = normalize_label(candidate.label)
+            if normalized == label:
+                return candidate
+            if fallback is None and label_group is not None and label_group_key(normalized) == label_group:
+                fallback = candidate
+        if fallback is not None:
+            return fallback
+        return None
 
     def _paired_preview_units(
         self,
@@ -4448,6 +4600,7 @@ class TranslatorWindow(QMainWindow):
         previous_codec = self.settings.enable_chinese_codec
         previous_preview_scope = self.settings.preview_scope
         previous_game_font = self.settings.preview_game_font_in_editors
+        previous_use_code_context = self.settings.preview_use_code_context
         previous_preview_resources = (
             self.settings.preview_translation_font_dir,
             self.settings.preview_ui_assets_dir,
@@ -4460,6 +4613,8 @@ class TranslatorWindow(QMainWindow):
         self.ai_delegate.set_provider(self.settings.provider)
         if self.settings.preview_scope != previous_preview_scope:
             self.table.viewport().update()
+        if self.settings.preview_use_code_context != previous_use_code_context:
+            self._refresh_preview_presentations()
         current_preview_resources = (
             self.settings.preview_translation_font_dir,
             self.settings.preview_ui_assets_dir,
@@ -5123,9 +5278,9 @@ def apply_modern_style(app: QApplication) -> None:
         QComboBox QAbstractItemView { background: #f2e5bc; border: 2px solid #3c3836; selection-background-color: #c6a15b; selection-color: #3c3836; }
         QPushButton, QToolButton { background: #d79921; color: #3c3836; border: 2px solid #3c3836; border-bottom: 5px solid #3c3836; border-radius: 5px; padding: 5px 10px 3px 10px; font-weight: 900; }
         QPushButton:hover, QToolButton:hover { background: #e8b75d; }
-        QToolButton#codeReferenceButton { border: 2px solid #3c3836; border-radius: 4px; padding: 0 6px; }
+        QToolButton#codeReferenceButton { background: #d79921; border: 2px solid #3c3836; border-radius: 4px; padding: 0 8px; }
         QToolButton#codeReferenceButton:disabled { background: #d5c4a1; color: #7c6f64; }
-        QLabel#codeReferenceCount { color: #665c54; font-weight: 800; }
+        QLabel#codeReferenceCount { background: #fbf1c7; color: #665c54; font-weight: 800; padding: 0 6px; }
         QListWidget { background: #fbf1c7; border: 3px solid #3c3836; border-radius: 8px; padding: 3px; font-size: 12px; }
         QListWidget::item { padding: 4px 7px; border-radius: 4px; }
         QListWidget::item:selected { background: #c6a15b; color: #3c3836; }

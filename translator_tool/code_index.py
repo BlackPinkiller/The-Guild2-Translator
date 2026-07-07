@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+import bisect
 from pathlib import Path
 import re
 
@@ -10,8 +11,7 @@ LABEL_RE = re.compile(
     r"@L_[A-Za-z0-9_]+_\+[A-Za-z0-9]+|"
     r"@L_[A-Za-z0-9_]+"
 )
-CALL_RE = re.compile(r"([A-Za-z_][A-Za-z0-9_]*)\s*\(")
-SCRIPT_SUFFIXES = {".lua", ".ms"}
+CODE_SUFFIXES = {".lua", ".ms", ".gui"}
 
 
 @dataclass(frozen=True)
@@ -22,6 +22,7 @@ class CodeReference:
     column: int
     call_name: str | None = None
     argument_index: int | None = None
+    arguments: tuple[str, ...] = ()
     source: str = "project"
 
     @property
@@ -75,12 +76,20 @@ def build_code_reference_index(
     game_root = game_root.expanduser().resolve()
     project_root = project_root.expanduser().resolve()
     if project_root.name.casefold() == vanilla_project_name.casefold():
-        return CodeReferenceIndex(scan_scripts_root(game_root / "Scripts", source="project"))
+        return CodeReferenceIndex(scan_code_roots((game_root / "Scripts", game_root / "GUI"), source="project"))
 
-    project_scripts = game_root / "mods" / project_root.name / "Scripts"
-    project_references = scan_scripts_root(project_scripts, source="project")
-    vanilla_references = scan_scripts_root(game_root / "Scripts", source="vanilla")
+    mod_root = game_root / "mods" / project_root.name
+    project_references = scan_code_roots((mod_root / "Scripts", mod_root / "GUI"), source="project")
+    vanilla_references = scan_code_roots((game_root / "Scripts", game_root / "GUI"), source="vanilla")
     return CodeReferenceIndex(project_references, vanilla_references)
+
+
+def scan_code_roots(roots: tuple[Path, ...], *, source: str = "project") -> dict[str, tuple[CodeReference, ...]]:
+    merged: dict[str, list[CodeReference]] = {}
+    for root in roots:
+        for label, references in scan_scripts_root(root, source=source).items():
+            merged.setdefault(label, []).extend(references)
+    return {label: tuple(items) for label, items in merged.items()}
 
 
 def scan_scripts_root(root: Path, *, source: str = "project") -> dict[str, tuple[CodeReference, ...]]:
@@ -93,23 +102,25 @@ def scan_scripts_root(root: Path, *, source: str = "project") -> dict[str, tuple
             text = path.read_text(encoding="utf-8-sig", errors="ignore")
         except OSError:
             continue
-        for line_number, line in enumerate(text.splitlines(), start=1):
-            for match in LABEL_RE.finditer(line):
-                label = normalize_label(match.group(0))
-                call_name, argument_index = _line_call_context(line, match.start())
-                reference = CodeReference(
-                    label=label,
-                    path=path,
-                    line=line_number,
-                    column=match.start() + 1,
-                    call_name=call_name,
-                    argument_index=argument_index,
-                    source=source,
-                )
-                grouped.setdefault(label, []).append(reference)
-                group_label = label_group_key(label)
-                if group_label is not None and group_label != label:
-                    grouped.setdefault(group_label, []).append(reference)
+        line_starts = _line_starts(text)
+        for match in LABEL_RE.finditer(text):
+            line_number, column = _line_column(line_starts, match.start())
+            label = normalize_label(match.group(0))
+            call_name, argument_index, arguments = _call_context(text, match.start())
+            reference = CodeReference(
+                label=label,
+                path=path,
+                line=line_number,
+                column=column,
+                call_name=call_name,
+                argument_index=argument_index,
+                arguments=arguments,
+                source=source,
+            )
+            grouped.setdefault(label, []).append(reference)
+            group_label = label_group_key(label)
+            if group_label is not None and group_label != label:
+                grouped.setdefault(group_label, []).append(reference)
     return {label: tuple(items) for label, items in grouped.items()}
 
 
@@ -171,7 +182,7 @@ def _script_files(root: Path) -> list[Path]:
             (
                 path
                 for path in root.rglob("*")
-                if path.is_file() and path.suffix.casefold() in SCRIPT_SUFFIXES
+                if path.is_file() and path.suffix.casefold() in CODE_SUFFIXES
             ),
             key=lambda path: path.as_posix().casefold(),
         )
@@ -179,11 +190,120 @@ def _script_files(root: Path) -> list[Path]:
         return []
 
 
-def _line_call_context(line: str, column: int) -> tuple[str | None, int | None]:
-    before = line[:column]
-    matches = list(CALL_RE.finditer(before))
-    if not matches:
-        return None, None
-    match = matches[-1]
-    argument_index = before[match.end() :].count(",")
-    return match.group(1), argument_index
+def _line_starts(text: str) -> tuple[int, ...]:
+    starts = [0]
+    for match in re.finditer(r"\n", text):
+        starts.append(match.end())
+    return tuple(starts)
+
+
+def _line_column(line_starts: tuple[int, ...], position: int) -> tuple[int, int]:
+    line_index = max(0, bisect.bisect_right(line_starts, position) - 1)
+    return line_index + 1, position - line_starts[line_index] + 1
+
+
+def _call_context(text: str, position: int) -> tuple[str | None, int | None, tuple[str, ...]]:
+    open_paren = _nearest_open_call_paren(text, position)
+    if open_paren is None:
+        return None, None, ()
+    prefix = text[:open_paren].rstrip()
+    match = re.search(r"([A-Za-z_][A-Za-z0-9_]*)$", prefix)
+    if match is None:
+        return None, None, ()
+    argument_index = _top_level_comma_count(text[open_paren + 1 : position])
+    close_paren = _matching_close_paren(text, open_paren)
+    arguments = _split_top_level_arguments(text[open_paren + 1 : close_paren]) if close_paren is not None else ()
+    return match.group(1), argument_index, arguments
+
+
+def _nearest_open_call_paren(text: str, position: int) -> int | None:
+    depth = 0
+    for index in range(position - 1, -1, -1):
+        char = text[index]
+        if char == ")":
+            depth += 1
+        elif char == "(":
+            if depth == 0:
+                return index
+            depth -= 1
+    return None
+
+
+def _top_level_comma_count(text: str) -> int:
+    depth = 0
+    count = 0
+    quote: str | None = None
+    escaped = False
+    for char in text:
+        if quote is not None:
+            if escaped:
+                escaped = False
+            elif char == "\\":
+                escaped = True
+            elif char == quote:
+                quote = None
+            continue
+        if char in {'"', "'"}:
+            quote = char
+        elif char in "([{":
+            depth += 1
+        elif char in ")]}":
+            depth = max(0, depth - 1)
+        elif char == "," and depth == 0:
+            count += 1
+    return count
+
+
+def _matching_close_paren(text: str, open_paren: int) -> int | None:
+    depth = 0
+    quote: str | None = None
+    escaped = False
+    for index in range(open_paren, len(text)):
+        char = text[index]
+        if quote is not None:
+            if escaped:
+                escaped = False
+            elif char == "\\":
+                escaped = True
+            elif char == quote:
+                quote = None
+            continue
+        if char in {'"', "'"}:
+            quote = char
+        elif char == "(":
+            depth += 1
+        elif char == ")":
+            depth -= 1
+            if depth == 0:
+                return index
+    return None
+
+
+def _split_top_level_arguments(text: str) -> tuple[str, ...]:
+    arguments: list[str] = []
+    depth = 0
+    quote: str | None = None
+    escaped = False
+    start = 0
+    for index, char in enumerate(text):
+        if quote is not None:
+            if escaped:
+                escaped = False
+            elif char == "\\":
+                escaped = True
+            elif char == quote:
+                quote = None
+            continue
+        if char in {'"', "'"}:
+            quote = char
+        elif char in "([{":
+            depth += 1
+        elif char in ")]}":
+            depth = max(0, depth - 1)
+        elif char == "," and depth == 0:
+            arguments.append(text[start:index].strip())
+            start = index + 1
+    trailing = text[start:].strip()
+    if trailing or text:
+        arguments.append(trailing)
+    return tuple(arguments)

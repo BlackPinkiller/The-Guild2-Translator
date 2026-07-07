@@ -12,8 +12,11 @@ import unicodedata
 from PySide6.QtCore import QBuffer, QIODevice, Qt
 from PySide6.QtGui import QColor, QImage, QPainter, qRgba
 
+from .code_window_context import PreviewWindowContext
 from .format_io import load_dbt, translatable_fields
 from .i18n import translate
+from .preview_placeholders import PlaceholderContext, PlaceholderValueBuilder
+from .preview_profiles import PreviewProfile, preview_profile
 from .validation import (
     COLOR_TOKEN_RE,
     FORMAT_GUIDE,
@@ -21,6 +24,7 @@ from .validation import (
     FORMAT_TOOLTIP,
     GUIDE_TOKEN_RE,
     GUILD2_TOKEN_RE,
+    ARG_SUFFIXES,
     PRINTF_TOKEN,
     QUOTE_STYLE_TOKEN,
     TOOLTIP_TOKEN_RE,
@@ -34,7 +38,8 @@ FONT_RECORD_RE = re.compile(
     r"(?:^|/)fonts/(?P<font>.+)_(?P<start>\d+)-(?P<end>\d+)\.tga(?P<index>\d+)$",
     re.IGNORECASE,
 )
-ARG_PREVIEW_RE = re.compile(r"%(\d+)([A-Za-z]*)")
+ARG_PREVIEW_SUFFIX_RE = "|".join(re.escape(suffix) for suffix in sorted(ARG_SUFFIXES, key=len, reverse=True))
+ARG_PREVIEW_RE = re.compile(rf"%(\d+)({ARG_PREVIEW_SUFFIX_RE})?")
 PRINTF_PREVIEW_RE = re.compile(PRINTF_TOKEN)
 SYMBOL_PREVIEW_RE = re.compile(r"\$S\[\s*(\d+)\s*\]")
 COLOR_VALUE_RE = re.compile(r"\d+")
@@ -49,6 +54,7 @@ class PreviewAtom:
     replacement: bool = False
     glyph_id: int | None = None
     color: tuple[int, int, int, int] | None = None
+    final_style: bool = False
 
 
 @dataclass(frozen=True)
@@ -65,6 +71,7 @@ class PreviewDocument:
     display_text: str
     spans: tuple[PreviewSpan, ...]
     display_to_raw: tuple[int, ...]
+    line_height_percent: int = 100
 
     @classmethod
     def from_atoms(cls, raw_text: str, atoms: list[PreviewAtom]) -> "PreviewDocument":
@@ -81,6 +88,7 @@ class PreviewDocument:
                 atom.replacement,
                 atom.glyph_id,
                 atom.color,
+                atom.final_style,
             )
             display_parts.append(text)
             display_end = display_position + len(text)
@@ -417,6 +425,21 @@ class GameLocalization:
         surname = self.localized(surname_key, target)
         return f"{first} {surname}".strip()
 
+    def sample_label(self, prefix: str, suffix: str, unit_key: str, number: int, target: bool) -> str:
+        keys = tuple(
+            sorted(
+                key
+                for key, value in self.source.items()
+                if key.startswith(prefix)
+                and key.endswith(suffix)
+                and value
+                and "_ATHMO_" not in key
+                and "_TEMPLATE_" not in key
+            )
+        )
+        key = self._pick(keys, f"{unit_key}:{number}:{prefix}:{suffix}")
+        return self.localized(key, target) if key else ""
+
 
 class PreviewService:
     def __init__(
@@ -433,7 +456,8 @@ class PreviewService:
         self._localization: GameLocalization | None = None
         self._atlases: dict[bool, GameGlyphAtlas | None] = {}
         self._ui_atlas: GameUiAtlas | None = None
-        self._render_cache: dict[tuple[str, str, str, bool, str], PreviewDocument] = {}
+        self._ui_image_cache: dict[str, QImage | None] = {}
+        self._render_cache: dict[tuple[str, str, str, str, bool, tuple[object, ...], str], PreviewDocument] = {}
         self._scaled_glyph_cache: dict[tuple[int, float, int], QImage] = {}
 
     def configure(
@@ -457,6 +481,7 @@ class PreviewService:
         self._localization = None
         self._atlases.clear()
         self._ui_atlas = None
+        self._ui_image_cache.clear()
         self._render_cache.clear()
         self._scaled_glyph_cache.clear()
 
@@ -474,77 +499,78 @@ class PreviewService:
             return "zh-CN"
         return normalized
 
-    def _argument_value(self, unit_key: str, number: int, suffix: str, target: bool) -> tuple[str, int | None]:
-        locale = self.locale(target)
-        if suffix in {"SN", "Sn", "SZ", "Sz"}:
-            return self.localization.character_name(unit_key, number, target), None
-        if suffix in {"SV", "Sv"}:
-            return self.localization.character_name(unit_key, number, target, forename_only=True), None
-        if suffix == "DS":
-            seed = f"{unit_key}:{number}:crest"
-            return GLYPH_MARK, 2029 + GameLocalization._index(seed, 17)
-        values = {
-            "NAME": "preview.value.city",
-            "GG": "preview.value.building_full",
-            "GN": "preview.value.building_name",
-            "GT": "preview.value.building_type",
-            "SK": "preview.value.class",
-            "ST": "preview.value.title",
-            "SA": "preview.value.office",
-            "SD": "preview.value.nobility",
-            "SB": "preview.value.profession",
-            "SL": "preview.value.level",
-            "DN": "preview.value.dynasty",
-            "n": "preview.value.number",
-            "i": "preview.value.integer",
-            "f": "preview.value.float",
-            "t": "preview.value.money",
-            "c": "preview.value.time",
-            "z": "preview.value.duration",
-            "j": "preview.value.date",
-            "s": "preview.value.string",
-            "l": "preview.value.label",
-            "": "preview.value.argument",
-        }
-        key = values.get(suffix, "preview.value.argument")
-        return translate(key, locale=locale, number=number), None
+    def _argument_value(
+        self,
+        unit_key: str,
+        label: str,
+        file_rel: str,
+        number: int,
+        suffix: str,
+        target: bool,
+        references: tuple[object, ...] = (),
+    ) -> tuple[str, int | None]:
+        return self._placeholder_argument_value(unit_key, label, file_rel, number, suffix, target, references)
 
-    def _named_value(self, token: str, unit_key: str, target: bool) -> tuple[str, int | None]:
-        name = token[1:-1]
-        if name == "n":
-            return "\n", None
-        if name in {"gold_icon", "hp_icon", "xp_icon", "my_crest"}:
-            glyphs = {"gold_icon": 2002, "hp_icon": 2003, "xp_icon": 2056, "my_crest": 2029}
-            return GLYPH_MARK, glyphs[name]
-        if name == "char_name":
-            return self.localization.character_name(unit_key, 1, target), None
-        if name == "spouse":
-            return self.localization.character_name(unit_key, 2, target), None
-        if name == "dyn_surname":
-            full = self.localization.character_name(unit_key, 1, target)
-            return full.rsplit(" ", 1)[-1], None
-        locale = self.locale(target)
-        key = {
-            "gold": "preview.value.money_plain",
-            "treasury": "preview.value.money_plain",
-            "wealth": "preview.value.money_plain",
-            "fame": "preview.value.number",
-            "imperial_fame": "preview.value.number",
-            "hp_cur": "preview.value.hp_current",
-            "hp_max": "preview.value.hp_max",
-            "xp": "preview.value.xp",
-            "level": "preview.value.level",
-            "settlement": "preview.value.city",
-            "settlement_level": "preview.value.level",
-            "settlement_tier_name": "preview.value.settlement_tier",
-            "nobility": "preview.value.nobility",
-            "children": "preview.value.children",
-            "marriage_status": "preview.value.marriage",
-            "turnover_tax": "preview.value.percent",
-            "church_tithe": "preview.value.percent",
-            "severity_of_law_name": "preview.value.law",
-        }.get(name, "preview.value.named")
-        return translate(key, locale=locale, name=name, number=1), None
+    def _named_value(
+        self,
+        token: str,
+        unit_key: str,
+        label: str,
+        file_rel: str,
+        target: bool,
+        references: tuple[object, ...] = (),
+    ) -> tuple[str, int | None]:
+        return self._placeholder_named_value(unit_key, label, file_rel, token, target, references)
+
+    def _placeholder_context(
+        self,
+        label: str,
+        file_rel: str,
+        target: bool,
+        references: tuple[object, ...] = (),
+    ) -> PlaceholderContext:
+        return PlaceholderContext(
+            label=label,
+            file_rel=file_rel,
+            target=target,
+            locale=self.locale(target),
+            references=references,
+        )
+
+    def _placeholder_builder(self) -> PlaceholderValueBuilder:
+        return PlaceholderValueBuilder(self.localization)
+
+    def _placeholder_argument_value(
+        self,
+        unit_key: str,
+        label: str,
+        file_rel: str,
+        number: int,
+        suffix: str,
+        target: bool,
+        references: tuple[object, ...] = (),
+    ) -> tuple[str, int | None]:
+        value = self._placeholder_builder().argument_value(
+            number,
+            suffix,
+            self._placeholder_context(label or unit_key, file_rel, target, references),
+        )
+        return value.text, value.glyph_id
+
+    def _placeholder_named_value(
+        self,
+        unit_key: str,
+        label: str,
+        file_rel: str,
+        token: str,
+        target: bool,
+        references: tuple[object, ...] = (),
+    ) -> tuple[str, int | None]:
+        value = self._placeholder_builder().named_value(
+            token,
+            self._placeholder_context(label or unit_key, file_rel, target, references),
+        )
+        return value.text, value.glyph_id
 
     def _localization_value(self, token: str, target: bool) -> str:
         label = token[2:]
@@ -555,16 +581,36 @@ class PreviewService:
         text: str,
         *,
         unit_key: str,
+        label: str = "",
         file_rel: str,
         kind: str,
         target: bool,
+        references: tuple[object, ...] = (),
     ) -> PreviewDocument:
-        key = (unit_key, file_rel, kind, target, text)
+        key = (unit_key, label, file_rel, kind, target, references, text)
         cached = self._render_cache.get(key)
         if cached is not None:
             return cached
         dialect = format_dialect(file_rel, kind)
-        compiler = _PreviewCompiler(self, unit_key, target, dialect)
+        profile = preview_profile(dialect)
+        blocker = profile.blocker(text)
+        if blocker is not None:
+            error = translate("preview.error.guide_quote", locale=self.locale(target))
+            document = PreviewDocument.from_atoms(
+                error,
+                [PreviewAtom(error, 0, len(text), replacement=False, final_style=True)] if text else [],
+            )
+            document = PreviewDocument(
+                document.raw_text,
+                document.atoms,
+                document.display_text,
+                document.spans,
+                document.display_to_raw,
+                profile.line_height_percent,
+            )
+            self._render_cache[key] = document
+            return document
+        compiler = _PreviewCompiler(self, unit_key, label, file_rel, target, dialect, references, profile)
         document = compiler.compile(text)
         if len(self._render_cache) >= 2048:
             self._render_cache.clear()
@@ -600,6 +646,9 @@ class PreviewService:
         return path.parent if path.is_file() else path
 
     def ui_image(self, name: str) -> QImage | None:
+        key = name.replace("\\", "/").casefold()
+        if key in self._ui_image_cache:
+            return self._ui_image_cache[key]
         if self._ui_atlas is None:
             root = self._configured_directory(self.ui_assets_dir)
             if root is None and self.game_root is not None:
@@ -607,7 +656,25 @@ class PreviewService:
             if root is None or not (root / "Sets.dat").is_file():
                 return None
             self._ui_atlas = GameUiAtlas(root)
-        return self._ui_atlas.image(name)
+        image = self._ui_atlas.image(name)
+        if image is not None and not image.isNull():
+            self._ui_image_cache[key] = image
+            return image
+        root = self._configured_directory(self.ui_assets_dir)
+        if root is None and self.game_root is not None:
+            root = self.game_root / "Textures" / "Hud"
+        if root is None:
+            return None
+        direct = root / name
+        if not direct.is_file():
+            direct = next((path for path in root.rglob(name) if path.is_file()), direct)
+        if direct.is_file() and direct.suffix.casefold() not in {".dds"}:
+            direct_image = QImage(str(direct))
+            if not direct_image.isNull():
+                self._ui_image_cache[key] = direct_image
+                return direct_image
+        self._ui_image_cache[key] = None
+        return None
 
     def game_window_image(
         self,
@@ -615,47 +682,80 @@ class PreviewService:
         body: PreviewDocument | None,
         *,
         target: bool,
+        context: PreviewWindowContext | None = None,
+        buttons: tuple[PreviewDocument, ...] = (),
     ) -> QImage:
-        background = next(
-            (
-                image
-                for name in ("mbback0.tga", "MessagePerga.tga", "Pamphlet.tga")
-                if (image := self.ui_image(name)) is not None and not image.isNull()
-            ),
-            None,
-        )
+        background = self._game_window_background(context)
         if background is None or background.isNull():
-            canvas = QImage(344, 344, QImage.Format.Format_ARGB32_Premultiplied)
-            canvas.fill(QColor("#d8bd83"))
+            canvas = QImage(
+                360 if context is not None and context.background == "dark_panel" else 344,
+                128 if context is not None and context.background == "dark_panel" else 344,
+                QImage.Format.Format_ARGB32_Premultiplied,
+            )
+            canvas.fill(QColor("#3b3631" if context is not None and context.background == "dark_panel" else "#d8bd83"))
         else:
             canvas = background.convertToFormat(QImage.Format.Format_ARGB32_Premultiplied)
         painter = QPainter(canvas)
         painter.setRenderHint(QPainter.RenderHint.SmoothPixmapTransform, True)
-        top = 35
+        default_color = context.default_color if context is not None else (55, 38, 24, 255)
+        dark_panel = context is not None and context.background == "dark_panel"
+        top = 18 if dark_panel else 35
+        left_margin = 26 if dark_panel else 34
+        right_margin = 26 if dark_panel else 34
         if header is not None:
             top = self._draw_game_document(
                 painter,
                 header,
                 target=target,
                 top=top,
-                left=34,
-                right=canvas.width() - 34,
+                left=left_margin,
+                right=canvas.width() - right_margin,
                 scale=1.0,
                 centered=True,
+                default_color=default_color,
             ) + 12
         if body is not None:
-            self._draw_game_document(
+            top = self._draw_game_document(
                 painter,
                 body,
                 target=target,
                 top=top,
-                left=32,
-                right=canvas.width() - 32,
-                scale=0.85,
+                left=left_margin,
+                right=canvas.width() - right_margin,
+                scale=0.78 if dark_panel else 0.85,
                 centered=False,
+                default_color=default_color,
+            )
+        if buttons:
+            self._draw_game_buttons(
+                painter,
+                buttons,
+                target=target,
+                top=max(top + 10, canvas.height() - 34 * len(buttons) - 22),
+                default_color=(235, 225, 175, 255),
             )
         painter.end()
         return canvas
+
+    def _game_window_background(self, context: PreviewWindowContext | None) -> QImage | None:
+        if context is not None and context.background == "dark_panel":
+            image = self.ui_image("GrayBackground.tga")
+            if image is not None and not image.isNull():
+                return image.scaled(
+                    380,
+                    148,
+                    Qt.AspectRatioMode.IgnoreAspectRatio,
+                    Qt.TransformationMode.SmoothTransformation,
+                )
+        names = ("mbback0.tga", "MessagePerga.tga", "Pamphlet.tga")
+        return next(
+            (
+                image
+                for name in names
+                if (image := self.ui_image(name)) is not None and not image.isNull()
+            ),
+            None,
+        )
 
     def _draw_game_document(
         self,
@@ -668,6 +768,7 @@ class PreviewService:
         right: int,
         scale: float,
         centered: bool,
+        default_color: tuple[int, int, int, int] = (55, 38, 24, 255),
     ) -> int:
         atlas = self._atlas(target)
         if atlas is None:
@@ -696,7 +797,7 @@ class PreviewService:
                     if not append_image(image):
                         break
                 continue
-            color = QColor(*(atom.color or (55, 38, 24, 255)))
+            color = QColor(*(atom.color or default_color))
             for char in atom.text.replace(PREVIEW_MARK, ""):
                 if char == "\n":
                     if len(lines) >= max_lines:
@@ -727,6 +828,39 @@ class PreviewService:
                 x += image.width()
             y += line_height
         return y
+
+    def _draw_game_buttons(
+        self,
+        painter: QPainter,
+        buttons: tuple[PreviewDocument, ...],
+        *,
+        target: bool,
+        top: int,
+        default_color: tuple[int, int, int, int],
+    ) -> None:
+        if not buttons:
+            return
+        canvas_width = painter.device().width()
+        button_width = min(250, max(150, canvas_width - 92))
+        button_height = 28
+        x = (canvas_width - button_width) // 2
+        y = top
+        for button in buttons[:4]:
+            painter.fillRect(x, y, button_width, button_height, QColor(44, 72, 28, 230))
+            painter.setPen(QColor(180, 160, 80, 230))
+            painter.drawRect(x, y, button_width, button_height)
+            self._draw_game_document(
+                painter,
+                button,
+                target=target,
+                top=y + 3,
+                left=x + 10,
+                right=x + button_width - 10,
+                scale=0.72,
+                centered=True,
+                default_color=default_color,
+            )
+            y += button_height + 5
 
     def _game_codepoints(self, char: str, target: bool) -> tuple[int, ...]:
         return (ord(char),)
@@ -797,7 +931,7 @@ class PreviewService:
         for span in document.spans:
             atom = span.atom
             style: list[str] = []
-            if atom.replacement and atom.glyph_id is None and atom.text not in {"\n", "\t", PREVIEW_MARK}:
+            if atom.replacement and not atom.final_style and atom.glyph_id is None and atom.text not in {"\n", "\t", PREVIEW_MARK}:
                 style.append("text-decoration:underline")
             if atom.color is not None:
                 red, green, blue, alpha = atom.color
@@ -829,11 +963,25 @@ class PreviewService:
 
 
 class _PreviewCompiler:
-    def __init__(self, service: PreviewService, unit_key: str, target: bool, dialect: str) -> None:
+    def __init__(
+        self,
+        service: PreviewService,
+        unit_key: str,
+        label: str,
+        file_rel: str,
+        target: bool,
+        dialect: str,
+        references: tuple[object, ...] = (),
+        profile: PreviewProfile | None = None,
+    ) -> None:
         self.service = service
         self.unit_key = unit_key
+        self.label = label
+        self.file_rel = file_rel
         self.target = target
         self.dialect = dialect
+        self.references = references
+        self.profile = profile or preview_profile(dialect)
         self.atoms: list[PreviewAtom] = []
         self.color: tuple[int, int, int, int] | None = None
         self.guide_rgb = {"r": 60, "g": 60, "b": 60}
@@ -846,7 +994,15 @@ class _PreviewCompiler:
             self._compile_matches(text, TOOLTIP_TOKEN_RE, self._tooltip_token)
         else:
             self._compile_matches(text, GUILD2_TOKEN_RE, self._guild2_token)
-        return PreviewDocument.from_atoms(text, self.atoms)
+        document = PreviewDocument.from_atoms(text, self.atoms)
+        return PreviewDocument(
+            document.raw_text,
+            document.atoms,
+            document.display_text,
+            document.spans,
+            document.display_to_raw,
+            self.profile.line_height_percent,
+        )
 
     def _emit(
         self,
@@ -856,8 +1012,19 @@ class _PreviewCompiler:
         *,
         replacement: bool = False,
         glyph_id: int | None = None,
+        final_style: bool | None = None,
     ) -> None:
-        self.atoms.append(PreviewAtom(text, raw_start, raw_end, replacement, glyph_id, self.color))
+        self.atoms.append(
+            PreviewAtom(
+                text,
+                raw_start,
+                raw_end,
+                replacement,
+                glyph_id,
+                self.color,
+                self.profile.final_style if final_style is None else final_style,
+            )
+        )
 
     def _compile_matches(self, text: str, pattern: re.Pattern[str], handler) -> None:
         position = 0
@@ -871,17 +1038,49 @@ class _PreviewCompiler:
 
     def _guild2_token(self, token: str, start: int, end: int) -> None:
         if self.quote_re.fullmatch(token):
-            self._emit("「", start, start + 1, replacement=True)
+            self._emit(">", start, start + 1, replacement=True)
             inner_start = start + 1
             inner_end = end - 1
             if inner_start < inner_end:
-                self._emit(token[1:-1], inner_start, inner_end)
-            self._emit("」", end - 1, end, replacement=True)
+                nested = _PreviewCompiler(
+                    self.service,
+                    self.unit_key,
+                    self.label,
+                    self.file_rel,
+                    self.target,
+                    self.dialect,
+                    self.references,
+                    self.profile,
+                )
+                nested.color = self.color
+                nested_document = nested.compile(token[1:-1])
+                for atom in nested_document.atoms:
+                    self.atoms.append(
+                        PreviewAtom(
+                            atom.text,
+                            atom.raw_start + inner_start,
+                            atom.raw_end + inner_start,
+                            atom.replacement,
+                            atom.glyph_id,
+                            atom.color,
+                            atom.final_style,
+                        )
+                    )
+            self._emit("<", end - 1, end, replacement=True)
             return
         if token.startswith("$[") and token.endswith("$]"):
             self._emit(PREVIEW_MARK, start, start + 2, replacement=True)
             inner = token[2:-2]
-            nested = _PreviewCompiler(self.service, self.unit_key, self.target, FORMAT_GUILD2)
+            nested = _PreviewCompiler(
+                self.service,
+                self.unit_key,
+                self.label,
+                self.file_rel,
+                self.target,
+                FORMAT_GUILD2,
+                self.references,
+                preview_profile(FORMAT_GUILD2),
+            )
             nested.color = self.color
             nested_document = nested.compile(inner)
             for atom in nested_document.atoms:
@@ -893,6 +1092,7 @@ class _PreviewCompiler:
                         atom.replacement,
                         atom.glyph_id,
                         atom.color,
+                        atom.final_style,
                     )
                 )
             self._emit(PREVIEW_MARK, end - 2, end, replacement=True)
@@ -951,9 +1151,12 @@ class _PreviewCompiler:
                 return
             value, glyph_id = self.service._argument_value(
                 self.unit_key,
+                self.label,
+                self.file_rel,
                 number,
                 argument.group(2),
                 self.target,
+                self.references,
             )
             self._emit(value, start, end, replacement=True, glyph_id=glyph_id)
             return
@@ -971,6 +1174,20 @@ class _PreviewCompiler:
         if SYMBOL_PREVIEW_RE.fullmatch(token):
             self._guild2_token(token, start, end)
             return
+        argument = ARG_PREVIEW_RE.fullmatch(token)
+        if argument is not None:
+            number = int(argument.group(1))
+            value, glyph_id = self.service._argument_value(
+                self.unit_key,
+                self.label,
+                self.file_rel,
+                number,
+                argument.group(2),
+                self.target,
+                self.references,
+            )
+            self._emit(value, start, end, replacement=True, glyph_id=glyph_id)
+            return
         if token in {"%dyn_color%", "%officer_color:alderman%"}:
             self.color = (115, 5, 20, 255)
             self._emit(PREVIEW_MARK, start, end, replacement=True)
@@ -979,27 +1196,42 @@ class _PreviewCompiler:
             self.color = None
             self._emit(PREVIEW_MARK, start, end, replacement=True)
             return
-        value, glyph_id = self.service._named_value(token, self.unit_key, self.target)
+        value, glyph_id = self.service._named_value(
+            token,
+            self.unit_key,
+            self.label,
+            self.file_rel,
+            self.target,
+            self.references,
+        )
         self._emit(value, start, end, replacement=True, glyph_id=glyph_id)
 
     def _guide_token(self, token: str, start: int, end: int) -> None:
         lowered = token.casefold()
         if token.startswith("<"):
+            value = self.profile.guide_token_text(token)
+            self._emit(value if value is not None else PREVIEW_MARK, start, end, replacement=False)
+            return
+        if token.startswith("<"):
             if lowered.startswith("<separator"):
                 value = "\n────────\n"
-            elif lowered in {"</header>", "</text>", "</list>", "</table>"}:
-                value = "\n\n"
+            elif lowered == "</header>":
+                value = "  "
+            elif lowered == "</text>":
+                value = "\n"
+            elif lowered in {"</list>", "</table>"}:
+                value = PREVIEW_MARK
             elif lowered == "</row>":
                 value = "\n"
             elif lowered == "</cell>":
-                value = "\t"
+                value = " "
             elif lowered == "<item>":
                 value = "• "
             elif lowered == "</item>":
-                value = "\n"
+                value = " "
             else:
                 value = PREVIEW_MARK
-            self._emit(value, start, end, replacement=True)
+            self._emit(value, start, end, replacement=False)
             return
         guide_value = GUIDE_VALUE_RE.fullmatch(token)
         if guide_value is not None:
@@ -1011,16 +1243,16 @@ class _PreviewCompiler:
                 self.guide_rgb["b"],
                 255,
             )
-            self._emit(PREVIEW_MARK, start, end, replacement=True)
+            self._emit(PREVIEW_MARK, start, end, replacement=False)
             return
         if token.startswith("{key:"):
             key = token[5:-1].replace("_", " ")
-            self._emit(key, start, end, replacement=True)
+            self._emit(key, start, end, replacement=False)
             return
         if token.startswith(("{autolist:", "{bullet_autolist:")):
             name = token[1:-1].split(":", 1)[1].replace("_", " ")
             locale = self.service.locale(self.target)
             value = translate("preview.value.dynamic_list", locale=locale, name=name)
-            self._emit(value, start, end, replacement=True)
+            self._emit(value, start, end, replacement=False)
             return
-        self._emit(PREVIEW_MARK, start, end, replacement=True)
+        self._emit(PREVIEW_MARK, start, end, replacement=False)

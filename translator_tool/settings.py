@@ -35,6 +35,7 @@ class AppSettings:
     preview_translation_font_dir: str = ""
     preview_ui_assets_dir: str = ""
     preview_game_font_in_editors: bool = False
+    preview_use_code_context: bool = True
     editor_zoom_steps: int = 0
     last_project_root: str = ""
     last_game_root: str = ""

@@ -20,7 +20,8 @@ from .ai import (
     TranslationProviderError,
 )
 from .cache import source_review_uids
-from .code_index import build_code_reference_index
+from .code_index import CodeReference, build_code_reference_index
+from .code_window_context import DARK_PANEL_TEXT, best_window_context
 from .codec_adapter import Guild2Codec, load_codec_for_language
 from .git_history import GitCommit, LanguageGit, TranslationLogEntry, combine_entries, format_entries
 from .history import OperationHistory, TranslationOperation, UnitChange
@@ -230,11 +231,12 @@ def assert_discover_game_source_projects_detects_vanilla_and_mods() -> None:
         safe_rmtree(temp)
 
 
-def assert_code_reference_index_scans_only_scripts_and_uses_vanilla_fallback() -> None:
+def assert_code_reference_index_avoids_db_and_uses_vanilla_fallback() -> None:
     temp = Path(tempfile.gettempdir()) / f"translator_tool_smoke_code_refs_{uuid.uuid4().hex[:8]}"
     try:
         game_root = temp / "game"
         (game_root / "Scripts").mkdir(parents=True, exist_ok=True)
+        (game_root / "GUI" / "Hud").mkdir(parents=True, exist_ok=True)
         (game_root / "DB" / "Languages").mkdir(parents=True, exist_ok=True)
         (game_root / "Scripts" / "Mission.lua").write_text(
             'MsgBox("Actor", nil, "@L_TRIAL_REMINDER_HEAD", "@L_TRIAL_REMINDER_BODY", var1)\n',
@@ -242,6 +244,22 @@ def assert_code_reference_index_scans_only_scripts_and_uses_vanilla_fallback() -
         )
         (game_root / "Scripts" / "Dynamic.lua").write_text(
             'MsgQuick("", "@L_DYNAMIC_BRANCH_+"..choice)\n',
+            encoding="utf-8",
+        )
+        (game_root / "Scripts" / "Multiline.lua").write_text(
+            "\n".join(
+                (
+                    'MsgBox("Actor",',
+                    '    helper("comma, inside"),',
+                    '    "@L_MULTILINE_HEAD_+0",',
+                    '    "@L_MULTILINE_BODY_+0",',
+                    '    GetID("Actor"))',
+                )
+            ),
+            encoding="utf-8",
+        )
+        (game_root / "GUI" / "Hud" / "Panel.gui").write_text(
+            'SetText("@L_GUI_ONLY_+0", citylabel)\n',
             encoding="utf-8",
         )
         (game_root / "DB" / "Languages" / "Text.dbt").write_text(
@@ -262,20 +280,84 @@ def assert_code_reference_index_scans_only_scripts_and_uses_vanilla_fallback() -
         underscore_refs = vanilla_index.references_for("_TRIAL_REMINDER_HEAD")
         if underscore_refs.project_count != 1 or underscore_refs.project[0].path.name != "Mission.lua":
             raise AssertionError("leading underscore label fallback was not indexed")
+        multiline_refs = vanilla_index.references_for("MULTILINE_BODY_+0")
+        if multiline_refs.project_count != 1:
+            raise AssertionError("multiline code reference was not indexed")
+        multiline = multiline_refs.project[0]
+        if multiline.call_name != "MsgBox" or multiline.argument_index != 3:
+            raise AssertionError(f"multiline call context was wrong: {multiline!r}")
+        if len(multiline.arguments) < 5 or multiline.arguments[4] != 'GetID("Actor")':
+            raise AssertionError(f"multiline argument expressions were not captured: {multiline.arguments!r}")
+        gui_refs = vanilla_index.references_for("GUI_ONLY_+0")
+        if gui_refs.project_count != 1 or gui_refs.project[0].path.suffix.casefold() != ".gui":
+            raise AssertionError("GUI code reference was not indexed")
 
         mod_project = temp / "sources" / "Reforged"
         mod_project.mkdir(parents=True, exist_ok=True)
         (game_root / "mods" / "Reforged" / "Scripts").mkdir(parents=True, exist_ok=True)
+        (game_root / "mods" / "Reforged" / "GUI").mkdir(parents=True, exist_ok=True)
         (game_root / "mods" / "Reforged" / "Scripts" / "Mod.lua").write_text(
             'MsgQuick("", "@L_MOD_ONLY_+0")\n',
+            encoding="utf-8",
+        )
+        (game_root / "mods" / "Reforged" / "GUI" / "ModPanel.gui").write_text(
+            'SetText("@L_MOD_GUI_ONLY_+0")\n',
             encoding="utf-8",
         )
         mod_index = build_code_reference_index(game_root, mod_project)
         if mod_index.references_for("MOD_ONLY_+0").project_count != 1:
             raise AssertionError("mod code reference was not indexed from mod Scripts")
+        if mod_index.references_for("MOD_GUI_ONLY_+0").project_count != 1:
+            raise AssertionError("mod code reference was not indexed from mod GUI")
         fallback = mod_index.references_for("TRIAL_REMINDER_HEAD")
         if fallback.project_count != 0 or fallback.vanilla_count != 1:
             raise AssertionError("mod code reference index did not keep vanilla fallback")
+    finally:
+        safe_rmtree(temp)
+
+
+def assert_code_window_context_extracts_window_labels_and_buttons() -> None:
+    temp = Path(tempfile.gettempdir()) / f"translator_tool_smoke_code_window_{uuid.uuid4().hex[:8]}"
+    try:
+        game_root = temp / "game"
+        (game_root / "Scripts").mkdir(parents=True, exist_ok=True)
+        (game_root / "Scripts" / "Window.lua").write_text(
+            "\n".join(
+                (
+                    'MsgBox("","", "@P"..',
+                    '    "@B[1,@L_MEASURE_WUERDENTRAGEREMPFANGEN_ASK_+0]"..',
+                    '    "@B[2,@L_MEASURE_WUERDENTRAGEREMPFANGEN_ASK_+1]"..',
+                    '    "@B[3,@L_MEASURE_WUERDENTRAGEREMPFANGEN_ASK_+2]",',
+                    '    "@L_MEASURE_WUERDENTRAGEREMPFANGEN_HEAD_+0",',
+                    '    "@L_MEASURE_WUERDENTRAGEREMPFANGEN_BODY_+1",stimmung,ort)',
+                    'MsgQuick("", "@L_SHORT_NOTICE_+0", GetID("Owner"))',
+                )
+            ),
+            encoding="utf-8",
+        )
+        project_root = temp / "sources" / "Vanilla"
+        project_root.mkdir(parents=True, exist_ok=True)
+        index = build_code_reference_index(game_root, project_root)
+        refs = index.references_for("MEASURE_WUERDENTRAGEREMPFANGEN_BODY_+1").project
+        context = best_window_context(refs, "MEASURE_WUERDENTRAGEREMPFANGEN_BODY_+1")
+        if context is None:
+            raise AssertionError("code window context was not built for MsgBox")
+        if context.header_label != "measure_wuerdentragerempfangen_head_+0":
+            raise AssertionError(f"wrong header label from MsgBox context: {context!r}")
+        if context.body_label != "measure_wuerdentragerempfangen_body_+1":
+            raise AssertionError(f"wrong body label from MsgBox context: {context!r}")
+        if tuple(button.label for button in context.buttons) != (
+            "measure_wuerdentragerempfangen_ask_+0",
+            "measure_wuerdentragerempfangen_ask_+1",
+            "measure_wuerdentragerempfangen_ask_+2",
+        ):
+            raise AssertionError(f"button labels were not extracted from @B tokens: {context.buttons!r}")
+        short_refs = index.references_for("SHORT_NOTICE_+0").project
+        short_context = best_window_context(short_refs, "SHORT_NOTICE_+0")
+        if short_context is None or short_context.background != "dark_panel":
+            raise AssertionError(f"MsgQuick should use the dark panel preview profile: {short_context!r}")
+        if short_context.default_color != DARK_PANEL_TEXT:
+            raise AssertionError(f"dark panel default text color should be white: {short_context!r}")
     finally:
         safe_rmtree(temp)
 
@@ -1251,6 +1333,22 @@ def assert_guild2_format_grammar() -> None:
     )
     if not any(issue.code in {"format-missing", "format-extra"} for issue in guide_tip):
         raise AssertionError("guide tip tags should remain case-sensitive and spacing-sensitive in txt files")
+    guide_quote = validate_translation(
+        "<text>Safe</text>",
+        '<text>"Crash risk"</text>',
+        dbt_field=False,
+        dialect=FORMAT_GUIDE,
+    )
+    if not any(issue.code == "guide-quote" for issue in guide_quote):
+        raise AssertionError("plain double quotes in Guide text should be warned as a crash risk")
+    guide_attr_quote = validate_translation(
+        '<list>[type="bullet"]<item>Safe</item></list>',
+        '<list>[type="bullet"]<item>Safe</item></list>',
+        dbt_field=False,
+        dialect=FORMAT_GUIDE,
+    )
+    if any(issue.code == "guide-quote" for issue in guide_attr_quote):
+        raise AssertionError("double quotes inside legal Guide attributes should not be warned")
     literal_percent = validate_translation(
         "Weak beer has 3-6% of alcohol and costs 50%.",
         "淡啤酒酒精度为 3-6%，价格是 50%。",
@@ -1372,6 +1470,14 @@ def assert_preview_i18n_and_symbol_mapping() -> None:
             '1 "_NAMES_ENGLISH_MALE_+0" "Jack" |\n'
             '2 "_NAMES_ENGLISH_SURNAMES_+0" "Smith" |\n'
             '3 "_PREVIEW_LABEL_+0" "Preview label" |\n'
+            '4 "_ITEM_RING_NAME_+0" "Ruby ring" |\n'
+            '5 "_BUILDING_Bakery_NAME_+0" "Bakery" |\n'
+            '6 "_BUILDING_Bakery_POOL_+0" "Bread & Butter" |\n'
+            '7 "_CHARACTERS_1_CLASSES_patron_NAME_+0" "Patron" |\n'
+            '8 "_CHARACTERS_1_CLASSES_patron_LEVEL_+0" "Worker" |\n'
+            '9 "_CHARACTERS_2_PROFESSIONS_baker_NAME_+0" "Baker" |\n'
+            '10 "_CHARACTERS_3_OFFICES_NAME_Mayor_+0" "Mayor" |\n'
+            '11 "_CHARACTERS_3_TITLES_NAME_+0" "Serf" |\n'
         )
         rows_target = (
             '1 "_NAMES_ENGLISH_MALE_+0" "杰克" |\n'
@@ -1389,10 +1495,164 @@ def assert_preview_i18n_and_symbol_mapping() -> None:
             raise AssertionError("the same preview identity was not localized independently on both sides")
         if "Preview label" not in source.display_text or "预览标签" not in target.display_text:
             raise AssertionError("@L localization preview did not use matching source and target labels")
+        label_seed_left = service.render(
+            "%1SN",
+            unit_key="left-uid",
+            label="SAME_PREVIEW_LABEL",
+            file_rel="Text.dbt",
+            kind="dbt",
+            target=True,
+        )
+        label_seed_right = service.render(
+            "%1SN",
+            unit_key="right-uid",
+            label="SAME_PREVIEW_LABEL",
+            file_rel="Text.dbt",
+            kind="dbt",
+            target=True,
+        )
+        if label_seed_left.display_text != label_seed_right.display_text:
+            raise AssertionError("placeholder preview should be seeded by label instead of uid")
         if not any(atom.glyph_id == 2012 and atom.text == GLYPH_MARK for atom in source.atoms):
             raise AssertionError("$S[2012] was not routed to the live glyph preview")
         if not any(atom.glyph_id == 2002 for atom in source.atoms):
             raise AssertionError("%2t did not preview the game's coin symbol")
+        strong_placeholders = service.render(
+            "%1GG | %2GN | %3GT | %4SK | %5ST | %6SA | %7SD | %8SB | %9SL | %10DN",
+            unit_key="same-entry",
+            label="STRONG_PLACEHOLDERS",
+            file_rel="Text.dbt",
+            kind="dbt",
+            target=False,
+        )
+        for snippet in ("Bread & Butter", "Bakery", "Patron", "Serf", "Mayor", "Baker", "Worker", "Smith"):
+            if snippet not in strong_placeholders.display_text:
+                raise AssertionError(f"strong placeholder preview did not sample DB text: {strong_placeholders.display_text!r}")
+
+        quoted_placeholder = service.render(
+            "with >%2l< and %1NAMEsuffix",
+            unit_key="same-entry",
+            label="QUOTED_PLACEHOLDER",
+            file_rel="Text.dbt",
+            kind="dbt",
+            target=False,
+        )
+        if "%2l" in quoted_placeholder.display_text or "%1NAME" in quoted_placeholder.display_text:
+            raise AssertionError("placeholders inside >...< or followed by plain text were left raw")
+        if ">" not in quoted_placeholder.display_text or "<" not in quoted_placeholder.display_text:
+            raise AssertionError(">...< fallback should keep visible angle markers")
+
+        semantic = service.render(
+            "%1SN >%2l< >%3l<",
+            unit_key="same-entry",
+            label="SEMANTIC_PLACEHOLDER",
+            file_rel="Text.dbt",
+            kind="dbt",
+            target=False,
+            references=(
+                CodeReference(
+                    "SEMANTIC_PLACEHOLDER",
+                    temp / "Scripts" / "Semantic.lua",
+                    1,
+                    1,
+                    "MsgBox",
+                    2,
+                    (
+                        '"Actor"',
+                        "nil",
+                        '"@L_SEMANTIC_PLACEHOLDER"',
+                        'GetID("Owner")',
+                        "citylabel",
+                        "ItemLabel[item1]",
+                    ),
+                ),
+            ),
+        )
+        if "Jack Smith" not in semantic.display_text or "London" not in semantic.display_text or "Ruby ring" not in semantic.display_text:
+            raise AssertionError(f"code-semantic placeholder preview did not use character/city/item fallbacks: {semantic.display_text!r}")
+        head_body_semantic = service.render(
+            "%1NAME",
+            unit_key="same-entry",
+            label="SEMANTIC_HEAD",
+            file_rel="Text.dbt",
+            kind="dbt",
+            target=False,
+            references=(
+                CodeReference(
+                    "SEMANTIC_HEAD",
+                    temp / "Scripts" / "HeadBody.lua",
+                    1,
+                    1,
+                    "MsgBoxNoWait",
+                    2,
+                    (
+                        '"Actor"',
+                        "false",
+                        '"@L_SEMANTIC_HEAD"',
+                        '"@L_SEMANTIC_BODY"',
+                        'GetID("Owner")',
+                    ),
+                ),
+            ),
+        )
+        if "Jack Smith" not in head_body_semantic.display_text:
+            raise AssertionError("head/body paired labels did not skip the body label when mapping placeholders")
+        suffix_priority = service.render(
+            "%1SA %1SN",
+            unit_key="same-entry",
+            label="SUFFIX_PRIORITY",
+            file_rel="Text.dbt",
+            kind="dbt",
+            target=False,
+            references=(
+                CodeReference(
+                    "SUFFIX_PRIORITY",
+                    temp / "Scripts" / "Office.lua",
+                    1,
+                    1,
+                    "MsgNews",
+                    1,
+                    ('"@L_SUFFIX_PRIORITY"', 'GetID("MrTorture")', 'GetID("Destination")'),
+                ),
+            ),
+        )
+        if "Jack Smith" not in suffix_priority.display_text or suffix_priority.display_text.startswith("Jack Smith "):
+            raise AssertionError("explicit suffix semantics should beat GetID-based code semantics")
+        name_city = service.render(
+            "%1NAME",
+            unit_key="same-entry",
+            label="NAME_CITY",
+            file_rel="Text.dbt",
+            kind="dbt",
+            target=False,
+            references=(
+                CodeReference(
+                    "NAME_CITY",
+                    temp / "Scripts" / "City.lua",
+                    1,
+                    1,
+                    "MsgNews",
+                    1,
+                    ('"@L_NAME_CITY"', 'GetID("Officer")', 'GetSettlementID("Officer")'),
+                ),
+            ),
+        )
+        if "London" not in name_city.display_text:
+            raise AssertionError("NAME should use settlement context instead of blindly treating GetID as a character")
+        weak_priority = service.render(
+            "%2l",
+            unit_key="same-entry",
+            label="WEAK_PRIORITY",
+            file_rel="Text.dbt",
+            kind="dbt",
+            target=False,
+            references=(
+                CodeReference("WEAK_PRIORITY", temp / "Scripts" / "Building.lua", 1, 1, "MsgQuick", 1, ('""', '"@L_WEAK_PRIORITY_+3"', 'GetID("")', 'GetID("WorkBuilding")')),
+                CodeReference("WEAK_PRIORITY", temp / "Scripts" / "Item.lua", 1, 1, "MsgQuick", 1, ('""', '"@L_WEAK_PRIORITY_+0"', 'GetID("")', 'ItemLabel[item1]')),
+            ),
+        )
+        if "Ruby ring" not in weak_priority.display_text:
+            raise AssertionError("weak label placeholders should prefer item semantics across fallback references")
 
         header = service.render(
             "$[Header text$]",
@@ -1419,7 +1679,7 @@ def assert_preview_i18n_and_symbol_mapping() -> None:
             raise AssertionError("Tooltips.dbt named macros did not produce a localized preview")
 
         guide = service.render(
-            "<header>Controls</header><text>{key:CURSOR_UP}</text>",
+            "<header>Controls</header><text>{key:CURSOR_UP}</text><list><item>First</item><item>Second</item></list><table><row><cell>A</cell><cell>B</cell></row></table>",
             unit_key="same-entry",
             file_rel="Guides/Controls.txt",
             kind="text",
@@ -1427,6 +1687,19 @@ def assert_preview_i18n_and_symbol_mapping() -> None:
         )
         if "CURSOR UP" not in guide.display_text or "<header>" in guide.display_text:
             raise AssertionError("Guide markup did not use the Guide preview dialect")
+        if "\n\n" in guide.display_text:
+            raise AssertionError(f"Guide preview spacing was too loose: {guide.display_text!r}")
+        if any(atom.replacement for atom in guide.atoms):
+            raise AssertionError("Guide preview should render as final style without placeholder underlines")
+        guide_crash = service.render(
+            '<text>"Crash risk"</text>',
+            unit_key="same-entry",
+            file_rel="Guides/Controls.txt",
+            kind="text",
+            target=False,
+        )
+        if "crash" not in guide_crash.display_text.casefold() or "Crash risk" in guide_crash.display_text:
+            raise AssertionError("Guide preview should be blocked by plain double quotes")
     finally:
         safe_rmtree(temp)
 
@@ -1788,7 +2061,8 @@ def main() -> int:
     assert_loaded_order_matches_file_lines(root)
     assert_local_project_roots_detect_sources_projects()
     assert_discover_game_source_projects_detects_vanilla_and_mods()
-    assert_code_reference_index_scans_only_scripts_and_uses_vanilla_fallback()
+    assert_code_reference_index_avoids_db_and_uses_vanilla_fallback()
+    assert_code_window_context_extracts_window_labels_and_buttons()
     assert_startup_prefers_local_sources_over_game_root()
     assert_sync_vanilla_sources_only_imports_originals()
     assert_sync_source_project_invalidates_changed_translations(root)
