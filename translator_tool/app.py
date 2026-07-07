@@ -3153,11 +3153,15 @@ class TranslatorWindow(QMainWindow):
             body_unit = unit
         button_units: list[TranslationUnit | str] = []
         for button in context.buttons:
-            candidate = self._unit_for_normalized_label(unit.file_rel, button.label)
+            candidate = unit if current_label == button.label else self._unit_for_normalized_label(unit.file_rel, button.label)
             if candidate is not None:
                 button_units.append(candidate)
             elif button.text:
                 button_units.append(button.text)
+        if header_unit is None and body_unit is None and not button_units:
+            header_unit, body_unit = self._paired_preview_units(unit)
+        if header_unit is None and body_unit is None:
+            body_unit = unit
         return context, header_unit, body_unit, tuple(button_units)
 
     def _unit_for_normalized_label(self, file_rel: str, label: str) -> TranslationUnit | None:
