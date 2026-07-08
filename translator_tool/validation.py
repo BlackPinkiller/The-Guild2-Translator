@@ -102,7 +102,6 @@ GUILD2_TOKEN_RE = re.compile(
             NAME_SUFFIX_TOKEN,
             LOCALIZATION_TOKEN,
             INLINE_FALLBACK_TOKEN,
-            QUOTE_STYLE_TOKEN,
         ]
     )
 )

@@ -1503,6 +1503,9 @@ def assert_guild2_format_grammar() -> None:
     )
     if any(issue.code == "unknown-format" for issue in decorated_percent):
         raise AssertionError("literal percent wrappers around color markup produced false warnings")
+    quote_style_translation = validate_translation(">Invite< %1SN", ">邀请< %1SN", dbt_field=True)
+    if any(issue.code in {"format-missing", "format-extra", "unknown-format"} for issue in quote_style_translation):
+        raise AssertionError(">...< text decoration should not produce format-token warnings")
     glued_argument = validate_translation("%2NAMEwe confirm with this", "%2NAMEwe confirm with this", dbt_field=True)
     if any(issue.code == "unknown-format" for issue in glued_argument):
         raise AssertionError("argument placeholders glued to following text produced false unknown-format warnings")
