@@ -4,7 +4,16 @@ from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Iterable
 
-from .cache import ignored_uids, set_ignored_many, set_source_review_many, source_review_uids
+from .cache import (
+    confirmed_uids,
+    ignored_uids,
+    need_work_uids,
+    set_confirmed_many,
+    set_ignored_many,
+    set_need_work_many,
+    set_source_review_many,
+    source_review_uids,
+)
 from .codec_adapter import CodecError, Guild2Codec, load_codec_for_language
 from .format_io import (
     DbtDocument,
@@ -36,7 +45,8 @@ TODO_REASON_EMPTY = "empty"
 TODO_REASON_SAME_AS_SOURCE = "same_as_source"
 TODO_REASON_SOURCE_CHANGED = "source_changed"
 TODO_REASON_IMPORT_REVIEW = "import_review"
-MANUAL_REVIEW_REASONS = {TODO_REASON_SOURCE_CHANGED, TODO_REASON_IMPORT_REVIEW}
+TODO_REASON_MANUAL_REVIEW = "manual_review"
+MANUAL_REVIEW_REASONS = {TODO_REASON_SOURCE_CHANGED, TODO_REASON_IMPORT_REVIEW, TODO_REASON_MANUAL_REVIEW}
 MISSING_WORK_STATUSES = {STATUS_TODO}
 # Temporary compatibility aliases while the UI and tests finish migrating to
 # the simplified status model.
@@ -102,6 +112,7 @@ class TranslationUnit:
     font_codec: Guild2Codec | None = field(default=None, repr=False)
     edited_text: str | None = None
     ignored: bool = False
+    confirmed: bool = False
     review_reason: str = TODO_REASON_NONE
     pending_delete: bool = False
 
@@ -148,12 +159,14 @@ class TranslationUnit:
     def todo_reason(self) -> str:
         if self.is_ignored or self.is_extra:
             return TODO_REASON_NONE
-        if self.review_reason:
-            return self.review_reason
         if not self.current_text:
             if self.ref.kind == "dbt" and self.ref.target_row is None and self.ref.suggested_row is None and not self.translate_text:
                 return TODO_REASON_MISSING_ROW
             return TODO_REASON_EMPTY
+        if self.confirmed:
+            return TODO_REASON_NONE
+        if self.review_reason:
+            return self.review_reason
         if self.current_text == self.source_text:
             return TODO_REASON_SAME_AS_SOURCE
         return TODO_REASON_NONE
@@ -310,11 +323,16 @@ class Project:
         )
 
         ignored = ignored_uids(root, language)
+        confirmed = confirmed_uids(root, language)
+        need_work = need_work_uids(root, language)
         source_review = source_review_uids(root, language)
         for unit in units:
             unit.ignored = unit.uid in ignored
+            unit.confirmed = unit.uid in confirmed
             if unit.uid in source_review:
                 unit.review_reason = TODO_REASON_SOURCE_CHANGED
+            elif unit.uid in need_work:
+                unit.review_reason = TODO_REASON_MANUAL_REVIEW
 
         unit_index = {unit.uid: unit for unit in units}
         insertion_anchors = {
@@ -368,18 +386,67 @@ class Project:
         selected = tuple(units)
         for unit in selected:
             unit.ignored = ignored
+            if ignored:
+                unit.confirmed = False
+                if unit.review_reason == TODO_REASON_MANUAL_REVIEW:
+                    unit.review_reason = TODO_REASON_NONE
+                unit.pending_delete = False
         if selected:
             set_ignored_many(self.root, self.language, tuple(unit.uid for unit in selected), ignored)
+            if ignored:
+                set_confirmed_many(self.root, self.language, tuple(unit.uid for unit in selected), False)
+                set_need_work_many(self.root, self.language, tuple(unit.uid for unit in selected), False)
 
     def set_units_source_review(self, units: Iterable[TranslationUnit], source_changed: bool) -> None:
         selected = tuple(units)
         for unit in selected:
             if source_changed:
                 unit.review_reason = TODO_REASON_SOURCE_CHANGED
+                unit.confirmed = False
+                unit.ignored = False
             elif unit.review_reason == TODO_REASON_SOURCE_CHANGED:
                 unit.review_reason = TODO_REASON_NONE
         if selected:
             set_source_review_many(self.root, self.language, tuple(unit.uid for unit in selected), source_changed)
+            if source_changed:
+                set_confirmed_many(self.root, self.language, tuple(unit.uid for unit in selected), False)
+                set_need_work_many(self.root, self.language, tuple(unit.uid for unit in selected), False)
+                set_ignored_many(self.root, self.language, tuple(unit.uid for unit in selected), False)
+
+    def set_units_need_work(self, units: Iterable[TranslationUnit], need_work: bool) -> None:
+        selected = tuple(units)
+        for unit in selected:
+            if need_work:
+                unit.review_reason = TODO_REASON_MANUAL_REVIEW
+                unit.confirmed = False
+                unit.ignored = False
+                unit.pending_delete = False
+            elif unit.review_reason == TODO_REASON_MANUAL_REVIEW:
+                unit.review_reason = TODO_REASON_NONE
+        if selected:
+            uids = tuple(unit.uid for unit in selected)
+            set_need_work_many(self.root, self.language, uids, need_work)
+            if need_work:
+                set_confirmed_many(self.root, self.language, uids, False)
+                set_ignored_many(self.root, self.language, uids, False)
+                set_source_review_many(self.root, self.language, uids, False)
+
+    def set_units_confirmed(self, units: Iterable[TranslationUnit], confirmed: bool) -> None:
+        selected = tuple(units)
+        for unit in selected:
+            unit.confirmed = confirmed
+            if confirmed:
+                unit.ignored = False
+                unit.pending_delete = False
+                if unit.review_reason in {TODO_REASON_SOURCE_CHANGED, TODO_REASON_MANUAL_REVIEW}:
+                    unit.review_reason = TODO_REASON_NONE
+        if selected:
+            uids = tuple(unit.uid for unit in selected)
+            set_confirmed_many(self.root, self.language, uids, confirmed)
+            if confirmed:
+                set_ignored_many(self.root, self.language, uids, False)
+                set_need_work_many(self.root, self.language, uids, False)
+                set_source_review_many(self.root, self.language, uids, False)
 
     def save(
         self, units: Iterable[TranslationUnit] | None = None, *, auto_space_before_color_tokens: bool = False

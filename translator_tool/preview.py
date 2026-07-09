@@ -4,6 +4,7 @@ from dataclasses import dataclass
 import base64
 import hashlib
 import html
+import math
 from pathlib import Path
 import re
 import struct
@@ -121,6 +122,56 @@ class PreviewDocument:
 
     def display_range(self, raw_start: int, raw_end: int) -> tuple[int, int]:
         return self.display_position(raw_start), self.display_position(raw_end)
+
+
+@dataclass(frozen=True)
+class GameWindowLayout:
+    width: int
+    height: int
+    top: int
+    left_margin: int
+    right_margin: int
+    body_scale: float
+
+
+def _document_text(document: PreviewDocument | None) -> str:
+    if document is None:
+        return ""
+    return document.display_text.replace(PREVIEW_MARK, "").replace(GLYPH_MARK, "##")
+
+
+def _line_visual_units(line: str) -> float:
+    total = 0.0
+    for char in line:
+        if unicodedata.east_asian_width(char) in {"F", "W"}:
+            total += 2.0
+        else:
+            total += 1.0
+    return total
+
+
+def _document_visual_units(document: PreviewDocument | None) -> float:
+    return sum(_line_visual_units(line) for line in (_document_text(document).splitlines() or [""]))
+
+
+def _estimated_document_lines(document: PreviewDocument, columns: int) -> int:
+    columns = max(1, columns)
+    lines = _document_text(document).splitlines() or [""]
+    return sum(max(1, math.ceil(_line_visual_units(line) / columns)) for line in lines)
+
+
+def _estimated_button_height(document: PreviewDocument, button_width: int) -> int:
+    columns = max(8, round((button_width - 20) / 13))
+    line_height = max(12, round(25 * 0.72))
+    return max(36, _estimated_document_lines(document, columns) * line_height + 18)
+
+
+def _estimated_buttons_height(buttons: tuple[PreviewDocument, ...], canvas_width: int) -> int:
+    if not buttons:
+        return 0
+    button_width = min(250, max(150, canvas_width - 92))
+    heights = [_estimated_button_height(button, button_width) for button in buttons]
+    return sum(heights) + max(0, len(heights) - 1) * 6
 
 
 @dataclass(frozen=True)
@@ -687,11 +738,12 @@ class PreviewService:
         context: PreviewWindowContext | None = None,
         buttons: tuple[PreviewDocument, ...] = (),
     ) -> QImage:
-        background = self._game_window_background(context)
+        layout = self._game_window_layout(context, header, body, buttons)
+        background = self._game_window_background(context, layout.width, layout.height)
         if background is None or background.isNull():
             canvas = QImage(
-                360 if context is not None and context.background == "dark_panel" else 344,
-                128 if context is not None and context.background == "dark_panel" else 344,
+                layout.width,
+                layout.height,
                 QImage.Format.Format_ARGB32_Premultiplied,
             )
             canvas.fill(QColor("#3b3631" if context is not None and context.background == "dark_panel" else "#d8bd83"))
@@ -700,10 +752,9 @@ class PreviewService:
         painter = QPainter(canvas)
         painter.setRenderHint(QPainter.RenderHint.SmoothPixmapTransform, True)
         default_color = context.default_color if context is not None else (55, 38, 24, 255)
-        dark_panel = context is not None and context.background == "dark_panel"
-        top = 18 if dark_panel else 35
-        left_margin = 26 if dark_panel else 34
-        right_margin = 26 if dark_panel else 34
+        top = layout.top
+        left_margin = layout.left_margin
+        right_margin = layout.right_margin
         if header is not None:
             top = self._draw_game_document(
                 painter,
@@ -724,39 +775,101 @@ class PreviewService:
                 top=top,
                 left=left_margin,
                 right=canvas.width() - right_margin,
-                scale=0.78 if dark_panel else 0.85,
+                scale=layout.body_scale,
                 centered=False,
                 default_color=default_color,
             )
         if buttons:
+            button_block_height = _estimated_buttons_height(buttons, canvas.width())
             self._draw_game_buttons(
                 painter,
                 buttons,
                 target=target,
-                top=max(top + 10, canvas.height() - 42 * len(buttons) - 22),
+                top=max(top + 10, canvas.height() - button_block_height - 22),
                 default_color=(235, 225, 175, 255),
             )
         painter.end()
         return canvas
 
-    def _game_window_background(self, context: PreviewWindowContext | None) -> QImage | None:
+    def _game_window_layout(
+        self,
+        context: PreviewWindowContext | None,
+        header: PreviewDocument | None,
+        body: PreviewDocument | None,
+        buttons: tuple[PreviewDocument, ...],
+    ) -> GameWindowLayout:
+        dark_panel = context is not None and context.background == "dark_panel"
+        candidates = (
+            ((380, 148), (440, 280), (520, 430))
+            if dark_panel
+            else ((344, 240), (380, 344), (460, 520))
+        )
+        minimum_index = 0
+        if len(buttons) >= 4:
+            minimum_index = 2
+        elif len(buttons) >= 2:
+            minimum_index = 1
+        if _document_visual_units(header) + _document_visual_units(body) >= 220:
+            minimum_index = max(minimum_index, 2)
+
+        top = 18 if dark_panel else 30
+        left_margin = 26 if dark_panel else 34
+        right_margin = 26 if dark_panel else 34
+        body_scale = 0.78 if dark_panel else 0.85
+        body_line_height = max(12, round(25 * body_scale))
+        header_line_height = 25
+        button_gap = 6
+
+        for index, (width, height) in enumerate(candidates):
+            usable_width = max(90, width - left_margin - right_margin)
+            text_columns = max(8, round(usable_width / 13))
+            button_width = min(250, max(150, width - 92))
+            needed = top + 24
+            if header is not None:
+                needed += _estimated_document_lines(header, text_columns) * header_line_height + 12
+            if body is not None:
+                needed += _estimated_document_lines(body, text_columns) * body_line_height
+            if buttons:
+                needed += 10 + sum(_estimated_button_height(button, button_width) for button in buttons)
+                needed += max(0, len(buttons) - 1) * button_gap
+            if index >= minimum_index and needed <= height:
+                return GameWindowLayout(width, height, top, left_margin, right_margin, body_scale)
+
+        width, height = candidates[-1]
+        return GameWindowLayout(width, height, top, left_margin, right_margin, body_scale)
+
+    def _game_window_background(self, context: PreviewWindowContext | None, width: int, height: int) -> QImage | None:
         if context is not None and context.background == "dark_panel":
             image = self.ui_image("GrayBackground.tga")
             if image is not None and not image.isNull():
                 return image.scaled(
-                    380,
-                    148,
+                    width,
+                    height,
                     Qt.AspectRatioMode.IgnoreAspectRatio,
                     Qt.TransformationMode.SmoothTransformation,
                 )
         names = ("mbback0.tga", "MessagePerga.tga", "Pamphlet.tga")
-        return next(
-            (
-                image
-                for name in names
-                if (image := self.ui_image(name)) is not None and not image.isNull()
+        images = tuple(
+            image
+            for name in names
+            if (image := self.ui_image(name)) is not None and not image.isNull()
+        )
+        if not images:
+            return None
+        target_area = width * height
+        target_aspect = width / max(1, height)
+        source = min(
+            images,
+            key=lambda image: (
+                abs(image.width() * image.height() - target_area),
+                abs(image.width() / max(1, image.height()) - target_aspect),
             ),
-            None,
+        )
+        return source.scaled(
+            width,
+            height,
+            Qt.AspectRatioMode.IgnoreAspectRatio,
+            Qt.TransformationMode.SmoothTransformation,
         )
 
     def _draw_game_document(
@@ -868,10 +981,10 @@ class PreviewService:
             return
         canvas_width = painter.device().width()
         button_width = min(250, max(150, canvas_width - 92))
-        button_height = 36
         x = (canvas_width - button_width) // 2
         y = top
         for button in buttons:
+            button_height = _estimated_button_height(button, button_width)
             if not self._draw_game_button_background(painter, QRect(x, y, button_width, button_height)):
                 painter.fillRect(x, y, button_width, button_height, QColor(44, 72, 28, 230))
                 painter.setPen(QColor(180, 160, 80, 230))

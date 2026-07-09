@@ -35,21 +35,28 @@ def save_cache(root: Path, cache: dict[str, Any]) -> None:
 
 
 def ignored_uids(root: Path, language: str) -> set[str]:
-    cache = load_cache(root)
-    language_data = cache.get("languages", {}).get(language, {})
-    ignored = language_data.get("ignored", []) if isinstance(language_data, dict) else []
-    if not isinstance(ignored, list):
-        return set()
-    return {str(item) for item in ignored}
+    return _uid_set(root, language, "ignored")
 
 
 def source_review_uids(root: Path, language: str) -> set[str]:
+    return _uid_set(root, language, "source_review")
+
+
+def need_work_uids(root: Path, language: str) -> set[str]:
+    return _uid_set(root, language, "need_work")
+
+
+def confirmed_uids(root: Path, language: str) -> set[str]:
+    return _uid_set(root, language, "confirmed")
+
+
+def _uid_set(root: Path, language: str, key: str) -> set[str]:
     cache = load_cache(root)
     language_data = cache.get("languages", {}).get(language, {})
-    review = language_data.get("source_review", []) if isinstance(language_data, dict) else []
-    if not isinstance(review, list):
+    values = language_data.get(key, []) if isinstance(language_data, dict) else []
+    if not isinstance(values, list):
         return set()
-    return {str(item) for item in review}
+    return {str(item) for item in values}
 
 
 def set_ignored(root: Path, language: str, uid: str, ignored: bool) -> None:
@@ -57,22 +64,7 @@ def set_ignored(root: Path, language: str, uid: str, ignored: bool) -> None:
 
 
 def set_ignored_many(root: Path, language: str, uids: list[str] | tuple[str, ...], ignored: bool) -> None:
-    cache = load_cache(root)
-    languages = cache.setdefault("languages", {})
-    language_data = languages.setdefault(language, {})
-    if not isinstance(language_data, dict):
-        language_data = {}
-        languages[language] = language_data
-    current = language_data.get("ignored", [])
-    if not isinstance(current, list):
-        current = []
-    values = {str(item) for item in current}
-    if ignored:
-        values.update(str(uid) for uid in uids)
-    else:
-        values.difference_update(str(uid) for uid in uids)
-    language_data["ignored"] = sorted(values)
-    save_cache(root, cache)
+    _set_uid_set_many(root, language, "ignored", uids, ignored)
 
 
 def set_source_review(root: Path, language: str, uid: str, review: bool) -> None:
@@ -80,19 +72,31 @@ def set_source_review(root: Path, language: str, uid: str, review: bool) -> None
 
 
 def set_source_review_many(root: Path, language: str, uids: list[str] | tuple[str, ...], review: bool) -> None:
+    _set_uid_set_many(root, language, "source_review", uids, review)
+
+
+def set_need_work_many(root: Path, language: str, uids: list[str] | tuple[str, ...], need_work: bool) -> None:
+    _set_uid_set_many(root, language, "need_work", uids, need_work)
+
+
+def set_confirmed_many(root: Path, language: str, uids: list[str] | tuple[str, ...], confirmed: bool) -> None:
+    _set_uid_set_many(root, language, "confirmed", uids, confirmed)
+
+
+def _set_uid_set_many(root: Path, language: str, key: str, uids: list[str] | tuple[str, ...], enabled: bool) -> None:
     cache = load_cache(root)
     languages = cache.setdefault("languages", {})
     language_data = languages.setdefault(language, {})
     if not isinstance(language_data, dict):
         language_data = {}
         languages[language] = language_data
-    current = language_data.get("source_review", [])
+    current = language_data.get(key, [])
     if not isinstance(current, list):
         current = []
     values = {str(item) for item in current}
-    if review:
+    if enabled:
         values.update(str(uid) for uid in uids)
     else:
         values.difference_update(str(uid) for uid in uids)
-    language_data["source_review"] = sorted(values)
+    language_data[key] = sorted(values)
     save_cache(root, cache)

@@ -19,9 +19,9 @@ from .ai import (
     OpenAICompatibleProvider,
     TranslationProviderError,
 )
-from .cache import source_review_uids
+from .cache import confirmed_uids, need_work_uids, source_review_uids
 from .code_index import CodeReference, build_code_reference_index
-from .code_window_context import DARK_PANEL_TEXT, best_window_context
+from .code_window_context import DARK_PANEL_TEXT, PreviewWindowContext, best_window_context
 from .codec_adapter import Guild2Codec, load_codec_for_language
 from .git_history import GitCommit, LanguageGit, TranslationLogEntry, combine_entries, format_entries
 from .history import OperationHistory, TranslationOperation, UnitChange
@@ -38,8 +38,12 @@ from .project import (
     STATUS_TRANSLATED,
     TODO_REASON_EMPTY,
     TODO_REASON_IMPORT_REVIEW,
+    TODO_REASON_MANUAL_REVIEW,
     TODO_REASON_MISSING_ROW,
+    TODO_REASON_SAME_AS_SOURCE,
     TODO_REASON_SOURCE_CHANGED,
+    TranslationUnit,
+    UnitRef,
 )
 from .settings import AppSettings, load_settings, save_settings
 from .source_sync import (
@@ -485,6 +489,28 @@ def assert_game_preview_draws_all_buttons() -> None:
     service.game_window_image(None, None, target=False, buttons=buttons)
     if drawn != [button.display_text for button in buttons]:
         raise AssertionError(f"game preview should draw every button without truncation: {drawn!r}")
+    layout_service = PreviewService()
+    layout_service._draw_game_document = fake_draw_document  # type: ignore[method-assign]
+    layout_service._draw_game_button_background = lambda _painter, _rect: True  # type: ignore[method-assign]
+    compact = layout_service.game_window_image(
+        None,
+        PreviewDocument.from_atoms("Hi", [PreviewAtom("Hi", 0, 2)]),
+        target=False,
+    )
+    if compact.width() != 344 or compact.height() != 240:
+        raise AssertionError(f"short parchment previews should use the compact layout: {compact.size()!r}")
+    dialogue = layout_service.game_window_image(
+        None,
+        None,
+        target=False,
+        context=PreviewWindowContext("short", "dark_panel", DARK_PANEL_TEXT),
+        buttons=tuple(
+            PreviewDocument.from_atoms(f"Choice {index}", [PreviewAtom(f"Choice {index}", 0, 8)])
+            for index in range(4)
+        ),
+    )
+    if dialogue.width() != 520 or dialogue.height() != 430:
+        raise AssertionError(f"dialogue previews with many choices should use the large layout: {dialogue.size()!r}")
 
 
 def assert_onscreen_help_preview_pairs_name_and_description() -> None:
@@ -500,6 +526,31 @@ def assert_onscreen_help_preview_pairs_name_and_description() -> None:
     tooltip_head, tooltip_body = TranslatorWindow._paired_preview_units(window, tooltip)
     if tooltip_head is not None or tooltip_body is not tooltip:
         raise AssertionError("ONSCREENHELP TOOLTIP should not be paired into the help window body")
+
+
+def assert_name_tooltip_preview_pairs_title_and_body() -> None:
+    from .app import TranslatorWindow
+
+    name = SimpleNamespace(file_rel="Text.dbt", label="BUILDING_CityWall_NAME_+1")
+    tooltip = SimpleNamespace(file_rel="Text.dbt", label="_BUILDING_CityWall_TOOLTIP_+0")
+    window = SimpleNamespace(
+        model=SimpleNamespace(units=(name, tooltip)),
+        _code_references_for_unit=lambda _unit: (),
+    )
+    window._paired_preview_units = lambda unit: TranslatorWindow._paired_preview_units(window, unit)
+    paired_name, paired_tooltip = TranslatorWindow._paired_preview_units(window, name)
+    if paired_name is not name or paired_tooltip is not tooltip:
+        raise AssertionError("NAME should pair with the matching TOOLTIP body")
+    paired_name, paired_tooltip = TranslatorWindow._paired_preview_units(window, tooltip)
+    if paired_name is not name or paired_tooltip is not tooltip:
+        raise AssertionError("TOOLTIP should pair back to the matching NAME title")
+    context, header, body, buttons = TranslatorWindow._game_preview_parts(window, tooltip)
+    if context is None or context.kind != "tooltip" or context.background != "dark_panel":
+        raise AssertionError(f"NAME/TOOLTIP pairs should use the tooltip preview profile: {context!r}")
+    if context.default_color != DARK_PANEL_TEXT:
+        raise AssertionError(f"tooltip preview should use the dark panel text color: {context!r}")
+    if header is not name or body is not tooltip or buttons:
+        raise AssertionError("NAME/TOOLTIP preview parts were not assembled as title/body")
 
 
 def assert_sync_source_project_invalidates_changed_translations(root: Path) -> None:
@@ -566,6 +617,63 @@ def assert_source_review_cache(root: Path) -> None:
     if next(item for item in reloaded_again.units if item.uid == unit.uid).review_reason:
         raise AssertionError("source review flag was not removed from cache")
     safe_rmtree(temp)
+
+
+def assert_manual_status_cache() -> None:
+    temp = Path(tempfile.gettempdir()) / f"translator_tool_smoke_manual_status_{uuid.uuid4().hex[:8]}"
+    try:
+        temp.mkdir(parents=True, exist_ok=False)
+        unit = TranslationUnit(
+            uid="unit:1",
+            file_rel="Text.dbt",
+            record_id="1",
+            label="_TEST_+0",
+            field_name="english",
+            source_text="Same text",
+            translate_text="Same text",
+            status=STATUS_TODO,
+            ref=UnitRef(kind="dbt", target_doc=SimpleNamespace(path=temp / "Text.dbt")),
+        )
+        project = Project(
+            root=temp,
+            languages_root=temp / "languages",
+            language="#chinese",
+            codec=None,
+            source_docs={},
+            source_text_docs={},
+            target_dbt_docs={},
+            target_text_docs={},
+            units=[unit],
+            source_order={},
+            unit_index={unit.uid: unit},
+            insertion_anchors={},
+        )
+        if unit.todo_reason != TODO_REASON_SAME_AS_SOURCE:
+            raise AssertionError("same-as-source fixture should start as untranslated")
+        project.set_units_confirmed((unit,), True)
+        if unit.filter_status() != STATUS_TRANSLATED or unit.todo_reason:
+            raise AssertionError("confirmed same-as-source translation should be treated as translated")
+        if unit.uid not in confirmed_uids(temp, "#chinese"):
+            raise AssertionError("confirmed translation flag was not persisted")
+        project.set_units_need_work((unit,), True)
+        if unit.review_reason != TODO_REASON_MANUAL_REVIEW or unit.filter_status() != STATUS_TODO:
+            raise AssertionError("manual need-work mark did not re-enter the TODO status")
+        if unit.uid not in need_work_uids(temp, "#chinese"):
+            raise AssertionError("manual need-work flag was not persisted")
+        if unit.uid in confirmed_uids(temp, "#chinese"):
+            raise AssertionError("manual need-work mark should clear confirmed state")
+        project.set_units_source_review((unit,), True)
+        if unit.review_reason != TODO_REASON_SOURCE_CHANGED:
+            raise AssertionError("source review should replace manual need-work reason")
+        if unit.uid in need_work_uids(temp, "#chinese"):
+            raise AssertionError("source review should clear manual need-work cache")
+        project.set_units_ignored((unit,), True)
+        if unit.filter_status() != STATUS_IGNORED:
+            raise AssertionError("ignored mark should still override manual status flags")
+        if unit.uid in confirmed_uids(temp, "#chinese") or unit.uid in need_work_uids(temp, "#chinese"):
+            raise AssertionError("ignored mark should clear confirmed and need-work caches")
+    finally:
+        safe_rmtree(temp)
 
 
 def assert_startup_prefers_local_sources_over_game_root() -> None:
@@ -2494,6 +2602,7 @@ def main() -> int:
     assert_code_preview_unit_lookup_accepts_leading_underscore_labels()
     assert_game_preview_draws_all_buttons()
     assert_onscreen_help_preview_pairs_name_and_description()
+    assert_name_tooltip_preview_pairs_title_and_body()
     assert_startup_prefers_local_sources_over_game_root()
     assert_sync_vanilla_sources_only_imports_originals()
     assert_sync_source_project_invalidates_changed_translations(root)
@@ -2520,6 +2629,7 @@ def main() -> int:
     assert_validation_warnings_do_not_block()
     assert_ignore_cache(root)
     assert_source_review_cache(root)
+    assert_manual_status_cache()
     assert_operation_history()
     assert_ai_token_protection()
     assert_linebreak_format_is_ignored()

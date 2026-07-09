@@ -89,6 +89,7 @@ from .project import (
     MISSING_WORK_STATUSES,
     Project,
     ProjectError,
+    TODO_REASON_MANUAL_REVIEW,
     TODO_REASON_SOURCE_CHANGED,
     STATUS_EXTRA,
     STATUS_IGNORED,
@@ -3158,9 +3159,10 @@ class TranslatorWindow(QMainWindow):
         context = best_window_context(self._code_references_for_unit(unit), unit.label)
         if context is None:
             header_unit, body_unit = self._paired_preview_units(unit)
-            if self._is_onscreen_help_label(unit.label):
+            is_onscreen_help = TranslatorWindow._is_onscreen_help_label(unit.label)
+            if is_onscreen_help or TranslatorWindow._is_name_tooltip_pair(header_unit, body_unit):
                 context = PreviewWindowContext(
-                    kind="onscreen_help",
+                    kind="onscreen_help" if is_onscreen_help else "tooltip",
                     background="dark_panel",
                     default_color=DARK_PANEL_TEXT,
                     header_label=normalize_label(header_unit.label) if header_unit is not None else "",
@@ -3254,6 +3256,29 @@ class TranslatorWindow(QMainWindow):
             if role == "tooltip":
                 return None, unit
             return paired["name"], paired["description"]
+        name_tooltip = re.match(r"^(.*?)(NAME|TOOLTIP)(_[+]\d+)?$", unit.label, re.IGNORECASE)
+        if name_tooltip is not None:
+            prefix, kind, suffix = name_tooltip.groups()
+            suffix = suffix or ""
+            tooltip = TranslatorWindow._preview_unit_for_labels(
+                self.model.units,
+                unit.file_rel,
+                (f"{prefix}TOOLTIP_+0", f"{prefix}TOOLTIP{suffix}"),
+            )
+            name = TranslatorWindow._preview_unit_for_labels(
+                self.model.units,
+                unit.file_rel,
+                (f"{prefix}NAME{suffix}", f"{prefix}NAME_+0", f"{prefix}NAME_+1"),
+            )
+            if name is None:
+                name = TranslatorWindow._preview_unit_for_role(self.model.units, unit.file_rel, prefix, "NAME")
+            role = kind.casefold()
+            if role == "name":
+                name = unit
+            elif role == "tooltip":
+                tooltip = unit
+            if name is not None and tooltip is not None:
+                return name, tooltip
         match = re.match(r"^(.*?)(HEAD|BODY)(_[+]\d+)?$", unit.label, re.IGNORECASE)
         if match is None:
             return None, unit
@@ -3274,6 +3299,51 @@ class TranslatorWindow(QMainWindow):
                     paired[role] = candidate
         paired[kind.casefold()] = unit
         return paired["head"], paired["body"]
+
+    @staticmethod
+    def _preview_unit_for_labels(
+        units: Iterable[TranslationUnit],
+        file_rel: str,
+        labels: tuple[str, ...],
+    ) -> TranslationUnit | None:
+        keys = {TranslatorWindow._preview_label_key(label) for label in labels if label}
+        for candidate in units:
+            if candidate.file_rel == file_rel and TranslatorWindow._preview_label_key(candidate.label) in keys:
+                return candidate
+        return None
+
+    @staticmethod
+    def _preview_unit_for_role(
+        units: Iterable[TranslationUnit],
+        file_rel: str,
+        prefix: str,
+        role: str,
+    ) -> TranslationUnit | None:
+        prefix_key = TranslatorWindow._preview_label_key(prefix)
+        role_value = role.casefold()
+        for candidate in units:
+            if candidate.file_rel != file_rel:
+                continue
+            match = re.match(r"^(.*?)(NAME|TOOLTIP)(_[+]\d+)?$", candidate.label, re.IGNORECASE)
+            if match is None:
+                continue
+            candidate_prefix, candidate_role, _ = match.groups()
+            if candidate_role.casefold() == role_value and TranslatorWindow._preview_label_key(candidate_prefix) == prefix_key:
+                return candidate
+        return None
+
+    @staticmethod
+    def _preview_label_key(label: str) -> str:
+        return normalize_label(label).lstrip("_")
+
+    @staticmethod
+    def _is_name_tooltip_pair(header_unit: TranslationUnit | None, body_unit: TranslationUnit | None) -> bool:
+        if header_unit is None or body_unit is None:
+            return False
+        return bool(
+            re.match(r"^.*NAME(_[+]\d+)?$", header_unit.label, re.IGNORECASE)
+            and re.match(r"^.*TOOLTIP(_[+]\d+)?$", body_unit.label, re.IGNORECASE)
+        )
 
     @staticmethod
     def _is_onscreen_help_label(label: str) -> bool:
@@ -4047,7 +4117,10 @@ class TranslatorWindow(QMainWindow):
                 self.typing_before = unit.current_text
                 self.typing_before_deleted = unit.pending_delete
         before_status = unit.filter_status()
+        was_confirmed = unit.confirmed and text != unit.current_text
         unit.set_text(text)
+        if was_confirmed and self.project is not None:
+            self.project.set_units_confirmed((unit,), False)
         self.model.refresh_unit(unit)
         self._update_recent_translation_marker(unit, before_status)
         self._update_issue_detail(unit)
@@ -4079,7 +4152,10 @@ class TranslatorWindow(QMainWindow):
         if unit is None:
             return
         before_status = unit.filter_status()
+        was_confirmed = unit.confirmed and text != unit.current_text
         unit.set_text(text)
+        if was_confirmed and self.project is not None:
+            self.project.set_units_confirmed((unit,), False)
         unit.set_pending_delete(pending_delete)
         self.model.refresh_unit(unit)
         self._update_recent_translation_marker(unit, before_status)
@@ -4179,35 +4255,54 @@ class TranslatorWindow(QMainWindow):
             return
         units = self._selected_units()
         count = len(units)
-        suffix = f" · {count}" if count > 1 else ""
+        suffix = translate("menu.selection_suffix", count=count) if count > 1 else ""
         can_delete_all = bool(units) and all(item.can_delete_translation() for item in units)
-        can_mark_delete = can_delete_all and any(not item.pending_delete for item in units)
-        can_unmark_delete = any(item.pending_delete for item in units)
+        all_pending_delete = bool(units) and all(item.pending_delete for item in units)
+        can_toggle_delete = all_pending_delete or can_delete_all
+        all_need_work = bool(units) and all(item.review_reason == TODO_REASON_MANUAL_REVIEW for item in units)
+        all_ignored = bool(units) and all(item.ignored for item in units)
+        can_mark_review = bool(units) and all(not item.is_extra for item in units)
+        can_confirm = can_mark_review and all(item.current_text for item in units)
         menu = QMenu(self)
-        menu.addSection(translate("menu.selected_entries"))
-        copy_translation = menu.addAction(translate("menu.copy_selected_translation", suffix=suffix))
+        menu.addSection(translate("menu.entry_status"))
+        confirm_translated = menu.addAction(translate("menu.confirm_translated", suffix=suffix))
+        confirm_translated.setEnabled(can_confirm)
+        need_work = menu.addAction(
+            translate("menu.unmark_need_work", suffix=suffix)
+            if all_need_work
+            else translate("menu.mark_need_work", suffix=suffix)
+        )
+        need_work.setEnabled(can_mark_review)
+        ignored = menu.addAction(
+            translate("menu.unmark_ignored", suffix=suffix)
+            if all_ignored
+            else translate("menu.mark_ignored", suffix=suffix)
+        )
+        ignored.setEnabled(can_mark_review)
         menu.addSection(translate("menu.translation_edit"))
+        copy_translation = menu.addAction(translate("menu.copy_selected_translation", suffix=suffix))
         restore = menu.addAction(translate("menu.restore_loaded", suffix=suffix))
         source = menu.addAction(translate("menu.restore_source", suffix=suffix))
         clear = menu.addAction(translate("menu.clear_translation", suffix=suffix))
         menu.addSection(translate("menu.ai_service"))
         ai_translate = menu.addAction(translate("menu.ai_translate_selected", suffix=suffix))
         llm_suggestion = menu.addAction(translate("menu.llm_suggestion"))
+        llm_suggestion.setEnabled(count == 1)
         menu.addSection(translate("menu.delete_cleanup"))
-        mark_delete = menu.addAction(translate("menu.mark_delete", suffix=suffix))
-        mark_delete.setEnabled(can_mark_delete)
-        unmark_delete = menu.addAction(translate("menu.unmark_delete", suffix=suffix))
-        unmark_delete.setEnabled(can_unmark_delete)
-        menu.addSection(translate("menu.entry_status"))
-        confirm_current_translation = menu.addAction(translate("menu.confirm_current_translation", suffix=suffix))
-        confirm_current_translation.setEnabled(any(item.review_reason == TODO_REASON_SOURCE_CHANGED for item in units))
-        ignored = menu.addAction(
-            translate("menu.unmark_ignored", suffix=suffix)
-            if all(item.ignored for item in units)
-            else translate("menu.mark_ignored", suffix=suffix)
+        delete_mark = menu.addAction(
+            translate("menu.unmark_delete", suffix=suffix)
+            if all_pending_delete
+            else translate("menu.mark_delete", suffix=suffix)
         )
+        delete_mark.setEnabled(can_toggle_delete)
         action = menu.exec(global_point)
-        if action == copy_translation:
+        if action == confirm_translated:
+            self._set_units_confirmed(units)
+        elif action == need_work:
+            self._set_units_need_work(units, not all_need_work)
+        elif action == ignored:
+            self._set_units_ignored(units, not all_ignored)
+        elif action == copy_translation:
             self._copy_unit_translations(units)
         elif action == restore:
             self._replace_units_state(
@@ -4224,14 +4319,8 @@ class TranslatorWindow(QMainWindow):
             self.translate_selected_units(units)
         elif action == llm_suggestion:
             self.request_llm_suggestion(unit.uid)
-        elif action == mark_delete:
-            self._set_units_pending_delete(units, True)
-        elif action == unmark_delete:
-            self._set_units_pending_delete(units, False)
-        elif action == confirm_current_translation:
-            self._set_units_source_review(units, False)
-        elif action == ignored:
-            self._set_units_ignored(units, not all(item.ignored for item in units))
+        elif action == delete_mark:
+            self._set_units_pending_delete(units, not all_pending_delete)
 
     def _select_context_row(self, index: QModelIndex) -> None:
         """Keep an existing multi-selection intact when opening its context menu."""
@@ -4260,17 +4349,53 @@ class TranslatorWindow(QMainWindow):
     def _set_ignored(self, unit: TranslationUnit, ignored: bool) -> None:
         self._set_units_ignored((unit,), ignored)
 
-    def _set_units_ignored(self, units: Iterable[TranslationUnit], ignored: bool) -> None:
-        if self.project is None:
-            return
+    def _refresh_unit_metadata(self, units: Iterable[TranslationUnit]) -> tuple[TranslationUnit, ...]:
         selected = tuple(units)
-        self.project.set_units_ignored(selected, ignored)
         for unit in selected:
             self.model.refresh_unit(unit)
             self.model.set_recently_translated(unit, False)
+        self.proxy.refresh_rows()
         self._apply_filters()
+        self._update_counts()
         self._update_issue_detail(self._current_unit())
         self._update_window_title()
+        return selected
+
+    def _set_units_confirmed(self, units: Iterable[TranslationUnit]) -> None:
+        if self.project is None:
+            return
+        selected = tuple(unit for unit in units if unit.current_text and not unit.is_extra)
+        if not selected:
+            return
+        self.project.set_units_confirmed(selected, True)
+        self._refresh_unit_metadata(selected)
+        self.statusBar().showMessage(translate("status.confirmed_translated", count=len(selected)), 3000)
+
+    def _set_units_need_work(self, units: Iterable[TranslationUnit], need_work: bool) -> None:
+        if self.project is None:
+            return
+        selected = tuple(unit for unit in units if not unit.is_extra)
+        if not selected:
+            return
+        self.project.set_units_need_work(selected, need_work)
+        self._refresh_unit_metadata(selected)
+        self.statusBar().showMessage(
+            translate("status.need_work_marked" if need_work else "status.need_work_cleared", count=len(selected)),
+            3000,
+        )
+
+    def _set_units_ignored(self, units: Iterable[TranslationUnit], ignored: bool) -> None:
+        if self.project is None:
+            return
+        selected = tuple(unit for unit in units if not unit.is_extra)
+        if not selected:
+            return
+        self.project.set_units_ignored(selected, ignored)
+        self._refresh_unit_metadata(selected)
+        self.statusBar().showMessage(
+            translate("status.ignored_marked" if ignored else "status.ignored_cleared", count=len(selected)),
+            3000,
+        )
 
     def _set_units_source_review(self, units: Iterable[TranslationUnit], source_changed: bool) -> None:
         if self.project is None:
