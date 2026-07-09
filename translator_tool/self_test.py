@@ -472,6 +472,8 @@ def assert_code_preview_unit_lookup_accepts_leading_underscore_labels() -> None:
 
 
 def assert_game_preview_draws_all_buttons() -> None:
+    from PySide6.QtGui import QImage
+
     service = PreviewService()
     buttons = tuple(
         PreviewDocument.from_atoms(f"Button {index}", [PreviewAtom(f"Button {index}", 0, 8)])
@@ -511,6 +513,27 @@ def assert_game_preview_draws_all_buttons() -> None:
     )
     if dialogue.width() != 520 or dialogue.height() != 430:
         raise AssertionError(f"dialogue previews with many choices should use the large layout: {dialogue.size()!r}")
+    title_service = PreviewService()
+    title_service._draw_game_document = fake_draw_document  # type: ignore[method-assign]
+    requested_images: list[str] = []
+
+    def fake_ui_image(name: str) -> QImage | None:
+        requested_images.append(name)
+        if name == "header_red.tga":
+            image = QImage(265, 22, QImage.Format.Format_ARGB32)
+            image.fill(0xFFFF0000)
+            return image
+        return None
+
+    title_service.ui_image = fake_ui_image  # type: ignore[method-assign]
+    title_service.game_window_image(
+        PreviewDocument.from_atoms("Title", [PreviewAtom("Title", 0, 5)]),
+        PreviewDocument.from_atoms("Body", [PreviewAtom("Body", 0, 4)]),
+        target=False,
+        context=PreviewWindowContext("tooltip", "dark_panel", DARK_PANEL_TEXT),
+    )
+    if "header_red.tga" not in requested_images:
+        raise AssertionError("tooltip title preview did not request the game red title bar asset")
 
 
 def assert_onscreen_help_preview_pairs_name_and_description() -> None:

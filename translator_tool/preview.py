@@ -756,17 +756,24 @@ class PreviewService:
         left_margin = layout.left_margin
         right_margin = layout.right_margin
         if header is not None:
+            title_bar = self._draw_game_title_bar(
+                painter,
+                context,
+                top=top,
+                left=left_margin,
+                right=canvas.width() - right_margin,
+            )
             top = self._draw_game_document(
                 painter,
                 header,
                 target=target,
-                top=top,
+                top=top + (2 if title_bar else 0),
                 left=left_margin,
                 right=canvas.width() - right_margin,
-                scale=1.0,
+                scale=0.82 if title_bar else 1.0,
                 centered=True,
-                default_color=default_color,
-            ) + 12
+                default_color=(222, 178, 41, 255) if title_bar else default_color,
+            ) + (8 if title_bar else 12)
         if body is not None:
             top = self._draw_game_document(
                 painter,
@@ -790,6 +797,27 @@ class PreviewService:
             )
         painter.end()
         return canvas
+
+    def _draw_game_title_bar(
+        self,
+        painter: QPainter,
+        context: PreviewWindowContext | None,
+        *,
+        top: int,
+        left: int,
+        right: int,
+    ) -> bool:
+        if context is None or context.kind not in {"tooltip", "onscreen_help"}:
+            return False
+        bar = self.ui_image("header_red.tga")
+        if bar is None or bar.isNull():
+            return False
+        height = max(22, round(bar.height() * min(1.15, max(1.0, (right - left) / max(1, bar.width())))))
+        painter.drawImage(
+            QRect(left, top, max(1, right - left), height),
+            bar,
+        )
+        return True
 
     def _game_window_layout(
         self,
