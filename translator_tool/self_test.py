@@ -72,8 +72,18 @@ def project_root() -> Path:
         return root
     sources = root / "sources"
     if sources.is_dir():
-        for candidate in sorted(sources.iterdir()):
-            if candidate.is_dir() and (candidate / "languages").is_dir():
+        candidates = [sources / "Vanilla", *sorted(sources.iterdir())]
+        for candidate in candidates:
+            languages = candidate / "languages"
+            if all(
+                path.is_file()
+                for path in (
+                    languages / "Text.dbt",
+                    languages / "Tooltips.dbt",
+                    languages / "#chinese" / "Text.dbt",
+                    languages / "#chinese" / "Tooltips.dbt",
+                )
+            ):
                 return candidate
     return root
 
@@ -136,6 +146,19 @@ def make_temp_project(root: Path, prefix: str) -> Path:
     temp.mkdir(parents=True, exist_ok=False)
     copy_project_subset(root, temp)
     return temp
+
+
+def remove_matching_target_rows(root: Path, file_name: str, count: int) -> None:
+    source_doc = load_dbt(root / "languages" / file_name)
+    target_path = root / "languages" / "#chinese" / file_name
+    target_doc = load_dbt(target_path)
+    rows = [row for row in target_doc.rows if row_key(file_name, row) in source_doc.row_index][:count]
+    if len(rows) != count:
+        raise AssertionError(f"{file_name} fixture does not contain {count} matching target rows")
+    text = target_doc.text
+    for row in rows:
+        text = text.replace(row.original_line, "", 1)
+    target_path.write_bytes(text.encode(target_doc.profile.encoding))
 
 
 def safe_rmtree(path: Path) -> None:
@@ -874,25 +897,29 @@ def assert_save_removes_extra_target_row(root: Path) -> None:
 
 def assert_save_missing(root: Path) -> None:
     temp = make_temp_project(root, "translator_tool_smoke_missing_")
-    project = Project.load(temp, "#chinese")
-    unit = next(
-        unit
-        for unit in project.units
-        if unit.file_rel == "Text.dbt" and unit.filter_status() == STATUS_TODO and unit.todo_reason == TODO_REASON_MISSING_ROW
-    )
-    unit.set_text(unit.source_text or "test")
-    result = project.save([unit])
-    if not result.changed_files:
-        raise AssertionError("save_missing did not write a file")
-    reloaded = Project.load(temp, "#chinese")
-    saved = [item for item in reloaded.units if item.file_rel == unit.file_rel and item.record_id == unit.record_id and item.label == unit.label]
-    if not saved or saved[0].todo_reason == TODO_REASON_MISSING_ROW:
-        raise AssertionError("inserted missing row did not reload as an existing row")
-    safe_rmtree(temp)
+    try:
+        remove_matching_target_rows(temp, "Text.dbt", 1)
+        project = Project.load(temp, "#chinese")
+        unit = next(
+            unit
+            for unit in project.units
+            if unit.file_rel == "Text.dbt" and unit.filter_status() == STATUS_TODO and unit.todo_reason == TODO_REASON_MISSING_ROW
+        )
+        unit.set_text(unit.source_text or "test")
+        result = project.save([unit])
+        if not result.changed_files:
+            raise AssertionError("save_missing did not write a file")
+        reloaded = Project.load(temp, "#chinese")
+        saved = [item for item in reloaded.units if item.file_rel == unit.file_rel and item.record_id == unit.record_id and item.label == unit.label]
+        if not saved or saved[0].todo_reason == TODO_REASON_MISSING_ROW:
+            raise AssertionError("inserted missing row did not reload as an existing row")
+    finally:
+        safe_rmtree(temp)
 
 
 def assert_missing_insertions_follow_file_order(root: Path) -> None:
     temp = make_temp_project(root, "translator_tool_smoke_missing_order_")
+    remove_matching_target_rows(temp, "Text.dbt", 2)
     project = Project.load(temp, "#chinese")
     missing = [
         unit
@@ -920,6 +947,7 @@ def assert_missing_insertions_follow_file_order(root: Path) -> None:
 
 def assert_unsaved_translation_status(root: Path) -> None:
     temp = make_temp_project(root, "translator_tool_smoke_status_")
+    remove_matching_target_rows(temp, "Text.dbt", 1)
     project = Project.load(temp, "#chinese")
     unit = next(
         item
@@ -1173,7 +1201,7 @@ def assert_editor_undo_stays_local(root: Path) -> None:
         guide_source.write_bytes("Guide Title\r\nGuide Body\r\n".encode("utf-16"))
         os.environ["LOCALAPPDATA"] = str(settings_dir)
         app_module.MANAGED_PROJECT_ROOT = temp
-        save_settings(AppSettings())
+        save_settings(AppSettings(last_project_root=str(temp)))
         app = QApplication.instance()
         created_app = app is None
         if app is None:
@@ -1182,6 +1210,8 @@ def assert_editor_undo_stays_local(root: Path) -> None:
 
         unit = next(item for item in win.model.units if item.ref.kind == "dbt" and item.source_text)
         original = unit.current_text
+        original_dirty_count = win.project.dirty_count()
+        win.project.set_units_confirmed((unit,), True)
         win.current_uid = unit.uid
         win._set_editor_unit(unit)
         win.show()
@@ -1212,6 +1242,14 @@ def assert_editor_undo_stays_local(root: Path) -> None:
             raise AssertionError("one Ctrl+Z should trigger only one editor undo")
         if win.translation_edit.toPlainText() != original or unit.current_text != original:
             raise AssertionError("editor undo did not restore only the in-progress text edit")
+        if unit.is_dirty or win.project.dirty_count() != original_dirty_count:
+            raise AssertionError("editor undo restored the original text but left it marked unsaved")
+        confirmed_after_undo = unit.uid in confirmed_uids(win.project.root, win.project.language)
+        if not unit.confirmed or not confirmed_after_undo:
+            raise AssertionError(
+                "editor undo restored the original text but not its saved confirmation state: "
+                f"memory={unit.confirmed!r}, cache={confirmed_after_undo!r}"
+            )
         if win.current_uid != unit.uid:
             raise AssertionError("editor undo unexpectedly changed the selected translation unit")
         if win.translation_edit.textCursor().position() == 0 and original:

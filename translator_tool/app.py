@@ -2359,6 +2359,7 @@ class TranslatorWindow(QMainWindow):
         self.typing_uid = ""
         self.typing_before = ""
         self.typing_before_deleted = False
+        self._editor_unconfirmed_uids: set[str] = set()
         self._replaying_editor_history = False
         self.editor_zoom_steps = self.settings.editor_zoom_steps
         self.typing_timer = QTimer(self)
@@ -3427,6 +3428,7 @@ class TranslatorWindow(QMainWindow):
         self.typing_uid = ""
         self.typing_before = ""
         self.typing_before_deleted = False
+        self._editor_unconfirmed_uids.clear()
         self.current_uid = ""
         self.model.clear()
         self.table.clearSelection()
@@ -3653,6 +3655,7 @@ class TranslatorWindow(QMainWindow):
         self.typing_uid = ""
         self.typing_before = ""
         self.typing_before_deleted = False
+        self._editor_unconfirmed_uids.clear()
         self.current_uid = ""
         self.model.set_project(self.project)
         self.translation_highlighter.set_glyph_codec(self.project.codec if ENABLE_FONT_GLYPH_VALIDATION else None)
@@ -4127,10 +4130,7 @@ class TranslatorWindow(QMainWindow):
                 self.typing_before = unit.current_text
                 self.typing_before_deleted = unit.pending_delete
         before_status = unit.filter_status()
-        was_confirmed = unit.confirmed and text != unit.current_text
-        unit.set_text(text)
-        if was_confirmed and self.project is not None:
-            self.project.set_units_confirmed((unit,), False)
+        self._set_unit_text(unit, text)
         self.model.refresh_unit(unit)
         self._update_recent_translation_marker(unit, before_status)
         self._update_issue_detail(unit)
@@ -4162,10 +4162,7 @@ class TranslatorWindow(QMainWindow):
         if unit is None:
             return
         before_status = unit.filter_status()
-        was_confirmed = unit.confirmed and text != unit.current_text
-        unit.set_text(text)
-        if was_confirmed and self.project is not None:
-            self.project.set_units_confirmed((unit,), False)
+        self._set_unit_text(unit, text)
         unit.set_pending_delete(pending_delete)
         self.model.refresh_unit(unit)
         self._update_recent_translation_marker(unit, before_status)
@@ -4173,6 +4170,19 @@ class TranslatorWindow(QMainWindow):
             self._set_editor_unit(unit)
         self._update_counts()
         self._update_window_title()
+
+    def _set_unit_text(self, unit: TranslationUnit, text: str) -> None:
+        was_confirmed = unit.confirmed and text != unit.current_text
+        if was_confirmed:
+            self._editor_unconfirmed_uids.add(unit.uid)
+        unit.set_text(text)
+        if self.project is None:
+            return
+        if was_confirmed:
+            self.project.set_units_confirmed((unit,), False)
+        elif unit.current_text == unit.translate_text and unit.uid in self._editor_unconfirmed_uids:
+            self.project.set_units_confirmed((unit,), True)
+            self._editor_unconfirmed_uids.discard(unit.uid)
 
     def _update_recent_translation_marker(self, unit: TranslationUnit, before_status: str) -> None:
         current_status = unit.filter_status()
