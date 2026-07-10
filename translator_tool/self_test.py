@@ -453,6 +453,10 @@ def assert_code_window_context_extracts_window_labels_and_buttons() -> None:
 def assert_code_preview_unit_lookup_accepts_leading_underscore_labels() -> None:
     from .app import TranslatorWindow
 
+    current = SimpleNamespace(
+        file_rel="languages/Text.dbt",
+        label="_MESSAGES_SLANDER_SPEECH_THEFT_+0",
+    )
     window = SimpleNamespace(
         model=SimpleNamespace(
             units=(
@@ -469,6 +473,13 @@ def assert_code_preview_unit_lookup_accepts_leading_underscore_labels() -> None:
     wildcard = TranslatorWindow._unit_for_normalized_label(window, "languages/Text.dbt", "scenario_war_*_+0")
     if wildcard is None or wildcard.label != "_SCENARIO_WAR_GERMANY_+0":
         raise AssertionError("code preview unit lookup did not resolve dynamic wildcard labels")
+    selected = TranslatorWindow._unit_for_context_label(
+        window,
+        current,
+        "messages_slander_speech_*_+0",
+    )
+    if selected is not current:
+        raise AssertionError("a dynamic code label did not preserve the matching selected preview entry")
 
 
 def assert_game_preview_draws_all_buttons() -> None:

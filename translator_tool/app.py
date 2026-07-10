@@ -3169,16 +3169,11 @@ class TranslatorWindow(QMainWindow):
                     body_label=normalize_label(body_unit.label) if body_unit is not None else "",
                 )
             return context, header_unit, body_unit, ()
-        header_unit = self._unit_for_normalized_label(unit.file_rel, context.header_label)
-        body_unit = self._unit_for_normalized_label(unit.file_rel, context.body_label)
-        current_label = normalize_label(unit.label)
-        if current_label == context.header_label:
-            header_unit = unit
-        if current_label == context.body_label:
-            body_unit = unit
+        header_unit = self._unit_for_context_label(unit, context.header_label)
+        body_unit = self._unit_for_context_label(unit, context.body_label)
         button_units: list[TranslationUnit | str] = []
         for button in context.buttons:
-            candidate = unit if current_label == button.label else self._unit_for_normalized_label(unit.file_rel, button.label)
+            candidate = self._unit_for_context_label(unit, button.label)
             if candidate is not None:
                 button_units.append(candidate)
             elif button.text:
@@ -3190,6 +3185,21 @@ class TranslatorWindow(QMainWindow):
         if header_unit is None and body_unit is None:
             body_unit = unit
         return context, header_unit, body_unit, tuple(button_units)
+
+    def _unit_for_context_label(
+        self,
+        current_unit: TranslationUnit,
+        label: str,
+    ) -> TranslationUnit | None:
+        normalized_current = normalize_label(current_unit.label).lstrip("_")
+        normalized_label = normalize_label(label).lstrip("_")
+        if normalized_current == normalized_label:
+            return current_unit
+        if "*" in normalized_label:
+            pattern = "^" + re.escape(normalized_label).replace("\\*", "[a-z0-9_]+") + "$"
+            if re.match(pattern, normalized_current):
+                return current_unit
+        return self._unit_for_normalized_label(current_unit.file_rel, label)
 
     def _unit_for_normalized_label(self, file_rel: str, label: str) -> TranslationUnit | None:
         if not label:
