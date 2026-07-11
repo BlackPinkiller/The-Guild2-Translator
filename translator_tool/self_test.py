@@ -152,7 +152,8 @@ def remove_matching_target_rows(root: Path, file_name: str, count: int) -> None:
     source_doc = load_dbt(root / "languages" / file_name)
     target_path = root / "languages" / "#chinese" / file_name
     target_doc = load_dbt(target_path)
-    rows = [row for row in target_doc.rows if row_key(file_name, row) in source_doc.row_index][:count]
+    source_index = source_doc.row_index
+    rows = [row for row in target_doc.rows if row_key(file_name, row) in source_index][:count]
     if len(rows) != count:
         raise AssertionError(f"{file_name} fixture does not contain {count} matching target rows")
     text = target_doc.text
