@@ -4257,7 +4257,9 @@ class TranslatorWindow(QMainWindow):
     def _update_recent_translation_marker(self, unit: TranslationUnit, before_status: str) -> None:
         current_status = unit.filter_status()
         changed_existing_translation = unit.is_dirty and unit.status == STATUS_TRANSLATED
-        if current_status == STATUS_TRANSLATED and (before_status in MISSING_WORK_STATUSES or changed_existing_translation):
+        if current_status == STATUS_TRANSLATED and unit.is_dirty and (
+            before_status in MISSING_WORK_STATUSES or changed_existing_translation
+        ):
             self.model.set_recently_translated(unit, True)
         elif current_status != STATUS_TRANSLATED or not unit.is_dirty:
             self.model.set_recently_translated(unit, False)
