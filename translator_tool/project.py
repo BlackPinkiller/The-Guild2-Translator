@@ -15,6 +15,7 @@ from .cache import (
     source_review_uids,
 )
 from .codec_adapter import CodecError, Guild2Codec, load_codec_for_language
+from .file_utils import atomic_write
 from .format_io import (
     DbtDocument,
     DbtRow,
@@ -573,24 +574,6 @@ class Project:
 
     def _insertion_line_index(self, file_rel: str, missing_key: tuple[int, str]) -> int | None:
         return self.insertion_anchors.get(file_rel, {}).get(missing_key)
-
-
-def atomic_write(path: Path, data: bytes) -> None:
-    """Replace a project file without ever exposing a partially written file."""
-    path.parent.mkdir(parents=True, exist_ok=True)
-    temp_path = path.with_name(path.name + ".tmp")
-    temp_path.write_bytes(data)
-    try:
-        import os
-
-        os.replace(temp_path, path)
-    except PermissionError:
-        # The game can occasionally keep a language file open on Windows.
-        path.write_bytes(data)
-        try:
-            temp_path.unlink()
-        except OSError:
-            pass
 
 
 def _build_insertion_anchors(

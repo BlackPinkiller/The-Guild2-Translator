@@ -4,6 +4,8 @@ import json
 from pathlib import Path
 from typing import Any
 
+from .file_utils import atomic_write
+
 
 CACHE_FILE_NAME = "translator_tool_cache.json"
 
@@ -31,7 +33,8 @@ def load_cache(root: Path) -> dict[str, Any]:
 
 def save_cache(root: Path, cache: dict[str, Any]) -> None:
     path = cache_path(root)
-    path.write_text(json.dumps(cache, ensure_ascii=False, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    data = (json.dumps(cache, ensure_ascii=False, indent=2, sort_keys=True) + "\n").encode("utf-8")
+    atomic_write(path, data)
 
 
 def ignored_uids(root: Path, language: str) -> set[str]:

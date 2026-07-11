@@ -11,6 +11,8 @@ from pathlib import Path
 import sys
 from typing import Any
 
+from .file_utils import atomic_write
+
 
 APP_DIR_NAME = "TheGuild2Translator"
 SETTINGS_FILE_NAME = "settings.json"
@@ -81,8 +83,8 @@ def load_settings() -> AppSettings:
 
 def save_settings(settings: AppSettings) -> None:
     path = settings_path()
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(json.dumps(asdict(settings), ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+    data = (json.dumps(asdict(settings), ensure_ascii=False, indent=2) + "\n").encode("utf-8")
+    atomic_write(path, data)
 
 
 def protect_secret(value: str) -> str:
