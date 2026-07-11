@@ -160,6 +160,7 @@ class UnitTableModel(QAbstractTableModel):
         self.project = project
         self.units: list[TranslationUnit] = list(project.units) if project else []
         self._row_by_uid: dict[str, int] = {}
+        self._units_by_file: dict[str, tuple[TranslationUnit, ...]] = {}
         self._search: dict[str, str] = {}
         self._format_warning: dict[str, bool] = {}
         self._glyph_warning: dict[str, bool] = {}
@@ -182,6 +183,7 @@ class UnitTableModel(QAbstractTableModel):
         self.units = []
         self._search.clear()
         self._row_by_uid.clear()
+        self._units_by_file.clear()
         self._format_warning.clear()
         self._glyph_warning.clear()
         self._recently_translated.clear()
@@ -305,9 +307,16 @@ class UnitTableModel(QAbstractTableModel):
     def row_for_uid(self, uid: str) -> int | None:
         return self._row_by_uid.get(uid)
 
+    def units_for_file(self, file_rel: str) -> tuple[TranslationUnit, ...]:
+        return self._units_by_file.get(file_rel, ())
+
     def _rebuild_indexes(self) -> None:
         self._row_by_uid = {unit.uid: index for index, unit in enumerate(self.units)}
         self._search = {unit.uid: _search_blob(unit) for unit in self.units}
+        units_by_file: dict[str, list[TranslationUnit]] = {}
+        for unit in self.units:
+            units_by_file.setdefault(unit.file_rel, []).append(unit)
+        self._units_by_file = {file_rel: tuple(units) for file_rel, units in units_by_file.items()}
 
     def retranslate(self) -> None:
         if self.columnCount() > 0:
@@ -3276,9 +3285,7 @@ class TranslatorWindow(QMainWindow):
         ]
         label_groups = {group for candidate in labels if (group := label_group_key(candidate)) is not None}
         fallback: TranslationUnit | None = None
-        for candidate in self.model.units:
-            if candidate.file_rel != file_rel:
-                continue
+        for candidate in TranslatorWindow._preview_units_for_file(self, file_rel):
             normalized = normalize_label(candidate.label)
             if normalized in labels:
                 return candidate
@@ -3313,9 +3320,7 @@ class TranslatorWindow(QMainWindow):
                 "description": f"{prefix}DESCRIPTION{suffix}".casefold(),
             }
             paired: dict[str, TranslationUnit | None] = {"name": None, "description": None}
-            for candidate in self.model.units:
-                if candidate.file_rel != unit.file_rel:
-                    continue
+            for candidate in TranslatorWindow._preview_units_for_file(self, unit.file_rel):
                 normalized = candidate.label.casefold()
                 for role, label in labels.items():
                     if normalized == label:
@@ -3331,17 +3336,19 @@ class TranslatorWindow(QMainWindow):
             prefix, kind, suffix = name_tooltip.groups()
             suffix = suffix or ""
             tooltip = TranslatorWindow._preview_unit_for_labels(
-                self.model.units,
+                TranslatorWindow._preview_units_for_file(self, unit.file_rel),
                 unit.file_rel,
                 (f"{prefix}TOOLTIP_+0", f"{prefix}TOOLTIP{suffix}"),
             )
             name = TranslatorWindow._preview_unit_for_labels(
-                self.model.units,
+                TranslatorWindow._preview_units_for_file(self, unit.file_rel),
                 unit.file_rel,
                 (f"{prefix}NAME{suffix}", f"{prefix}NAME_+0", f"{prefix}NAME_+1"),
             )
             if name is None:
-                name = TranslatorWindow._preview_unit_for_role(self.model.units, unit.file_rel, prefix, "NAME")
+                name = TranslatorWindow._preview_unit_for_role(
+                    TranslatorWindow._preview_units_for_file(self, unit.file_rel), unit.file_rel, prefix, "NAME"
+                )
             role = kind.casefold()
             if role == "name":
                 name = unit
@@ -3360,15 +3367,19 @@ class TranslatorWindow(QMainWindow):
             "body": f"{prefix}BODY{body_suffix}".casefold(),
         }
         paired: dict[str, TranslationUnit | None] = {"head": None, "body": None}
-        for candidate in self.model.units:
-            if candidate.file_rel != unit.file_rel:
-                continue
+        for candidate in TranslatorWindow._preview_units_for_file(self, unit.file_rel):
             normalized = candidate.label.casefold()
             for role, label in labels.items():
                 if normalized == label:
                     paired[role] = candidate
         paired[kind.casefold()] = unit
         return paired["head"], paired["body"]
+
+    def _preview_units_for_file(self, file_rel: str) -> Iterable[TranslationUnit]:
+        indexed_lookup = getattr(self.model, "units_for_file", None)
+        if callable(indexed_lookup):
+            return indexed_lookup(file_rel)
+        return (candidate for candidate in self.model.units if candidate.file_rel == file_rel)
 
     @staticmethod
     def _preview_unit_for_labels(
