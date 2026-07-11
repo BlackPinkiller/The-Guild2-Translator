@@ -1046,6 +1046,7 @@ def assert_project_history_settings(root: Path) -> None:
         save_settings(
             AppSettings(
                 ui_language="zh-CN",
+                ui_theme="guild2",
                 last_project_root=expected[0],
                 recent_project_roots=expected,
                 enable_chinese_codec=True,
@@ -1059,6 +1060,8 @@ def assert_project_history_settings(root: Path) -> None:
         loaded = load_settings()
         if (
             loaded.ui_language != "zh-CN"
+            or
+            loaded.ui_theme != "guild2"
             or
             loaded.last_project_root != expected[0]
             or loaded.recent_project_roots != expected[:8]

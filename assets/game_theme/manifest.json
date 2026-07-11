@@ -1,0 +1,2044 @@
+{
+  "source_root": "F:\\Games\\Steam\\steamapps\\common\\The Guild 2 Renaissance\\Textures\\Hud",
+  "assets": {
+    "background_scroll": {
+      "source": "background_scroll.tga",
+      "kind": "direct",
+      "size": [
+        686,
+        580
+      ]
+    },
+    "panel_slider": {
+      "source": "panel_slider.tga",
+      "kind": "direct",
+      "size": [
+        165,
+        21
+      ]
+    },
+    "btn_back": {
+      "source": "btn_back.tga",
+      "kind": "direct",
+      "size": [
+        85,
+        36
+      ]
+    },
+    "header_red": {
+      "source": "HUD/Hud_Icons/header_red.tga",
+      "kind": "atlas",
+      "size": [
+        265,
+        22
+      ],
+      "x": 0,
+      "y": 966,
+      "width": 265,
+      "height": 22,
+      "atlas": "SetGame6.dds"
+    },
+    "button_green_background": {
+      "source": "HUD/Hud_Icons/button_green_background.tga",
+      "kind": "atlas",
+      "size": [
+        53,
+        53
+      ],
+      "x": 870,
+      "y": 616,
+      "width": 53,
+      "height": 53,
+      "atlas": "SetGame6.dds"
+    },
+    "news_scroll": {
+      "source": "HUD/Hud_Icons/news_scroll.tga",
+      "kind": "atlas",
+      "size": [
+        36,
+        32
+      ],
+      "x": 528,
+      "y": 80,
+      "width": 36,
+      "height": 32,
+      "atlas": "SetGame9.dds"
+    },
+    "scrollup": {
+      "source": "HUD/Hud_Icons/scrollup.tga",
+      "kind": "atlas",
+      "size": [
+        16,
+        16
+      ],
+      "x": 175,
+      "y": 997,
+      "width": 16,
+      "height": 16,
+      "atlas": "SetGame9.dds"
+    },
+    "scrolldown": {
+      "source": "HUD/Hud_Icons/scrolldown.tga",
+      "kind": "atlas",
+      "size": [
+        16,
+        16
+      ],
+      "x": 223,
+      "y": 997,
+      "width": 16,
+      "height": 16,
+      "atlas": "SetGame9.dds"
+    },
+    "scrollbar_vertical": {
+      "source": "HUD/sheets/evidences/scrollbar.tga",
+      "kind": "atlas",
+      "size": [
+        17,
+        55
+      ],
+      "x": 1004,
+      "y": 956,
+      "width": 17,
+      "height": 55,
+      "atlas": "SetSheets2.dds"
+    },
+    "scrollbar_horizontal": {
+      "source": "HUD/sheets/evidences/scrollbar_horizontal.tga",
+      "kind": "atlas",
+      "size": [
+        55,
+        17
+      ],
+      "x": 687,
+      "y": 526,
+      "width": 55,
+      "height": 17,
+      "atlas": "SetSheets2.dds"
+    },
+    "button_start": {
+      "source": "Hud/NoCompression/StartmenueButton.tga",
+      "kind": "atlas",
+      "size": [
+        217,
+        46
+      ],
+      "x": 744,
+      "y": 213,
+      "width": 217,
+      "height": 46,
+      "atlas": "SetGame1.tga"
+    },
+    "button_start_pressed": {
+      "source": "Hud/NoCompression/StartmenueButton1.tga",
+      "kind": "atlas",
+      "size": [
+        217,
+        46
+      ],
+      "x": 0,
+      "y": 966,
+      "width": 217,
+      "height": 46,
+      "atlas": "SetGame1.tga"
+    },
+    "header_red_nocompression": {
+      "source": "Hud/NoCompression/header_red.tga",
+      "kind": "atlas",
+      "size": [
+        265,
+        22
+      ],
+      "x": 248,
+      "y": 928,
+      "width": 265,
+      "height": 22,
+      "atlas": "SetGame1.tga"
+    },
+    "panel_top_middle": {
+      "source": "Hud/NoCompression/PanelObenMitte.tga",
+      "kind": "atlas",
+      "size": [
+        234,
+        34
+      ],
+      "x": 740,
+      "y": 872,
+      "width": 234,
+      "height": 34,
+      "atlas": "SetGame1.tga"
+    },
+    "close": {
+      "source": "HUD/Hud_Icons/btn_close.tga",
+      "kind": "atlas",
+      "size": [
+        23,
+        23
+      ],
+      "x": 1001,
+      "y": 21,
+      "width": 23,
+      "height": 23,
+      "atlas": "SetGame6.dds"
+    },
+    "B_3DWindow_01_0": {
+      "source": "HUD/borders/B_3DWindow_01.tga0",
+      "kind": "atlas",
+      "size": [
+        20,
+        22
+      ],
+      "x": 1004,
+      "y": 621,
+      "width": 20,
+      "height": 22,
+      "atlas": "SetGame8.tga"
+    },
+    "B_3DWindow_01_1": {
+      "source": "HUD/borders/B_3DWindow_01.tga1",
+      "kind": "atlas",
+      "size": [
+        93,
+        22
+      ],
+      "x": 347,
+      "y": 962,
+      "width": 93,
+      "height": 22,
+      "atlas": "SetGame1.tga"
+    },
+    "B_3DWindow_01_2": {
+      "source": "HUD/borders/B_3DWindow_01.tga2",
+      "kind": "atlas",
+      "size": [
+        20,
+        22
+      ],
+      "x": 1004,
+      "y": 643,
+      "width": 20,
+      "height": 22,
+      "atlas": "SetGame8.tga"
+    },
+    "B_3DWindow_01_3": {
+      "source": "HUD/borders/B_3DWindow_01.tga3",
+      "kind": "atlas",
+      "size": [
+        20,
+        87
+      ],
+      "x": 888,
+      "y": 936,
+      "width": 20,
+      "height": 87,
+      "atlas": "SetGame1.tga"
+    },
+    "B_3DWindow_01_4": {
+      "source": "HUD/borders/B_3DWindow_01.tga4",
+      "kind": "atlas",
+      "size": [
+        93,
+        87
+      ],
+      "x": 915,
+      "y": 906,
+      "width": 93,
+      "height": 87,
+      "atlas": "SetGame1.tga"
+    },
+    "B_3DWindow_01_5": {
+      "source": "HUD/borders/B_3DWindow_01.tga5",
+      "kind": "atlas",
+      "size": [
+        20,
+        87
+      ],
+      "x": 225,
+      "y": 895,
+      "width": 20,
+      "height": 87,
+      "atlas": "SetGame8.tga"
+    },
+    "B_3DWindow_01_6": {
+      "source": "HUD/borders/B_3DWindow_01.tga6",
+      "kind": "atlas",
+      "size": [
+        20,
+        22
+      ],
+      "x": 1004,
+      "y": 665,
+      "width": 20,
+      "height": 22,
+      "atlas": "SetGame8.tga"
+    },
+    "B_3DWindow_01_7": {
+      "source": "HUD/borders/B_3DWindow_01.tga7",
+      "kind": "atlas",
+      "size": [
+        93,
+        22
+      ],
+      "x": 217,
+      "y": 978,
+      "width": 93,
+      "height": 22,
+      "atlas": "SetGame1.tga"
+    },
+    "B_3DWindow_01_8": {
+      "source": "HUD/borders/B_3DWindow_01.tga8",
+      "kind": "atlas",
+      "size": [
+        20,
+        22
+      ],
+      "x": 1004,
+      "y": 687,
+      "width": 20,
+      "height": 22,
+      "atlas": "SetGame8.tga"
+    },
+    "B_Header_01_0": {
+      "source": "HUD/borders/B_Header_01.tga0",
+      "kind": "atlas",
+      "size": [
+        21,
+        12
+      ],
+      "x": 284,
+      "y": 1000,
+      "width": 21,
+      "height": 12,
+      "atlas": "SetGame1.tga"
+    },
+    "B_Header_01_1": {
+      "source": "HUD/borders/B_Header_01.tga1",
+      "kind": "atlas",
+      "size": [
+        8,
+        12
+      ],
+      "x": 234,
+      "y": 556,
+      "width": 8,
+      "height": 12,
+      "atlas": "SetGame8.tga"
+    },
+    "B_Header_01_2": {
+      "source": "HUD/borders/B_Header_01.tga2",
+      "kind": "atlas",
+      "size": [
+        21,
+        12
+      ],
+      "x": 78,
+      "y": 934,
+      "width": 21,
+      "height": 12,
+      "atlas": "SetGame8.tga"
+    },
+    "B_Header_01_3": {
+      "source": "HUD/borders/B_Header_01.tga3",
+      "kind": "atlas",
+      "size": [
+        21,
+        2
+      ],
+      "x": 908,
+      "y": 1019,
+      "width": 21,
+      "height": 2,
+      "atlas": "SetGame1.tga"
+    },
+    "B_Header_01_4": {
+      "source": "HUD/borders/B_Header_01.tga4",
+      "kind": "atlas",
+      "size": [
+        8,
+        2
+      ],
+      "x": 128,
+      "y": 1020,
+      "width": 8,
+      "height": 2,
+      "atlas": "SetGame1.tga"
+    },
+    "B_Header_01_5": {
+      "source": "HUD/borders/B_Header_01.tga5",
+      "kind": "atlas",
+      "size": [
+        21,
+        2
+      ],
+      "x": 256,
+      "y": 1006,
+      "width": 21,
+      "height": 2,
+      "atlas": "SetGame1.tga"
+    },
+    "B_Header_01_6": {
+      "source": "HUD/borders/B_Header_01.tga6",
+      "kind": "atlas",
+      "size": [
+        21,
+        12
+      ],
+      "x": 115,
+      "y": 1007,
+      "width": 21,
+      "height": 12,
+      "atlas": "SetGame8.tga"
+    },
+    "B_Header_01_7": {
+      "source": "HUD/borders/B_Header_01.tga7",
+      "kind": "atlas",
+      "size": [
+        8,
+        12
+      ],
+      "x": 379,
+      "y": 995,
+      "width": 8,
+      "height": 12,
+      "atlas": "SetGame8.tga"
+    },
+    "B_Header_01_8": {
+      "source": "HUD/borders/B_Header_01.tga8",
+      "kind": "atlas",
+      "size": [
+        21,
+        12
+      ],
+      "x": 134,
+      "y": 775,
+      "width": 21,
+      "height": 12,
+      "atlas": "SetGame8.tga"
+    },
+    "Border_wood_0": {
+      "source": "HUD/borders/Border_wood.tga0",
+      "kind": "atlas",
+      "size": [
+        5,
+        5
+      ],
+      "x": 305,
+      "y": 1005,
+      "width": 5,
+      "height": 5,
+      "atlas": "SetGame1.tga"
+    },
+    "Border_wood_1": {
+      "source": "HUD/borders/Border_wood.tga1",
+      "kind": "atlas",
+      "size": [
+        84,
+        5
+      ],
+      "x": 513,
+      "y": 966,
+      "width": 84,
+      "height": 5,
+      "atlas": "SetGame1.tga"
+    },
+    "Border_wood_2": {
+      "source": "HUD/borders/Border_wood.tga2",
+      "kind": "atlas",
+      "size": [
+        5,
+        5
+      ],
+      "x": 305,
+      "y": 1000,
+      "width": 5,
+      "height": 5,
+      "atlas": "SetGame1.tga"
+    },
+    "Border_wood_3": {
+      "source": "HUD/borders/Border_wood.tga3",
+      "kind": "atlas",
+      "size": [
+        5,
+        72
+      ],
+      "x": 1006,
+      "y": 319,
+      "width": 5,
+      "height": 72,
+      "atlas": "SetGame1.tga"
+    },
+    "Border_wood_4": {
+      "source": "HUD/borders/Border_wood.tga4",
+      "kind": "atlas",
+      "size": [
+        84,
+        72
+      ],
+      "x": 487,
+      "y": 210,
+      "width": 84,
+      "height": 72,
+      "atlas": "SetGame8.tga"
+    },
+    "Border_wood_5": {
+      "source": "HUD/borders/Border_wood.tga5",
+      "kind": "atlas",
+      "size": [
+        5,
+        72
+      ],
+      "x": 1011,
+      "y": 319,
+      "width": 5,
+      "height": 72,
+      "atlas": "SetGame1.tga"
+    },
+    "Border_wood_6": {
+      "source": "HUD/borders/Border_wood.tga6",
+      "kind": "atlas",
+      "size": [
+        5,
+        5
+      ],
+      "x": 225,
+      "y": 973,
+      "width": 5,
+      "height": 5,
+      "atlas": "SetGame1.tga"
+    },
+    "Border_wood_7": {
+      "source": "HUD/borders/Border_wood.tga7",
+      "kind": "atlas",
+      "size": [
+        84,
+        5
+      ],
+      "x": 513,
+      "y": 971,
+      "width": 84,
+      "height": 5,
+      "atlas": "SetGame1.tga"
+    },
+    "Border_wood_8": {
+      "source": "HUD/borders/Border_wood.tga8",
+      "kind": "atlas",
+      "size": [
+        5,
+        5
+      ],
+      "x": 980,
+      "y": 901,
+      "width": 5,
+      "height": 5,
+      "atlas": "SetGame1.tga"
+    },
+    "Border_Gold_01_0": {
+      "source": "HUD/borders/Border_Gold_01.tga0",
+      "kind": "atlas",
+      "size": [
+        6,
+        6
+      ],
+      "x": 713,
+      "y": 1018,
+      "width": 6,
+      "height": 6,
+      "atlas": "SetGame1.tga"
+    },
+    "Border_Gold_01_1": {
+      "source": "HUD/borders/Border_Gold_01.tga1",
+      "kind": "atlas",
+      "size": [
+        124,
+        6
+      ],
+      "x": 626,
+      "y": 942,
+      "width": 124,
+      "height": 6,
+      "atlas": "SetGame1.tga"
+    },
+    "Border_Gold_01_2": {
+      "source": "HUD/borders/Border_Gold_01.tga2",
+      "kind": "atlas",
+      "size": [
+        6,
+        6
+      ],
+      "x": 725,
+      "y": 1018,
+      "width": 6,
+      "height": 6,
+      "atlas": "SetGame1.tga"
+    },
+    "Border_Gold_01_3": {
+      "source": "HUD/borders/Border_Gold_01.tga3",
+      "kind": "atlas",
+      "size": [
+        6,
+        124
+      ],
+      "x": 974,
+      "y": 515,
+      "width": 6,
+      "height": 124,
+      "atlas": "SetGame1.tga"
+    },
+    "Border_Gold_01_4": {
+      "source": "HUD/borders/Border_Gold_01.tga4",
+      "kind": "atlas",
+      "size": [
+        124,
+        124
+      ],
+      "x": 306,
+      "y": 304,
+      "width": 124,
+      "height": 124,
+      "atlas": "SetGame8.tga"
+    },
+    "Border_Gold_01_5": {
+      "source": "HUD/borders/Border_Gold_01.tga5",
+      "kind": "atlas",
+      "size": [
+        6,
+        124
+      ],
+      "x": 988,
+      "y": 263,
+      "width": 6,
+      "height": 124,
+      "atlas": "SetGame1.tga"
+    },
+    "Border_Gold_01_6": {
+      "source": "HUD/borders/Border_Gold_01.tga6",
+      "kind": "atlas",
+      "size": [
+        6,
+        6
+      ],
+      "x": 731,
+      "y": 1018,
+      "width": 6,
+      "height": 6,
+      "atlas": "SetGame1.tga"
+    },
+    "Border_Gold_01_7": {
+      "source": "HUD/borders/Border_Gold_01.tga7",
+      "kind": "atlas",
+      "size": [
+        124,
+        6
+      ],
+      "x": 750,
+      "y": 942,
+      "width": 124,
+      "height": 6,
+      "atlas": "SetGame1.tga"
+    },
+    "Border_Gold_01_8": {
+      "source": "HUD/borders/Border_Gold_01.tga8",
+      "kind": "atlas",
+      "size": [
+        6,
+        6
+      ],
+      "x": 737,
+      "y": 1018,
+      "width": 6,
+      "height": 6,
+      "atlas": "SetGame1.tga"
+    },
+    "dark_panel_background": {
+      "source": "HUD/NoCompression/Priority3/PanelBackground_01.tga",
+      "kind": "atlas",
+      "size": [
+        344,
+        344
+      ],
+      "x": 512,
+      "y": 0,
+      "width": 344,
+      "height": 344,
+      "atlas": "SetGame6.dds"
+    },
+    "dark_panel_background_light": {
+      "source": "HUD/NoCompression/Priority3/PanelBackground_light_01.tga",
+      "kind": "atlas",
+      "size": [
+        256,
+        256
+      ],
+      "x": 290,
+      "y": 534,
+      "width": 256,
+      "height": 256,
+      "atlas": "SetGame6.dds"
+    },
+    "header_left": {
+      "source": "HUD/NoCompression/Priority3/Header_left_01.tga",
+      "kind": "atlas",
+      "size": [
+        14,
+        25
+      ],
+      "x": 927,
+      "y": 57,
+      "width": 14,
+      "height": 25,
+      "atlas": "SetGame6.dds"
+    },
+    "header_middle": {
+      "source": "HUD/NoCompression/Priority3/Header_middle_01.tga",
+      "kind": "atlas",
+      "size": [
+        241,
+        25
+      ],
+      "x": 0,
+      "y": 992,
+      "width": 241,
+      "height": 25,
+      "atlas": "SetGame6.dds"
+    },
+    "header_right": {
+      "source": "HUD/NoCompression/Priority3/Header_right_01.tga",
+      "kind": "atlas",
+      "size": [
+        14,
+        25
+      ],
+      "x": 1000,
+      "y": 192,
+      "width": 14,
+      "height": 25,
+      "atlas": "SetGame9.dds"
+    },
+    "panel_bar": {
+      "source": "Hud/NoCompression/PanelLeiste.tga",
+      "kind": "atlas",
+      "size": [
+        1024,
+        7
+      ],
+      "x": 0,
+      "y": 198,
+      "width": 1024,
+      "height": 7,
+      "atlas": "SetGame1.tga"
+    },
+    "panel_top": {
+      "source": "Hud/NoCompression/PanelOben.tga",
+      "kind": "atlas",
+      "size": [
+        1024,
+        41
+      ],
+      "x": 0,
+      "y": 157,
+      "width": 1024,
+      "height": 41,
+      "atlas": "SetGame1.tga"
+    },
+    "panel_top_left": {
+      "source": "Hud/NoCompression/PanelObenLinks.tga",
+      "kind": "atlas",
+      "size": [
+        445,
+        34
+      ],
+      "x": 0,
+      "y": 872,
+      "width": 445,
+      "height": 34,
+      "atlas": "SetGame1.tga"
+    },
+    "panel_top_right": {
+      "source": "Hud/NoCompression/PanelObenRechts.tga",
+      "kind": "atlas",
+      "size": [
+        295,
+        34
+      ],
+      "x": 445,
+      "y": 872,
+      "width": 295,
+      "height": 34,
+      "atlas": "SetGame1.tga"
+    },
+    "panel_bottom": {
+      "source": "Hud/NoCompression/PanelUnten.tga",
+      "kind": "atlas",
+      "size": [
+        1024,
+        157
+      ],
+      "x": 0,
+      "y": 0,
+      "width": 1024,
+      "height": 157,
+      "atlas": "SetGame1.tga"
+    },
+    "panel_bottom_left": {
+      "source": "Hud/NoCompression/PanelUntenLinks.tga",
+      "kind": "atlas",
+      "size": [
+        119,
+        157
+      ],
+      "x": 0,
+      "y": 432,
+      "width": 119,
+      "height": 157,
+      "atlas": "SetGame8.tga"
+    },
+    "panel_bottom_middle": {
+      "source": "Hud/NoCompression/PanelUntenMitte.tga",
+      "kind": "atlas",
+      "size": [
+        744,
+        59
+      ],
+      "x": 0,
+      "y": 205,
+      "width": 744,
+      "height": 59,
+      "atlas": "SetGame1.tga"
+    },
+    "panel_bottom_right": {
+      "source": "Hud/NoCompression/PanelUntenRechts.tga",
+      "kind": "atlas",
+      "size": [
+        162,
+        210
+      ],
+      "x": 487,
+      "y": 0,
+      "width": 162,
+      "height": 210,
+      "atlas": "SetGame8.tga"
+    },
+    "button_start_small": {
+      "source": "Hud/NoCompression/StartmenueButton1_klein.tga",
+      "kind": "atlas",
+      "size": [
+        113,
+        30
+      ],
+      "x": 513,
+      "y": 936,
+      "width": 113,
+      "height": 30,
+      "atlas": "SetGame1.tga"
+    },
+    "scroll_corner": {
+      "source": "Hud/NoCompression/scrollecke.tga",
+      "kind": "atlas",
+      "size": [
+        22,
+        22
+      ],
+      "x": 284,
+      "y": 556,
+      "width": 22,
+      "height": 22,
+      "atlas": "SetGame8.tga"
+    },
+    "scrollbar_no_shadow": {
+      "source": "HUD/sheets/evidences/scrollbar_ohneschatten.tga",
+      "kind": "atlas",
+      "size": [
+        16,
+        53
+      ],
+      "x": 1005,
+      "y": 533,
+      "width": 16,
+      "height": 53,
+      "atlas": "SetSheets2.dds"
+    },
+    "scrollbar_no_horizontal": {
+      "source": "HUD/sheets/evidences/scrollbar_ohne_hori.tga",
+      "kind": "atlas",
+      "size": [
+        53,
+        16
+      ],
+      "x": 524,
+      "y": 956,
+      "width": 53,
+      "height": 16,
+      "atlas": "SetSheets2.dds"
+    },
+    "B_ButtonFrame_01_0": {
+      "source": "HUD/borders/B_ButtonFrame_01.tga0",
+      "kind": "atlas",
+      "size": [
+        3,
+        3
+      ],
+      "x": 1011,
+      "y": 260,
+      "width": 3,
+      "height": 3,
+      "atlas": "SetGame1.tga"
+    },
+    "B_ButtonFrame_01_1": {
+      "source": "HUD/borders/B_ButtonFrame_01.tga1",
+      "kind": "atlas",
+      "size": [
+        39,
+        3
+      ],
+      "x": 217,
+      "y": 1006,
+      "width": 39,
+      "height": 3,
+      "atlas": "SetGame1.tga"
+    },
+    "B_ButtonFrame_01_2": {
+      "source": "HUD/borders/B_ButtonFrame_01.tga2",
+      "kind": "atlas",
+      "size": [
+        3,
+        3
+      ],
+      "x": 1014,
+      "y": 260,
+      "width": 3,
+      "height": 3,
+      "atlas": "SetGame1.tga"
+    },
+    "B_ButtonFrame_01_3": {
+      "source": "HUD/borders/B_ButtonFrame_01.tga3",
+      "kind": "atlas",
+      "size": [
+        3,
+        26
+      ],
+      "x": 576,
+      "y": 982,
+      "width": 3,
+      "height": 26,
+      "atlas": "SetGame1.tga"
+    },
+    "B_ButtonFrame_01_4": {
+      "source": "HUD/borders/B_ButtonFrame_01.tga4",
+      "kind": "atlas",
+      "size": [
+        39,
+        26
+      ],
+      "x": 908,
+      "y": 993,
+      "width": 39,
+      "height": 26,
+      "atlas": "SetGame1.tga"
+    },
+    "B_ButtonFrame_01_5": {
+      "source": "HUD/borders/B_ButtonFrame_01.tga5",
+      "kind": "atlas",
+      "size": [
+        3,
+        26
+      ],
+      "x": 1020,
+      "y": 495,
+      "width": 3,
+      "height": 26,
+      "atlas": "SetGame1.tga"
+    },
+    "B_ButtonFrame_01_6": {
+      "source": "HUD/borders/B_ButtonFrame_01.tga6",
+      "kind": "atlas",
+      "size": [
+        3,
+        3
+      ],
+      "x": 510,
+      "y": 1018,
+      "width": 3,
+      "height": 3,
+      "atlas": "SetGame1.tga"
+    },
+    "B_ButtonFrame_01_7": {
+      "source": "HUD/borders/B_ButtonFrame_01.tga7",
+      "kind": "atlas",
+      "size": [
+        39,
+        3
+      ],
+      "x": 947,
+      "y": 1007,
+      "width": 39,
+      "height": 3,
+      "atlas": "SetGame1.tga"
+    },
+    "B_ButtonFrame_01_8": {
+      "source": "HUD/borders/B_ButtonFrame_01.tga8",
+      "kind": "atlas",
+      "size": [
+        3,
+        3
+      ],
+      "x": 998,
+      "y": 387,
+      "width": 3,
+      "height": 3,
+      "atlas": "SetGame1.tga"
+    },
+    "Border_4px_0": {
+      "source": "HUD/borders/Border_4px.tga0",
+      "kind": "atlas",
+      "size": [
+        4,
+        4
+      ],
+      "x": 1019,
+      "y": 590,
+      "width": 4,
+      "height": 4,
+      "atlas": "SetGame1.tga"
+    },
+    "Border_4px_1": {
+      "source": "HUD/borders/Border_4px.tga1",
+      "kind": "atlas",
+      "size": [
+        128,
+        4
+      ],
+      "x": 0,
+      "y": 1020,
+      "width": 128,
+      "height": 4,
+      "atlas": "SetGame1.tga"
+    },
+    "Border_4px_2": {
+      "source": "HUD/borders/Border_4px.tga2",
+      "kind": "atlas",
+      "size": [
+        4,
+        4
+      ],
+      "x": 986,
+      "y": 387,
+      "width": 4,
+      "height": 4,
+      "atlas": "SetGame1.tga"
+    },
+    "Border_4px_3": {
+      "source": "HUD/borders/Border_4px.tga3",
+      "kind": "atlas",
+      "size": [
+        4,
+        128
+      ],
+      "x": 974,
+      "y": 263,
+      "width": 4,
+      "height": 128,
+      "atlas": "SetGame1.tga"
+    },
+    "Border_4px_4": {
+      "source": "HUD/borders/Border_4px.tga4",
+      "kind": "atlas",
+      "size": [
+        128,
+        128
+      ],
+      "x": 178,
+      "y": 304,
+      "width": 128,
+      "height": 128,
+      "atlas": "SetGame8.tga"
+    },
+    "Border_4px_5": {
+      "source": "HUD/borders/Border_4px.tga5",
+      "kind": "atlas",
+      "size": [
+        4,
+        128
+      ],
+      "x": 978,
+      "y": 263,
+      "width": 4,
+      "height": 128,
+      "atlas": "SetGame1.tga"
+    },
+    "Border_4px_6": {
+      "source": "HUD/borders/Border_4px.tga6",
+      "kind": "atlas",
+      "size": [
+        4,
+        4
+      ],
+      "x": 1019,
+      "y": 594,
+      "width": 4,
+      "height": 4,
+      "atlas": "SetGame1.tga"
+    },
+    "Border_4px_7": {
+      "source": "HUD/borders/Border_4px.tga7",
+      "kind": "atlas",
+      "size": [
+        128,
+        4
+      ],
+      "x": 744,
+      "y": 259,
+      "width": 128,
+      "height": 4,
+      "atlas": "SetGame1.tga"
+    },
+    "Border_4px_8": {
+      "source": "HUD/borders/Border_4px.tga8",
+      "kind": "atlas",
+      "size": [
+        4,
+        4
+      ],
+      "x": 990,
+      "y": 387,
+      "width": 4,
+      "height": 4,
+      "atlas": "SetGame1.tga"
+    },
+    "Border_BtnGreen_large_0": {
+      "source": "HUD/borders/Border_BtnGreen_large.tga0",
+      "kind": "atlas",
+      "size": [
+        8,
+        8
+      ],
+      "x": 805,
+      "y": 276,
+      "width": 8,
+      "height": 8,
+      "atlas": "SetGame8.tga"
+    },
+    "Border_BtnGreen_large_1": {
+      "source": "HUD/borders/Border_BtnGreen_large.tga1",
+      "kind": "atlas",
+      "size": [
+        201,
+        8
+      ],
+      "x": 248,
+      "y": 954,
+      "width": 201,
+      "height": 8,
+      "atlas": "SetGame1.tga"
+    },
+    "Border_BtnGreen_large_2": {
+      "source": "HUD/borders/Border_BtnGreen_large.tga2",
+      "kind": "atlas",
+      "size": [
+        8,
+        8
+      ],
+      "x": 922,
+      "y": 561,
+      "width": 8,
+      "height": 8,
+      "atlas": "SetGame8.tga"
+    },
+    "Border_BtnGreen_large_3": {
+      "source": "HUD/borders/Border_BtnGreen_large.tga3",
+      "kind": "atlas",
+      "size": [
+        8,
+        30
+      ],
+      "x": 931,
+      "y": 487,
+      "width": 8,
+      "height": 30,
+      "atlas": "SetGame8.tga"
+    },
+    "Border_BtnGreen_large_4": {
+      "source": "HUD/borders/Border_BtnGreen_large.tga4",
+      "kind": "atlas",
+      "size": [
+        201,
+        30
+      ],
+      "x": 513,
+      "y": 906,
+      "width": 201,
+      "height": 30,
+      "atlas": "SetGame1.tga"
+    },
+    "Border_BtnGreen_large_5": {
+      "source": "HUD/borders/Border_BtnGreen_large.tga5",
+      "kind": "atlas",
+      "size": [
+        8,
+        30
+      ],
+      "x": 1006,
+      "y": 102,
+      "width": 8,
+      "height": 30,
+      "atlas": "SetGame8.tga"
+    },
+    "Border_BtnGreen_large_6": {
+      "source": "HUD/borders/Border_BtnGreen_large.tga6",
+      "kind": "atlas",
+      "size": [
+        8,
+        8
+      ],
+      "x": 813,
+      "y": 276,
+      "width": 8,
+      "height": 8,
+      "atlas": "SetGame8.tga"
+    },
+    "Border_BtnGreen_large_7": {
+      "source": "HUD/borders/Border_BtnGreen_large.tga7",
+      "kind": "atlas",
+      "size": [
+        201,
+        8
+      ],
+      "x": 0,
+      "y": 1012,
+      "width": 201,
+      "height": 8,
+      "atlas": "SetGame1.tga"
+    },
+    "Border_BtnGreen_large_8": {
+      "source": "HUD/borders/Border_BtnGreen_large.tga8",
+      "kind": "atlas",
+      "size": [
+        8,
+        8
+      ],
+      "x": 930,
+      "y": 561,
+      "width": 8,
+      "height": 8,
+      "atlas": "SetGame8.tga"
+    },
+    "Border_BtnGreen_small_0": {
+      "source": "HUD/borders/Border_BtnGreen_small.tga0",
+      "kind": "atlas",
+      "size": [
+        7,
+        7
+      ],
+      "x": 972,
+      "y": 1017,
+      "width": 7,
+      "height": 7,
+      "atlas": "SetGame1.tga"
+    },
+    "Border_BtnGreen_small_1": {
+      "source": "HUD/borders/Border_BtnGreen_small.tga1",
+      "kind": "atlas",
+      "size": [
+        99,
+        7
+      ],
+      "x": 201,
+      "y": 1012,
+      "width": 99,
+      "height": 7,
+      "atlas": "SetGame1.tga"
+    },
+    "Border_BtnGreen_small_2": {
+      "source": "HUD/borders/Border_BtnGreen_small.tga2",
+      "kind": "atlas",
+      "size": [
+        7,
+        7
+      ],
+      "x": 663,
+      "y": 395,
+      "width": 7,
+      "height": 7,
+      "atlas": "SetGame8.tga"
+    },
+    "Border_BtnGreen_small_3": {
+      "source": "HUD/borders/Border_BtnGreen_small.tga3",
+      "kind": "atlas",
+      "size": [
+        7,
+        16
+      ],
+      "x": 440,
+      "y": 962,
+      "width": 7,
+      "height": 16,
+      "atlas": "SetGame1.tga"
+    },
+    "Border_BtnGreen_small_4": {
+      "source": "HUD/borders/Border_BtnGreen_small.tga4",
+      "kind": "atlas",
+      "size": [
+        99,
+        16
+      ],
+      "x": 626,
+      "y": 960,
+      "width": 99,
+      "height": 16,
+      "atlas": "SetGame1.tga"
+    },
+    "Border_BtnGreen_small_5": {
+      "source": "HUD/borders/Border_BtnGreen_small.tga5",
+      "kind": "atlas",
+      "size": [
+        7,
+        16
+      ],
+      "x": 423,
+      "y": 428,
+      "width": 7,
+      "height": 16,
+      "atlas": "SetGame8.tga"
+    },
+    "Border_BtnGreen_small_6": {
+      "source": "HUD/borders/Border_BtnGreen_small.tga6",
+      "kind": "atlas",
+      "size": [
+        7,
+        7
+      ],
+      "x": 989,
+      "y": 234,
+      "width": 7,
+      "height": 7,
+      "atlas": "SetGame8.tga"
+    },
+    "Border_BtnGreen_small_7": {
+      "source": "HUD/borders/Border_BtnGreen_small.tga7",
+      "kind": "atlas",
+      "size": [
+        99,
+        7
+      ],
+      "x": 310,
+      "y": 984,
+      "width": 99,
+      "height": 7,
+      "atlas": "SetGame1.tga"
+    },
+    "Border_BtnGreen_small_8": {
+      "source": "HUD/borders/Border_BtnGreen_small.tga8",
+      "kind": "atlas",
+      "size": [
+        7,
+        7
+      ],
+      "x": 670,
+      "y": 395,
+      "width": 7,
+      "height": 7,
+      "atlas": "SetGame8.tga"
+    },
+    "Border_BtnGreen_verysmall_0": {
+      "source": "HUD/borders/Border_BtnGreen_verysmall.tga0",
+      "kind": "atlas",
+      "size": [
+        4,
+        4
+      ],
+      "x": 994,
+      "y": 387,
+      "width": 4,
+      "height": 4,
+      "atlas": "SetGame1.tga"
+    },
+    "Border_BtnGreen_verysmall_1": {
+      "source": "HUD/borders/Border_BtnGreen_verysmall.tga1",
+      "kind": "atlas",
+      "size": [
+        99,
+        4
+      ],
+      "x": 310,
+      "y": 991,
+      "width": 99,
+      "height": 4,
+      "atlas": "SetGame1.tga"
+    },
+    "Border_BtnGreen_verysmall_2": {
+      "source": "HUD/borders/Border_BtnGreen_verysmall.tga2",
+      "kind": "atlas",
+      "size": [
+        4,
+        4
+      ],
+      "x": 1019,
+      "y": 586,
+      "width": 4,
+      "height": 4,
+      "atlas": "SetGame1.tga"
+    },
+    "Border_BtnGreen_verysmall_3": {
+      "source": "HUD/borders/Border_BtnGreen_verysmall.tga3",
+      "kind": "atlas",
+      "size": [
+        4,
+        16
+      ],
+      "x": 1019,
+      "y": 532,
+      "width": 4,
+      "height": 16,
+      "atlas": "SetGame1.tga"
+    },
+    "Border_BtnGreen_verysmall_4": {
+      "source": "HUD/borders/Border_BtnGreen_verysmall.tga4",
+      "kind": "atlas",
+      "size": [
+        99,
+        16
+      ],
+      "x": 725,
+      "y": 960,
+      "width": 99,
+      "height": 16,
+      "atlas": "SetGame1.tga"
+    },
+    "Border_BtnGreen_verysmall_5": {
+      "source": "HUD/borders/Border_BtnGreen_verysmall.tga5",
+      "kind": "atlas",
+      "size": [
+        4,
+        16
+      ],
+      "x": 1019,
+      "y": 548,
+      "width": 4,
+      "height": 16,
+      "atlas": "SetGame1.tga"
+    },
+    "Border_BtnGreen_verysmall_6": {
+      "source": "HUD/borders/Border_BtnGreen_verysmall.tga6",
+      "kind": "atlas",
+      "size": [
+        4,
+        4
+      ],
+      "x": 1019,
+      "y": 598,
+      "width": 4,
+      "height": 4,
+      "atlas": "SetGame1.tga"
+    },
+    "Border_BtnGreen_verysmall_7": {
+      "source": "HUD/borders/Border_BtnGreen_verysmall.tga7",
+      "kind": "atlas",
+      "size": [
+        99,
+        4
+      ],
+      "x": 310,
+      "y": 995,
+      "width": 99,
+      "height": 4,
+      "atlas": "SetGame1.tga"
+    },
+    "Border_BtnGreen_verysmall_8": {
+      "source": "HUD/borders/Border_BtnGreen_verysmall.tga8",
+      "kind": "atlas",
+      "size": [
+        4,
+        4
+      ],
+      "x": 982,
+      "y": 387,
+      "width": 4,
+      "height": 4,
+      "atlas": "SetGame1.tga"
+    },
+    "Border_Buildings_01_0": {
+      "source": "HUD/borders/Border_Buildings_01.tga0",
+      "kind": "atlas",
+      "size": [
+        6,
+        6
+      ],
+      "x": 398,
+      "y": 1006,
+      "width": 6,
+      "height": 6,
+      "atlas": "SetGame1.tga"
+    },
+    "Border_Buildings_01_1": {
+      "source": "HUD/borders/Border_Buildings_01.tga1",
+      "kind": "atlas",
+      "size": [
+        124,
+        6
+      ],
+      "x": 626,
+      "y": 936,
+      "width": 124,
+      "height": 6,
+      "atlas": "SetGame1.tga"
+    },
+    "Border_Buildings_01_2": {
+      "source": "HUD/borders/Border_Buildings_01.tga2",
+      "kind": "atlas",
+      "size": [
+        6,
+        6
+      ],
+      "x": 480,
+      "y": 1018,
+      "width": 6,
+      "height": 6,
+      "atlas": "SetGame1.tga"
+    },
+    "Border_Buildings_01_3": {
+      "source": "HUD/borders/Border_Buildings_01.tga3",
+      "kind": "atlas",
+      "size": [
+        6,
+        124
+      ],
+      "x": 974,
+      "y": 391,
+      "width": 6,
+      "height": 124,
+      "atlas": "SetGame1.tga"
+    },
+    "Border_Buildings_01_4": {
+      "source": "HUD/borders/Border_Buildings_01.tga4",
+      "kind": "atlas",
+      "size": [
+        124,
+        124
+      ],
+      "x": 827,
+      "y": 0,
+      "width": 124,
+      "height": 124,
+      "atlas": "SetGame8.tga"
+    },
+    "Border_Buildings_01_5": {
+      "source": "HUD/borders/Border_Buildings_01.tga5",
+      "kind": "atlas",
+      "size": [
+        6,
+        124
+      ],
+      "x": 982,
+      "y": 263,
+      "width": 6,
+      "height": 124,
+      "atlas": "SetGame1.tga"
+    },
+    "Border_Buildings_01_6": {
+      "source": "HUD/borders/Border_Buildings_01.tga6",
+      "kind": "atlas",
+      "size": [
+        6,
+        6
+      ],
+      "x": 492,
+      "y": 1018,
+      "width": 6,
+      "height": 6,
+      "atlas": "SetGame1.tga"
+    },
+    "Border_Buildings_01_7": {
+      "source": "HUD/borders/Border_Buildings_01.tga7",
+      "kind": "atlas",
+      "size": [
+        124,
+        6
+      ],
+      "x": 750,
+      "y": 936,
+      "width": 124,
+      "height": 6,
+      "atlas": "SetGame1.tga"
+    },
+    "Border_Buildings_01_8": {
+      "source": "HUD/borders/Border_Buildings_01.tga8",
+      "kind": "atlas",
+      "size": [
+        6,
+        6
+      ],
+      "x": 504,
+      "y": 1018,
+      "width": 6,
+      "height": 6,
+      "atlas": "SetGame1.tga"
+    },
+    "Border_Gold_02_0": {
+      "source": "HUD/borders/Border_Gold_02.tga0",
+      "kind": "atlas",
+      "size": [
+        6,
+        6
+      ],
+      "x": 749,
+      "y": 1018,
+      "width": 6,
+      "height": 6,
+      "atlas": "SetGame1.tga"
+    },
+    "Border_Gold_02_1": {
+      "source": "HUD/borders/Border_Gold_02.tga1",
+      "kind": "atlas",
+      "size": [
+        124,
+        6
+      ],
+      "x": 626,
+      "y": 948,
+      "width": 124,
+      "height": 6,
+      "atlas": "SetGame1.tga"
+    },
+    "Border_Gold_02_2": {
+      "source": "HUD/borders/Border_Gold_02.tga2",
+      "kind": "atlas",
+      "size": [
+        6,
+        6
+      ],
+      "x": 761,
+      "y": 1018,
+      "width": 6,
+      "height": 6,
+      "atlas": "SetGame1.tga"
+    },
+    "Border_Gold_02_3": {
+      "source": "HUD/borders/Border_Gold_02.tga3",
+      "kind": "atlas",
+      "size": [
+        6,
+        124
+      ],
+      "x": 974,
+      "y": 639,
+      "width": 6,
+      "height": 124,
+      "atlas": "SetGame1.tga"
+    },
+    "Border_Gold_02_4": {
+      "source": "HUD/borders/Border_Gold_02.tga4",
+      "kind": "atlas",
+      "size": [
+        124,
+        124
+      ],
+      "x": 119,
+      "y": 432,
+      "width": 124,
+      "height": 124,
+      "atlas": "SetGame8.tga"
+    },
+    "Border_Gold_02_5": {
+      "source": "HUD/borders/Border_Gold_02.tga5",
+      "kind": "atlas",
+      "size": [
+        6,
+        124
+      ],
+      "x": 994,
+      "y": 263,
+      "width": 6,
+      "height": 124,
+      "atlas": "SetGame1.tga"
+    },
+    "Border_Gold_02_6": {
+      "source": "HUD/borders/Border_Gold_02.tga6",
+      "kind": "atlas",
+      "size": [
+        6,
+        6
+      ],
+      "x": 767,
+      "y": 1018,
+      "width": 6,
+      "height": 6,
+      "atlas": "SetGame1.tga"
+    },
+    "Border_Gold_02_7": {
+      "source": "HUD/borders/Border_Gold_02.tga7",
+      "kind": "atlas",
+      "size": [
+        124,
+        6
+      ],
+      "x": 750,
+      "y": 948,
+      "width": 124,
+      "height": 6,
+      "atlas": "SetGame1.tga"
+    },
+    "Border_Gold_02_8": {
+      "source": "HUD/borders/Border_Gold_02.tga8",
+      "kind": "atlas",
+      "size": [
+        6,
+        6
+      ],
+      "x": 773,
+      "y": 1018,
+      "width": 6,
+      "height": 6,
+      "atlas": "SetGame1.tga"
+    },
+    "Border_Silver_01_0": {
+      "source": "HUD/borders/Border_Silver_01.tga0",
+      "kind": "atlas",
+      "size": [
+        6,
+        6
+      ],
+      "x": 719,
+      "y": 1018,
+      "width": 6,
+      "height": 6,
+      "atlas": "SetGame1.tga"
+    },
+    "Border_Silver_01_1": {
+      "source": "HUD/borders/Border_Silver_01.tga1",
+      "kind": "atlas",
+      "size": [
+        124,
+        6
+      ],
+      "x": 626,
+      "y": 954,
+      "width": 124,
+      "height": 6,
+      "atlas": "SetGame1.tga"
+    },
+    "Border_Silver_01_2": {
+      "source": "HUD/borders/Border_Silver_01.tga2",
+      "kind": "atlas",
+      "size": [
+        6,
+        6
+      ],
+      "x": 277,
+      "y": 1006,
+      "width": 6,
+      "height": 6,
+      "atlas": "SetGame1.tga"
+    },
+    "Border_Silver_01_3": {
+      "source": "HUD/borders/Border_Silver_01.tga3",
+      "kind": "atlas",
+      "size": [
+        6,
+        124
+      ],
+      "x": 974,
+      "y": 763,
+      "width": 6,
+      "height": 124,
+      "atlas": "SetGame1.tga"
+    },
+    "Border_Silver_01_4": {
+      "source": "HUD/borders/Border_Silver_01.tga4",
+      "kind": "atlas",
+      "size": [
+        124,
+        124
+      ],
+      "x": 0,
+      "y": 589,
+      "width": 124,
+      "height": 124,
+      "atlas": "SetGame8.tga"
+    },
+    "Border_Silver_01_5": {
+      "source": "HUD/borders/Border_Silver_01.tga5",
+      "kind": "atlas",
+      "size": [
+        6,
+        124
+      ],
+      "x": 1000,
+      "y": 263,
+      "width": 6,
+      "height": 124,
+      "atlas": "SetGame1.tga"
+    },
+    "Border_Silver_01_6": {
+      "source": "HUD/borders/Border_Silver_01.tga6",
+      "kind": "atlas",
+      "size": [
+        6,
+        6
+      ],
+      "x": 486,
+      "y": 1018,
+      "width": 6,
+      "height": 6,
+      "atlas": "SetGame1.tga"
+    },
+    "Border_Silver_01_7": {
+      "source": "HUD/borders/Border_Silver_01.tga7",
+      "kind": "atlas",
+      "size": [
+        124,
+        6
+      ],
+      "x": 750,
+      "y": 954,
+      "width": 124,
+      "height": 6,
+      "atlas": "SetGame1.tga"
+    },
+    "Border_Silver_01_8": {
+      "source": "HUD/borders/Border_Silver_01.tga8",
+      "kind": "atlas",
+      "size": [
+        6,
+        6
+      ],
+      "x": 440,
+      "y": 978,
+      "width": 6,
+      "height": 6,
+      "atlas": "SetGame1.tga"
+    },
+    "border_green_0": {
+      "source": "HUD/borders/border_green.tga0",
+      "kind": "atlas",
+      "size": [
+        6,
+        6
+      ],
+      "x": 785,
+      "y": 1018,
+      "width": 6,
+      "height": 6,
+      "atlas": "SetGame1.tga"
+    },
+    "border_green_1": {
+      "source": "HUD/borders/border_green.tga1",
+      "kind": "atlas",
+      "size": [
+        12,
+        6
+      ],
+      "x": 448,
+      "y": 1018,
+      "width": 12,
+      "height": 6,
+      "atlas": "SetGame1.tga"
+    },
+    "border_green_2": {
+      "source": "HUD/borders/border_green.tga2",
+      "kind": "atlas",
+      "size": [
+        6,
+        6
+      ],
+      "x": 1017,
+      "y": 579,
+      "width": 6,
+      "height": 6,
+      "atlas": "SetGame8.tga"
+    },
+    "border_green_3": {
+      "source": "HUD/borders/border_green.tga3",
+      "kind": "atlas",
+      "size": [
+        6,
+        16
+      ],
+      "x": 1018,
+      "y": 205,
+      "width": 6,
+      "height": 16,
+      "atlas": "SetGame1.tga"
+    },
+    "border_green_4": {
+      "source": "HUD/borders/border_green.tga4",
+      "kind": "atlas",
+      "size": [
+        12,
+        16
+      ],
+      "x": 371,
+      "y": 749,
+      "width": 12,
+      "height": 16,
+      "atlas": "SetGame8.tga"
+    },
+    "border_green_5": {
+      "source": "HUD/borders/border_green.tga5",
+      "kind": "atlas",
+      "size": [
+        6,
+        16
+      ],
+      "x": 1018,
+      "y": 221,
+      "width": 6,
+      "height": 16,
+      "atlas": "SetGame1.tga"
+    },
+    "border_green_6": {
+      "source": "HUD/borders/border_green.tga6",
+      "kind": "atlas",
+      "size": [
+        6,
+        6
+      ],
+      "x": 791,
+      "y": 1018,
+      "width": 6,
+      "height": 6,
+      "atlas": "SetGame1.tga"
+    },
+    "border_green_7": {
+      "source": "HUD/borders/border_green.tga7",
+      "kind": "atlas",
+      "size": [
+        12,
+        6
+      ],
+      "x": 460,
+      "y": 1018,
+      "width": 12,
+      "height": 6,
+      "atlas": "SetGame1.tga"
+    },
+    "border_green_8": {
+      "source": "HUD/borders/border_green.tga8",
+      "kind": "atlas",
+      "size": [
+        6,
+        6
+      ],
+      "x": 779,
+      "y": 1018,
+      "width": 6,
+      "height": 6,
+      "atlas": "SetGame1.tga"
+    },
+    "border_header_red_0": {
+      "source": "HUD/borders/border_header_red.tga0",
+      "kind": "atlas",
+      "size": [
+        2,
+        2
+      ],
+      "x": 822,
+      "y": 1016,
+      "width": 2,
+      "height": 2,
+      "atlas": "SetGame1.tga"
+    },
+    "border_header_red_1": {
+      "source": "HUD/borders/border_header_red.tga1",
+      "kind": "atlas",
+      "size": [
+        265,
+        2
+      ],
+      "x": 248,
+      "y": 950,
+      "width": 265,
+      "height": 2,
+      "atlas": "SetGame1.tga"
+    },
+    "border_header_red_2": {
+      "source": "HUD/borders/border_header_red.tga2",
+      "kind": "atlas",
+      "size": [
+        2,
+        2
+      ],
+      "x": 822,
+      "y": 1018,
+      "width": 2,
+      "height": 2,
+      "atlas": "SetGame1.tga"
+    },
+    "border_header_red_3": {
+      "source": "HUD/borders/border_header_red.tga3",
+      "kind": "atlas",
+      "size": [
+        2,
+        22
+      ],
+      "x": 1022,
+      "y": 957,
+      "width": 2,
+      "height": 22,
+      "atlas": "SetGame1.tga"
+    },
+    "border_header_red_4": {
+      "source": "HUD/borders/border_header_red.tga4",
+      "kind": "atlas",
+      "size": [
+        265,
+        22
+      ],
+      "x": 248,
+      "y": 906,
+      "width": 265,
+      "height": 22,
+      "atlas": "SetGame1.tga"
+    },
+    "border_header_red_5": {
+      "source": "HUD/borders/border_header_red.tga5",
+      "kind": "atlas",
+      "size": [
+        2,
+        22
+      ],
+      "x": 1018,
+      "y": 237,
+      "width": 2,
+      "height": 22,
+      "atlas": "SetGame1.tga"
+    },
+    "border_header_red_6": {
+      "source": "HUD/borders/border_header_red.tga6",
+      "kind": "atlas",
+      "size": [
+        2,
+        2
+      ],
+      "x": 138,
+      "y": 1020,
+      "width": 2,
+      "height": 2,
+      "atlas": "SetGame1.tga"
+    },
+    "border_header_red_7": {
+      "source": "HUD/borders/border_header_red.tga7",
+      "kind": "atlas",
+      "size": [
+        265,
+        2
+      ],
+      "x": 248,
+      "y": 952,
+      "width": 265,
+      "height": 2,
+      "atlas": "SetGame1.tga"
+    },
+    "border_header_red_8": {
+      "source": "HUD/borders/border_header_red.tga8",
+      "kind": "atlas",
+      "size": [
+        2,
+        2
+      ],
+      "x": 822,
+      "y": 1020,
+      "width": 2,
+      "height": 2,
+      "atlas": "SetGame1.tga"
+    }
+  }
+}

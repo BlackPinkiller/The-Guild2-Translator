@@ -20,6 +20,7 @@ RECENT_PROJECT_LIMIT = 8
 @dataclass
 class AppSettings:
     ui_language: str = "en"
+    ui_theme: str = "modern"
     provider: str = "google"
     openai_base_url: str = "https://api.openai.com/v1"
     openai_model: str = "gpt-4o-mini"

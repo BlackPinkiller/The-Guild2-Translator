@@ -82,6 +82,7 @@ from .code_window_context import DARK_PANEL_TEXT, PreviewWindowContext, best_win
 from .code_open import open_code_reference
 from .codec_adapter import CodecError, Guild2Codec, load_codec_for_language, language_uses_codec
 from .git_history import GitCommit, GitError, LanguageGit, TranslationLogEntry
+from .game_theme import GameAssetSet, GameHeaderFrame, GamePanelFrame, install_game_theme_style
 from .history import OperationHistory, TranslationOperation, UnitChange
 from .i18n import current_language, history_kind_text, set_language, status_text, todo_reason_text, translate, ui_language_options
 from .project import (
@@ -559,6 +560,8 @@ class EditorGroupBox(QGroupBox):
 
     def __init__(self) -> None:
         super().__init__()
+        self.setObjectName("editorPanel")
+        self.game_assets = GameAssetSet()
         self.code_button = QToolButton(self)
         self.code_button.setObjectName("codeReferenceButton")
         self.code_button.setAutoRaise(False)
@@ -570,6 +573,15 @@ class EditorGroupBox(QGroupBox):
         self.preview_button.setObjectName("previewToggle")
         self.preview_button.setCheckable(True)
         self.preview_button.setAutoRaise(False)
+
+    def paintEvent(self, event) -> None:  # noqa: N802
+        super().paintEvent(event)
+        app = QApplication.instance()
+        if app is None or app.property("guild2Theme") is not True:
+            return
+        painter = QPainter(self)
+        self.game_assets.nine_slice(painter, self.rect(), "B_3DWindow_01")
+        painter.end()
 
     def resizeEvent(self, event: QEvent) -> None:  # noqa: N802
         super().resizeEvent(event)
@@ -645,7 +657,7 @@ class PreviewTextDelegate(RowTintDelegate):
         x = option.rect.left() + 5
         baseline = option.rect.center().y() + (metrics.ascent() - metrics.descent()) // 2
         right = option.rect.right() - 5
-        default_color = QColor("#9d0006") if unit.pending_delete else QColor("#3c3836")
+        default_color = QColor("#d4775d") if unit.pending_delete else QColor(_theme_color("text", "#3c3836"))
 
         for atom in document.atoms:
             if x >= right:
@@ -683,7 +695,7 @@ class PreviewTextDelegate(RowTintDelegate):
                     float(metrics.height()),
                 )
                 style = Qt.PenStyle.DashLine if atom.color is not None else Qt.PenStyle.SolidLine
-                underline_color = QColor(*atom.color) if atom.color is not None else QColor("#79740e")
+                underline_color = QColor(*atom.color) if atom.color is not None else QColor(_theme_color("markup_token", "#79740e"))
                 painter.setPen(QPen(underline_color, 2, style))
                 painter.drawLine(marker_rect.bottomLeft(), marker_rect.bottomRight())
                 underline_y = float(marker_rect.bottom())
@@ -701,7 +713,7 @@ class PreviewTextDelegate(RowTintDelegate):
             if rendered != text:
                 break
 
-        painter.setPen(QColor("#d5c4a1"))
+        painter.setPen(QColor(_theme_color("muted_text", "#d5c4a1")))
         painter.drawLine(option.rect.bottomLeft(), option.rect.bottomRight())
         painter.restore()
 
@@ -715,9 +727,10 @@ class PopupHighlightDelegate(QStyledItemDelegate):
 
     def paint(self, painter: QPainter, option: QStyleOptionViewItem, index: QModelIndex) -> None:
         data = index.data(Qt.ItemDataRole.UserRole)
+        palette = QApplication.palette()
         if data == LANGUAGE_ACTION_SEPARATOR:
             painter.save()
-            painter.setPen(QPen(QColor("#bdae93"), 1))
+            painter.setPen(QPen(palette.color(QPalette.ColorRole.Mid), 1))
             y = option.rect.center().y()
             painter.drawLine(option.rect.left() + 8, y, option.rect.right() - 8, y)
             painter.restore()
@@ -728,18 +741,18 @@ class PopupHighlightDelegate(QStyledItemDelegate):
 
         if is_current_value:
             painter.save()
-            painter.fillRect(option.rect, QColor("#c6a15b"))
+            painter.fillRect(option.rect, palette.color(QPalette.ColorRole.Highlight))
             painter.restore()
-            option.palette.setColor(QPalette.ColorRole.Highlight, QColor("#c6a15b"))
-            option.palette.setColor(QPalette.ColorRole.HighlightedText, QColor("#3c3836"))
-            option.palette.setColor(QPalette.ColorRole.Text, QColor("#3c3836"))
+            option.palette.setColor(QPalette.ColorRole.Highlight, palette.color(QPalette.ColorRole.Highlight))
+            option.palette.setColor(QPalette.ColorRole.HighlightedText, palette.color(QPalette.ColorRole.HighlightedText))
+            option.palette.setColor(QPalette.ColorRole.Text, palette.color(QPalette.ColorRole.Text))
         elif is_hovered or is_selected:
             painter.save()
-            painter.fillRect(option.rect, QColor("#d5c4a1"))
+            painter.fillRect(option.rect, palette.color(QPalette.ColorRole.Midlight))
             painter.restore()
-            option.palette.setColor(QPalette.ColorRole.Highlight, QColor("#d5c4a1"))
-            option.palette.setColor(QPalette.ColorRole.HighlightedText, QColor("#3c3836"))
-            option.palette.setColor(QPalette.ColorRole.Text, QColor("#3c3836"))
+            option.palette.setColor(QPalette.ColorRole.Highlight, palette.color(QPalette.ColorRole.Midlight))
+            option.palette.setColor(QPalette.ColorRole.HighlightedText, palette.color(QPalette.ColorRole.Text))
+            option.palette.setColor(QPalette.ColorRole.Text, palette.color(QPalette.ColorRole.Text))
 
         super().paint(painter, option, index)
 
@@ -750,16 +763,6 @@ class PopupSelectionComboBox(QComboBox):
     def __init__(self, parent: QWidget | None = None) -> None:
         super().__init__(parent)
         self.view().setItemDelegate(PopupHighlightDelegate(self))
-        self.view().setStyleSheet(
-            """
-            QAbstractItemView {
-                background: #f2e5bc;
-                border: 2px solid #3c3836;
-                selection-background-color: #c6a15b;
-                selection-color: #3c3836;
-            }
-            """
-        )
 
     def showPopup(self) -> None:  # noqa: N802
         super().showPopup()
@@ -854,6 +857,17 @@ class AiButtonDelegate(QStyledItemDelegate):
         painter.setRenderHint(QPainter.RenderHint.Antialiasing)
         if hovered and not pressed:
             rect.translate(0, -1)
+        if bool(QApplication.instance().property("guild2Theme")):
+            game_button = QImage(_game_theme_asset("button_start_pressed.png" if pressed else "button_start.png"))
+            if not game_button.isNull():
+                painter.drawImage(rect, game_button)
+                painter.setPen(QColor("#f4e8ae"))
+                font = painter.font()
+                font.setBold(True)
+                painter.setFont(font)
+                painter.drawText(rect, Qt.AlignmentFlag.AlignCenter, translate("table.ai_action"))
+                painter.restore()
+                return
         if not pressed:
             painter.setPen(Qt.PenStyle.NoPen)
             painter.setBrush(QColor("#3c3836"))
@@ -1286,7 +1300,10 @@ class PreviewPlainTextEdit(QTextEdit):
                 for offset, char in enumerate(atom.text):
                     if char in {"\n", "\r", "\t", PREVIEW_MARK}:
                         continue
-                    image = self._text_glyph_provider(char, atom.color)
+                    image = self._text_glyph_provider(
+                        char,
+                        atom.color or _theme_rgba("text", (55, 38, 24, 255)),
+                    )
                     if image is None or not hasattr(image, "isNull") or image.isNull():
                         continue
                     glyph_cursor = QTextCursor(self.document())
@@ -1330,7 +1347,7 @@ class PreviewPlainTextEdit(QTextEdit):
                 )
             elif has_visible_replacement and not atom.final_style:
                 char_format.setUnderlineStyle(QTextCharFormat.UnderlineStyle.DashUnderline)
-                char_format.setUnderlineColor(QColor("#79740e"))
+                char_format.setUnderlineColor(QColor(_theme_color("markup_token", "#79740e")))
             if atom.replacement and atom.text not in {"\n", "\t", PREVIEW_MARK}:
                 char_format.setFontWeight(QFont.Weight.Normal)
             if atom.glyph_id is not None and self._glyph_provider is not None:
@@ -1436,13 +1453,13 @@ class TokenHighlighter(QSyntaxHighlighter):
         super().__init__(document)
         self.glyph_codec = glyph_codec
         self.dialect = dialect
-        self.format_token = _text_format("#075a9c")
-        self.color_token = _text_format("#7a3e9d")
-        self.markup_token = _text_format("#6b6b00")
-        self.quote_token = _text_format("#107c10")
-        self.bad_token = _text_format("#b00020", underline=True)
-        self.warn_token = _text_format("#c45f00", underline=True)
-        self.glyph_token = _text_format("#cc241d", underline=True)
+        self.format_token = _text_format(_theme_color("format_token", "#075a9c"))
+        self.color_token = _text_format(_theme_color("color_token", "#7a3e9d"))
+        self.markup_token = _text_format(_theme_color("markup_token", "#6b6b00"))
+        self.quote_token = _text_format(_theme_color("quote_token", "#107c10"))
+        self.bad_token = _text_format(_theme_color("bad_token", "#b00020"), underline=True)
+        self.warn_token = _text_format(_theme_color("warn_token", "#c45f00"), underline=True)
+        self.glyph_token = _text_format(_theme_color("glyph_token", "#cc241d"), underline=True)
 
     def set_glyph_codec(self, glyph_codec: Guild2Codec | None) -> None:
         self.glyph_codec = glyph_codec
@@ -1452,6 +1469,16 @@ class TokenHighlighter(QSyntaxHighlighter):
         if dialect == self.dialect:
             return
         self.dialect = dialect
+        self.rehighlight()
+
+    def refresh_theme(self) -> None:
+        self.format_token.setForeground(QColor(_theme_color("format_token", "#075a9c")))
+        self.color_token.setForeground(QColor(_theme_color("color_token", "#7a3e9d")))
+        self.markup_token.setForeground(QColor(_theme_color("markup_token", "#6b6b00")))
+        self.quote_token.setForeground(QColor(_theme_color("quote_token", "#107c10")))
+        self.bad_token.setForeground(QColor(_theme_color("bad_token", "#b00020")))
+        self.warn_token.setForeground(QColor(_theme_color("warn_token", "#c45f00")))
+        self.glyph_token.setForeground(QColor(_theme_color("glyph_token", "#cc241d")))
         self.rehighlight()
 
     def highlightBlock(self, text: str) -> None:  # noqa: N802
@@ -1644,6 +1671,9 @@ class SettingsDialog(QDialog):
         self.ui_language = QComboBox()
         self.ui_language_label = QLabel()
         interface_form.addRow(self.ui_language_label, self.ui_language)
+        self.ui_theme = QComboBox()
+        self.ui_theme_label = QLabel()
+        interface_form.addRow(self.ui_theme_label, self.ui_theme)
         self.preview_scope = QComboBox()
         self.preview_scope_label = QLabel()
         interface_form.addRow(self.preview_scope_label, self.preview_scope)
@@ -1807,6 +1837,19 @@ class SettingsDialog(QDialog):
         self.preview_scope.setCurrentIndex(index if index >= 0 else 0)
         del blocker
 
+    def _populate_theme_combo(self) -> None:
+        current = str(self.ui_theme.currentData() or self.settings.ui_theme or "modern")
+        blocker = QSignalBlocker(self.ui_theme)
+        self.ui_theme.clear()
+        for value in ("modern", "guild2"):
+            self.ui_theme.addItem(
+                translate(f"settings.theme.{value}", locale=self._preview_language),
+                value,
+            )
+        index = self.ui_theme.findData(current)
+        self.ui_theme.setCurrentIndex(index if index >= 0 else 0)
+        del blocker
+
     def _on_language_changed(self) -> None:
         self._preview_language = str(self.ui_language.currentData() or self._preview_language)
         self._retranslate_ui()
@@ -1815,6 +1858,7 @@ class SettingsDialog(QDialog):
         locale = self._preview_language
         self.setWindowTitle(translate("settings.title", locale=locale))
         self._populate_ui_language_combo()
+        self._populate_theme_combo()
         self._populate_provider_combo()
         self._populate_preview_scope_combo()
 
@@ -1832,6 +1876,7 @@ class SettingsDialog(QDialog):
         self.preview_assets_group.setTitle(translate("settings.preview_assets_group", locale=locale))
 
         self.ui_language_label.setText(translate("settings.ui_language", locale=locale))
+        self.ui_theme_label.setText(translate("settings.ui_theme", locale=locale))
         self.preview_scope_label.setText(translate("settings.preview_scope", locale=locale))
         self.preview_scope_hint.setText(translate("settings.preview_scope_hint", locale=locale))
         self.preview_translation_font_label.setText(translate("settings.preview_translation_font_dir", locale=locale))
@@ -1896,6 +1941,7 @@ class SettingsDialog(QDialog):
         return replace(
             self.settings,
             ui_language=str(self.ui_language.currentData() or current_language()),
+            ui_theme=str(self.ui_theme.currentData() or "modern"),
             provider=str(self.provider.currentData()),
             google_endpoint=self.google_endpoint.text().strip(),
             source_language=self.source_language.text().strip() or "en",
@@ -2400,6 +2446,10 @@ class TranslatorWindow(QMainWindow):
             QTimer.singleShot(0, self.choose_project_folder)
 
     def _build_ui(self) -> None:
+        app = QApplication.instance()
+        theme_qss = app.property("gameThemeQss") if app is not None else None
+        if isinstance(theme_qss, str):
+            self.setStyleSheet(theme_qss)
         root = QWidget()
         root.setObjectName("root")
         self.setCentralWidget(root)
@@ -2407,7 +2457,7 @@ class TranslatorWindow(QMainWindow):
         layout.setContentsMargins(14, 12, 14, 12)
         layout.setSpacing(9)
 
-        titlebar = QFrame()
+        titlebar = GameHeaderFrame()
         titlebar.setObjectName("titlebar")
         title_layout = QHBoxLayout(titlebar)
         title_layout.setContentsMargins(14, 9, 12, 9)
@@ -2505,8 +2555,10 @@ class TranslatorWindow(QMainWindow):
 
         self.main_splitter = QSplitter(Qt.Orientation.Vertical)
         layout.addWidget(self.main_splitter, 1)
-        self.table_frame = QFrame()
+        self.table_frame = GamePanelFrame()
+        self.table_frame.setObjectName("tablePanel")
         table_layout = QVBoxLayout(self.table_frame)
+        self.table_layout = table_layout
         table_layout.setContentsMargins(0, 0, 0, 0)
         self.table = QTableView()
         self.table.setModel(self.proxy)
@@ -2642,6 +2694,7 @@ class TranslatorWindow(QMainWindow):
         layout.addWidget(self.issue_label)
         self._populate_status_choices()
         self._retranslate_ui()
+        self._apply_theme_layout()
         self.statusBar().showMessage(translate("status.ready"))
 
         for shortcut, slot in (
@@ -2809,6 +2862,12 @@ class TranslatorWindow(QMainWindow):
         editor.setLineWrapMode(QTextEdit.LineWrapMode.WidgetWidth)
         layout.addWidget(editor)
         return box, editor, box.preview_button
+
+    def _apply_theme_layout(self) -> None:
+        app = QApplication.instance()
+        game_theme = app is not None and app.property("guild2Theme") is True
+        margin = 7 if game_theme else 0
+        self.table_layout.setContentsMargins(margin, margin, margin, margin)
 
     def _start_code_reference_index(self) -> None:
         self.code_reference_index = None
@@ -4817,8 +4876,10 @@ class TranslatorWindow(QMainWindow):
     def show_settings(self) -> None:
         dialog = SettingsDialog(self.settings, self)
         if dialog.exec() != QDialog.DialogCode.Accepted:
+            dialog.deleteLater()
             return
         previous_language = self.settings.ui_language
+        previous_theme = self.settings.ui_theme
         previous_codec = self.settings.enable_chinese_codec
         previous_preview_scope = self.settings.preview_scope
         previous_game_font = self.settings.preview_game_font_in_editors
@@ -4829,6 +4890,14 @@ class TranslatorWindow(QMainWindow):
         )
         self.settings = dialog.result_settings()
         save_settings(self.settings)
+        if self.settings.ui_theme != previous_theme:
+            next_theme = self.settings.ui_theme
+            dialog.destroyed.connect(
+                lambda _object=None, theme=next_theme: QTimer.singleShot(
+                    0, lambda: self._apply_runtime_theme(theme)
+                )
+            )
+        dialog.deleteLater()
         if self.settings.ui_language != previous_language:
             set_language(self.settings.ui_language)
             self._retranslate_ui()
@@ -4869,6 +4938,27 @@ class TranslatorWindow(QMainWindow):
             self.git.ensure_repository(self.settings)
         except GitError as exc:
             QMessageBox.warning(self, translate("dialog.git_settings_error"), str(exc))
+
+    def _apply_runtime_theme(self, theme: str) -> None:
+        app = QApplication.instance()
+        if app is None:
+            return
+        self.setUpdatesEnabled(False)
+        try:
+            # Clear the window-level game QSS before replacing the proxy style.
+            # Otherwise Qt repolishes the large table and both editor trees twice.
+            self.setStyleSheet("")
+            apply_theme(app, theme)
+            if theme == "guild2":
+                self.setStyleSheet(str(app.property("gameThemeQss") or ""))
+            if hasattr(self, "source_highlighter"):
+                self.source_highlighter.refresh_theme()
+            if hasattr(self, "translation_highlighter"):
+                self.translation_highlighter.refresh_theme()
+            self._apply_theme_layout()
+        finally:
+            self.setUpdatesEnabled(True)
+        self.update()
 
     def _current_unit(self) -> TranslationUnit | None:
         return self.model.unit_for_uid(self.current_uid) if self.current_uid else None
@@ -5442,6 +5532,30 @@ def _extract_recommended_translation(markdown: str) -> str:
     return match.group(1).strip() if match else ""
 
 
+def _theme_color(name: str, fallback: str) -> str:
+    app = QApplication.instance()
+    if app is not None and bool(app.property("guild2Theme")):
+        return {
+            "text": "#d8c68f",
+            "muted_text": "#a99667",
+            "format_token": "#9bb69b",
+            "color_token": "#c49a82",
+            "markup_token": "#d0ad61",
+            "quote_token": "#9bb276",
+            "bad_token": "#d4775d",
+            "warn_token": "#c49b55",
+            "glyph_token": "#d4775d",
+        }.get(name, fallback)
+    return fallback
+
+
+def _theme_rgba(name: str, fallback: tuple[int, int, int, int]) -> tuple[int, int, int, int]:
+    value = _theme_color(name, "")
+    if not value.startswith("#") or len(value) != 7:
+        return fallback
+    return tuple(int(value[index : index + 2], 16) for index in (1, 3, 5)) + (fallback[3],)
+
+
 def _text_format(color: str, underline: bool = False) -> QTextCharFormat:
     fmt = QTextCharFormat()
     fmt.setForeground(QColor(color))
@@ -5450,7 +5564,11 @@ def _text_format(color: str, underline: bool = False) -> QTextCharFormat:
 
 
 def apply_modern_style(app: QApplication) -> None:
+    app.setProperty("guild2Theme", False)
+    app.setProperty("gameThemeQss", "")
+    app.setStyleSheet("")
     app.setStyle("Fusion")
+    app._game_theme_style = None
     palette = app.palette()
     palette.setColor(QPalette.ColorRole.Window, QColor("#ebdbb2"))
     palette.setColor(QPalette.ColorRole.Base, QColor("#fbf1c7"))
@@ -5530,12 +5648,78 @@ def apply_modern_style(app: QApplication) -> None:
     )
 
 
+def _game_theme_asset(name: str) -> str:
+    return (Path(__file__).resolve().parents[1] / "assets" / "game_theme" / name).as_posix()
+
+
+def apply_game_style(app: QApplication) -> None:
+    asset = _game_theme_asset
+    app.setProperty("guild2Theme", True)
+    app.setStyleSheet("")
+    app.setStyle("Fusion")
+    palette = app.palette()
+    palette.setColor(QPalette.ColorRole.Window, QColor("#2b2419"))
+    palette.setColor(QPalette.ColorRole.Base, QColor("#2b2419"))
+    palette.setColor(QPalette.ColorRole.AlternateBase, QColor("#33291c"))
+    palette.setColor(QPalette.ColorRole.Text, QColor("#eadca7"))
+    palette.setColor(QPalette.ColorRole.Button, QColor("#4a321d"))
+    palette.setColor(QPalette.ColorRole.Highlight, QColor("#876a2f"))
+    palette.setColor(QPalette.ColorRole.HighlightedText, QColor("#fff0b8"))
+    app.setPalette(palette)
+    install_game_theme_style(app)
+    qss = f"""
+        QMainWindow, #root {{ background-color: #2b2419; background-image: url({asset("dark_panel_background_2048.png")}); background-repeat: no-repeat; background-position: top left; border: 4px solid transparent; border-image: url({asset("Border_4px_4.png")}) 4 4 4 4 stretch stretch; }}
+        #titlebar {{ background-color: #4a1e12; min-height: 42px; }}
+        #workspaceTitle {{ color: #e1c777; font-size: 18px; font-weight: 900; letter-spacing: 1px; }}
+        #workspaceSubtitle {{ color: #b89a57; font-size: 10px; font-weight: 800; letter-spacing: 2px; }}
+        #toolbar {{ background-color: #2b2419; background-image: url({asset("dark_panel_background_2048.png")}); background-repeat: no-repeat; border: 4px solid transparent; border-image: url({asset("Border_4px_4.png")}) 4 4 4 4 stretch stretch; padding: 2px; }}
+        #toolbar QLabel {{ font-weight: 800; }}
+        #counts, #issues, #hint {{ background: transparent; color: #eadca7; }}
+        #counts {{ border-image: url({asset("Border_4px_4.png")}) 4 4 4 4 stretch stretch; padding: 5px 8px; font-weight: 800; }}
+        #issues {{ border-image: url({asset("Border_4px_4.png")}) 4 4 4 4 stretch stretch; padding: 8px 10px; font-weight: 600; }}
+        #tablePanel, #editorPanel {{ background-color: #2b2419; background-image: url({asset("dark_panel_background_2048.png")}); background-repeat: no-repeat; border: 0px; }}
+        #editorPanel {{ margin-top: 10px; }}
+        #editorPanel QPlainTextEdit {{ background-color: #211a12; background-image: url({asset("dark_panel_background_2048.png")}); background-repeat: no-repeat; color: #d8c68f; selection-background-color: #6c4d25; selection-color: #ead79a; padding: 10px; }}
+        QSplitter::handle {{ background: #806537; }}
+        QDialog {{ background-color: #2b2419; background-image: url({asset("dark_panel_background_2048.png")}); background-repeat: no-repeat; }}
+        QGroupBox {{ background: transparent; border: 0px; margin-top: 14px; padding-top: 8px; font-weight: 900; color: #eadca7; }}
+        QGroupBox::title {{ subcontrol-origin: margin; subcontrol-position: top left; left: 12px; padding: 0 6px; background: #33291c; color: #d8c68f; }}
+        QAbstractScrollArea {{ background: transparent; }}
+        QTableView, QListWidget, QPlainTextEdit, QTextEdit, QTextBrowser {{ background: transparent; border: 0px; selection-background-color: #735727; selection-color: #fff0b8; }}
+        QTableView::viewport, QListWidget::viewport, QAbstractScrollArea > QWidget {{ background: transparent; }}
+        QTableView::item {{ background: transparent; border-bottom: 1px solid #5a4526; padding: 2px 4px; }}
+        QTableView::item:selected, QListWidget::item:selected {{ background: #735727; color: #fff0b8; }}
+        QHeaderView::section {{ background-color: #4a1e12; background-image: url({asset("header_middle.png")}); background-repeat: repeat-x; color: #d8c68f; border-right: 1px solid #9d7a36; border-bottom: 2px solid #c4a258; padding: 8px; font-weight: 900; }}
+        QLineEdit {{ background: #0d0b08; color: #d8c68f; padding: 5px 7px; min-height: 20px; font-weight: 600; }}
+        QComboBox QAbstractItemView {{ background: #2b2419; color: #d8c68f; selection-background-color: #735727; selection-color: #ead79a; }}
+        QTabWidget, QTabWidget > QWidget {{ background: transparent; }}
+        QTabWidget::pane {{ background: transparent; border: 2px solid #806537; top: -1px; }}
+        QScrollBar:vertical {{ background: #1b1510; width: 18px; margin: 18px 0 18px 0; }}
+        QScrollBar:horizontal {{ background: #1b1510; height: 18px; margin: 0 18px 0 18px; }}
+        QStatusBar {{ background: #2b2419; color: #eadca7; font-weight: 700; }}
+        QMenu, QToolTip {{ background-color: #2b2419; color: #eadca7; border: 2px solid #806537; padding: 4px; }}
+        QMenu::item {{ padding: 7px 22px 7px 10px; font-weight: 700; }}
+        QMenu::item:selected {{ background: #735727; color: #fff0b8; }}
+        """
+    app.setProperty("gameThemeQss", qss)
+    app.setStyleSheet("")
+
+
+def apply_theme(app: QApplication | None, theme: str) -> None:
+    if app is None:
+        return
+    if theme == "guild2":
+        apply_game_style(app)
+    else:
+        apply_modern_style(app)
+
+
 def main() -> None:
     app = QApplication([])
     app.setApplicationName("The Guild 2 Translator")
     if APP_ICON_PATH.exists():
         app.setWindowIcon(QIcon(str(APP_ICON_PATH)))
-    apply_modern_style(app)
+    apply_theme(app, load_settings().ui_theme)
     window = TranslatorWindow()
     if APP_ICON_PATH.exists():
         window.setWindowIcon(QIcon(str(APP_ICON_PATH)))
