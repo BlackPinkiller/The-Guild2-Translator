@@ -960,7 +960,11 @@ def assert_unsaved_translation_status(root: Path) -> None:
     unit.set_text("AI translated")
     if unit.display_status() != STATUS_TRANSLATED or unit.filter_status() != STATUS_TRANSLATED:
         raise AssertionError("an unsaved translated unit did not report translated status")
-    translated = next(item for item in project.units if item.filter_status() == STATUS_TRANSLATED)
+    translated = next(
+        item
+        for item in project.units
+        if item.filter_status() == STATUS_TRANSLATED and item.ref.target_row is not None
+    )
     translated.set_text(translated.current_text + "x")
     if translated.display_status() != STATUS_TRANSLATED or translated.filter_status() != STATUS_TRANSLATED or not translated.is_dirty:
         raise AssertionError("an edited translated unit did not keep a translated status with a dirty marker")

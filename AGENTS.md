@@ -41,7 +41,7 @@ This repository contains The Guild 2 Translator, a Windows desktop editor for Th
 - Preserve raw file bytes, detected encoding, newline style, column layout, row order, and final-newline behavior unless the requested feature explicitly changes one of them.
 - Never overwrite, normalize, sync, export, repack, or bulk-edit files under `sources/` merely to validate a code change.
 - Do not run source-sync or save workflows against a real project during routine verification. Use the temporary fixtures created by `translator_tool.self_test` or a new isolated temporary fixture.
-- Empty translation text means removing the target translation row so source fallback remains intact. Target-only extra DBT rows are removed on save according to existing project semantics.
+- Empty translation text is a valid explicit override. Removing a target translation row requires the existing pending-delete action; do not infer deletion from empty editor text. Target-only extra DBT rows are removed on save according to existing project semantics.
 - Preserve manual workflow metadata in `translator_tool_cache.json`; ignored/review/need-work/confirmed state is user progress.
 - Settings and credentials are user-local state. Tests that touch settings must isolate and restore environment/path state.
 - Preview rendering is visual-only. Raw placeholders and stored translation text must remain unchanged while preview substitutions are displayed.
@@ -75,4 +75,3 @@ This repository contains The Guild 2 Translator, a Windows desktop editor for Th
 - `build_translator_lite_onefile.bat` builds a single executable and ZIP.
 - Both packages must include `encoder/guild2_codec.py`, `encoder/data`, `assets/app-icon.ico`, and `assets/game_theme`.
 - Build scripts delete and recreate local build environments and output directories. Do not run them while another task depends on those artifacts.
-
