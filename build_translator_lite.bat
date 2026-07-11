@@ -16,7 +16,7 @@ if errorlevel 1 goto :failed
 python -m pip install --no-cache-dir "PyInstaller>=6.0" PySide6-Essentials
 if errorlevel 1 goto :failed
 
-python -m pip show PySide6 PySide6-Addons PySide6-Essentials shiboken6
+python -m pip show PySide6-Essentials shiboken6
 
 if exist build\dist rmdir /s /q build\dist
 if exist build\work rmdir /s /q build\work
