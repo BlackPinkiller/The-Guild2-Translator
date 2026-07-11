@@ -2407,6 +2407,35 @@ def assert_git_history(root: Path) -> None:
         git = LanguageGit(temp)
         git.ensure_repository(AppSettings())
         project = Project.load(temp, "#chinese")
+        same_as_source = next(
+            item
+            for item in project.units
+            if item.todo_reason == TODO_REASON_SAME_AS_SOURCE and item.ref.target_row is not None
+        )
+        same_previous = same_as_source.current_text
+        same_as_source.set_text(same_previous + " history update")
+        same_result = project.save([same_as_source])
+        same_commit = git.commit_saved(
+            same_result.changed_files, same_result.saved_units, same_result.deleted_units
+        )
+        if same_commit is None:
+            raise AssertionError("Git commit was not created for a same-as-source translation update")
+        if "update 1" not in same_commit.subject or "add 1" in same_commit.subject:
+            raise AssertionError("same-as-source commit summary was incorrectly counted as an addition")
+        same_entries = git.entries_for_commit(same_commit.full_hash)
+        same_entry = next(
+            (
+                entry
+                for entry in same_entries
+                if entry.label == same_as_source.label and entry.field_name == same_as_source.field_name
+            ),
+            None,
+        )
+        if same_entry is None or same_entry.kind != "更新":
+            raise AssertionError("a non-empty translation matching its source was incorrectly logged as an addition")
+        if same_entry.previous_text != same_previous or same_entry.translated_text != same_as_source.current_text:
+            raise AssertionError("same-as-source history did not preserve the real before and after text")
+
         unit = next(item for item in project.units if item.file_rel == "Text.dbt" and item.filter_status() == STATUS_TRANSLATED)
         unit.set_text(unit.current_text + "测试")
         result = project.save([unit])
@@ -2536,6 +2565,13 @@ def assert_combined_git_history_format() -> None:
         raise AssertionError("combined history lost a net update")
     if merged_update[0].before_text != "拜拜" or merged_update[0].translated_text != "回头见":
         raise AssertionError("combined history did not preserve the earliest old text and the latest new text")
+    same_source_early = TranslationLogEntry("更新", "Text.dbt", "12", "Same", "Text", "Same", "First", "Same")
+    same_source_later = TranslationLogEntry("更新", "Text.dbt", "12", "Same", "Text", "Same", "Second", "First")
+    same_source_merged = combine_entries(((same_source_early,), (same_source_later,)))
+    if len(same_source_merged) != 1 or same_source_merged[0].kind != "更新":
+        raise AssertionError("combined history reclassified a same-as-source update as an addition")
+    if same_source_merged[0].before_text != "Same" or same_source_merged[0].translated_text != "Second":
+        raise AssertionError("combined same-as-source history lost its real before or after text")
     reverted = TranslationLogEntry("更新", "Text.dbt", "10", "Greeting", "Text", "Hello", "Hello", "您好")
     if combine_entries(((early,), (reverted,))):
         raise AssertionError("combined history kept an entry whose final translation reverted to the starting text")

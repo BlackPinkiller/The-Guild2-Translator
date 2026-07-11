@@ -20,7 +20,7 @@ from .format_io import (
     translatable_fields,
 )
 from .i18n import translate
-from .project import MISSING_WORK_STATUSES, TranslationUnit
+from .project import TranslationUnit
 from .settings import AppSettings
 
 
@@ -79,10 +79,10 @@ class TranslationLogEntry:
         if self.change_key != newer.change_key:
             raise ValueError("cannot merge unrelated history entries")
         previous_text = self.previous_text
-        if newer.kind == "删除" and previous_text not in {None, "", self.source_text}:
+        if newer.kind == "删除" and previous_text not in {None, ""}:
             kind = "删除"
         else:
-            kind = "新增" if previous_text in {None, "", self.source_text} else "更新"
+            kind = _history_kind(previous_text)
         return TranslationLogEntry(
             kind,
             newer.file_rel,
@@ -152,7 +152,7 @@ class LanguageGit:
             return None
         units = tuple(saved_units)
         deleted = len(tuple(deleted_units))
-        added = sum(1 for unit in units if unit.status in MISSING_WORK_STATUSES)
+        added = sum(1 for unit in units if unit.translate_text == "")
         updated = len(units) - added
         files = ", ".join(sorted({Path(path).name for path in relative_paths}))
         portions: list[str] = []
@@ -274,7 +274,7 @@ class LanguageGit:
                 source_field = matching_source_field(field_name, source_doc.string_columns)
                 source_text = source_row.get(source_field) if source_row is not None else ""
                 previous_text = self._decode(before_value) if before_value is not None else None
-                kind = "新增" if previous_text in {None, "", source_text} else "更新"
+                kind = _history_kind(previous_text)
                 entries.append(
                     TranslationLogEntry(
                         kind,
@@ -323,7 +323,7 @@ class LanguageGit:
             previous_text = before if before is not None else ""
             return [TranslationLogEntry("删除", file_rel, "", file_rel, "body", source, "", previous_text)]
         previous_text = before if before is not None else None
-        kind = "新增" if previous_text in {None, "", source} else "更新"
+        kind = _history_kind(previous_text)
         return [TranslationLogEntry(kind, file_rel, "", file_rel, "body", source, after, previous_text)]
 
     def _decode(self, value: str) -> str:
@@ -448,6 +448,10 @@ def combine_entries(entry_groups: Iterable[Iterable[TranslationLogEntry]]) -> li
             current = combined.get(entry.change_key)
             combined[entry.change_key] = entry if current is None else current.merged_with(entry)
     return [entry for entry in combined.values() if entry.translated_text != entry.before_text]
+
+
+def _history_kind(previous_text: str | None) -> str:
+    return "新增" if previous_text in {None, ""} else "更新"
 
 
 def _display_subject(subject: str) -> str:
