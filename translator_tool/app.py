@@ -4,6 +4,7 @@ from collections import Counter
 from dataclasses import replace
 from difflib import SequenceMatcher
 import html
+import json
 import math
 from pathlib import Path
 import re
@@ -15,6 +16,7 @@ from typing import Callable, Iterable
 from PySide6.QtCore import (
     QAbstractTableModel,
     QEvent,
+    QMimeData,
     QModelIndex,
     QObject,
     QPoint,
@@ -139,6 +141,9 @@ STATUS_FILTER_ALL = "__all_statuses__"
 STATUS_FILTER_TODO = "__needs_translation__"
 LANGUAGE_ACTION_NEW = "__new_language__"
 LANGUAGE_ACTION_SEPARATOR = "__language_separator__"
+ENTRY_CLIPBOARD_MIME = "application/x-guild2-translator-entries+json"
+MAX_ENTRY_CLIPBOARD_BYTES = 64 * 1024 * 1024
+MAX_ENTRY_CLIPBOARD_COUNT = 100_000
 
 
 class UnitTableModel(QAbstractTableModel):
@@ -271,11 +276,29 @@ class UnitTableModel(QAbstractTableModel):
         self._glyph_warning.pop(unit.uid, None)
         self.dataChanged.emit(self.index(row, 0), self.index(row, self.columnCount() - 1))
 
-    def set_recently_translated(self, unit: TranslationUnit, recent: bool) -> None:
+    def refresh_units(self, units: Iterable[TranslationUnit]) -> None:
+        rows: list[int] = []
+        for unit in units:
+            row = self._row_by_uid.get(unit.uid)
+            if row is None:
+                continue
+            self._search[unit.uid] = _search_blob(unit)
+            self._format_warning.pop(unit.uid, None)
+            self._glyph_warning.pop(unit.uid, None)
+            rows.append(row)
+        if rows:
+            self.dataChanged.emit(
+                self.index(min(rows), 0),
+                self.index(max(rows), self.columnCount() - 1),
+            )
+
+    def set_recently_translated(self, unit: TranslationUnit, recent: bool, *, notify: bool = True) -> None:
         if recent:
             self._recently_translated.add(unit.uid)
         else:
             self._recently_translated.discard(unit.uid)
+        if not notify:
+            return
         row = self._row_by_uid.get(unit.uid)
         if row is None:
             return
@@ -2580,6 +2603,7 @@ class TranslatorWindow(QMainWindow):
         self.table.setWordWrap(False)
         self.table.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
         self.table.customContextMenuRequested.connect(self._show_table_menu)
+        self.table.installEventFilter(self)
         self.table.viewport().installEventFilter(self)
         self.table_tooltip_filter = DelayedToolTipFilter(
             self.table.viewport(),
@@ -2724,15 +2748,36 @@ class TranslatorWindow(QMainWindow):
         if watched is getattr(self, "source_code_button", None):
             return self._handle_code_button_event(event)
         code_popup = getattr(self, "code_reference_popup", None)
-        if watched is code_popup or (code_popup is not None and watched is code_popup.viewport()):
+        try:
+            code_popup_viewport = code_popup.viewport() if code_popup is not None else None
+        except RuntimeError:
+            # Qt can delete the popup's C++ object before the last shutdown
+            # events reach this Python event filter.
+            code_popup = None
+            code_popup_viewport = None
+        if watched is code_popup or watched is code_popup_viewport:
             return self._handle_code_popup_event(event)
         editor = self._watched_editor(watched)
         if isinstance(editor, PreviewPlainTextEdit):
             if event.type() == QEvent.Type.ShortcutOverride and isinstance(event, QKeyEvent):
+                if (
+                    editor is self.translation_edit
+                    and event.matches(QKeySequence.StandardKey.Paste)
+                    and QApplication.clipboard().mimeData().hasFormat(ENTRY_CLIPBOARD_MIME)
+                ):
+                    event.accept()
+                    return True
                 if event.matches(QKeySequence.StandardKey.Undo) or event.matches(QKeySequence.StandardKey.Redo) or self._is_ctrl_shift_z(event):
                     event.accept()
                     return True
             if event.type() == QEvent.Type.KeyPress and isinstance(event, QKeyEvent):
+                if (
+                    editor is self.translation_edit
+                    and event.matches(QKeySequence.StandardKey.Paste)
+                    and QApplication.clipboard().mimeData().hasFormat(ENTRY_CLIPBOARD_MIME)
+                ):
+                    self._paste_unit_translations()
+                    return True
                 if event.matches(QKeySequence.StandardKey.Undo):
                     self.undo()
                     return True
@@ -2745,7 +2790,20 @@ class TranslatorWindow(QMainWindow):
                     self._change_editor_zoom(1 if delta > 0 else -1)
                     return True
         table = getattr(self, "table", None)
-        if isinstance(table, QTableView) and watched is table.viewport():
+        if isinstance(table, QTableView) and (watched is table or watched is table.viewport()):
+            if event.type() == QEvent.Type.ShortcutOverride and isinstance(event, QKeyEvent):
+                if event.matches(QKeySequence.StandardKey.Copy) or event.matches(QKeySequence.StandardKey.Paste):
+                    event.accept()
+                    return True
+            if event.type() == QEvent.Type.KeyPress and isinstance(event, QKeyEvent):
+                if event.matches(QKeySequence.StandardKey.Copy):
+                    self._copy_unit_entries(self._selected_units())
+                    return True
+                if event.matches(QKeySequence.StandardKey.Paste):
+                    self._paste_unit_translations()
+                    return True
+            if watched is not table.viewport():
+                return super().eventFilter(watched, event)
             if event.type() == QEvent.Type.MouseButtonPress and event.button() == Qt.MouseButton.RightButton:
                 index = self.table.indexAt(event.position().toPoint())
                 if index.isValid():
@@ -2805,7 +2863,11 @@ class TranslatorWindow(QMainWindow):
         if editor is not self.translation_edit:
             return False
         if not editor.document().isUndoAvailable():
-            return False
+            # A redoable editor command means local undo just reached the
+            # entry's initial text.  Do not replay the same typing through the
+            # application-level history.  When both stacks are empty (for
+            # example after a Guides/dbt switch), the normal fallback remains.
+            return editor.document().isRedoAvailable()
         self._cancel_pending_typing_operation()
         self._replaying_editor_history = True
         try:
@@ -4227,17 +4289,47 @@ class TranslatorWindow(QMainWindow):
                 )
             )
 
-    def _apply_operation_state(self, uid: str, text: str, pending_delete: bool) -> None:
-        unit = self.model.unit_for_uid(uid)
-        if unit is None:
+    def _apply_operation_changes(self, changes: tuple[UnitChange, ...], *, use_after: bool) -> None:
+        changed: list[tuple[TranslationUnit, str, bool]] = []
+        unconfirm: list[TranslationUnit] = []
+        restore_confirmation: list[TranslationUnit] = []
+        changed_uids: set[str] = set()
+        for change in changes:
+            unit = self.model.unit_for_uid(change.uid)
+            if unit is None:
+                continue
+            text = change.after if use_after else change.before
+            pending_delete = change.after_deleted if use_after else change.before_deleted
+            before_status = unit.filter_status()
+            was_confirmed = unit.confirmed and text != unit.current_text
+            if was_confirmed:
+                self._editor_unconfirmed_uids.add(unit.uid)
+                unconfirm.append(unit)
+            unit.set_text(text)
+            if not was_confirmed and unit.current_text == unit.translate_text and unit.uid in self._editor_unconfirmed_uids:
+                restore_confirmation.append(unit)
+                self._editor_unconfirmed_uids.discard(unit.uid)
+            changed.append((unit, before_status, pending_delete))
+            changed_uids.add(unit.uid)
+
+        if not changed:
             return
-        before_status = unit.filter_status()
-        self._set_unit_text(unit, text)
-        unit.set_pending_delete(pending_delete)
-        self.model.refresh_unit(unit)
-        self._update_recent_translation_marker(unit, before_status)
-        if uid == self.current_uid:
-            self._set_editor_unit(unit)
+        if self.project is not None:
+            if unconfirm:
+                self.project.set_units_confirmed(unconfirm, False)
+            if restore_confirmation:
+                self.project.set_units_confirmed(restore_confirmation, True)
+        for unit, before_status, pending_delete in changed:
+            unit.set_pending_delete(pending_delete)
+            self._update_recent_translation_marker(unit, before_status, notify=False)
+        changed_units = tuple(unit for unit, _before_status, _pending_delete in changed)
+        self.model.refresh_units(changed_units)
+        selection_blocker = QSignalBlocker(self.table.selectionModel())
+        self.proxy.refresh_rows()
+        del selection_blocker
+        current = self.model.unit_for_uid(self.current_uid) if self.current_uid else None
+        if current is not None and current.uid in changed_uids:
+            self._set_editor_unit(current)
         self._update_counts()
         self._update_window_title()
 
@@ -4254,15 +4346,15 @@ class TranslatorWindow(QMainWindow):
             self.project.set_units_confirmed((unit,), True)
             self._editor_unconfirmed_uids.discard(unit.uid)
 
-    def _update_recent_translation_marker(self, unit: TranslationUnit, before_status: str) -> None:
+    def _update_recent_translation_marker(self, unit: TranslationUnit, before_status: str, *, notify: bool = True) -> None:
         current_status = unit.filter_status()
         changed_existing_translation = unit.is_dirty and unit.status == STATUS_TRANSLATED
         if current_status == STATUS_TRANSLATED and unit.is_dirty and (
             before_status in MISSING_WORK_STATUSES or changed_existing_translation
         ):
-            self.model.set_recently_translated(unit, True)
+            self.model.set_recently_translated(unit, True, notify=notify)
         elif current_status != STATUS_TRANSLATED or not unit.is_dirty:
-            self.model.set_recently_translated(unit, False)
+            self.model.set_recently_translated(unit, False, notify=notify)
 
     def _replace_current_text(self, text: str, label: str) -> None:
         unit = self._current_unit()
@@ -4295,14 +4387,7 @@ class TranslatorWindow(QMainWindow):
         )
         if not changes:
             return
-        for change in changes:
-            self._apply_operation_state(change.uid, change.after, change.after_deleted)
-        self.proxy.refresh_rows()
-        current = self._current_unit()
-        if current is not None and any(change.uid == current.uid for change in changes):
-            self._set_editor_unit(current)
-        self._update_counts()
-        self._update_window_title()
+        self._apply_operation_changes(changes, use_after=True)
         self.history.push(TranslationOperation(label, changes))
 
     def _set_units_pending_delete(self, units: Iterable[TranslationUnit], pending_delete: bool) -> None:
@@ -4321,16 +4406,18 @@ class TranslatorWindow(QMainWindow):
         if self._try_editor_undo():
             return
         self._commit_typing_operation()
-        operation = self.history.undo(self._apply_operation_state)
+        operation = self.history.take_undo()
         if operation:
+            self._apply_operation_changes(operation.changes, use_after=False)
             self.statusBar().showMessage(translate("status.undo", label=operation.label), 2500)
 
     def redo(self) -> None:
         if self._try_editor_redo():
             return
         self._commit_typing_operation()
-        operation = self.history.redo(self._apply_operation_state)
+        operation = self.history.take_redo()
         if operation:
+            self._apply_operation_changes(operation.changes, use_after=True)
             self.statusBar().showMessage(translate("status.redo", label=operation.label), 2500)
 
     def _show_table_menu(self, point: QPoint) -> None:
@@ -4395,7 +4482,7 @@ class TranslatorWindow(QMainWindow):
         elif action == ignored:
             self._set_units_ignored(units, not all_ignored)
         elif action == copy_translation:
-            self._copy_unit_translations(units)
+            self._copy_unit_entries(units)
         elif action == restore:
             self._replace_units_state(
                 units,
@@ -4424,19 +4511,100 @@ class TranslatorWindow(QMainWindow):
 
     def _selected_units(self) -> list[TranslationUnit]:
         units: list[TranslationUnit] = []
-        for index in self.table.selectionModel().selectedRows():
+        for index in sorted(self.table.selectionModel().selectedRows(), key=lambda item: item.row()):
             unit = self._unit_from_proxy_index(index)
             if unit is not None:
                 units.append(unit)
         return units
 
-    def _copy_unit_translations(self, units: Iterable[TranslationUnit]) -> None:
-        texts = [unit.current_text for unit in units if unit.current_text]
-        if not texts:
+    def _copy_unit_entries(self, units: Iterable[TranslationUnit]) -> None:
+        selected = tuple(units)
+        if not selected:
             self.statusBar().showMessage(translate("status.copy_none"), 2500)
             return
-        QApplication.clipboard().setText("\n".join(texts))
-        self.statusBar().showMessage(translate("status.copy_done", count=len(texts)), 2500)
+        payload = [
+            {
+                "key": _entry_clipboard_key(unit),
+                "source": unit.source_text,
+                "translation": unit.current_text,
+            }
+            for unit in selected
+        ]
+        mime = QMimeData()
+        mime.setData(
+            ENTRY_CLIPBOARD_MIME,
+            json.dumps(payload, ensure_ascii=False, separators=(",", ":")).encode("utf-8"),
+        )
+        mime.setText(
+            "\n".join(
+                f"<{_clipboard_display_text(item['key'])}, {_clipboard_display_text(item['source'])}, "
+                f"{_clipboard_display_text(item['translation'])}>"
+                for item in payload
+            )
+        )
+        QApplication.clipboard().setMimeData(mime)
+        self.statusBar().showMessage(translate("status.copy_done", count=len(selected)), 2500)
+
+    def _clipboard_translations(self) -> list[str] | None:
+        mime = QApplication.clipboard().mimeData()
+        if not mime.hasFormat(ENTRY_CLIPBOARD_MIME):
+            return None
+        raw = bytes(mime.data(ENTRY_CLIPBOARD_MIME))
+        if not raw or len(raw) > MAX_ENTRY_CLIPBOARD_BYTES:
+            return None
+        try:
+            payload = json.loads(raw.decode("utf-8"))
+        except (UnicodeDecodeError, json.JSONDecodeError):
+            return None
+        if not isinstance(payload, list) or not payload or len(payload) > MAX_ENTRY_CLIPBOARD_COUNT:
+            return None
+        translations: list[str] = []
+        for item in payload:
+            if not isinstance(item, dict) or not isinstance(item.get("translation"), str):
+                return None
+            translations.append(item["translation"])
+        return translations
+
+    def _paste_unit_translations(self) -> None:
+        translations = self._clipboard_translations()
+        if translations is None:
+            self.statusBar().showMessage(translate("status.paste_unavailable"), 3000)
+            return
+        indexes = sorted(self.table.selectionModel().selectedRows(), key=lambda item: item.row())
+        copied_count = len(translations)
+        if len(indexes) == copied_count:
+            targets = [self._unit_from_proxy_index(index) for index in indexes]
+        elif len(indexes) == 1:
+            start = indexes[0].row()
+            if start + copied_count > self.proxy.rowCount():
+                self.statusBar().showMessage(translate("status.paste_range_short"), 3500)
+                return
+            targets = [self._unit_from_proxy_index(self.proxy.index(row, 0)) for row in range(start, start + copied_count)]
+        else:
+            self.statusBar().showMessage(
+                translate("status.paste_count_mismatch", copied=copied_count, selected=len(indexes)),
+                4000,
+            )
+            return
+        selected = tuple(unit for unit in targets if unit is not None)
+        if len(selected) != copied_count:
+            self.statusBar().showMessage(translate("status.paste_range_short"), 3500)
+            return
+        texts = {unit.uid: text for unit, text in zip(selected, translations)}
+        changed_count = sum(
+            unit.current_text != texts[unit.uid] or unit.pending_delete
+            for unit in selected
+        )
+        if not changed_count:
+            self.statusBar().showMessage(translate("status.paste_no_changes"), 2500)
+            return
+        self._replace_units_state(
+            selected,
+            texts,
+            False,
+            translate("operation.paste_translations", count=changed_count),
+        )
+        self.statusBar().showMessage(translate("status.paste_done", count=changed_count), 3000)
 
     def _set_ignored(self, unit: TranslationUnit, ignored: bool) -> None:
         self._set_units_ignored((unit,), ignored)
@@ -5056,6 +5224,14 @@ def _search_blob(unit: TranslationUnit) -> str:
             todo_reason,
         )
     ).lower()
+
+
+def _entry_clipboard_key(unit: TranslationUnit) -> str:
+    return unit.label or unit.record_id or unit.file_rel
+
+
+def _clipboard_display_text(text: str) -> str:
+    return text.replace("\\", "\\\\").replace("\r\n", "\n").replace("\r", "\n").replace("\n", "\\n")
 
 
 def _clip(text: str, limit: int) -> str:

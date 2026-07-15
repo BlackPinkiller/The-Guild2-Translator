@@ -47,20 +47,32 @@ class OperationHistory:
         self._redo.clear()
 
     def undo(self, apply: Callable[[str, str, bool], None]) -> TranslationOperation | None:
-        if not self._undo:
+        operation = self.take_undo()
+        if operation is None:
             return None
-        operation = self._undo.pop()
         for change in operation.changes:
             apply(change.uid, change.before, change.before_deleted)
-        self._redo.append(operation)
         return operation
 
     def redo(self, apply: Callable[[str, str, bool], None]) -> TranslationOperation | None:
+        operation = self.take_redo()
+        if operation is None:
+            return None
+        for change in operation.changes:
+            apply(change.uid, change.after, change.after_deleted)
+        return operation
+
+    def take_undo(self) -> TranslationOperation | None:
+        if not self._undo:
+            return None
+        operation = self._undo.pop()
+        self._redo.append(operation)
+        return operation
+
+    def take_redo(self) -> TranslationOperation | None:
         if not self._redo:
             return None
         operation = self._redo.pop()
-        for change in operation.changes:
-            apply(change.uid, change.after, change.after_deleted)
         self._undo.append(operation)
         return operation
 

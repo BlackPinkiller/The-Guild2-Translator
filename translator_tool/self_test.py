@@ -1198,7 +1198,7 @@ def assert_bundled_settings_are_isolated_by_location() -> None:
 
 def assert_editor_undo_stays_local(root: Path) -> None:
     os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
-    from PySide6.QtCore import Qt
+    from PySide6.QtCore import QItemSelection, QItemSelectionModel, Qt
     from PySide6.QtGui import QTextCursor
     from PySide6.QtTest import QTest
     from PySide6.QtWidgets import QApplication
@@ -1348,6 +1348,91 @@ def assert_editor_undo_stays_local(root: Path) -> None:
         app.processEvents()
         if second.current_text != second_original:
             raise AssertionError("editor undo did not fall back to entry history after returning from guide txt mode")
+
+        win.history.clear()
+        win._set_editor_unit(second)
+        win.translation_edit.setFocus(Qt.FocusReason.OtherFocusReason)
+        app.processEvents()
+        cycle_baseline = second.current_text
+        cycle_second = cycle_baseline + "2"
+        cycle_third = cycle_baseline + "3"
+        for text in (cycle_second, cycle_third):
+            win.translation_edit.selectAll()
+            win.translation_edit.insertPlainText(text)
+            app.processEvents()
+            QTest.qWait(TYPING_GROUP_DELAY_MS + 120)
+            app.processEvents()
+
+        for expected in (cycle_second, cycle_baseline):
+            QTest.keyClick(win.translation_edit, Qt.Key.Key_Z, Qt.KeyboardModifier.ControlModifier)
+            app.processEvents()
+            if second.current_text != expected:
+                raise AssertionError("editor-local undo did not restore the expected text sequence")
+        QTest.keyClick(win.translation_edit, Qt.Key.Key_Z, Qt.KeyboardModifier.ControlModifier)
+        app.processEvents()
+        if second.current_text != cycle_baseline:
+            raise AssertionError("exhausted editor undo replayed the same typing through entry history")
+
+        win.only_missing.setChecked(False)
+        win.status_combo.setCurrentIndex(win.status_combo.findData(app_module.STATUS_FILTER_ALL))
+        win._apply_filters()
+        app.processEvents()
+        clipboard_units = [win._unit_from_proxy_index(win.proxy.index(row, 0)) for row in range(4)]
+        if any(unit is None for unit in clipboard_units):
+            raise AssertionError("entry clipboard smoke test needs four visible translation entries")
+        clipboard_units = [unit for unit in clipboard_units if unit is not None]
+        source_texts = tuple(unit.source_text for unit in clipboard_units)
+        copied_before = tuple(unit.current_text for unit in clipboard_units[:2])
+        copied_texts = ("clipboard translation A", "clipboard translation B")
+        win._replace_units_state(
+            clipboard_units[:2],
+            {unit.uid: text for unit, text in zip(clipboard_units[:2], copied_texts)},
+            False,
+            "clipboard setup",
+        )
+        win.history.clear()
+
+        def select_proxy_rows(first: int, last: int) -> None:
+            selection_model = win.table.selectionModel()
+            current = win.proxy.index(first, 0)
+            win.table.setCurrentIndex(current)
+            selection = QItemSelection(current, win.proxy.index(last, win.model.columnCount() - 1))
+            selection_model.select(
+                selection,
+                QItemSelectionModel.SelectionFlag.ClearAndSelect | QItemSelectionModel.SelectionFlag.Rows,
+            )
+            win.table.setFocus(Qt.FocusReason.OtherFocusReason)
+            app.processEvents()
+
+        select_proxy_rows(0, 1)
+        QTest.keyClick(win.table, Qt.Key.Key_C, Qt.KeyboardModifier.ControlModifier)
+        app.processEvents()
+        clipboard_mime = QApplication.clipboard().mimeData()
+        if not clipboard_mime.hasFormat(app_module.ENTRY_CLIPBOARD_MIME):
+            raise AssertionError("entry copy did not publish the app clipboard format")
+        if not clipboard_mime.text().startswith("<") or "clipboard translation A" not in clipboard_mime.text():
+            raise AssertionError("entry copy did not publish the complete external text format")
+
+        target_before = tuple(unit.current_text for unit in clipboard_units[2:])
+        select_proxy_rows(2, 2)
+        QTest.keyClick(win.table, Qt.Key.Key_V, Qt.KeyboardModifier.ControlModifier)
+        app.processEvents()
+        if tuple(unit.current_text for unit in clipboard_units[2:]) != copied_texts:
+            raise AssertionError("multi-entry paste did not fill consecutive translations from the selected row")
+        if tuple(unit.source_text for unit in clipboard_units) != source_texts:
+            raise AssertionError("entry paste modified source text")
+        win.undo()
+        app.processEvents()
+        if tuple(unit.current_text for unit in clipboard_units[2:]) != target_before:
+            raise AssertionError("one undo did not restore the complete multi-entry paste")
+        win._replace_units_state(
+            clipboard_units[:2],
+            {unit.uid: text for unit, text in zip(clipboard_units[:2], copied_before)},
+            False,
+            "clipboard cleanup",
+        )
+        win.history.clear()
+        QApplication.clipboard().clear()
 
         win.close()
         app.processEvents()
