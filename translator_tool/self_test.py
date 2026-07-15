@@ -274,6 +274,7 @@ def assert_code_reference_index_avoids_db_and_uses_vanilla_fallback() -> None:
             "\n".join(
                 (
                     'MsgQuick("", "@L_DYNAMIC_BRANCH_+"..choice)',
+                    'MsgQuick("", "@L_THIEF_066_BURGLEAHOUSE_FAILURES_+3")',
                     'MsgBoxNoWait("All", nil, "@L_WAR_END_LOOSE_HEAD_+0", "@L_WAR_END_LOOSE_BODY_+0", "@L_SCENARIO_LORD_"..enemy.."_+1")',
                 )
             ),
@@ -310,6 +311,12 @@ def assert_code_reference_index_avoids_db_and_uses_vanilla_fallback() -> None:
         dynamic_refs = vanilla_index.references_for("DYNAMIC_BRANCH_+1")
         if dynamic_refs.project_count != 1 or dynamic_refs.project[0].path.name != "Dynamic.lua":
             raise AssertionError("dynamic _+n code reference fallback was not indexed")
+        static_mismatch_refs = vanilla_index.references_for("THIEF_066_BURGLEAHOUSE_FAILURES_+1")
+        if static_mismatch_refs.project_count:
+            raise AssertionError("a fixed _+3 label was treated as a dynamic _+n reference")
+        static_exact_refs = vanilla_index.references_for("THIEF_066_BURGLEAHOUSE_FAILURES_+3")
+        if static_exact_refs.project_count != 1 or static_exact_refs.project[0].path.name != "Dynamic.lua":
+            raise AssertionError("fixed _+n code reference was not indexed exactly")
         concatenated_refs = vanilla_index.references_for("SCENARIO_LORD_ENEMY_+1")
         if concatenated_refs.project_count != 1 or concatenated_refs.project[0].path.name != "Dynamic.lua":
             raise AssertionError("concatenated dynamic label code reference fallback was not indexed")

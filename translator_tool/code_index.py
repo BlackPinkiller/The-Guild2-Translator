@@ -127,9 +127,6 @@ def scan_scripts_root(root: Path, *, source: str = "project") -> dict[str, tuple
                 source=source,
             )
             grouped.setdefault(label, []).append(reference)
-            group_label = label_group_key(label)
-            if group_label is not None and group_label != label:
-                grouped.setdefault(group_label, []).append(reference)
         for label, position in dynamic_label_matches(text):
             line_number, column = _line_column(line_starts, position)
             call_name, argument_index, arguments = _call_context(text, position)
