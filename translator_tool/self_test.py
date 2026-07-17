@@ -51,6 +51,12 @@ from .project import (
     UnitRef,
 )
 from .settings import AppSettings, load_settings, save_settings
+from .self_tests.clipboard import assert_entry_clipboard_decoder
+from .self_tests.performance import (
+    LARGE_BATCH_MIN_ENTRIES,
+    LARGE_BATCH_SAVE_LIMIT_SECONDS,
+    assert_within_budget,
+)
 from .source_sync import (
     discover_game_source_projects,
     local_project_roots,
@@ -1114,6 +1120,31 @@ def assert_recovery_draft_round_trip(root: Path) -> None:
         safe_rmtree(temp)
 
 
+def assert_project_edit_state_keeps_confirmation_consistent(root: Path) -> None:
+    temp = make_temp_project(root, "translator_tool_smoke_edit_state_")
+    try:
+        project = Project.load(temp, "#chinese", enable_codec=False)
+        unit = next(item for item in project.units if item.translate_text and not item.is_extra)
+        original = unit.current_text
+        project.set_units_confirmed((unit,), True)
+
+        project.apply_unit_edits(((unit, original + "x", None),))
+        if unit.confirmed or unit.uid in confirmed_uids(temp, "#chinese"):
+            raise AssertionError("editing a confirmed translation did not clear confirmation")
+        project.apply_unit_edits(((unit, original, None),))
+        if not unit.confirmed or unit.uid not in confirmed_uids(temp, "#chinese"):
+            raise AssertionError("reverting an editor change did not restore confirmation")
+
+        project.apply_unit_edits(((unit, original, True),))
+        if unit.confirmed or not unit.pending_delete:
+            raise AssertionError("marking a confirmed translation for deletion kept stale confirmation")
+        project.apply_unit_edits(((unit, original, False),))
+        if not unit.confirmed or unit.pending_delete:
+            raise AssertionError("undoing a deletion did not restore confirmation")
+    finally:
+        safe_rmtree(temp)
+
+
 def assert_large_batch_save_stays_interactive(root: Path) -> None:
     temp = make_temp_project(root, "translator_tool_smoke_large_save_")
     try:
@@ -1128,8 +1159,13 @@ def assert_large_batch_save_stays_interactive(root: Path) -> None:
         started = time.perf_counter()
         project.save(edited)
         elapsed = time.perf_counter() - started
-        if len(edited) >= 10_000 and elapsed > 8.0:
-            raise AssertionError(f"large batch save is too slow: {elapsed:.3f}s for {len(edited)} entries")
+        if len(edited) >= LARGE_BATCH_MIN_ENTRIES:
+            assert_within_budget(
+                "large batch save",
+                elapsed,
+                LARGE_BATCH_SAVE_LIMIT_SECONDS,
+                detail=f"{len(edited)} entries",
+            )
     finally:
         safe_rmtree(temp)
 
@@ -3240,7 +3276,9 @@ def main() -> int:
     assert_failed_save_does_not_mutate_loaded_documents(root)
     assert_atomic_write_many_rolls_back_partial_commit()
     assert_recovery_draft_round_trip(root)
+    assert_project_edit_state_keeps_confirmation_consistent(root)
     assert_large_batch_save_stays_interactive(root)
+    assert_entry_clipboard_decoder()
     assert_missing_insertions_follow_file_order(root)
     assert_unsaved_translation_status(root)
     assert_mod_label_match_inserts_source_formatted_row(root)

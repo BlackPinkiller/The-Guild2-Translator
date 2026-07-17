@@ -4,7 +4,6 @@ from collections import Counter
 from dataclasses import replace
 from difflib import SequenceMatcher
 import html
-import json
 import math
 from pathlib import Path
 import re
@@ -83,6 +82,7 @@ from .code_index import CodeReference, CodeReferenceIndex, CodeReferenceSet, bui
 from .code_window_context import DARK_PANEL_TEXT, PreviewWindowContext, best_window_context
 from .code_open import open_code_reference
 from .codec_adapter import CodecError, Guild2Codec, load_codec_for_language, language_uses_codec
+from .entry_clipboard import ENTRY_CLIPBOARD_MIME, decode_translations, encode_entries
 from .git_history import GitCommit, GitError, LanguageGit, TranslationLogEntry
 from .game_theme import GameAssetSet, GameHeaderFrame, GamePanelFrame, install_game_theme_style
 from .history import OperationHistory, TranslationOperation, UnitChange
@@ -144,11 +144,6 @@ STATUS_FILTER_TODO = "__needs_translation__"
 STATUS_FILTER_REVIEW = STATUS_REVIEW
 LANGUAGE_ACTION_NEW = "__new_language__"
 LANGUAGE_ACTION_SEPARATOR = "__language_separator__"
-ENTRY_CLIPBOARD_MIME = "application/x-guild2-translator-entries+json"
-MAX_ENTRY_CLIPBOARD_BYTES = 64 * 1024 * 1024
-MAX_ENTRY_CLIPBOARD_COUNT = 100_000
-
-
 class SearchLineEdit(QLineEdit):
     case_sensitive_toggled = Signal(bool)
 
@@ -2621,7 +2616,6 @@ class TranslatorWindow(QMainWindow):
         self.typing_uid = ""
         self.typing_before = ""
         self.typing_before_deleted = False
-        self._editor_unconfirmed_uids: set[str] = set()
         self._replaying_editor_history = False
         self.editor_zoom_steps = self.settings.editor_zoom_steps
         self.typing_timer = QTimer(self)
@@ -3774,7 +3768,6 @@ class TranslatorWindow(QMainWindow):
         self.typing_uid = ""
         self.typing_before = ""
         self.typing_before_deleted = False
-        self._editor_unconfirmed_uids.clear()
         self.current_uid = ""
         self._filter_anchor_uid = ""
         self.model.clear()
@@ -4010,7 +4003,6 @@ class TranslatorWindow(QMainWindow):
         self.typing_uid = ""
         self.typing_before = ""
         self.typing_before_deleted = False
-        self._editor_unconfirmed_uids.clear()
         self.current_uid = ""
         self._filter_anchor_uid = ""
         self.model.set_project(self.project)
@@ -4653,8 +4645,11 @@ class TranslatorWindow(QMainWindow):
         if unit is None:
             return
         before_status = unit.filter_status()
-        self._set_unit_text(unit, text)
-        unit.set_pending_delete(pending_delete)
+        if self.project is not None:
+            self.project.apply_unit_edits(((unit, text, pending_delete),))
+        else:
+            unit.set_text(text)
+            unit.set_pending_delete(pending_delete)
         self.model.refresh_unit(unit)
         self._update_recent_translation_marker(unit, before_status)
         if uid == self.current_uid:
@@ -4665,8 +4660,7 @@ class TranslatorWindow(QMainWindow):
 
     def _apply_operation_changes(self, changes: tuple[UnitChange, ...], *, use_after: bool) -> None:
         changed: list[tuple[TranslationUnit, str, bool]] = []
-        unconfirm: list[TranslationUnit] = []
-        restore_confirmation: list[TranslationUnit] = []
+        edit_states: list[tuple[TranslationUnit, str, bool | None]] = []
         changed_uids: set[str] = set()
         for change in changes:
             unit = self.model.unit_for_uid(change.uid)
@@ -4675,26 +4669,20 @@ class TranslatorWindow(QMainWindow):
             text = change.after if use_after else change.before
             pending_delete = change.after_deleted if use_after else change.before_deleted
             before_status = unit.filter_status()
-            was_confirmed = unit.confirmed and text != unit.current_text
-            if was_confirmed:
-                self._editor_unconfirmed_uids.add(unit.uid)
-                unconfirm.append(unit)
-            unit.set_text(text)
-            if not was_confirmed and unit.current_text == unit.translate_text and unit.uid in self._editor_unconfirmed_uids:
-                restore_confirmation.append(unit)
-                self._editor_unconfirmed_uids.discard(unit.uid)
             changed.append((unit, before_status, pending_delete))
+            edit_states.append((unit, text, pending_delete))
             changed_uids.add(unit.uid)
 
         if not changed:
             return
         if self.project is not None:
-            if unconfirm:
-                self.project.set_units_confirmed(unconfirm, False)
-            if restore_confirmation:
-                self.project.set_units_confirmed(restore_confirmation, True)
-        for unit, before_status, pending_delete in changed:
-            unit.set_pending_delete(pending_delete)
+            self.project.apply_unit_edits(edit_states)
+        else:
+            for unit, text, pending_delete in edit_states:
+                unit.set_text(text)
+                if pending_delete is not None:
+                    unit.set_pending_delete(pending_delete)
+        for unit, before_status, _pending_delete in changed:
             self._update_recent_translation_marker(unit, before_status, notify=False)
         changed_units = tuple(unit for unit, _before_status, _pending_delete in changed)
         self.model.refresh_units(changed_units)
@@ -4709,17 +4697,10 @@ class TranslatorWindow(QMainWindow):
         self._schedule_recovery_snapshot()
 
     def _set_unit_text(self, unit: TranslationUnit, text: str) -> None:
-        was_confirmed = unit.confirmed and text != unit.current_text
-        if was_confirmed:
-            self._editor_unconfirmed_uids.add(unit.uid)
-        unit.set_text(text)
         if self.project is None:
+            unit.set_text(text)
             return
-        if was_confirmed:
-            self.project.set_units_confirmed((unit,), False)
-        elif unit.current_text == unit.translate_text and unit.uid in self._editor_unconfirmed_uids:
-            self.project.set_units_confirmed((unit,), True)
-            self._editor_unconfirmed_uids.discard(unit.uid)
+        self.project.apply_unit_edits(((unit, text, None),))
 
     def _update_recent_translation_marker(self, unit: TranslationUnit, before_status: str, *, notify: bool = True) -> None:
         current_status = unit.filter_status()
@@ -4897,25 +4878,10 @@ class TranslatorWindow(QMainWindow):
         if not selected:
             self.statusBar().showMessage(translate("status.copy_none"), 2500)
             return
-        payload = [
-            {
-                "key": _entry_clipboard_key(unit),
-                "source": unit.source_text,
-                "translation": unit.current_text,
-            }
-            for unit in selected
-        ]
+        raw, plain_text = encode_entries(selected)
         mime = QMimeData()
-        mime.setData(
-            ENTRY_CLIPBOARD_MIME,
-            json.dumps(payload, ensure_ascii=False, separators=(",", ":")).encode("utf-8"),
-        )
-        mime.setText(
-            "\n".join(
-                f"{item['key']}\t{item['source']}\t{item['translation']}"
-                for item in payload
-            )
-        )
+        mime.setData(ENTRY_CLIPBOARD_MIME, raw)
+        mime.setText(plain_text)
         QApplication.clipboard().setMimeData(mime)
         self.statusBar().showMessage(translate("status.copy_done", count=len(selected)), 2500)
 
@@ -4923,21 +4889,7 @@ class TranslatorWindow(QMainWindow):
         mime = QApplication.clipboard().mimeData()
         if not mime.hasFormat(ENTRY_CLIPBOARD_MIME):
             return None
-        raw = bytes(mime.data(ENTRY_CLIPBOARD_MIME))
-        if not raw or len(raw) > MAX_ENTRY_CLIPBOARD_BYTES:
-            return None
-        try:
-            payload = json.loads(raw.decode("utf-8"))
-        except (UnicodeDecodeError, json.JSONDecodeError):
-            return None
-        if not isinstance(payload, list) or not payload or len(payload) > MAX_ENTRY_CLIPBOARD_COUNT:
-            return None
-        translations: list[str] = []
-        for item in payload:
-            if not isinstance(item, dict) or not isinstance(item.get("translation"), str):
-                return None
-            translations.append(item["translation"])
-        return translations
+        return decode_translations(bytes(mime.data(ENTRY_CLIPBOARD_MIME)))
 
     def _paste_unit_translations(self) -> None:
         translations = self._clipboard_translations()
@@ -5617,10 +5569,6 @@ class TranslatorWindow(QMainWindow):
         if self.suggestion_cancel_event is not None:
             self.suggestion_cancel_event.set()
         self.code_reference_index_token += 1
-
-
-def _entry_clipboard_key(unit: TranslationUnit) -> str:
-    return unit.label or unit.record_id or unit.file_rel
 
 
 def _clip(text: str, limit: int) -> str:
