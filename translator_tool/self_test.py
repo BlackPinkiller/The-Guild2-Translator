@@ -2148,7 +2148,9 @@ def assert_guild2_format_grammar() -> None:
         dialect=FORMAT_GUIDE,
     )
     if not any(issue.code == "guide-quote" for issue in guide_quote):
-        raise AssertionError("plain double quotes in Guide text should be warned as a crash risk")
+        raise AssertionError("plain double quotes in Guide text should be rejected as a crash risk")
+    if not any(issue.code == "guide-quote" and issue.blocks_save for issue in guide_quote):
+        raise AssertionError("plain double quotes in Guide text should block saving")
     guide_attr_quote = validate_translation(
         '<list>[type="bullet"]<item>Safe</item></list>',
         '<list>[type="bullet"]<item>Safe</item></list>',
@@ -2157,6 +2159,12 @@ def assert_guild2_format_grammar() -> None:
     )
     if any(issue.code == "guide-quote" for issue in guide_attr_quote):
         raise AssertionError("double quotes inside legal Guide attributes should not be warned")
+    dbt_quote = validate_translation("Safe", '中文"引号', dbt_field=True)
+    if not any(issue.code == "dbt-quote" and issue.blocks_save for issue in dbt_quote):
+        raise AssertionError("plain double quotes in DBT text should block saving")
+    chinese_punctuation = validate_translation("Safe", "“中文”，‘标点’。", dbt_field=True)
+    if chinese_punctuation:
+        raise AssertionError("Chinese punctuation should not produce Translation-Kit warnings")
     literal_percent = validate_translation(
         "Weak beer has 3-6% of alcohol and costs 50%.",
         "淡啤酒酒精度为 3-6%，价格是 50%。",

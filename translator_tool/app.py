@@ -122,7 +122,6 @@ from .source_sync import (
 )
 from .validation import (
     COLOR_TOKEN_RE,
-    CHINESE_QUOTE_RE,
     FORMAT_GUILD2,
     format_counter_items,
     format_dialect,
@@ -1663,7 +1662,6 @@ class TokenHighlighter(QSyntaxHighlighter):
         self.markup_token = _text_format(_theme_color("markup_token", "#6b6b00"))
         self.quote_token = _text_format(_theme_color("quote_token", "#107c10"))
         self.bad_token = _text_format(_theme_color("bad_token", "#b00020"), underline=True)
-        self.warn_token = _text_format(_theme_color("warn_token", "#c45f00"), underline=True)
         self.glyph_token = _text_format(_theme_color("glyph_token", "#cc241d"), underline=True)
 
     def set_glyph_codec(self, glyph_codec: Guild2Codec | None) -> None:
@@ -1682,7 +1680,6 @@ class TokenHighlighter(QSyntaxHighlighter):
         self.markup_token.setForeground(QColor(_theme_color("markup_token", "#6b6b00")))
         self.quote_token.setForeground(QColor(_theme_color("quote_token", "#107c10")))
         self.bad_token.setForeground(QColor(_theme_color("bad_token", "#b00020")))
-        self.warn_token.setForeground(QColor(_theme_color("warn_token", "#c45f00")))
         self.glyph_token.setForeground(QColor(_theme_color("glyph_token", "#cc241d")))
         self.rehighlight()
 
@@ -1697,8 +1694,6 @@ class TokenHighlighter(QSyntaxHighlighter):
             elif token.startswith(">") and token.endswith("<"):
                 fmt = self.quote_token
             self.setFormat(match.start(), match.end() - match.start(), fmt)
-        for match in CHINESE_QUOTE_RE.finditer(text):
-            self.setFormat(match.start(), match.end() - match.start(), self.warn_token)
         if self.glyph_codec is not None:
             position = 0
             for char in text:
@@ -6126,7 +6121,6 @@ def _theme_color(name: str, fallback: str) -> str:
             "markup_token": "#d0ad61",
             "quote_token": "#9bb276",
             "bad_token": "#d4775d",
-            "warn_token": "#c49b55",
             "glyph_token": "#d4775d",
         }.get(name, fallback)
     return fallback

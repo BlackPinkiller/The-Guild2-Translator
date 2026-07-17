@@ -156,7 +156,6 @@ PROTECTED_TOKEN_RE = re.compile(
     "|".join((GUILD2_TOKEN_RE.pattern, TOOLTIP_TOKEN_RE.pattern, GUIDE_TOKEN_RE.pattern))
 )
 
-CHINESE_QUOTE_RE = re.compile(r"[\u201C\u201D\u2018\u2019]")
 ARG_TOKEN_RE = re.compile(ARG_TOKEN)
 NAME_SUFFIX_TOKEN_RE = re.compile(rf"^{NAME_SUFFIX_TOKEN}$")
 UNKNOWN_PERCENT_RE = re.compile(r"%(?:\d*[A-Za-z][A-Za-z0-9]*|[^\s])?")
@@ -647,14 +646,11 @@ def validate_translation(
         if quote_count:
             issues.append(
                 ValidationIssue(
-                    "warning",
+                    "error",
                     translate("validation.guide_quote", count=quote_count),
                     code="guide-quote",
                 )
             )
-    if CHINESE_QUOTE_RE.search(target):
-        bad = "".join(dict.fromkeys(CHINESE_QUOTE_RE.findall(target)))
-        issues.append(ValidationIssue("warning", translate("validation.quote_style", text=bad), code="quote-style"))
     if source_suspect:
         issues.append(
             ValidationIssue(
