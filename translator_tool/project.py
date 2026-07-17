@@ -15,7 +15,7 @@ from .cache import (
     source_review_uids,
 )
 from .codec_adapter import CodecError, Guild2Codec, load_codec_for_language
-from .file_utils import atomic_write
+from .file_utils import atomic_write_many
 from .format_io import (
     DbtDocument,
     DbtRow,
@@ -39,6 +39,7 @@ STATUS_TRANSLATED = "已翻译"
 STATUS_EXTRA = "多余"
 STATUS_IGNORED = "无需翻译"
 STATUS_PENDING_DELETE = "待删除"
+STATUS_REVIEW = "需审核"
 
 TODO_REASON_NONE = ""
 TODO_REASON_MISSING_ROW = "missing_row"
@@ -55,7 +56,6 @@ STATUS_MISSING_ROW = STATUS_TODO
 STATUS_EMPTY = STATUS_TODO
 STATUS_SAME = STATUS_TODO
 STATUS_MODIFIED = STATUS_TRANSLATED
-STATUS_REVIEW = STATUS_TODO
 STATUS_TRANSLATION_ONLY = STATUS_EXTRA
 NON_TRANSLATION_DBT_FILES = {"tables.dbt"}
 # Internal compatibility switch.  Other game adapters can disable this until
@@ -177,6 +177,8 @@ class TranslationUnit:
             return STATUS_IGNORED
         if self.is_extra:
             return STATUS_EXTRA
+        if self.requires_manual_review:
+            return STATUS_REVIEW
         if self.todo_reason != TODO_REASON_NONE:
             return STATUS_TODO
         return STATUS_TRANSLATED
@@ -456,8 +458,37 @@ class Project:
         requested = list(self.dirty_units() if supplied is None else [unit for unit in supplied if unit.is_dirty])
         deleted_units = [unit for unit in requested if unit.pending_delete]
         touched_docs: dict[Path, DbtDocument | PlainTextDocument] = {}
+        working_rows: dict[Path, dict[int, DbtRow]] = {}
         deleted_paths: set[Path] = set()
         errors: list[str] = []
+
+        def working_doc(document: DbtDocument | PlainTextDocument) -> DbtDocument | PlainTextDocument:
+            existing = touched_docs.get(document.path)
+            if existing is not None:
+                return existing
+            if isinstance(document, DbtDocument):
+                copied = replace(
+                    document,
+                    rows=[
+                        replace(row, fields=list(row.fields), updates=dict(row.updates))
+                        for row in document.rows
+                    ],
+                    parse_errors=list(document.parse_errors),
+                    insertions=list(document.insertions),
+                )
+                working_rows[document.path] = {row.line_index: row for row in copied.rows}
+            else:
+                copied = replace(document)
+            touched_docs[document.path] = copied
+            return copied
+
+        def working_row(document: DbtDocument, row: DbtRow) -> DbtRow:
+            working_doc(document)
+            match = working_rows[document.path].get(row.line_index)
+            if match is None:
+                raise ProjectError(f"internal error, row {row.row_id} is missing from {document.path.name}")
+            return match
+
         for unit in deleted_units:
             if not unit.can_delete_translation():
                 errors.append(translate("project.save.no_deletable_row", file=unit.file_rel, record_id=unit.record_id))
@@ -467,8 +498,7 @@ class Project:
                 assert isinstance(ref.target_doc, DbtDocument)
                 row = ref.target_row or ref.suggested_row
                 assert row is not None
-                row.delete()
-                touched_docs[ref.target_doc.path] = ref.target_doc
+                working_row(ref.target_doc, row).delete()
             elif ref.kind == "text":
                 deleted_paths.add(ref.target_doc.path)
         selected = [unit for unit in requested if not unit.pending_delete]
@@ -503,13 +533,13 @@ class Project:
             ref = unit.ref
             if ref.kind == "text":
                 assert isinstance(ref.target_doc, PlainTextDocument)
-                ref.target_doc.set_raw_text(prepared_values[unit.uid])
-                touched_docs[ref.target_doc.path] = ref.target_doc
+                copied = working_doc(ref.target_doc)
+                assert isinstance(copied, PlainTextDocument)
+                copied.set_raw_text(prepared_values[unit.uid])
                 continue
             if ref.target_row is not None:
                 assert isinstance(ref.target_doc, DbtDocument)
-                ref.target_row.set_raw(ref.target_field, prepared_values[unit.uid])
-                touched_docs[ref.target_doc.path] = ref.target_doc
+                working_row(ref.target_doc, ref.target_row).set_raw(ref.target_field, prepared_values[unit.uid])
                 continue
             if ref.row_key is None:
                 errors.append(f"{unit.file_rel} #{unit.record_id}: internal error, missing row key")
@@ -522,6 +552,8 @@ class Project:
 
         for (file_rel, missing_key), grouped_units in sorted(missing_groups.items(), key=missing_order):
             target_doc = self.target_dbt_docs[file_rel]
+            copied_target = working_doc(target_doc)
+            assert isinstance(copied_target, DbtDocument)
             source_doc = self.source_docs[file_rel]
             source_row = grouped_units[0].ref.source_row
             if source_row is None:
@@ -537,14 +569,13 @@ class Project:
                 values[unit.ref.target_field] = prepared_values[unit.uid]
 
             try:
-                new_line = make_inserted_line(source_row, source_doc, target_doc, values)
+                new_line = make_inserted_line(source_row, source_doc, copied_target, values)
             except ValueError as exc:
                 errors.append(str(exc))
                 continue
 
             before_index = self._insertion_line_index(file_rel, missing_key)
-            target_doc.insertions.append((before_index, new_line))
-            touched_docs[target_doc.path] = target_doc
+            copied_target.insertions.append((before_index, new_line))
 
         if errors:
             raise SaveValidationError(errors)
@@ -557,19 +588,17 @@ class Project:
         if errors:
             raise SaveValidationError(errors)
 
-        changed_files: list[Path] = []
-        for path in sorted(deleted_paths, key=str):
-            if path.exists():
-                path.unlink()
-                changed_files.append(path)
+        changed_files = [path for path in sorted(deleted_paths, key=str) if path.exists()]
+        writes: dict[Path, bytes] = {}
         for doc in sorted(touched_docs.values(), key=lambda item: str(item.path)):
             if doc.path in deleted_paths:
                 continue
             new_bytes = doc.render_bytes()
             if new_bytes == doc.raw:
                 continue
-            atomic_write(doc.path, new_bytes)
+            writes[doc.path] = new_bytes
             changed_files.append(doc.path)
+        atomic_write_many(writes, deleted_paths)
         return SaveResult(tuple(changed_files), tuple(selected), tuple(deleted_units))
 
     def _insertion_line_index(self, file_rel: str, missing_key: tuple[int, str]) -> int | None:

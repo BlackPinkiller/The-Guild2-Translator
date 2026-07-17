@@ -1,9 +1,11 @@
 from __future__ import annotations
 
+from collections import OrderedDict
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
 import argparse
+import os
 import re
 import subprocess
 import threading
@@ -102,6 +104,9 @@ class LanguageGit:
     # brief grace period. Never touch a non-empty or freshly-created lock:
     # those may still belong to a live Git operation.
     STALE_INDEX_LOCK_SECONDS = 5
+    COMMAND_TIMEOUT_SECONDS = 15
+    ENTRY_CACHE_LIMIT = 128
+    COMBINED_CACHE_LIMIT = 32
 
     def __init__(
         self,
@@ -122,8 +127,8 @@ class LanguageGit:
         )
         self._cache_lock = threading.Lock()
         self._commit_list_cache: tuple[GitCommit, ...] | None = None
-        self._entry_cache: dict[str, tuple[TranslationLogEntry, ...]] = {}
-        self._combined_cache: dict[tuple[str, ...], tuple[TranslationLogEntry, ...]] = {}
+        self._entry_cache: OrderedDict[str, tuple[TranslationLogEntry, ...]] = OrderedDict()
+        self._combined_cache: OrderedDict[tuple[str, ...], tuple[TranslationLogEntry, ...]] = OrderedDict()
 
     def ensure_repository(self, settings: AppSettings) -> bool:
         """Create the initial language baseline. Returns true when it was created."""
@@ -205,6 +210,8 @@ class LanguageGit:
     def entries_for_commit(self, commit: str) -> list[TranslationLogEntry]:
         with self._cache_lock:
             cached = self._entry_cache.get(commit)
+            if cached is not None:
+                self._entry_cache.move_to_end(commit)
         if cached is not None:
             return list(cached)
         parent = self._parent_of(commit)
@@ -230,8 +237,11 @@ class LanguageGit:
                 entries.extend(self._text_entries(file_rel, source, before, after))
         packed = tuple(entries)
         with self._cache_lock:
-            self._entry_cache.setdefault(commit, packed)
-            cached = self._entry_cache[commit]
+            self._entry_cache[commit] = packed
+            self._entry_cache.move_to_end(commit)
+            while len(self._entry_cache) > self.ENTRY_CACHE_LIMIT:
+                self._entry_cache.popitem(last=False)
+            cached = packed
         return list(cached)
 
     def entries_for_commits(self, commits_oldest_first: Iterable[str]) -> list[TranslationLogEntry]:
@@ -241,13 +251,18 @@ class LanguageGit:
             return []
         with self._cache_lock:
             cached = self._combined_cache.get(commit_list)
+            if cached is not None:
+                self._combined_cache.move_to_end(commit_list)
         if cached is not None:
             return list(cached)
         entry_groups = tuple(tuple(self.entries_for_commit(commit)) for commit in commit_list)
         combined = tuple(entry for group in entry_groups for entry in group)
         with self._cache_lock:
-            self._combined_cache.setdefault(commit_list, combined)
-            cached = self._combined_cache[commit_list]
+            self._combined_cache[commit_list] = combined
+            self._combined_cache.move_to_end(commit_list)
+            while len(self._combined_cache) > self.COMBINED_CACHE_LIMIT:
+                self._combined_cache.popitem(last=False)
+            cached = combined
         return list(cached)
 
     def _dbt_entries(
@@ -385,15 +400,20 @@ class LanguageGit:
             )
         except FileNotFoundError as exc:
             raise GitError(translate("git.error.not_found")) from exc
+        except subprocess.TimeoutExpired as exc:
+            raise GitError(translate("git.error.timeout", seconds=self.COMMAND_TIMEOUT_SECONDS)) from exc
         if check and result.returncode != 0:
             stderr = result.stderr.decode("utf-8", "replace") if isinstance(result.stderr, bytes) else result.stderr
             if "index.lock" in stderr and self._clear_stale_index_lock():
                 # Retry exactly once. A real concurrent Git operation will
                 # keep or recreate its own lock and report its own error.
-                result = subprocess.run(
-                    ["git", "-C", str(self.repo), *args],
-                    **self._subprocess_kwargs(text=text),
-                )
+                try:
+                    result = subprocess.run(
+                        ["git", "-C", str(self.repo), *args],
+                        **self._subprocess_kwargs(text=text),
+                    )
+                except subprocess.TimeoutExpired as exc:
+                    raise GitError(translate("git.error.timeout", seconds=self.COMMAND_TIMEOUT_SECONDS)) from exc
                 if result.returncode == 0:
                     return result
                 stderr = result.stderr.decode("utf-8", "replace") if isinstance(result.stderr, bytes) else result.stderr
@@ -408,6 +428,8 @@ class LanguageGit:
             "encoding": "utf-8" if text else None,
             "errors": "replace" if text else None,
             "check": False,
+            "timeout": LanguageGit.COMMAND_TIMEOUT_SECONDS,
+            "env": {**os.environ, "GIT_TERMINAL_PROMPT": "0"},
         }
         if hasattr(subprocess, "CREATE_NO_WINDOW") and hasattr(subprocess, "STARTUPINFO"):
             startupinfo = subprocess.STARTUPINFO()

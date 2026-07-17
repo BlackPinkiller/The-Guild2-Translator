@@ -22,7 +22,7 @@ class JsonTransport(Protocol):
 
 
 class UrlLibTransport:
-    timeout_seconds = 45
+    timeout_seconds = 20
 
     def get_json(self, url: str) -> Any:
         return self._read_json(Request(url, headers={"User-Agent": "TheGuild2Translator/1.0"}))

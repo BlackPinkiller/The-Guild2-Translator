@@ -3,10 +3,10 @@ from __future__ import annotations
 from dataclasses import dataclass
 import filecmp
 import re
-import shutil
 from pathlib import Path
 
-from .cache import set_source_review_many
+from .cache import cache_path, set_source_review_many
+from .file_utils import atomic_write_many
 from .format_io import load_dbt, load_plain_text, matching_source_field, translatable_fields
 
 
@@ -123,23 +123,37 @@ def sync_source_project(source_root: Path, project_root: Path) -> SourceSyncResu
     synced_source_files: list[str] = []
     removed_source_files: list[str] = []
     invalidated_units = 0
+    writes: dict[Path, bytes] = {}
+    deletions: set[Path] = set()
+    workflow_cache_path = cache_path(project_root)
+    workflow_cache_before = workflow_cache_path.read_bytes() if workflow_cache_path.exists() else None
 
-    for rel_path, source_file in source_files.items():
-        target_file = target_languages_root / rel_path
-        previous_file = existing_files.get(rel_path)
-        if previous_file is not None and filecmp.cmp(source_file, previous_file, shallow=False):
-            continue
-        if previous_file is not None:
-            invalidated_units += _mark_translations_for_source_change(project_root, rel_path, previous_file, source_file)
-        _copy_file(source_file, target_file)
-        synced_source_files.append(rel_path.as_posix())
+    try:
+        for rel_path, source_file in source_files.items():
+            target_file = target_languages_root / rel_path
+            previous_file = existing_files.get(rel_path)
+            if previous_file is not None and filecmp.cmp(source_file, previous_file, shallow=False):
+                continue
+            if previous_file is not None:
+                invalidated_units += _mark_translations_for_source_change(project_root, rel_path, previous_file, source_file)
+            writes[target_file] = source_file.read_bytes()
+            synced_source_files.append(rel_path.as_posix())
 
-    for rel_path, previous_file in existing_files.items():
-        if rel_path in source_files:
-            continue
-        previous_file.unlink()
+        for rel_path, previous_file in existing_files.items():
+            if rel_path in source_files:
+                continue
+            deletions.add(previous_file)
+            removed_source_files.append(rel_path.as_posix())
+
+        atomic_write_many(writes, deletions)
+    except Exception:
+        if workflow_cache_before is None:
+            atomic_write_many({}, (workflow_cache_path,))
+        else:
+            atomic_write_many({workflow_cache_path: workflow_cache_before})
+        raise
+    for previous_file in deletions:
         _prune_empty_directories(previous_file.parent, target_languages_root)
-        removed_source_files.append(rel_path.as_posix())
 
     return SourceSyncResult(
         project_root=project_root,
@@ -197,11 +211,6 @@ def _should_skip_managed_path(rel_path: Path) -> bool:
     if parts[0].startswith("#"):
         return True
     return any(part.startswith(".") for part in parts)
-
-
-def _copy_file(source_file: Path, target_file: Path) -> None:
-    target_file.parent.mkdir(parents=True, exist_ok=True)
-    shutil.copy2(source_file, target_file)
 
 
 def _translation_roots(project_root: Path) -> list[Path]:
