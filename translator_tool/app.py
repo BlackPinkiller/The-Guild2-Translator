@@ -4410,10 +4410,21 @@ class TranslatorWindow(QMainWindow):
         if self.table.currentIndex().data(Qt.ItemDataRole.UserRole) != uid:
             self.table.setCurrentIndex(proxy_index)
             self.table.selectRow(proxy_index.row())
-            self.table.scrollTo(proxy_index, QAbstractItemView.ScrollHint.PositionAtCenter)
+        self.table.scrollTo(proxy_index, QAbstractItemView.ScrollHint.PositionAtCenter)
+        QTimer.singleShot(0, lambda selected_uid=uid: self._scroll_selected_row_into_view(selected_uid))
         if self.current_uid != uid:
             self._on_row_selected(proxy_index, QModelIndex())
         return True
+
+    def _scroll_selected_row_into_view(self, uid: str) -> None:
+        if uid != self._filter_anchor_uid or self._is_document_file_selected():
+            return
+        source_row = self.model.row_for_uid(uid)
+        if source_row is None:
+            return
+        proxy_index = self.proxy.mapFromSource(self.model.index(source_row, 0))
+        if proxy_index.isValid():
+            self.table.scrollTo(proxy_index, QAbstractItemView.ScrollHint.PositionAtCenter)
 
     def _update_counts(self) -> None:
         if self.project is None:

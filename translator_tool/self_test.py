@@ -1628,8 +1628,9 @@ def assert_editor_undo_stays_local(root: Path) -> None:
 
         search_selection_target = next(
             item
-            for item in win.model.units
+            for item in reversed(win.model.units)
             if item.uid != translated_for_filter.uid
+            and item.file_rel == str(win.file_combo.currentData())
             and item.label
             and item.label != translated_for_filter.label
             and '"' not in item.label
@@ -1669,6 +1670,10 @@ def assert_editor_undo_stays_local(root: Path) -> None:
             or win.table.currentIndex().data(Qt.ItemDataRole.UserRole) != search_selection_target.uid
         ):
             raise AssertionError("clearing search ignored the entry most recently selected in filtered results")
+        restored_source_index = win.model.index(win.model.row_for_uid(search_selection_target.uid), 0)
+        restored_proxy_index = win.proxy.mapFromSource(restored_source_index)
+        if not win.table.visualRect(restored_proxy_index).intersects(win.table.viewport().rect()):
+            raise AssertionError("clearing search kept the selected UID but left its row outside the visible viewport")
 
         search_unit = next(
             item
