@@ -203,7 +203,7 @@ def format_tokens(text: str, *, dialect: str = FORMAT_GUILD2) -> Counter[str]:
 
 
 def normalize_color_token_spacing(text: str) -> str:
-    if "$C[" not in text:
+    if "$C" not in text:
         return text
     matches = list(TOKEN_RE.finditer(text))
     if not matches:

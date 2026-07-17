@@ -97,12 +97,15 @@ from .project import (
     STATUS_EXTRA,
     STATUS_IGNORED,
     STATUS_PENDING_DELETE,
+    STATUS_REVIEW,
     STATUS_TODO,
     STATUS_TRANSLATED,
     SaveValidationError,
     TranslationUnit,
 )
 from .preview import GLYPH_MARK, PREVIEW_MARK, PreviewAtom, PreviewDocument, PreviewService
+from .recovery import apply_recovery_draft, clear_recovery_draft, load_recovery_draft, save_recovery_draft
+from .search import SearchClause, parse_search_query, search_blob as _search_blob, search_field_values as _search_field_values
 from .settings import AppSettings, load_settings, protect_secret, reveal_secret, save_settings
 from .source_sync import (
     DEFAULT_TRANSLATION_LANGUAGE,
@@ -139,11 +142,32 @@ TYPING_GROUP_DELAY_MS = 750
 FILE_FILTER_ALL = "__all_files__"
 STATUS_FILTER_ALL = "__all_statuses__"
 STATUS_FILTER_TODO = "__needs_translation__"
+STATUS_FILTER_REVIEW = STATUS_REVIEW
 LANGUAGE_ACTION_NEW = "__new_language__"
 LANGUAGE_ACTION_SEPARATOR = "__language_separator__"
 ENTRY_CLIPBOARD_MIME = "application/x-guild2-translator-entries+json"
 MAX_ENTRY_CLIPBOARD_BYTES = 64 * 1024 * 1024
 MAX_ENTRY_CLIPBOARD_COUNT = 100_000
+
+
+class SearchLineEdit(QLineEdit):
+    case_sensitive_toggled = Signal(bool)
+
+    def __init__(self, parent: QWidget | None = None) -> None:
+        super().__init__(parent)
+        self.case_button = QToolButton(self)
+        self.case_button.setText("Aa")
+        self.case_button.setCheckable(True)
+        self.case_button.setAutoRaise(True)
+        self.case_button.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.case_button.setFixedSize(28, 22)
+        self.case_button.toggled.connect(self.case_sensitive_toggled)
+        self.case_button.toggled.connect(lambda checked: self.case_button.setProperty("active", checked))
+        self.setTextMargins(0, 0, 52, 0)
+
+    def resizeEvent(self, event) -> None:  # noqa: N802
+        super().resizeEvent(event)
+        self.case_button.move(max(0, self.width() - 52), max(0, (self.height() - self.case_button.height()) // 2))
 
 
 class UnitTableModel(QAbstractTableModel):
@@ -167,6 +191,7 @@ class UnitTableModel(QAbstractTableModel):
         self._row_by_uid: dict[str, int] = {}
         self._units_by_file: dict[str, tuple[TranslationUnit, ...]] = {}
         self._search: dict[str, str] = {}
+        self._search_case_sensitive: dict[str, str] = {}
         self._format_warning: dict[str, bool] = {}
         self._glyph_warning: dict[str, bool] = {}
         self._recently_translated: set[str] = set()
@@ -187,6 +212,7 @@ class UnitTableModel(QAbstractTableModel):
         self.project = None
         self.units = []
         self._search.clear()
+        self._search_case_sensitive.clear()
         self._row_by_uid.clear()
         self._units_by_file.clear()
         self._format_warning.clear()
@@ -227,10 +253,13 @@ class UnitTableModel(QAbstractTableModel):
                 detail = ""
                 if unit.filter_status() == STATUS_TODO and unit.todo_reason:
                     detail = "\n" + translate("issue.todo_reason_prefix", text=todo_reason_text(unit.todo_reason))
-                return status_text(unit.display_status()) + suffix + detail
+                label = translate("status.review") if unit.requires_manual_review else status_text(unit.display_status())
+                return label + suffix + detail
         if role == Qt.ItemDataRole.BackgroundRole:
             if unit.pending_delete:
                 return QColor("#f2d6d3")
+            if unit.requires_manual_review:
+                return QColor("#f4b66f")
             if self.has_glyph_warning(index.row()):
                 return QColor("#f3d9a4")
             return QColor("#dce5b5") if unit.uid in self._recently_translated else None
@@ -263,15 +292,38 @@ class UnitTableModel(QAbstractTableModel):
             return None
         return self.project.unit_by_uid(uid)
 
-    def search_blob(self, row: int) -> str:
+    def search_blob(self, row: int, *, case_sensitive: bool = False) -> str:
         unit = self.units[row]
-        return self._search.get(unit.uid, "")
+        index = self._search_case_sensitive if case_sensitive else self._search
+        return index.get(unit.uid, "")
+
+    def matches_search(
+        self,
+        row: int,
+        clauses: tuple[SearchClause, ...],
+        *,
+        case_sensitive: bool,
+    ) -> bool:
+        unit = self.unit_at(row)
+        if unit is None:
+            return False
+        blob = self.search_blob(row, case_sensitive=case_sensitive)
+        for clause in clauses:
+            values = (blob,) if not clause.field else _search_field_values(unit, clause.field)
+            if not case_sensitive and clause.field:
+                values = tuple(value.casefold() for value in values)
+            matched = any(clause.needle in value for value in values)
+            if matched == clause.excluded:
+                return False
+        return True
 
     def refresh_unit(self, unit: TranslationUnit) -> None:
         row = self._row_by_uid.get(unit.uid)
         if row is None:
             return
-        self._search[unit.uid] = _search_blob(unit)
+        raw_search = _search_blob(unit)
+        self._search_case_sensitive[unit.uid] = raw_search
+        self._search[unit.uid] = raw_search.casefold()
         self._format_warning.pop(unit.uid, None)
         self._glyph_warning.pop(unit.uid, None)
         self.dataChanged.emit(self.index(row, 0), self.index(row, self.columnCount() - 1))
@@ -282,7 +334,9 @@ class UnitTableModel(QAbstractTableModel):
             row = self._row_by_uid.get(unit.uid)
             if row is None:
                 continue
-            self._search[unit.uid] = _search_blob(unit)
+            raw_search = _search_blob(unit)
+            self._search_case_sensitive[unit.uid] = raw_search
+            self._search[unit.uid] = raw_search.casefold()
             self._format_warning.pop(unit.uid, None)
             self._glyph_warning.pop(unit.uid, None)
             rows.append(row)
@@ -335,7 +389,8 @@ class UnitTableModel(QAbstractTableModel):
 
     def _rebuild_indexes(self) -> None:
         self._row_by_uid = {unit.uid: index for index, unit in enumerate(self.units)}
-        self._search = {unit.uid: _search_blob(unit) for unit in self.units}
+        self._search_case_sensitive = {unit.uid: _search_blob(unit) for unit in self.units}
+        self._search = {uid: text.casefold() for uid, text in self._search_case_sensitive.items()}
         units_by_file: dict[str, list[TranslationUnit]] = {}
         for unit in self.units:
             units_by_file.setdefault(unit.file_rel, []).append(unit)
@@ -356,18 +411,115 @@ class UnitFilterProxyModel(QSortFilterProxyModel):
         self.only_missing = True
         self.only_format_warnings = False
         self.query = ""
-        # Source order is meaningful for this project. Disabling proxy sorting avoids a
-        # multi-second re-sort when the user reveals all 17k+ translation units.
+        self.case_sensitive = False
+        self.search_clauses: tuple[SearchClause, ...] = ()
+        self._sort_rank_by_uid: dict[str, int] = {}
+        # Edits and filter changes must not continuously re-sort a large project.
+        # Sorting is only performed when the user explicitly clicks a column.
         self.setDynamicSortFilter(False)
 
+    def setSourceModel(self, source_model) -> None:  # noqa: N802
+        super().setSourceModel(source_model)
+        if source_model is not None:
+            source_model.modelReset.connect(self._resort_after_model_reset)
+
+    def _resort_after_model_reset(self) -> None:
+        column = self.sortColumn()
+        if column >= 0:
+            self.sort(column, self.sortOrder())
+
+    def sort(self, column: int, order: Qt.SortOrder = Qt.SortOrder.AscendingOrder) -> None:
+        self._sort_rank_by_uid.clear()
+        source = self.sourceModel()
+        if column >= 0 and isinstance(source, UnitTableModel):
+            ranked = sorted(
+                range(source.rowCount()),
+                key=lambda row: self._sort_key(source, source.unit_at(row), row, column),
+            )
+            self._sort_rank_by_uid = {
+                unit.uid: rank
+                for rank, row in enumerate(ranked)
+                if (unit := source.unit_at(row)) is not None
+            }
+        super().sort(column, order)
+
+    def lessThan(self, left: QModelIndex, right: QModelIndex) -> bool:  # noqa: N802
+        source = self.sourceModel()
+        if not isinstance(source, UnitTableModel):
+            return super().lessThan(left, right)
+        left_unit = source.unit_at(left.row())
+        right_unit = source.unit_at(right.row())
+        if left_unit is None or right_unit is None:
+            return left.row() < right.row()
+        left_rank = self._sort_rank_by_uid.get(left_unit.uid)
+        right_rank = self._sort_rank_by_uid.get(right_unit.uid)
+        if left_rank is None or right_rank is None:
+            return left.row() < right.row()
+        return left_rank < right_rank
+
+    def _sort_key(
+        self,
+        source: UnitTableModel,
+        unit: TranslationUnit | None,
+        source_row: int,
+        column: int,
+    ) -> tuple[object, ...]:
+        if unit is None:
+            return (source_row,)
+        text_tie = (unit.file_rel.casefold(), unit.label.casefold(), source_row)
+        if column == UnitTableModel.FILE:
+            key: tuple[object, ...] = (unit.file_rel.casefold(), *text_tie)
+        elif column == UnitTableModel.ID:
+            record_id = unit.record_id.strip()
+            key = ((0, int(record_id)) if record_id.isdecimal() else (1, record_id.casefold()), *text_tie)
+        elif column == UnitTableModel.LABEL:
+            key = (unit.label.casefold(), *text_tie)
+        elif column == UnitTableModel.SOURCE:
+            key = (unit.source_text.casefold(), *text_tie)
+        elif column == UnitTableModel.TRANSLATION:
+            key = (unit.current_text.casefold(), *text_tie)
+        elif column == UnitTableModel.STATUS:
+            status_rank = {
+                STATUS_TODO: 0,
+                STATUS_REVIEW: 1,
+                STATUS_TRANSLATED: 2,
+                STATUS_IGNORED: 3,
+                STATUS_EXTRA: 4,
+                STATUS_PENDING_DELETE: 5,
+            }
+            status = unit.display_status()
+            key = (status_rank.get(status, 99), status.casefold(), *text_tie)
+        elif column == UnitTableModel.FORMAT:
+            key = (0 if source.has_format_warning(source_row) else 1, *text_tie)
+        elif column == UnitTableModel.AI:
+            can_translate = bool(
+                unit.source_text
+                and not unit.is_ignored
+                and not unit.requires_manual_review
+                and unit.filter_status() in MISSING_WORK_STATUSES
+            )
+            key = (0 if unit.pending_delete else 1 if can_translate else 2, *text_tie)
+        else:
+            key = (*text_tie,)
+        return key
+
     def set_filters(
-        self, *, file_filter: str, status_filter: str, only_missing: bool, only_format_warnings: bool, query: str
+        self,
+        *,
+        file_filter: str,
+        status_filter: str,
+        only_missing: bool,
+        only_format_warnings: bool,
+        query: str,
+        case_sensitive: bool = False,
     ) -> None:
         self.file_filter = file_filter
         self.status_filter = status_filter
         self.only_missing = only_missing
         self.only_format_warnings = only_format_warnings
-        self.query = query.strip().lower()
+        self.query = query.strip()
+        self.case_sensitive = case_sensitive
+        self.search_clauses = parse_search_query(self.query, case_sensitive=case_sensitive)
         self.beginFilterChange()
         self.endFilterChange(QSortFilterProxyModel.Direction.Rows)
 
@@ -388,18 +540,26 @@ class UnitFilterProxyModel(QSortFilterProxyModel):
         if self.file_filter != FILE_FILTER_ALL and unit.file_rel != self.file_filter:
             return False
         effective_status = unit.filter_status()
+        needs_review = unit.requires_manual_review
+        needs_translation = effective_status in MISSING_WORK_STATUSES and not needs_review
         keep_visible = source.is_recently_translated(unit)
         if unit.pending_delete:
             keep_visible = True
-        if self.status_filter == STATUS_FILTER_TODO and effective_status not in MISSING_WORK_STATUSES and not keep_visible:
+        if self.status_filter == STATUS_FILTER_REVIEW and not needs_review:
             return False
-        if self.status_filter == STATUS_FILTER_ALL and self.only_missing and effective_status not in MISSING_WORK_STATUSES and not keep_visible:
+        if self.status_filter == STATUS_FILTER_TODO and not needs_translation and not keep_visible:
             return False
-        if self.status_filter not in {STATUS_FILTER_ALL, STATUS_FILTER_TODO} and effective_status != self.status_filter:
+        if self.status_filter == STATUS_FILTER_ALL and self.only_missing and not needs_translation and not keep_visible:
+            return False
+        if self.status_filter not in {STATUS_FILTER_ALL, STATUS_FILTER_TODO, STATUS_FILTER_REVIEW} and effective_status != self.status_filter:
             return False
         if self.only_format_warnings and not source.has_format_warning(source_row):
             return False
-        return not self.query or self.query in source.search_blob(source_row)
+        return not self.search_clauses or source.matches_search(
+            source_row,
+            self.search_clauses,
+            case_sensitive=self.case_sensitive,
+        )
 
 
 class RowTintDelegate(QStyledItemDelegate):
@@ -554,9 +714,12 @@ class GamePreviewHoverFilter(QObject):
         button.installEventFilter(self)
 
     def eventFilter(self, watched: QObject, event: QEvent) -> bool:  # noqa: N802
-        if watched is not self.button:
+        try:
+            if watched is not self.button:
+                return False
+            event_type = event.type()
+        except RuntimeError:
             return False
-        event_type = event.type()
         if event_type == QEvent.Type.ToolTip:
             return True
         if event_type in {QEvent.Type.Enter, QEvent.Type.MouseMove}:
@@ -572,7 +735,10 @@ class GamePreviewHoverFilter(QObject):
         return False
 
     def _show(self) -> None:
-        if self.button.isChecked() or not self.hovered:
+        try:
+            if self.button.isChecked() or not self.hovered:
+                return
+        except RuntimeError:
             return
         image = self.image_provider()
         if image is None or image.isNull():
@@ -584,7 +750,10 @@ class GamePreviewHoverFilter(QObject):
     def cancel(self) -> None:
         self.hovered = False
         self.timer.stop()
-        self.popup.hide()
+        try:
+            self.popup.hide()
+        except RuntimeError:
+            pass
 
 
 class EditorGroupBox(QGroupBox):
@@ -947,7 +1116,10 @@ class AiButtonDelegate(QStyledItemDelegate):
         return super().editorEvent(event, model, option, index)
 
     def eventFilter(self, watched: QObject, event: QEvent) -> bool:  # noqa: N802
-        table = self.parent()
+        try:
+            table = self.parent()
+        except RuntimeError:
+            return False
         if not isinstance(table, QTableView) or watched is not table.viewport():
             return super().eventFilter(watched, event)
         if event.type() == QEvent.Type.MouseMove:
@@ -1035,6 +1207,7 @@ class FormatDiffDelegate(QStyledItemDelegate):
 class StatusBadgeDelegate(QStyledItemDelegate):
     STYLES = {
         STATUS_TODO: ("status.todo", "#d79921", "#3c3836"),
+        STATUS_REVIEW: ("status.review", "#d65d0e", "#fbf1c7"),
         STATUS_TRANSLATED: ("status.translated", "#98971a", "#fbf1c7"),
         STATUS_PENDING_DELETE: ("status.pending_delete", "#cc241d", "#fbf1c7"),
         STATUS_IGNORED: ("status.ignored", "#928374", "#fbf1c7"),
@@ -2239,7 +2412,12 @@ class SuggestionDialog(QDialog):
         self.setMinimumSize(350, 200)
         self.resize(350, 250)
         self._markdown = ""
+        self._pending_chunks: list[str] = []
         self._recommended_translation = ""
+        self._render_timer = QTimer(self)
+        self._render_timer.setSingleShot(True)
+        self._render_timer.setInterval(40)
+        self._render_timer.timeout.connect(self._flush_chunks)
 
         layout = QVBoxLayout(self)
         self.loading_label = QLabel(translate("suggestion.loading"))
@@ -2260,7 +2438,15 @@ class SuggestionDialog(QDialog):
         layout.addWidget(buttons)
 
     def append_chunk(self, chunk: str) -> None:
-        self._markdown += chunk
+        self._pending_chunks.append(chunk)
+        if not self._render_timer.isActive():
+            self._render_timer.start()
+
+    def _flush_chunks(self) -> None:
+        if not self._pending_chunks:
+            return
+        self._markdown += "".join(self._pending_chunks)
+        self._pending_chunks.clear()
         self.content.setMarkdown(self._markdown)
         self.content.verticalScrollBar().setValue(self.content.verticalScrollBar().maximum())
 
@@ -2269,6 +2455,8 @@ class SuggestionDialog(QDialog):
         self.content.setPlainText(message)
 
     def complete(self) -> None:
+        self._render_timer.stop()
+        self._flush_chunks()
         self.loading_label.setText(translate("suggestion.ready"))
         self._recommended_translation = _extract_recommended_translation(self._markdown)
         self.apply_button.setEnabled(bool(self._recommended_translation))
@@ -2431,6 +2619,7 @@ class TranslatorWindow(QMainWindow):
         self.proxy.setSourceModel(self.model)
         self.history = OperationHistory()
         self.current_uid = ""
+        self._filter_anchor_uid = ""
         self._game_preview_cache: dict[tuple[object, ...], QImage] = {}
         self.last_applied_query = ""
         self.loading_editor = False
@@ -2444,6 +2633,15 @@ class TranslatorWindow(QMainWindow):
         self.typing_timer.setSingleShot(True)
         self.typing_timer.setInterval(TYPING_GROUP_DELAY_MS)
         self.typing_timer.timeout.connect(self._commit_typing_operation)
+        self.recovery_timer = QTimer(self)
+        self.recovery_timer.setSingleShot(True)
+        self.recovery_timer.setInterval(800)
+        self.recovery_timer.timeout.connect(self._write_recovery_snapshot)
+        self._recovery_warning_shown = False
+        self.counts_refresh_timer = QTimer(self)
+        self.counts_refresh_timer.setSingleShot(True)
+        self.counts_refresh_timer.setInterval(50)
+        self.counts_refresh_timer.timeout.connect(self._update_counts)
         self.ai_cancel_event: threading.Event | None = None
         self.ai_results: dict[str, str] = {}
         self.ai_changes: list[UnitChange] = []
@@ -2547,12 +2745,22 @@ class TranslatorWindow(QMainWindow):
         self.only_format_warnings = QCheckBox()
         self.only_format_warnings.toggled.connect(self._apply_filters)
         toolbar_layout.addWidget(self.only_format_warnings)
+        self.reset_sort_button = QToolButton()
+        self.reset_sort_button.clicked.connect(self._reset_table_sort)
+        self.reset_sort_button.hide()
+        toolbar_layout.addWidget(self.reset_sort_button)
         toolbar_layout.addStretch(1)
         self.search_label = QLabel()
         toolbar_layout.addWidget(self.search_label)
-        self.search_edit = QLineEdit()
+        self.search_edit = SearchLineEdit()
         self.search_edit.setClearButtonEnabled(True)
         self.search_edit.setMinimumWidth(240)
+        self.search_edit.case_button.setStyleSheet(
+            "QToolButton { color: #665c54; font-weight: 800; border-radius: 4px; padding: 0; }"
+            "QToolButton:hover { background: #e5d6aa; }"
+            "QToolButton:checked { color: #fbf1c7; background: #458588; }"
+        )
+        self.search_edit.case_sensitive_toggled.connect(self._on_search_case_toggled)
         self.search_debounce = QTimer(self)
         self.search_debounce.setSingleShot(True)
         self.search_debounce.setInterval(250)
@@ -2581,9 +2789,18 @@ class TranslatorWindow(QMainWindow):
         self.retry_button.setVisible(False)
         title_layout.addWidget(self.retry_button)
 
+        counts_row = QHBoxLayout()
+        counts_row.setContentsMargins(0, 0, 0, 0)
+        counts_row.setSpacing(8)
         self.counts_label = QLabel()
         self.counts_label.setObjectName("counts")
-        layout.addWidget(self.counts_label)
+        counts_row.addWidget(self.counts_label, 1)
+        self.review_attention_button = QPushButton()
+        self.review_attention_button.setObjectName("reviewAttention")
+        self.review_attention_button.clicked.connect(self._show_review_attention)
+        self.review_attention_button.hide()
+        counts_row.addWidget(self.review_attention_button)
+        layout.addLayout(counts_row)
 
         self.main_splitter = QSplitter(Qt.Orientation.Vertical)
         layout.addWidget(self.main_splitter, 1)
@@ -2597,9 +2814,10 @@ class TranslatorWindow(QMainWindow):
         self.table.setSelectionBehavior(QTableView.SelectionBehavior.SelectRows)
         self.table.setSelectionMode(QTableView.SelectionMode.ExtendedSelection)
         self.table.setAlternatingRowColors(False)
-        # Keeping source order is both clearer for translators and dramatically faster
-        # when switching the filter from pending entries to the full project.
-        self.table.setSortingEnabled(False)
+        self.table.setSortingEnabled(True)
+        self.proxy.sort(-1)
+        self.table.horizontalHeader().setSortIndicatorShown(False)
+        self.table.horizontalHeader().sortIndicatorChanged.connect(self._on_table_sort_changed)
         self.table.setWordWrap(False)
         self.table.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
         self.table.customContextMenuRequested.connect(self._show_table_menu)
@@ -3493,6 +3711,7 @@ class TranslatorWindow(QMainWindow):
         return bool(re.match(r"^.*ONSCREENHELP.*(?:NAME|DESCRIPTION|TOOLTIP)(_[+]\d+)?$", label, re.IGNORECASE))
 
     def _refresh_preview_presentations(self) -> None:
+        self._game_preview_cache.clear()
         self.source_edit.refresh_preview()
         self.translation_edit.refresh_preview()
         self._update_preview_tooltips()
@@ -3562,6 +3781,7 @@ class TranslatorWindow(QMainWindow):
         self.typing_before_deleted = False
         self._editor_unconfirmed_uids.clear()
         self.current_uid = ""
+        self._filter_anchor_uid = ""
         self.model.clear()
         self.table.clearSelection()
         self._update_file_choices()
@@ -3633,7 +3853,10 @@ class TranslatorWindow(QMainWindow):
         if not self.project.has_dirty_units():
             return True
         answer = QMessageBox.question(self, translate("dialog.reload_title"), translate("dialog.reload_discard"))
-        return answer == QMessageBox.StandardButton.Yes
+        if answer == QMessageBox.StandardButton.Yes:
+            self._clear_current_recovery()
+            return True
+        return False
 
     def _apply_language_selection(self, language: str, *, create: bool = False) -> None:
         if not create and self.project is not None and language == self.project.language:
@@ -3711,6 +3934,7 @@ class TranslatorWindow(QMainWindow):
                 answer = QMessageBox.question(self, translate("dialog.switch_project_title"), translate("dialog.switch_project_discard"))
                 if answer != QMessageBox.StandardButton.Yes:
                     return
+                self._clear_current_recovery()
         preferred = self._normalized_language_name(self.language_combo.currentText())
         self.project_root = root
         self._remember_project_root(root)
@@ -3742,6 +3966,7 @@ class TranslatorWindow(QMainWindow):
                 answer = QMessageBox.question(self, translate("dialog.reload_title"), translate("dialog.reload_discard"))
                 if answer != QMessageBox.StandardButton.Yes:
                     return
+                self._clear_current_recovery()
         created_language_dir = False
         try:
             language_root = self.project_root / "languages" / language
@@ -3776,6 +4001,9 @@ class TranslatorWindow(QMainWindow):
             self._remember_project_root(self.project_root)
 
     def _activate_project(self, project: Project) -> None:
+        self.recovery_timer.stop()
+        recovered, skipped = self._offer_recovery_draft(project)
+        self._game_preview_cache.clear()
         self.project = project
         self.preview_service.configure(
             self.game_root,
@@ -3789,6 +4017,7 @@ class TranslatorWindow(QMainWindow):
         self.typing_before_deleted = False
         self._editor_unconfirmed_uids.clear()
         self.current_uid = ""
+        self._filter_anchor_uid = ""
         self.model.set_project(self.project)
         self.translation_highlighter.set_glyph_codec(self.project.codec if ENABLE_FONT_GLYPH_VALIDATION else None)
         self._start_code_reference_index()
@@ -3799,7 +4028,33 @@ class TranslatorWindow(QMainWindow):
         self._update_counts()
         self._update_pending_state()
         self._update_project_button()
-        self.statusBar().showMessage(translate("status.project_loaded", count=len(self.project.units)), 4500)
+        if recovered or skipped:
+            self.statusBar().showMessage(
+                translate("status.recovery_restored", count=recovered, skipped=skipped),
+                7000,
+            )
+            self._schedule_recovery_snapshot()
+        else:
+            self.statusBar().showMessage(translate("status.project_loaded", count=len(self.project.units)), 4500)
+
+    def _offer_recovery_draft(self, project: Project) -> tuple[int, int]:
+        draft = load_recovery_draft(project.root, project.language)
+        if draft is None or not draft.units:
+            return 0, 0
+        answer = QMessageBox.question(
+            self,
+            translate("dialog.recovery_title"),
+            translate("dialog.recovery_detail", count=len(draft.units)),
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.Yes,
+        )
+        if answer != QMessageBox.StandardButton.Yes:
+            clear_recovery_draft(project.root, project.language)
+            return 0, 0
+        restored, skipped = apply_recovery_draft(project, draft)
+        if not restored:
+            clear_recovery_draft(project.root, project.language)
+        return restored, skipped
 
     def choose_project_folder(self) -> None:
         current = self.game_root or APP_ROOT
@@ -3945,6 +4200,7 @@ class TranslatorWindow(QMainWindow):
         choices = [
             (translate("filter.all_statuses"), STATUS_FILTER_ALL),
             (translate("filter.needs_translation"), STATUS_FILTER_TODO),
+            (translate("filter.needs_review"), STATUS_FILTER_REVIEW),
             (status_text(STATUS_TRANSLATED), STATUS_TRANSLATED),
             (status_text(STATUS_EXTRA), STATUS_EXTRA),
             (status_text(STATUS_IGNORED), STATUS_IGNORED),
@@ -3966,8 +4222,12 @@ class TranslatorWindow(QMainWindow):
         self.file_label.setText(translate("toolbar.file"))
         self.search_label.setText(translate("toolbar.search"))
         self.search_edit.setPlaceholderText(translate("toolbar.search_placeholder"))
+        self.search_edit.case_button.setToolTip(translate("toolbar.search_case_sensitive"))
         self.only_missing.setText(translate("toolbar.only_missing"))
         self.only_format_warnings.setText(translate("toolbar.only_format_warnings"))
+        self.reset_sort_button.setText(translate("toolbar.reset_sort"))
+        self.reset_sort_button.setToolTip(translate("toolbar.reset_sort_tooltip"))
+        self.review_attention_button.setToolTip(translate("review_attention.tooltip"))
         for button in self.top_buttons:
             button.setText(translate(str(button.property("text_key") or "")))
         self.retry_button.setText(translate("button.retry_commit"))
@@ -4078,27 +4338,67 @@ class TranslatorWindow(QMainWindow):
 
     def _apply_filters(self) -> None:
         query = self.search_edit.text()
-        clearing_search = bool(self.last_applied_query) and not query.strip()
         previous_document_mode = not self.table_frame.isVisible()
-        selected_uid = self.current_uid
-        self.proxy.set_filters(
-            file_filter=str(self.file_combo.currentData() or FILE_FILTER_ALL),
-            status_filter=str(self.status_combo.currentData() or STATUS_FILTER_TODO),
-            only_missing=self.only_missing.isChecked(),
-            only_format_warnings=self.only_format_warnings.isChecked(),
-            query=query,
+        selected_uid = self._filter_anchor_uid or self.current_uid
+        selected_visible = self._change_proxy_rows(
+            lambda: self.proxy.set_filters(
+                file_filter=str(self.file_combo.currentData() or FILE_FILTER_ALL),
+                status_filter=str(self.status_combo.currentData() or STATUS_FILTER_TODO),
+                only_missing=self.only_missing.isChecked(),
+                only_format_warnings=self.only_format_warnings.isChecked(),
+                query=query,
+                case_sensitive=self.search_edit.case_button.isChecked(),
+            ),
+            selected_uid,
         )
         self.last_applied_query = query.strip()
         self._update_counts()
         if self._sync_document_layout():
             return
         if previous_document_mode:
+            if selected_visible and self._restore_selected_row(selected_uid):
+                return
             self.current_uid = ""
             self._set_editor_unit(None)
             self._update_window_title()
             return
-        if clearing_search and selected_uid:
+        if selected_visible:
             self._restore_selected_row(selected_uid)
+
+    def _change_proxy_rows(self, change: Callable[[], None], selected_uid: str) -> bool:
+        """Apply a proxy change without letting Qt invent a new current row."""
+        selection_model = self.table.selectionModel()
+        selection_blocker = QSignalBlocker(selection_model)
+        try:
+            change()
+            selected_index = QModelIndex()
+            if selected_uid:
+                source_row = self.model.row_for_uid(selected_uid)
+                selected_index = (
+                    self.proxy.mapFromSource(self.model.index(source_row, 0))
+                    if source_row is not None
+                    else QModelIndex()
+                )
+            if not selected_index.isValid():
+                self.table.clearSelection()
+                selection_model.clearCurrentIndex()
+        finally:
+            del selection_blocker
+        return selected_index.isValid()
+
+    def _on_table_sort_changed(self, column: int, _order: Qt.SortOrder) -> None:
+        sorted_view = column >= 0
+        self.table.horizontalHeader().setSortIndicatorShown(sorted_view)
+        self.reset_sort_button.setVisible(sorted_view)
+        if self._filter_anchor_uid:
+            self._restore_selected_row(self._filter_anchor_uid)
+
+    def _reset_table_sort(self) -> None:
+        self.proxy.sort(-1)
+        self.table.horizontalHeader().setSortIndicatorShown(False)
+        self.reset_sort_button.hide()
+        if self._filter_anchor_uid:
+            self._restore_selected_row(self._filter_anchor_uid)
 
     def _on_search_changed(self, text: str) -> None:
         # Do not apply an empty intermediate value synchronously. Replacing a
@@ -4107,29 +4407,42 @@ class TranslatorWindow(QMainWindow):
         self._refresh_editor_highlights()
         self.search_debounce.start()
 
-    def _restore_selected_row(self, uid: str) -> None:
+    def _on_search_case_toggled(self, _checked: bool) -> None:
+        self._refresh_editor_highlights()
+        self._apply_filters()
+
+    def _restore_selected_row(self, uid: str) -> bool:
         if self._is_document_file_selected():
-            return
+            return False
         source_row = self.model.row_for_uid(uid)
         if source_row is None:
-            return
+            return False
         proxy_index = self.proxy.mapFromSource(self.model.index(source_row, 0))
         if not proxy_index.isValid():
-            return
-        self.table.setCurrentIndex(proxy_index)
-        self.table.selectRow(proxy_index.row())
-        self.table.scrollTo(proxy_index, QAbstractItemView.ScrollHint.PositionAtCenter)
+            return False
+        if self.table.currentIndex().data(Qt.ItemDataRole.UserRole) != uid:
+            self.table.setCurrentIndex(proxy_index)
+            self.table.selectRow(proxy_index.row())
+            self.table.scrollTo(proxy_index, QAbstractItemView.ScrollHint.PositionAtCenter)
+        if self.current_uid != uid:
+            self._on_row_selected(proxy_index, QModelIndex())
+        return True
 
     def _update_counts(self) -> None:
         if self.project is None:
             self.counts_label.setText("")
+            self.review_attention_button.hide()
             return
         effective: Counter[str] = Counter()
         todo = 0
+        review = 0
         for unit in self.project.units:
             status = unit.filter_status()
             effective[status] += 1
-            todo += status in MISSING_WORK_STATUSES
+            if unit.requires_manual_review:
+                review += 1
+            else:
+                todo += status in MISSING_WORK_STATUSES
         recent = self.model.recently_translated_count
         self.counts_label.setText(
             translate(
@@ -4137,11 +4450,25 @@ class TranslatorWindow(QMainWindow):
                 visible=self.proxy.rowCount(),
                 total=len(self.project.units),
                 todo=todo,
+                review=review,
                 translated=effective[STATUS_TRANSLATED],
                 recent=recent,
                 ignored=effective[STATUS_IGNORED],
             )
         )
+        self.review_attention_button.setText(translate("review_attention.button", count=review))
+        self.review_attention_button.setVisible(review > 0)
+
+    def _show_review_attention(self) -> None:
+        status_index = self.status_combo.findData(STATUS_FILTER_REVIEW)
+        if status_index < 0:
+            return
+        status_blocker = QSignalBlocker(self.status_combo)
+        missing_blocker = QSignalBlocker(self.only_missing)
+        self.status_combo.setCurrentIndex(status_index)
+        self.only_missing.setChecked(False)
+        del status_blocker, missing_blocker
+        self._apply_filters()
 
     def _update_window_title(self) -> None:
         if self.project is None:
@@ -4174,6 +4501,8 @@ class TranslatorWindow(QMainWindow):
         self._commit_typing_operation()
         unit = self._unit_from_proxy_index(current)
         self.current_uid = unit.uid if unit else ""
+        if unit is not None:
+            self._filter_anchor_uid = unit.uid
         self._set_editor_unit(unit)
         self._update_window_title()
 
@@ -4195,33 +4524,39 @@ class TranslatorWindow(QMainWindow):
         self._refresh_editor_highlights()
         self._update_code_reference_display()
 
-    def _search_ranges(self, text: str) -> list[tuple[int, int]]:
-        query = self.search_edit.text()
-        if not query:
+    def _search_ranges(self, text: str, field: str) -> list[tuple[int, int]]:
+        case_sensitive = self.search_edit.case_button.isChecked()
+        clauses = parse_search_query(self.search_edit.text(), case_sensitive=case_sensitive)
+        needles = tuple(
+            clause.needle
+            for clause in clauses
+            if not clause.excluded and clause.field in {"", field}
+        )
+        if not needles:
             return []
-        needle = query.casefold()
-        haystack = text.casefold()
+        haystack = text if case_sensitive else text.casefold()
         ranges: list[tuple[int, int]] = []
-        start = 0
-        while True:
-            index = haystack.find(needle, start)
-            if index < 0:
-                break
-            ranges.append((index, index + len(query)))
-            start = index + max(len(query), 1)
-        return ranges
+        for needle in needles:
+            start = 0
+            while True:
+                index = haystack.find(needle, start)
+                if index < 0:
+                    break
+                ranges.append((index, index + len(needle)))
+                start = index + max(len(needle), 1)
+        return sorted(set(ranges))
 
     def _refresh_editor_highlights(self) -> None:
         unit = self._current_unit()
         source_selections: list[QTextEdit.ExtraSelection] = []
         translation_selections: list[QTextEdit.ExtraSelection] = []
 
-        for start, end in self._search_ranges(self.source_edit.toPlainText()):
+        for start, end in self._search_ranges(self.source_edit.toPlainText(), "source"):
             display_start, display_end = self.source_edit.map_raw_range(start, end)
             source_selections.append(
                 _make_editor_selection(self.source_edit, display_start, display_end, background="#f6e58d")
             )
-        for start, end in self._search_ranges(self.translation_edit.toPlainText()):
+        for start, end in self._search_ranges(self.translation_edit.toPlainText(), "translation"):
             display_start, display_end = self.translation_edit.map_raw_range(start, end)
             translation_selections.append(
                 _make_editor_selection(self.translation_edit, display_start, display_end, background="#f6e58d")
@@ -4268,8 +4603,9 @@ class TranslatorWindow(QMainWindow):
         self._update_issue_detail(unit)
         self._update_preview_tooltips()
         self._refresh_editor_highlights()
-        self._update_counts()
+        self._schedule_counts_update()
         self._update_window_title()
+        self._schedule_recovery_snapshot()
         if not self._replaying_editor_history:
             self.typing_timer.start()
 
@@ -4288,6 +4624,49 @@ class TranslatorWindow(QMainWindow):
                     (UnitChange(unit.uid, before, unit.current_text, before_deleted, unit.pending_delete),),
                 )
             )
+
+    def _schedule_recovery_snapshot(self) -> None:
+        if self.project is not None:
+            self.recovery_timer.start()
+
+    def _write_recovery_snapshot(self) -> None:
+        if self.project is None:
+            return
+        try:
+            save_recovery_draft(self.project)
+            self._recovery_warning_shown = False
+        except OSError as exc:
+            if not self._recovery_warning_shown:
+                self.statusBar().showMessage(translate("status.recovery_failed", error=exc), 7000)
+                self._recovery_warning_shown = True
+
+    def _schedule_counts_update(self) -> None:
+        if not self.counts_refresh_timer.isActive():
+            self.counts_refresh_timer.start()
+
+    def _clear_current_recovery(self) -> None:
+        self.recovery_timer.stop()
+        if self.project is None:
+            return
+        try:
+            clear_recovery_draft(self.project.root, self.project.language)
+        except OSError as exc:
+            self.statusBar().showMessage(translate("status.recovery_failed", error=exc), 7000)
+
+    def _apply_operation_state(self, uid: str, text: str, pending_delete: bool) -> None:
+        unit = self.model.unit_for_uid(uid)
+        if unit is None:
+            return
+        before_status = unit.filter_status()
+        self._set_unit_text(unit, text)
+        unit.set_pending_delete(pending_delete)
+        self.model.refresh_unit(unit)
+        self._update_recent_translation_marker(unit, before_status)
+        if uid == self.current_uid:
+            self._set_editor_unit(unit)
+        self._update_counts()
+        self._update_window_title()
+        self._schedule_recovery_snapshot()
 
     def _apply_operation_changes(self, changes: tuple[UnitChange, ...], *, use_after: bool) -> None:
         changed: list[tuple[TranslationUnit, str, bool]] = []
@@ -4324,14 +4703,15 @@ class TranslatorWindow(QMainWindow):
             self._update_recent_translation_marker(unit, before_status, notify=False)
         changed_units = tuple(unit for unit, _before_status, _pending_delete in changed)
         self.model.refresh_units(changed_units)
-        selection_blocker = QSignalBlocker(self.table.selectionModel())
-        self.proxy.refresh_rows()
-        del selection_blocker
+        selected_uid = self._filter_anchor_uid or self.current_uid
+        if self._change_proxy_rows(self.proxy.refresh_rows, selected_uid):
+            self._restore_selected_row(selected_uid)
         current = self.model.unit_for_uid(self.current_uid) if self.current_uid else None
         if current is not None and current.uid in changed_uids:
             self._set_editor_unit(current)
         self._update_counts()
         self._update_window_title()
+        self._schedule_recovery_snapshot()
 
     def _set_unit_text(self, unit: TranslationUnit, text: str) -> None:
         was_confirmed = unit.confirmed and text != unit.current_text
@@ -4537,8 +4917,7 @@ class TranslatorWindow(QMainWindow):
         )
         mime.setText(
             "\n".join(
-                f"<{_clipboard_display_text(item['key'])}, {_clipboard_display_text(item['source'])}, "
-                f"{_clipboard_display_text(item['translation'])}>"
+                f"{item['key']}\t{item['source']}\t{item['translation']}"
                 for item in payload
             )
         )
@@ -4572,14 +4951,19 @@ class TranslatorWindow(QMainWindow):
             return
         indexes = sorted(self.table.selectionModel().selectedRows(), key=lambda item: item.row())
         copied_count = len(translations)
-        if len(indexes) == copied_count:
+        if copied_count == 1 and indexes:
             targets = [self._unit_from_proxy_index(index) for index in indexes]
+            target_translations = translations * len(indexes)
+        elif len(indexes) == copied_count:
+            targets = [self._unit_from_proxy_index(index) for index in indexes]
+            target_translations = translations
         elif len(indexes) == 1:
             start = indexes[0].row()
             if start + copied_count > self.proxy.rowCount():
                 self.statusBar().showMessage(translate("status.paste_range_short"), 3500)
                 return
             targets = [self._unit_from_proxy_index(self.proxy.index(row, 0)) for row in range(start, start + copied_count)]
+            target_translations = translations
         else:
             self.statusBar().showMessage(
                 translate("status.paste_count_mismatch", copied=copied_count, selected=len(indexes)),
@@ -4587,10 +4971,10 @@ class TranslatorWindow(QMainWindow):
             )
             return
         selected = tuple(unit for unit in targets if unit is not None)
-        if len(selected) != copied_count:
+        if len(selected) != len(target_translations):
             self.statusBar().showMessage(translate("status.paste_range_short"), 3500)
             return
-        texts = {unit.uid: text for unit, text in zip(selected, translations)}
+        texts = {unit.uid: text for unit, text in zip(selected, target_translations)}
         changed_count = sum(
             unit.current_text != texts[unit.uid] or unit.pending_delete
             for unit in selected
@@ -4614,7 +4998,6 @@ class TranslatorWindow(QMainWindow):
         for unit in selected:
             self.model.refresh_unit(unit)
             self.model.set_recently_translated(unit, False)
-        self.proxy.refresh_rows()
         self._apply_filters()
         self._update_counts()
         self._update_issue_detail(self._current_unit())
@@ -4926,7 +5309,9 @@ class TranslatorWindow(QMainWindow):
         if not self.ai_filter_refresh_pending:
             return
         self.ai_filter_refresh_pending = False
-        self.proxy.refresh_rows()
+        selected_uid = self._filter_anchor_uid or self.current_uid
+        if self._change_proxy_rows(self.proxy.refresh_rows, selected_uid):
+            self._restore_selected_row(selected_uid)
         self._update_counts()
 
     def _finish_ai(self, label: str) -> None:
@@ -4976,6 +5361,15 @@ class TranslatorWindow(QMainWindow):
         except SaveValidationError as exc:
             QMessageBox.warning(self, translate("dialog.save_blocked"), "\n".join(exc.messages[:20]))
             return
+        except (ProjectError, OSError) as exc:
+            QMessageBox.critical(
+                self,
+                translate("dialog.save_failed"),
+                translate("dialog.save_failed_detail", error=exc),
+            )
+            return
+        if result.changed_files or result.deleted_units:
+            self._clear_current_recovery()
         reviewed = tuple(
             unit for unit in (*result.saved_units, *result.deleted_units) if unit.review_reason == TODO_REASON_SOURCE_CHANGED
         )
@@ -5182,10 +5576,14 @@ class TranslatorWindow(QMainWindow):
             popup.hide()
         self._commit_typing_operation()
         if self.project is None:
+            self._prepare_shutdown()
             event.accept()
             return
+        self._write_recovery_snapshot()
         dirty_count = self.project.dirty_count()
         if not dirty_count:
+            self._clear_current_recovery()
+            self._prepare_shutdown()
             event.accept()
             return
         choice = QMessageBox.warning(
@@ -5198,40 +5596,36 @@ class TranslatorWindow(QMainWindow):
         if choice == QMessageBox.StandardButton.Save:
             self.save_all()
             if self.project is None or not self.project.has_dirty_units():
+                self._prepare_shutdown()
                 event.accept()
             else:
                 event.ignore()
             return
         if choice == QMessageBox.StandardButton.Discard:
+            self._clear_current_recovery()
+            self._prepare_shutdown()
             event.accept()
             return
         event.ignore()
 
-
-def _search_blob(unit: TranslationUnit) -> str:
-    todo_reason = todo_reason_text(unit.todo_reason) if unit.todo_reason else ""
-    return "\n".join(
-        (
-            unit.file_rel,
-            unit.record_id,
-            unit.label,
-            unit.field_name,
-            unit.source_text,
-            unit.current_text,
-            unit.status,
-            unit.filter_status(),
-            status_text(unit.display_status()),
-            todo_reason,
-        )
-    ).lower()
+    def _prepare_shutdown(self) -> None:
+        self.search_debounce.stop()
+        self.typing_timer.stop()
+        self.recovery_timer.stop()
+        self.counts_refresh_timer.stop()
+        self.ai_filter_refresh_timer.stop()
+        self.code_button_hold_timer.stop()
+        self.source_preview_tooltip_filter.cancel()
+        self.translation_preview_tooltip_filter.cancel()
+        if self.ai_cancel_event is not None:
+            self.ai_cancel_event.set()
+        if self.suggestion_cancel_event is not None:
+            self.suggestion_cancel_event.set()
+        self.code_reference_index_token += 1
 
 
 def _entry_clipboard_key(unit: TranslationUnit) -> str:
     return unit.label or unit.record_id or unit.file_rel
-
-
-def _clipboard_display_text(text: str) -> str:
-    return text.replace("\\", "\\\\").replace("\r\n", "\n").replace("\r", "\n").replace("\n", "\\n")
 
 
 def _clip(text: str, limit: int) -> str:
@@ -5777,6 +6171,8 @@ def apply_modern_style(app: QApplication) -> None:
         #toolbar { background: #d5c4a1; border: 3px solid #3c3836; border-radius: 10px; }
         #toolbar QLabel { font-weight: 800; }
         #counts { background: #fbf1c7; border: 2px solid #3c3836; border-radius: 6px; color: #3c3836; font-weight: 800; padding: 5px 8px; }
+        QPushButton#reviewAttention { background: #cc241d; color: #fbf1c7; min-height: 25px; }
+        QPushButton#reviewAttention:hover { background: #d65d0e; }
         #issues { background: #d3869b; border: 3px solid #3c3836; border-radius: 7px; padding: 8px 10px; color: #3c3836; font-weight: 600; }
         #hint { color: #3c3836; padding: 4px 0; font-weight: 600; }
         #projectManagerDialog { background: #ebdbb2; }
@@ -5865,6 +6261,8 @@ def apply_game_style(app: QApplication) -> None:
         #toolbar QLabel {{ font-weight: 800; }}
         #counts, #issues, #hint {{ background: transparent; color: #eadca7; }}
         #counts {{ border-image: url({asset("Border_4px_4.png")}) 4 4 4 4 stretch stretch; padding: 5px 8px; font-weight: 800; }}
+        QPushButton#reviewAttention {{ background: #8f2f20; color: #f3dfa0; border: 2px solid #c49b55; padding: 5px 10px; font-weight: 900; }}
+        QPushButton#reviewAttention:hover {{ background: #b0442c; }}
         #issues {{ border-image: url({asset("Border_4px_4.png")}) 4 4 4 4 stretch stretch; padding: 8px 10px; font-weight: 600; }}
         #tablePanel, #editorPanel {{ background-color: #2b2419; background-image: url({asset("dark_panel_background_2048.png")}); background-repeat: no-repeat; border: 0px; }}
         #editorPanel {{ margin-top: 10px; }}

@@ -11,6 +11,8 @@ from types import SimpleNamespace
 import uuid
 
 from . import project as project_module
+from . import file_utils as file_utils_module
+from . import source_sync as source_sync_module
 from . import settings as settings_module
 from .ai import (
     GoogleTranslateProvider,
@@ -19,21 +21,24 @@ from .ai import (
     OpenAICompatibleProvider,
     TranslationProviderError,
 )
-from .cache import confirmed_uids, need_work_uids, source_review_uids
+from .cache import cache_path, confirmed_uids, need_work_uids, source_review_uids
 from .code_index import CodeReference, build_code_reference_index
 from .code_window_context import DARK_PANEL_TEXT, PreviewWindowContext, best_window_context
 from .codec_adapter import Guild2Codec, load_codec_for_language
-from .git_history import GitCommit, LanguageGit, TranslationLogEntry, combine_entries, format_entries
+from .git_history import GitCommit, GitError, LanguageGit, TranslationLogEntry, combine_entries, format_entries
 from .history import OperationHistory, TranslationOperation, UnitChange
 from .i18n import set_language, status_text, translate
 from .format_io import load_dbt, load_plain_text, matching_source_field, row_key
 from .preview import GLYPH_MARK, PreviewAtom, PreviewDocument, PreviewService
+from .recovery import apply_recovery_draft, clear_recovery_draft, load_recovery_draft, recovery_path, save_recovery_draft
 from .project import (
     MISSING_WORK_STATUSES,
     Project,
+    SaveValidationError,
     STATUS_EXTRA,
     STATUS_IGNORED,
     STATUS_PENDING_DELETE,
+    STATUS_REVIEW,
     STATUS_TODO,
     STATUS_TRANSLATED,
     TODO_REASON_EMPTY,
@@ -56,6 +61,7 @@ from .source_sync import (
 from .validation import (
     FORMAT_GUIDE,
     FORMAT_TOOLTIP,
+    ValidationIssue,
     format_tokens,
     normalize_color_token_spacing,
     validate_translation,
@@ -105,7 +111,7 @@ def assert_statuses(root: Path) -> None:
     invalid_statuses = {
         unit.filter_status()
         for unit in project.units
-        if unit.filter_status() not in {STATUS_TODO, STATUS_TRANSLATED, STATUS_EXTRA, STATUS_IGNORED}
+        if unit.filter_status() not in {STATUS_TODO, STATUS_REVIEW, STATUS_TRANSLATED, STATUS_EXTRA, STATUS_IGNORED}
     }
     if invalid_statuses:
         raise AssertionError(f"unexpected simplified statuses were exposed: {sorted(invalid_statuses)!r}")
@@ -662,9 +668,61 @@ def assert_sync_source_project_invalidates_changed_translations(root: Path) -> N
             raise AssertionError("source sync should keep the existing translation text")
         if updated.review_reason != TODO_REASON_SOURCE_CHANGED:
             raise AssertionError("changed translation should be flagged for manual confirmation")
-        if updated.filter_status() not in MISSING_WORK_STATUSES:
-            raise AssertionError("changed translation should re-enter the untranslated filter")
+        if updated.filter_status() != STATUS_REVIEW:
+            raise AssertionError("changed translation should enter the needs-attention queue")
     finally:
+        safe_rmtree(temp)
+
+
+def assert_failed_source_sync_restores_workflow_cache(root: Path) -> None:
+    temp = Path(tempfile.gettempdir()) / f"translator_tool_smoke_source_rollback_{uuid.uuid4().hex[:8]}"
+    original_atomic_write_many = source_sync_module.atomic_write_many
+    try:
+        project_root = temp / "app" / "sources" / "Reforged"
+        source_root = temp / "game" / "DB" / "Languages"
+        copy_project_subset(root, project_root)
+        source_root.mkdir(parents=True, exist_ok=True)
+        for name in ["Text.dbt", "Tooltips.dbt"]:
+            shutil.copy2(root / "languages" / name, source_root / name)
+        project = Project.load(project_root, "#chinese", codec_root=tool_root())
+        unit = next(
+            item
+            for item in project.units
+            if item.ref.kind == "dbt" and item.status == STATUS_TRANSLATED and item.source_text and item.translate_text
+        )
+        source_doc = load_dbt(source_root / unit.file_rel)
+        source_field = matching_source_field(unit.ref.target_field, source_doc.string_columns)
+        source_row = source_doc.row_index[(int(unit.record_id), unit.label)]
+        source_row.set_raw(source_field, source_row.get(source_field) + " [rollback]")
+        (source_root / unit.file_rel).write_bytes(source_doc.render_bytes())
+
+        managed_source = project_root / "languages" / unit.file_rel
+        managed_before = managed_source.read_bytes()
+        workflow_path = cache_path(project_root)
+        cache_before = workflow_path.read_bytes() if workflow_path.exists() else None
+        calls = 0
+
+        def fail_source_commit(writes, deletions=()):
+            nonlocal calls
+            calls += 1
+            if calls == 1:
+                raise PermissionError("injected source transaction failure")
+            return original_atomic_write_many(writes, deletions)
+
+        source_sync_module.atomic_write_many = fail_source_commit
+        try:
+            sync_source_project(source_root, project_root)
+        except PermissionError:
+            pass
+        else:
+            raise AssertionError("source sync rollback test did not inject a transaction failure")
+        if managed_source.read_bytes() != managed_before:
+            raise AssertionError("failed source sync changed a managed source file")
+        cache_after = workflow_path.read_bytes() if workflow_path.exists() else None
+        if cache_after != cache_before:
+            raise AssertionError("failed source sync did not restore workflow review metadata")
+    finally:
+        source_sync_module.atomic_write_many = original_atomic_write_many
         safe_rmtree(temp)
 
 
@@ -721,8 +779,8 @@ def assert_manual_status_cache() -> None:
         if unit.uid not in confirmed_uids(temp, "#chinese"):
             raise AssertionError("confirmed translation flag was not persisted")
         project.set_units_need_work((unit,), True)
-        if unit.review_reason != TODO_REASON_MANUAL_REVIEW or unit.filter_status() != STATUS_TODO:
-            raise AssertionError("manual need-work mark did not re-enter the TODO status")
+        if unit.review_reason != TODO_REASON_MANUAL_REVIEW or unit.filter_status() != STATUS_REVIEW:
+            raise AssertionError("manual need-work mark did not enter the needs-attention status")
         if unit.uid not in need_work_uids(temp, "#chinese"):
             raise AssertionError("manual need-work flag was not persisted")
         if unit.uid in confirmed_uids(temp, "#chinese"):
@@ -806,6 +864,12 @@ def assert_save_auto_formats_color_tokens(root: Path) -> None:
         )
         if reloaded.current_text != expected:
             raise AssertionError("save did not normalize color-token spacing with the expected exceptions")
+        reloaded.set_text("alpha$C [10,20,30]beta")
+        saved.save([reloaded], auto_space_before_color_tokens=True)
+        spaced = Project.load(temp, "#chinese")
+        spaced_unit = next(item for item in spaced.units if item.uid == unit.uid)
+        if spaced_unit.current_text != "alpha $C [10,20,30]beta":
+            raise AssertionError("save skipped color-token normalization when $C and [ were separated")
     finally:
         safe_rmtree(temp)
 
@@ -953,6 +1017,123 @@ def assert_missing_insertions_follow_file_order(root: Path) -> None:
     safe_rmtree(temp)
 
 
+def assert_failed_save_does_not_mutate_loaded_documents(root: Path) -> None:
+    temp = make_temp_project(root, "translator_tool_smoke_failed_save_state_")
+    try:
+        project = Project.load(temp, "#chinese", enable_codec=False)
+        deletable = next(unit for unit in project.units if unit.ref.kind == "dbt" and unit.ref.target_row is not None)
+        invalid = next(unit for unit in project.units if unit.uid != deletable.uid and unit.ref.kind == "dbt")
+        deletable.set_pending_delete(True)
+        invalid.set_text(invalid.current_text + " audit")
+        invalid.initial_issues.append(ValidationIssue("error", "audit blocker", "audit"))
+        target_row = deletable.ref.target_row
+        target_doc = deletable.ref.target_doc
+        try:
+            project.save()
+        except SaveValidationError:
+            pass
+        else:
+            raise AssertionError("failed-save state test did not block the save")
+        if target_row.deleted or target_doc.is_changed():
+            raise AssertionError("a blocked save mutated the loaded target document")
+    finally:
+        safe_rmtree(temp)
+
+
+def assert_atomic_write_many_rolls_back_partial_commit() -> None:
+    temp = Path(tempfile.gettempdir()) / f"translator_tool_smoke_atomic_batch_{uuid.uuid4().hex[:8]}"
+    temp.mkdir(parents=True)
+    first = temp / "first.dbt"
+    second = temp / "second.dbt"
+    first.write_bytes(b"first-before")
+    second.write_bytes(b"second-before")
+    original_replace = file_utils_module.os.replace
+    def failing_replace(source, target) -> None:
+        if Path(source).suffix == ".tmp" and Path(target) == second:
+            raise PermissionError("injected second-file replacement failure")
+        original_replace(source, target)
+
+    file_utils_module.os.replace = failing_replace
+    try:
+        try:
+            file_utils_module.atomic_write_many({first: b"first-after", second: b"second-after"})
+        except PermissionError:
+            pass
+        else:
+            raise AssertionError("atomic batch test did not inject a replacement failure")
+        if first.read_bytes() != b"first-before" or second.read_bytes() != b"second-before":
+            raise AssertionError("atomic batch failure did not restore every original file")
+        leftovers = tuple(path.name for path in temp.iterdir() if path.suffix in {".tmp", ".bak"})
+        if leftovers:
+            raise AssertionError(f"atomic batch rollback left temporary files: {leftovers}")
+    finally:
+        file_utils_module.os.replace = original_replace
+        safe_rmtree(temp)
+
+
+def assert_recovery_draft_round_trip(root: Path) -> None:
+    temp = make_temp_project(root, "translator_tool_smoke_recovery_")
+    settings_root = Path(tempfile.gettempdir()) / f"translator_tool_smoke_recovery_settings_{uuid.uuid4().hex[:8]}"
+    previous_localappdata = os.environ.get("LOCALAPPDATA")
+    try:
+        os.environ["LOCALAPPDATA"] = str(settings_root)
+        project = Project.load(temp, "#chinese", enable_codec=False)
+        edited = next(unit for unit in project.units if unit.ref.kind == "dbt" and unit.ref.target_row is not None)
+        deleted = next(
+            unit
+            for unit in project.units
+            if unit.uid != edited.uid and unit.ref.kind == "dbt" and unit.ref.target_row is not None
+        )
+        recovered_text = edited.current_text + " recovery"
+        edited.set_text(recovered_text)
+        deleted.set_pending_delete(True)
+        if save_recovery_draft(project) != 2:
+            raise AssertionError("recovery draft did not include every unsaved text/delete change")
+
+        reloaded = Project.load(temp, "#chinese", enable_codec=False)
+        draft = load_recovery_draft(temp, "#chinese")
+        if draft is None:
+            raise AssertionError("recovery draft could not be loaded")
+        restored, skipped = apply_recovery_draft(reloaded, draft)
+        if restored != 2 or skipped:
+            raise AssertionError("recovery draft did not restore the expected entries")
+        if reloaded.unit_by_uid(edited.uid).current_text != recovered_text:
+            raise AssertionError("recovery draft lost edited translation text")
+        if not reloaded.unit_by_uid(deleted.uid).pending_delete:
+            raise AssertionError("recovery draft lost a pending deletion")
+
+        clear_recovery_draft(temp, "#chinese")
+        if recovery_path(temp, "#chinese").exists():
+            raise AssertionError("clearing recovery left the draft on disk")
+    finally:
+        if previous_localappdata is None:
+            os.environ.pop("LOCALAPPDATA", None)
+        else:
+            os.environ["LOCALAPPDATA"] = previous_localappdata
+        safe_rmtree(settings_root)
+        safe_rmtree(temp)
+
+
+def assert_large_batch_save_stays_interactive(root: Path) -> None:
+    temp = make_temp_project(root, "translator_tool_smoke_large_save_")
+    try:
+        project = Project.load(temp, "#chinese", enable_codec=False)
+        edited = [
+            unit
+            for unit in project.units
+            if unit.ref.kind == "dbt" and not unit.is_extra and unit.source_text
+        ]
+        for unit in edited:
+            unit.set_text(unit.current_text + "x")
+        started = time.perf_counter()
+        project.save(edited)
+        elapsed = time.perf_counter() - started
+        if len(edited) >= 10_000 and elapsed > 8.0:
+            raise AssertionError(f"large batch save is too slow: {elapsed:.3f}s for {len(edited)} entries")
+    finally:
+        safe_rmtree(temp)
+
+
 def assert_unsaved_translation_status(root: Path) -> None:
     temp = make_temp_project(root, "translator_tool_smoke_status_")
     remove_matching_target_rows(temp, "Text.dbt", 1)
@@ -1011,7 +1192,7 @@ def assert_mod_label_match_inserts_source_formatted_row(root: Path) -> None:
             for item in project.units
             if item.file_rel == "Text.dbt" and item.record_id == str(source_row.row_id) and item.label == original_key[1]
         )
-        if unit.review_reason != TODO_REASON_IMPORT_REVIEW or unit.display_status() != STATUS_TODO:
+        if unit.review_reason != TODO_REASON_IMPORT_REVIEW or unit.display_status() != STATUS_REVIEW:
             raise AssertionError("a unique mod label match was not marked for review")
         if unit.ref.target_row is not None or not unit.is_dirty:
             raise AssertionError("label match did not stage a source-row insertion")
@@ -1034,7 +1215,7 @@ def assert_mod_label_match_inserts_source_formatted_row(root: Path) -> None:
             if item.file_rel == "Text.dbt" and item.record_id == str(source_row.row_id) and item.label == original_key[1]
         )
         unit.set_text(unit.current_text + "x")
-        if unit.review_reason != TODO_REASON_IMPORT_REVIEW or unit.display_status() != STATUS_TODO:
+        if unit.review_reason != TODO_REASON_IMPORT_REVIEW or unit.display_status() != STATUS_REVIEW:
             raise AssertionError("editing a review item should keep the manual-check reason until it is confirmed")
         project.save([unit])
         saved = load_dbt(target_path)
@@ -1328,6 +1509,14 @@ def assert_editor_undo_stays_local(root: Path) -> None:
         if second.current_text != second_original + "q":
             raise AssertionError("dbt edit before document-mode switch did not commit as expected")
 
+        win.only_missing.setChecked(False)
+        win.status_combo.setCurrentIndex(win.status_combo.findData(app_module.STATUS_FILTER_ALL))
+        win._apply_filters()
+        app.processEvents()
+        if not win._restore_selected_row(second.uid):
+            raise AssertionError("document-mode selection smoke test could not select its DBT entry")
+        app.processEvents()
+
         guides_index = win.file_combo.findData("Guides/Intro.txt")
         if guides_index < 0:
             raise AssertionError("guide txt smoke test entry is missing from file filter")
@@ -1339,8 +1528,15 @@ def assert_editor_undo_stays_local(root: Path) -> None:
             raise AssertionError("dbt file is missing from file filter after leaving guide txt mode")
         win.file_combo.setCurrentIndex(dbt_index)
         app.processEvents()
-        win._restore_selected_row(second.uid)
-        app.processEvents()
+        if (
+            win.current_uid != second.uid
+            or win.table.currentIndex().data(Qt.ItemDataRole.UserRole) != second.uid
+        ):
+            raise AssertionError(
+                "returning from guide txt mode did not restore the last selected table entry: "
+                f"current={win.current_uid!r}, table={win.table.currentIndex().data(Qt.ItemDataRole.UserRole)!r}, "
+                f"anchor={win._filter_anchor_uid!r}, expected={second.uid!r}"
+            )
         win.translation_edit.setFocus(Qt.FocusReason.OtherFocusReason)
         app.processEvents()
 
@@ -1377,6 +1573,125 @@ def assert_editor_undo_stays_local(root: Path) -> None:
         win.status_combo.setCurrentIndex(win.status_combo.findData(app_module.STATUS_FILTER_ALL))
         win._apply_filters()
         app.processEvents()
+        translated_for_filter = next(
+            item for item in win.model.units if item.filter_status() == STATUS_TRANSLATED and item.source_text
+        )
+        win._restore_selected_row(translated_for_filter.uid)
+        app.processEvents()
+        if win.current_uid != translated_for_filter.uid:
+            raise AssertionError("filter-selection smoke test could not select a translated entry")
+        win.only_missing.setChecked(True)
+        app.processEvents()
+        translated_source_index = win.model.index(win.model.row_for_uid(translated_for_filter.uid), 0)
+        if win.proxy.mapFromSource(translated_source_index).isValid():
+            raise AssertionError("only-untranslated filter did not hide the translated selection")
+        win.only_missing.setChecked(False)
+        app.processEvents()
+        if win.current_uid != translated_for_filter.uid or win.table.currentIndex().data(Qt.ItemDataRole.UserRole) != translated_for_filter.uid:
+            raise AssertionError("clearing only-untranslated did not restore the previously selected entry")
+
+        search_selection_target = next(
+            item
+            for item in win.model.units
+            if item.uid != translated_for_filter.uid
+            and item.label
+            and item.label != translated_for_filter.label
+            and '"' not in item.label
+        )
+        target_source_index = win.model.index(win.model.row_for_uid(search_selection_target.uid), 0)
+        win.search_edit.setFocus(Qt.FocusReason.OtherFocusReason)
+        win.search_edit.setText(f'label:"{search_selection_target.label}"')
+        QTest.qWait(320)
+        app.processEvents()
+        if win.current_uid != translated_for_filter.uid:
+            raise AssertionError("search filtering discarded the last explicitly selected entry")
+        if not win.search_edit.hasFocus():
+            raise AssertionError("search filtering moved keyboard focus out of the search box")
+        win.search_edit.clear()
+        QTest.qWait(320)
+        app.processEvents()
+        if (
+            win.current_uid != translated_for_filter.uid
+            or win.table.currentIndex().data(Qt.ItemDataRole.UserRole) != translated_for_filter.uid
+        ):
+            raise AssertionError("clearing search did not restore the last selected entry")
+
+        win.search_edit.setText(f'label:"{search_selection_target.label}"')
+        QTest.qWait(320)
+        app.processEvents()
+        target_proxy_index = win.proxy.mapFromSource(target_source_index)
+        if not target_proxy_index.isValid():
+            raise AssertionError("search-selection smoke test did not reveal its target entry")
+        win.table.setCurrentIndex(target_proxy_index)
+        win.table.selectRow(target_proxy_index.row())
+        app.processEvents()
+        win.search_edit.clear()
+        QTest.qWait(320)
+        app.processEvents()
+        if (
+            win.current_uid != search_selection_target.uid
+            or win.table.currentIndex().data(Qt.ItemDataRole.UserRole) != search_selection_target.uid
+        ):
+            raise AssertionError("clearing search ignored the entry most recently selected in filtered results")
+
+        search_unit = next(
+            item
+            for item in win.model.units
+            if item.label
+            and item.source_text
+            and any(char.isupper() for char in item.label)
+            and '"' not in item.source_text
+        )
+        search_source_index = win.model.index(win.model.row_for_uid(search_unit.uid), 0)
+        win.search_edit.setText(f'label:{search_unit.label.lower()}')
+        win._apply_filters()
+        app.processEvents()
+        if not win.proxy.mapFromSource(search_source_index).isValid():
+            raise AssertionError("case-insensitive field search did not match a label")
+        win.search_edit.case_button.setChecked(True)
+        app.processEvents()
+        if win.proxy.mapFromSource(search_source_index).isValid():
+            raise AssertionError("Aa case-sensitive search still matched a differently-cased label")
+        win.search_edit.setText(
+            f'label:"{search_unit.label}", source:"{search_unit.source_text}"'
+        )
+        win._apply_filters()
+        app.processEvents()
+        if not win.proxy.mapFromSource(search_source_index).isValid():
+            raise AssertionError("quoted comma-separated AND search did not match all requested fields")
+        win.search_edit.setText(f'label:"{search_unit.label}"， -id:{search_unit.record_id}')
+        win._apply_filters()
+        app.processEvents()
+        if win.proxy.mapFromSource(search_source_index).isValid():
+            raise AssertionError("Chinese-comma search did not apply the excluded ID condition")
+        bracket_clauses = app_module.parse_search_query(
+            '$C[1,2,3], label:test',
+            case_sensitive=False,
+        )
+        if len(bracket_clauses) != 2 or bracket_clauses[0].needle != '$c[1,2,3]':
+            raise AssertionError("search parser split commas inside a color token")
+        win.search_edit.clear()
+        win.search_edit.case_button.setChecked(False)
+        win._apply_filters()
+        app.processEvents()
+
+        source_order_uids = tuple(item.uid for item in win.project.units)
+        visible_source_order = tuple(
+            win._unit_from_proxy_index(win.proxy.index(row, 0)).uid for row in range(win.proxy.rowCount())
+        )
+        for column in range(win.model.columnCount()):
+            win.table.sortByColumn(column, Qt.SortOrder.AscendingOrder)
+            app.processEvents()
+            if tuple(item.uid for item in win.project.units) != source_order_uids:
+                raise AssertionError(f"sorting column {column} changed the project's source/save order")
+        win.reset_sort_button.click()
+        app.processEvents()
+        restored_visible_order = tuple(
+            win._unit_from_proxy_index(win.proxy.index(row, 0)).uid for row in range(win.proxy.rowCount())
+        )
+        if restored_visible_order != visible_source_order:
+            raise AssertionError("clearing table sorting did not restore source display order")
+
         clipboard_units = [win._unit_from_proxy_index(win.proxy.index(row, 0)) for row in range(4)]
         if any(unit is None for unit in clipboard_units):
             raise AssertionError("entry clipboard smoke test needs four visible translation entries")
@@ -1410,8 +1725,9 @@ def assert_editor_undo_stays_local(root: Path) -> None:
         clipboard_mime = QApplication.clipboard().mimeData()
         if not clipboard_mime.hasFormat(app_module.ENTRY_CLIPBOARD_MIME):
             raise AssertionError("entry copy did not publish the app clipboard format")
-        if not clipboard_mime.text().startswith("<") or "clipboard translation A" not in clipboard_mime.text():
-            raise AssertionError("entry copy did not publish the complete external text format")
+        external_fields = clipboard_mime.text().splitlines()[0].split("\t")
+        if len(external_fields) != 3 or external_fields[2] != "clipboard translation A":
+            raise AssertionError("entry copy did not publish tab-separated label, source, and translation text")
 
         target_before = tuple(unit.current_text for unit in clipboard_units[2:])
         select_proxy_rows(2, 2)
@@ -1425,6 +1741,78 @@ def assert_editor_undo_stays_local(root: Path) -> None:
         app.processEvents()
         if tuple(unit.current_text for unit in clipboard_units[2:]) != target_before:
             raise AssertionError("one undo did not restore the complete multi-entry paste")
+
+        select_proxy_rows(0, 0)
+        QTest.keyClick(win.table, Qt.Key.Key_C, Qt.KeyboardModifier.ControlModifier)
+        app.processEvents()
+        select_proxy_rows(2, 3)
+        QTest.keyClick(win.table, Qt.Key.Key_V, Qt.KeyboardModifier.ControlModifier)
+        app.processEvents()
+        if tuple(unit.current_text for unit in clipboard_units[2:]) != (copied_texts[0], copied_texts[0]):
+            raise AssertionError("one copied translation was not pasted into every selected entry")
+        if tuple(unit.source_text for unit in clipboard_units) != source_texts:
+            raise AssertionError("one-to-many entry paste modified source text")
+        win.undo()
+        app.processEvents()
+        if tuple(unit.current_text for unit in clipboard_units[2:]) != target_before:
+            raise AssertionError("one undo did not restore the complete one-to-many paste")
+
+        ai_unit = clipboard_units[2]
+        ai_before = ai_unit.current_text
+        ai_after = ai_before + " AI result"
+        win.ai_changes = []
+        win.ai_failures = []
+        win.ai_is_batch = False
+        win._collect_ai_result(ai_unit.uid, ai_after)
+        if ai_unit.current_text != ai_after:
+            raise AssertionError("successful AI result was counted but not applied to the translation")
+        win._finish_ai("AI result smoke test")
+        win.table.setFocus(Qt.FocusReason.OtherFocusReason)
+        win.undo()
+        app.processEvents()
+        if ai_unit.current_text != ai_before:
+            raise AssertionError("one undo did not restore an applied AI translation")
+
+        attention_units = tuple(clipboard_units[2:])
+        win.project.set_units_source_review(attention_units, True)
+        win.model.refresh_units(attention_units)
+        win.proxy.refresh_rows()
+        win._update_counts()
+        app.processEvents()
+        if not win.review_attention_button.isVisible() or "2" not in win.review_attention_button.text():
+            raise AssertionError("source-update review entries did not show the prominent attention button")
+        status_index = win.model.index(win.model.row_for_uid(attention_units[0].uid), win.model.STATUS)
+        if status_index.data() != STATUS_REVIEW:
+            raise AssertionError("source-update review entry still used the untranslated status badge")
+
+        todo_index = win.status_combo.findData(app_module.STATUS_FILTER_TODO)
+        win.status_combo.setCurrentIndex(todo_index)
+        win._apply_filters()
+        app.processEvents()
+        for unit in attention_units:
+            source_index = win.model.index(win.model.row_for_uid(unit.uid), 0)
+            if win.proxy.mapFromSource(source_index).isValid():
+                raise AssertionError("needs-attention entry was still mixed into the needs-translation filter")
+
+        win.review_attention_button.click()
+        app.processEvents()
+        if win.status_combo.currentData() != app_module.STATUS_FILTER_REVIEW:
+            raise AssertionError("attention button did not activate the dedicated review filter")
+        visible_review_uids = {
+            unit.uid
+            for row in range(win.proxy.rowCount())
+            if (unit := win._unit_from_proxy_index(win.proxy.index(row, 0))) is not None
+        }
+        if not {unit.uid for unit in attention_units}.issubset(visible_review_uids):
+            raise AssertionError("dedicated review filter did not reveal all source-update entries")
+        if any(not win.model.unit_for_uid(uid).requires_manual_review for uid in visible_review_uids):
+            raise AssertionError("dedicated review filter included an ordinary untranslated entry")
+        win.project.set_units_source_review(attention_units, False)
+        win.model.refresh_units(attention_units)
+        win.status_combo.setCurrentIndex(win.status_combo.findData(app_module.STATUS_FILTER_ALL))
+        win.only_missing.setChecked(False)
+        win._apply_filters()
+        win._update_counts()
         win._replace_units_state(
             clipboard_units[:2],
             {unit.uid: text for unit, text in zip(clipboard_units[:2], copied_before)},
@@ -2572,6 +2960,26 @@ def assert_git_subprocess_hides_console() -> None:
             raise AssertionError("Git subprocesses did not provide hidden-window startup info on Windows")
 
 
+def assert_git_subprocess_timeout_is_reported() -> None:
+    git = LanguageGit(Path(tempfile.gettempdir()), enable_codec=False)
+    original_run = subprocess.run
+
+    def timed_out(*_args, **_kwargs):
+        raise subprocess.TimeoutExpired("git", LanguageGit.COMMAND_TIMEOUT_SECONDS)
+
+    subprocess.run = timed_out
+    try:
+        try:
+            git._run("status")
+        except GitError as exc:
+            if str(LanguageGit.COMMAND_TIMEOUT_SECONDS) not in str(exc):
+                raise AssertionError("Git timeout error did not report its bounded wait") from exc
+        else:
+            raise AssertionError("Git timeout did not become a recoverable GitError")
+    finally:
+        subprocess.run = original_run
+
+
 def assert_git_pending_is_scoped_to_active_language(root: Path) -> None:
     temp = make_temp_project(root, "translator_tool_smoke_git_scope_")
     git = LanguageGit(temp)
@@ -2814,12 +3222,17 @@ def main() -> int:
     assert_startup_prefers_local_sources_over_game_root()
     assert_sync_vanilla_sources_only_imports_originals()
     assert_sync_source_project_invalidates_changed_translations(root)
+    assert_failed_source_sync_restores_workflow_cache(root)
     assert_save_existing(root)
     assert_save_auto_formats_color_tokens(root)
     assert_save_guides_plain_text_uses_source_profile(root)
     assert_save_creates_missing_target_dbt_incrementally(root)
     assert_save_removes_extra_target_row(root)
     assert_save_missing(root)
+    assert_failed_save_does_not_mutate_loaded_documents(root)
+    assert_atomic_write_many_rolls_back_partial_commit()
+    assert_recovery_draft_round_trip(root)
+    assert_large_batch_save_stays_interactive(root)
     assert_missing_insertions_follow_file_order(root)
     assert_unsaved_translation_status(root)
     assert_mod_label_match_inserts_source_formatted_row(root)
@@ -2850,6 +3263,7 @@ def main() -> int:
     assert_llm_suggestion_context_prompt()
     assert_git_history(root)
     assert_git_subprocess_hides_console()
+    assert_git_subprocess_timeout_is_reported()
     assert_git_commit_display()
     assert_git_pending_is_scoped_to_active_language(root)
     assert_git_history_list_is_scoped_to_active_language(root)
