@@ -7,7 +7,7 @@ from pathlib import Path
 import time
 
 from .file_utils import atomic_write
-from .project import Project
+from .project import Project, TranslationUnit
 from .settings import settings_dir
 
 
@@ -113,17 +113,16 @@ def load_recovery_draft(project_root: Path, language: str) -> RecoveryDraft | No
 
 
 def apply_recovery_draft(project: Project, draft: RecoveryDraft) -> tuple[int, int]:
-    restored = 0
+    edits: list[tuple[TranslationUnit, str, bool | None]] = []
     skipped = 0
     for recovered in draft.units:
         unit = project.unit_by_uid(recovered.uid)
         if unit is None or unit.translate_text != recovered.base_text:
             skipped += 1
             continue
-        unit.set_text(recovered.text)
-        unit.set_pending_delete(recovered.pending_delete)
-        restored += 1
-    return restored, skipped
+        edits.append((unit, recovered.text, recovered.pending_delete))
+    project.apply_unit_edits(edits)
+    return len(edits), skipped
 
 
 def clear_recovery_draft(project_root: Path, language: str) -> None:

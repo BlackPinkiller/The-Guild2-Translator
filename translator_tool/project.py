@@ -223,6 +223,7 @@ class Project:
     source_order: dict[str, dict[tuple[int, str], int]]
     unit_index: dict[str, TranslationUnit]
     insertion_anchors: dict[str, dict[tuple[int, str], int | None]]
+    edit_unconfirmed_uids: set[str] = field(default_factory=set)
 
     @classmethod
     def load(
@@ -450,6 +451,40 @@ class Project:
                 set_ignored_many(self.root, self.language, uids, False)
                 set_need_work_many(self.root, self.language, uids, False)
                 set_source_review_many(self.root, self.language, uids, False)
+
+    def apply_unit_edits(
+        self,
+        edits: Iterable[tuple[TranslationUnit, str, bool | None]],
+    ) -> tuple[TranslationUnit, ...]:
+        """Apply editor text/delete state while keeping confirmation metadata consistent."""
+        changed: list[TranslationUnit] = []
+        unconfirm: list[TranslationUnit] = []
+        restore_confirmation: list[TranslationUnit] = []
+        pending_states: list[tuple[TranslationUnit, bool | None]] = []
+        for unit, text, pending_delete in edits:
+            was_confirmed = unit.confirmed and (text != unit.current_text or pending_delete is True)
+            if was_confirmed:
+                self.edit_unconfirmed_uids.add(unit.uid)
+                unconfirm.append(unit)
+            unit.set_text(text)
+            if (
+                not was_confirmed
+                and unit.current_text == unit.translate_text
+                and unit.uid in self.edit_unconfirmed_uids
+            ):
+                restore_confirmation.append(unit)
+                self.edit_unconfirmed_uids.discard(unit.uid)
+            pending_states.append((unit, pending_delete))
+            changed.append(unit)
+
+        if unconfirm:
+            self.set_units_confirmed(unconfirm, False)
+        if restore_confirmation:
+            self.set_units_confirmed(restore_confirmation, True)
+        for unit, pending_delete in pending_states:
+            if pending_delete is not None:
+                unit.set_pending_delete(pending_delete)
+        return tuple(changed)
 
     def save(
         self, units: Iterable[TranslationUnit] | None = None, *, auto_space_before_color_tokens: bool = False
