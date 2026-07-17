@@ -16,7 +16,9 @@ translation_review/
 Translation-format-FULL.txt
 local_docs/
 encoder/Mare
+# Local agent guidance uses progressive disclosure and is intentionally not versioned.
 AGENTS.md
+**/AGENTS.md
 
 # Python runtime files.
 __pycache__/
