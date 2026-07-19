@@ -5,6 +5,7 @@ from pathlib import Path
 import shutil
 import subprocess
 import tempfile
+import threading
 import time
 from datetime import datetime
 from types import SimpleNamespace
@@ -1521,7 +1522,28 @@ def assert_editor_undo_stays_local(root: Path) -> None:
         created_app = app is None
         if app is None:
             app = QApplication([])
+        LanguageGit(temp, "#chinese", codec_root=root).ensure_repository(AppSettings())
+        original_ensure_repository = app_module.LanguageGit.ensure_repository
+        main_thread_id = threading.get_ident()
+        git_init_thread_ids: list[int] = []
+
+        def tracked_ensure_repository(git: LanguageGit, settings: AppSettings) -> bool:
+            git_init_thread_ids.append(threading.get_ident())
+            return original_ensure_repository(git, settings)
+
+        app_module.LanguageGit.ensure_repository = tracked_ensure_repository
         win = TranslatorWindow()
+        git_init_deadline = time.monotonic() + 10.0
+        while not win.git_ready and not win._git_init_failed and time.monotonic() < git_init_deadline:
+            QTest.qWait(20)
+            app.processEvents()
+        app_module.LanguageGit.ensure_repository = original_ensure_repository
+        if not git_init_thread_ids:
+            raise AssertionError("Git initialization did not run during project startup")
+        if main_thread_id in git_init_thread_ids:
+            raise AssertionError("Git initialization blocked the Qt UI thread during project startup")
+        if not win.git_ready:
+            raise AssertionError("background Git initialization did not finish successfully")
 
         unit = next(item for item in win.model.units if item.ref.kind == "dbt" and item.source_text)
         original = unit.current_text
@@ -1949,6 +1971,8 @@ def assert_editor_undo_stays_local(root: Path) -> None:
         win.close()
         app.processEvents()
     finally:
+        if "original_ensure_repository" in locals():
+            app_module.LanguageGit.ensure_repository = original_ensure_repository
         app_module.MANAGED_PROJECT_ROOT = previous_managed_root
         if previous_localappdata is None:
             os.environ.pop("LOCALAPPDATA", None)

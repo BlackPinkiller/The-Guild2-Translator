@@ -1776,6 +1776,44 @@ class CodeIndexWorker(QRunnable):
             pass
 
 
+class GitInitWorkerSignals(QObject):
+    ready = Signal(int, bool)
+    failed = Signal(int, str)
+
+
+class GitInitWorker(QRunnable):
+    """Prepare Git without making project loading wait for subprocesses."""
+
+    def __init__(self, token: int, git: LanguageGit, settings: AppSettings) -> None:
+        super().__init__()
+        self.setAutoDelete(False)
+        self.token = token
+        self.git = git
+        self.settings = settings
+        self.signals = GitInitWorkerSignals()
+
+    def run(self) -> None:
+        try:
+            self.git.ensure_repository(self.settings)
+            pending = self.git.has_pending_changes()
+        except (GitError, OSError, ValueError) as exc:
+            try:
+                self.signals.failed.emit(self.token, str(exc))
+            except RuntimeError:
+                pass
+            return
+        except Exception as exc:
+            try:
+                self.signals.failed.emit(self.token, translate("error.unexpected", error=exc))
+            except RuntimeError:
+                pass
+            return
+        try:
+            self.signals.ready.emit(self.token, pending)
+        except RuntimeError:
+            pass
+
+
 class SuggestionWorkerSignals(QObject):
     chunk = Signal(str)
     failed = Signal(str)
@@ -2818,7 +2856,12 @@ class TranslatorWindow(QMainWindow):
             ui_assets_dir=self.settings.preview_ui_assets_dir,
         )
         self.git: LanguageGit | None = None
+        self.git_ready = False
         self.git_pending = False
+        self._git_pending_forced = False
+        self._git_init_failed = False
+        self._git_init_token = 0
+        self._git_init_workers: list[GitInitWorker] = []
         self.project: Project | None = None
         self.model = UnitTableModel()
         self.proxy = UnitFilterProxyModel()
@@ -3967,7 +4010,11 @@ class TranslatorWindow(QMainWindow):
     def _clear_loaded_project(self) -> None:
         self.project = None
         self.git = None
+        self.git_ready = False
         self.git_pending = False
+        self._git_pending_forced = False
+        self._git_init_failed = False
+        self._git_init_token += 1
         self.history.clear()
         self.typing_uid = ""
         self.typing_before = ""
@@ -4103,6 +4150,58 @@ class TranslatorWindow(QMainWindow):
         except OSError:
             return False
 
+    def _set_git_binding(self, git: LanguageGit) -> None:
+        self._git_init_token += 1
+        self.git = git
+        self.git_ready = False
+        self.git_pending = False
+        self._git_pending_forced = False
+        self._git_init_failed = False
+
+    def _start_git_initialization(self) -> None:
+        git = self.git
+        # Serialize repository preparation across rapid project/language switches.
+        # Different LanguageGit instances still share the same languages repository.
+        if git is None or self.git_ready or self._git_init_workers:
+            return
+        token = self._git_init_token
+        self.git_ready = False
+        self._git_init_failed = False
+        self._update_pending_state()
+        worker = GitInitWorker(token, git, self.settings)
+        worker.signals.ready.connect(self._git_initialization_ready)
+        worker.signals.failed.connect(self._git_initialization_failed)
+        self._git_init_workers.append(worker)
+        self.thread_pool.start(worker)
+
+    def _finish_git_initialization_worker(self, token: int) -> None:
+        self._git_init_workers = [
+            worker for worker in self._git_init_workers if worker.token != token
+        ]
+
+    def _git_initialization_ready(self, token: int, pending: bool) -> None:
+        self._finish_git_initialization_worker(token)
+        if token != self._git_init_token or self.git is None:
+            self._start_git_initialization()
+            return
+        self.git_ready = True
+        self._git_init_failed = False
+        self.git_pending = bool(pending or self._git_pending_forced)
+        self.retry_button.setVisible(self.git_pending)
+        self._update_window_title()
+
+    def _git_initialization_failed(self, token: int, message: str) -> None:
+        self._finish_git_initialization_worker(token)
+        if token != self._git_init_token or self.git is None:
+            self._start_git_initialization()
+            return
+        self.git_ready = False
+        self._git_init_failed = True
+        self.git_pending = self._git_pending_forced
+        self.retry_button.setVisible(True)
+        self._update_window_title()
+        self.statusBar().showMessage(translate("status.git_prepare_failed", error=message), 7000)
+
     def switch_local_project(self, root: Path) -> None:
         try:
             root = root.expanduser().resolve()
@@ -4167,13 +4266,17 @@ class TranslatorWindow(QMainWindow):
                 created_language_dir = True
                 self._load_language_choices(language)
             if not self._git_matches_current_project(language):
-                self.git = LanguageGit(
+                self._set_git_binding(LanguageGit(
                     self.project_root,
                     language,
                     codec_root=DEFAULT_PROJECT_ROOT,
                     enable_codec=self.settings.enable_chinese_codec,
-                )
-            self.git.ensure_repository(self.settings)
+                ))
+            # A first-time baseline must finish before editing can begin. Once
+            # repository metadata exists, routine validation is safe to defer.
+            if self.git is not None and not self.git.has_repository_metadata():
+                self.git.ensure_repository(self.settings)
+                self.git_ready = True
             project = Project.load(
                 self.project_root,
                 language,
@@ -4184,6 +4287,7 @@ class TranslatorWindow(QMainWindow):
             QMessageBox.critical(self, translate("dialog.load_error"), str(exc))
             return
         self._activate_project(project)
+        self._start_git_initialization()
         if created_language_dir:
             self.statusBar().showMessage(
                 translate("status.language_created_loaded", language=language, count=len(project.units)),
@@ -5031,7 +5135,7 @@ class TranslatorWindow(QMainWindow):
         ignored.setEnabled(can_mark_review)
         menu.addSection(translate("menu.translation_edit"))
         entry_history = menu.addAction(translate("menu.entry_history"))
-        entry_history.setEnabled(count == 1 and self.git is not None)
+        entry_history.setEnabled(count == 1 and self.git is not None and self.git_ready)
         copy_translation = menu.addAction(translate("menu.copy_selected_translation", suffix=suffix))
         restore = menu.addAction(translate("menu.restore_loaded", suffix=suffix))
         source = menu.addAction(translate("menu.restore_source", suffix=suffix))
@@ -5558,11 +5662,16 @@ class TranslatorWindow(QMainWindow):
         try:
             commit = (
                 self.git.commit_saved(result.changed_files, result.saved_units, result.deleted_units)
-                if self.git is not None
+                if self.git is not None and self.git_ready
                 else None
             )
-            commit_note = translate("status.saved_commit", hash=commit.short_hash) if commit else ""
+            if commit is not None:
+                commit_note = translate("status.saved_commit", hash=commit.short_hash)
+            elif self.git is not None and not self.git_ready:
+                self._git_pending_forced = True
+                commit_note = translate("status.saved_git_deferred")
         except GitError as exc:
+            self._git_pending_forced = True
             commit_note = translate("status.saved_git_failed", error=exc)
         self.load_project(discard_changes=True)
         delete_note = translate("status.saved_delete_note", count=len(result.deleted_units)) if result.deleted_units else ""
@@ -5581,11 +5690,16 @@ class TranslatorWindow(QMainWindow):
     def retry_commit(self) -> None:
         if self.git is None:
             return
+        if not self.git_ready:
+            self._start_git_initialization()
+            self.statusBar().showMessage(translate("status.git_preparing"), 4000)
+            return
         try:
             commit = self.git.commit_pending()
         except GitError as exc:
             QMessageBox.warning(self, translate("dialog.git_commit_failed"), str(exc))
             return
+        self._git_pending_forced = False
         self._update_pending_state()
         self.statusBar().showMessage(
             translate("status.retry_commit_done", hash=commit.short_hash) if commit else translate("status.retry_commit_none"),
@@ -5598,19 +5712,27 @@ class TranslatorWindow(QMainWindow):
             self.retry_button.setVisible(False)
             self._update_window_title()
             return
+        if not self.git_ready:
+            self.git_pending = self._git_pending_forced
+            self.retry_button.setVisible(self._git_init_failed or self.git_pending)
+            self._update_window_title()
+            return
         try:
             pending = self.git.has_pending_changes()
         except GitError:
             pending = True
-        self.git_pending = pending
-        self.retry_button.setVisible(pending)
-        if pending:
+        self.git_pending = bool(pending or self._git_pending_forced)
+        self.retry_button.setVisible(self.git_pending)
+        if self.git_pending:
             self.statusBar().showMessage(translate("status.git_pending"))
         self._update_window_title()
 
     def show_history(self) -> None:
         if self.git is None:
             QMessageBox.information(self, translate("dialog.history_title"), translate("dialog.history_requires_project"))
+            return
+        if not self.git_ready:
+            QMessageBox.information(self, translate("dialog.history_title"), translate("dialog.history_git_preparing"))
             return
         dialog = HistoryDialog(self.git, self)
         dialog.exec()
@@ -5619,6 +5741,9 @@ class TranslatorWindow(QMainWindow):
     def show_entry_history(self, unit: TranslationUnit) -> None:
         if self.git is None:
             QMessageBox.information(self, translate("dialog.history_title"), translate("dialog.history_requires_project"))
+            return
+        if not self.git_ready:
+            QMessageBox.information(self, translate("dialog.history_title"), translate("dialog.history_git_preparing"))
             return
         focus_key = (unit.file_rel, unit.record_id or "", unit.label, unit.ref.target_field)
         dialog = HistoryDialog(self.git, self, focus_key=focus_key)
@@ -5684,12 +5809,11 @@ class TranslatorWindow(QMainWindow):
             and language_uses_codec(self.project.language)
         ):
             self.load_project(discard_changes=False)
-        if self.git is None:
+        if self.git is None or not self.git_ready or self._git_init_workers:
             return
-        try:
-            self.git.ensure_repository(self.settings)
-        except GitError as exc:
-            QMessageBox.warning(self, translate("dialog.git_settings_error"), str(exc))
+        self._git_init_token += 1
+        self.git_ready = False
+        self._start_git_initialization()
 
     def _apply_runtime_theme(self, theme: str) -> None:
         app = QApplication.instance()

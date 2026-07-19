@@ -144,6 +144,10 @@ class LanguageGit:
         self._invalidate_history_cache()
         return True
 
+    def has_repository_metadata(self) -> bool:
+        """Cheap startup check used to keep first-time baseline creation synchronous."""
+        return (self.repo / ".git").exists()
+
     def commit_saved(
         self,
         changed_files: Iterable[Path],

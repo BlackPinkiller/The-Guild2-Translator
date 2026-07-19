@@ -11,6 +11,10 @@ _current_language = DEFAULT_UI_LANGUAGE
 
 _TRANSLATIONS: dict[str, dict[str, str]] = {
     "en": {
+        "dialog.history_git_preparing": "Git history is still being prepared. Try again in a moment.",
+        "status.git_preparing": "Preparing Git history in the background...",
+        "status.git_prepare_failed": "Git history could not be prepared: {error}. Files can still be saved; retry Git when ready.",
+        "status.saved_git_deferred": "; files were saved and the Git commit is pending",
         "language.name.en": "English",
         "language.name.zh-CN": "Chinese",
         "workspace.subtitle": "TRANSLATION WORKSPACE",
@@ -439,6 +443,10 @@ _TRANSLATIONS: dict[str, dict[str, str]] = {
         "error.unexpected": "Unexpected error: {error}",
     },
     "zh-CN": {
+        "dialog.history_git_preparing": "Git 历史仍在后台准备，请稍后再试。",
+        "status.git_preparing": "正在后台准备 Git 历史……",
+        "status.git_prepare_failed": "Git 历史准备失败：{error}。文件仍可正常保存，可稍后重试 Git。",
+        "status.saved_git_deferred": "；文件已保存，Git 提交正在等待处理",
         "language.name.en": "英语",
         "language.name.zh-CN": "中文",
         "workspace.subtitle": "翻译工作台",
