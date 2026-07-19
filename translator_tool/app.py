@@ -81,6 +81,7 @@ from .code_index import CodeReference, CodeReferenceIndex, CodeReferenceSet, bui
 from .code_window_context import DARK_PANEL_TEXT, PreviewWindowContext, best_window_context
 from .code_open import open_code_reference
 from .codec_adapter import CodecError, Guild2Codec, load_codec_for_language, language_uses_codec
+from .diagnostics import configure_diagnostics, log_exception, log_failure, log_metrics, shutdown_diagnostics
 from .entry_clipboard import ENTRY_CLIPBOARD_MIME, decode_translations, encode_entries
 from .git_history import GitCommit, GitError, LanguageGit, TranslationLogEntry
 from .game_theme import GameAssetSet, GameHeaderFrame, GamePanelFrame, install_game_theme_style
@@ -5624,20 +5625,32 @@ class TranslatorWindow(QMainWindow):
         self._commit_typing_operation()
         if self.project is None:
             return
+        save_started = time.perf_counter()
         try:
             result = self.project.save(
                 auto_space_before_color_tokens=self.settings.auto_space_before_color_tokens_on_save
             )
         except SaveValidationError as exc:
+            log_metrics(
+                "save_blocked",
+                total_ms=(time.perf_counter() - save_started) * 1000,
+                issue_count=len(exc.messages),
+            )
             QMessageBox.warning(self, translate("dialog.save_blocked"), "\n".join(exc.messages[:20]))
             return
         except (ProjectError, OSError) as exc:
+            log_failure(
+                "save_file_failed",
+                exc,
+                total_ms=(time.perf_counter() - save_started) * 1000,
+            )
             QMessageBox.critical(
                 self,
                 translate("dialog.save_failed"),
                 translate("dialog.save_failed_detail", error=exc),
             )
             return
+        project_save_ms = (time.perf_counter() - save_started) * 1000
         if result.changed_files or result.deleted_units:
             self._clear_current_recovery()
         reviewed = tuple(
@@ -5654,11 +5667,19 @@ class TranslatorWindow(QMainWindow):
         if not result.changed_files:
             if result.deleted_units:
                 self.load_project(discard_changes=True)
+                log_metrics(
+                    "save_delete_only",
+                    total_ms=(time.perf_counter() - save_started) * 1000,
+                    deleted_units=len(result.deleted_units),
+                )
                 self.statusBar().showMessage(translate("status.deleted_entries", count=len(result.deleted_units)), 4000)
                 return
+            log_metrics("save_no_changes", total_ms=(time.perf_counter() - save_started) * 1000)
             self.statusBar().showMessage(translate("status.no_changes_to_save"), 3000)
             return
         commit_note = ""
+        git_started = time.perf_counter()
+        git_failed = False
         try:
             commit = (
                 self.git.commit_saved(result.changed_files, result.saved_units, result.deleted_units)
@@ -5671,14 +5692,22 @@ class TranslatorWindow(QMainWindow):
                 self._git_pending_forced = True
                 commit_note = translate("status.saved_git_deferred")
         except GitError as exc:
+            git_failed = True
             self._git_pending_forced = True
             commit_note = translate("status.saved_git_failed", error=exc)
+            log_failure("save_git_failed", exc)
+        git_ms = (time.perf_counter() - git_started) * 1000
+        refresh_started = time.perf_counter()
+        refresh_fallback = False
         try:
             self._refresh_saved_project(result.changed_files)
-        except (ProjectError, OSError, ValueError):
+        except (ProjectError, OSError, ValueError) as exc:
+            refresh_fallback = True
+            log_failure("save_refresh_failed", exc)
             # The files are already durable. Fall back to the established full
             # reload instead of leaving a partially refreshed in-memory model.
             self.load_project(discard_changes=True)
+        refresh_ms = (time.perf_counter() - refresh_started) * 1000
         delete_note = translate("status.saved_delete_note", count=len(result.deleted_units)) if result.deleted_units else ""
         warning_note = translate("status.saved_warning_note", count=format_warning_count) if format_warning_count else ""
         self.statusBar().showMessage(
@@ -5690,6 +5719,20 @@ class TranslatorWindow(QMainWindow):
                 commit_note=commit_note,
             ),
             7000,
+        )
+        log_metrics(
+            "save_complete",
+            total_ms=(time.perf_counter() - save_started) * 1000,
+            project_save_ms=project_save_ms,
+            git_ms=git_ms,
+            refresh_ms=refresh_ms,
+            changed_files=len(result.changed_files),
+            saved_units=len(result.saved_units),
+            deleted_units=len(result.deleted_units),
+            warning_count=format_warning_count,
+            git_failed=git_failed,
+            git_deferred=self.git is not None and not self.git_ready,
+            refresh_fallback=refresh_fallback,
         )
 
     def _refresh_saved_project(self, changed_files: Iterable[Path]) -> None:
@@ -6576,16 +6619,28 @@ def apply_theme(app: QApplication | None, theme: str) -> None:
 
 
 def main() -> None:
-    app = QApplication([])
-    app.setApplicationName("The Guild 2 Translator")
-    if APP_ICON_PATH.exists():
-        app.setWindowIcon(QIcon(str(APP_ICON_PATH)))
-    apply_theme(app, load_settings().ui_theme)
-    window = TranslatorWindow()
-    if APP_ICON_PATH.exists():
-        window.setWindowIcon(QIcon(str(APP_ICON_PATH)))
-    window.show()
-    app.exec()
+    configure_diagnostics()
+    startup_started = time.perf_counter()
+    try:
+        app = QApplication([])
+        app.setApplicationName("The Guild 2 Translator")
+        if APP_ICON_PATH.exists():
+            app.setWindowIcon(QIcon(str(APP_ICON_PATH)))
+        apply_theme(app, load_settings().ui_theme)
+        window = TranslatorWindow()
+        log_metrics("startup_window_ready", total_ms=(time.perf_counter() - startup_started) * 1000)
+        if APP_ICON_PATH.exists():
+            window.setWindowIcon(QIcon(str(APP_ICON_PATH)))
+        window.show()
+        app.exec()
+    except BaseException:
+        error_type, _error, tb = sys.exc_info()
+        if error_type is not None:
+            log_exception("main_failed", error_type, tb)
+        raise
+    finally:
+        log_metrics("session_end")
+        shutdown_diagnostics()
 
 
 if __name__ == "__main__":

@@ -32,6 +32,7 @@ from .git_history import GitCommit, GitError, LanguageGit, TranslationLogEntry, 
 from .history import OperationHistory, TranslationOperation, UnitChange
 from .self_tests.project_refresh import assert_saved_file_refresh
 from .self_tests.git_commit import assert_tracked_git_commit_skips_redundant_add
+from .self_tests.diagnostics import assert_diagnostics_are_bounded_and_content_free
 from .i18n import set_language, status_text, translate
 from .format_io import load_dbt, load_plain_text, matching_source_field, row_key
 from .preview import GLYPH_MARK, PreviewAtom, PreviewDocument, PreviewService
@@ -3490,6 +3491,7 @@ def assert_llm_suggestion_context_prompt() -> None:
 def main() -> int:
     root = project_root()
     assert_codec(root)
+    assert_diagnostics_are_bounded_and_content_free()
     assert_font_glyph_validation(root)
     assert_round_trip(root)
     assert_statuses(root)
