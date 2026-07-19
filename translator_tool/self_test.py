@@ -11,6 +11,8 @@ from types import SimpleNamespace
 import uuid
 
 from . import project as project_module
+from . import cache as cache_module
+from . import recovery as recovery_module
 from . import file_utils as file_utils_module
 from . import source_sync as source_sync_module
 from . import settings as settings_module
@@ -22,7 +24,7 @@ from .ai import (
     TranslationProviderError,
 )
 from .cache import cache_path, confirmed_uids, need_work_uids, source_review_uids
-from .code_index import CodeReference, build_code_reference_index
+from .code_index import CodeReference, CodeReferenceIndex, build_code_reference_index
 from .code_window_context import DARK_PANEL_TEXT, PreviewWindowContext, best_window_context
 from .codec_adapter import Guild2Codec, load_codec_for_language
 from .git_history import GitCommit, GitError, LanguageGit, TranslationLogEntry, combine_entries, format_entries
@@ -369,6 +371,22 @@ def assert_code_reference_index_avoids_db_and_uses_vanilla_fallback() -> None:
             raise AssertionError("mod code reference index did not keep vanilla fallback")
     finally:
         safe_rmtree(temp)
+
+
+def assert_stale_code_index_workers_are_released() -> None:
+    from . import app as app_module
+
+    stale = SimpleNamespace(token=7)
+    window = SimpleNamespace(code_reference_workers=[stale], code_reference_index_token=8)
+    app_module.TranslatorWindow._code_reference_index_ready(window, 7, CodeReferenceIndex())
+    if window.code_reference_workers:
+        raise AssertionError("a completed stale code-index worker remained retained")
+
+    stale = SimpleNamespace(token=9)
+    window = SimpleNamespace(code_reference_workers=[stale], code_reference_index_token=10)
+    app_module.TranslatorWindow._code_reference_index_failed(window, 9, "ignored")
+    if window.code_reference_workers:
+        raise AssertionError("a failed stale code-index worker remained retained")
 
 
 def assert_code_window_context_extracts_window_labels_and_buttons() -> None:
@@ -805,6 +823,32 @@ def assert_manual_status_cache() -> None:
         safe_rmtree(temp)
 
 
+def assert_workflow_cache_updates_once(root: Path) -> None:
+    temp = make_temp_project(root, "translator_tool_smoke_cache_transaction_")
+    original_atomic_write = cache_module.atomic_write
+    writes = 0
+    try:
+        project = Project.load(temp, "#chinese", enable_codec=False)
+        unit = next(item for item in project.units if not item.is_extra)
+
+        def count_atomic_write(path: Path, data: bytes) -> None:
+            nonlocal writes
+            writes += 1
+            original_atomic_write(path, data)
+
+        cache_module.atomic_write = count_atomic_write
+        project.set_units_need_work((unit,), True)
+        if writes != 1:
+            raise AssertionError(f"one workflow transition wrote the cache {writes} times")
+        if unit.uid not in need_work_uids(temp, "#chinese"):
+            raise AssertionError("transactional workflow cache update lost the requested state")
+        if unit.uid in confirmed_uids(temp, "#chinese"):
+            raise AssertionError("transactional workflow cache update kept conflicting confirmation state")
+    finally:
+        cache_module.atomic_write = original_atomic_write
+        safe_rmtree(temp)
+
+
 def assert_startup_prefers_local_sources_over_game_root() -> None:
     from . import app as app_module
     from .app import TranslatorWindow
@@ -1112,6 +1156,45 @@ def assert_recovery_draft_round_trip(root: Path) -> None:
         if recovery_path(temp, "#chinese").exists():
             raise AssertionError("clearing recovery left the draft on disk")
     finally:
+        if previous_localappdata is None:
+            os.environ.pop("LOCALAPPDATA", None)
+        else:
+            os.environ["LOCALAPPDATA"] = previous_localappdata
+        safe_rmtree(settings_root)
+        safe_rmtree(temp)
+
+
+def assert_recovery_draft_limits_match(root: Path) -> None:
+    temp = make_temp_project(root, "translator_tool_smoke_recovery_limit_")
+    settings_root = Path(tempfile.gettempdir()) / f"translator_tool_settings_{uuid.uuid4().hex[:8]}"
+    previous_localappdata = os.environ.get("LOCALAPPDATA")
+    original_limit = recovery_module.MAX_RECOVERY_UNITS
+    try:
+        os.environ["LOCALAPPDATA"] = str(settings_root)
+        project = Project.load(temp, "#chinese", enable_codec=False)
+        units = [item for item in project.units if item.source_text and not item.is_extra][:2]
+        if len(units) != 2:
+            raise AssertionError("recovery limit fixture does not contain two editable units")
+        recovery_module.MAX_RECOVERY_UNITS = 1
+        project.apply_unit_edits(((units[0], units[0].current_text + "a", None),))
+        if save_recovery_draft(project) != 1:
+            raise AssertionError("recovery draft rejected its exact supported entry limit")
+        valid_before = recovery_path(project.root, project.language).read_bytes()
+
+        project.apply_unit_edits(((units[1], units[1].current_text + "b", None),))
+        try:
+            save_recovery_draft(project)
+        except OSError:
+            pass
+        else:
+            raise AssertionError("recovery draft saved more entries than its loader accepts")
+        if recovery_path(project.root, project.language).read_bytes() != valid_before:
+            raise AssertionError("oversized recovery update replaced the last valid draft")
+        loaded = load_recovery_draft(project.root, project.language)
+        if loaded is None or len(loaded.units) != 1:
+            raise AssertionError("the last valid recovery draft became unreadable after an oversized update")
+    finally:
+        recovery_module.MAX_RECOVERY_UNITS = original_limit
         if previous_localappdata is None:
             os.environ.pop("LOCALAPPDATA", None)
         else:
@@ -2929,6 +3012,17 @@ def assert_operation_history() -> None:
     if values["second"] != ("AI 二", True):
         raise AssertionError("redo did not restore the delete mark")
 
+    bounded = OperationHistory(max_operations=2, max_changes=2, max_text_chars=8)
+    for number in range(3):
+        bounded.push(TranslationOperation(str(number), (UnitChange(str(number), "a", "b"),)))
+    if bounded.take_undo().label != "2" or bounded.take_undo().label != "1" or bounded.take_undo() is not None:
+        raise AssertionError("bounded undo history did not discard only its oldest operation")
+    oversized = OperationHistory(max_operations=1, max_changes=1, max_text_chars=1)
+    latest = TranslationOperation("large", (UnitChange("1", "before", "after"), UnitChange("2", "x", "y")))
+    oversized.push(latest)
+    if oversized.take_undo() != latest:
+        raise AssertionError("a single operation larger than the history budget was not kept undoable")
+
 
 def assert_git_history(root: Path) -> None:
     temp = make_temp_project(root, "translator_tool_smoke_git_")
@@ -2998,6 +3092,73 @@ def assert_git_history(root: Path) -> None:
             raise AssertionError("Git history text output did not label deleted entries")
     finally:
         safe_rmtree(temp)
+
+
+def assert_history_dialog_search_and_entry_timeline() -> None:
+    os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+    from PySide6.QtTest import QTest
+    from PySide6.QtWidgets import QApplication
+
+    from .app import HistoryDialog
+
+    commits = [
+        GitCommit("b" * 40, "bbbbbbb", datetime.fromtimestamp(2), "second change"),
+        GitCommit("a" * 40, "aaaaaaa", datetime.fromtimestamp(1), "first change"),
+    ]
+    early = TranslationLogEntry("新增", "Text.dbt", "10", "Greeting", "Text", "Hello", "First")
+    later = TranslationLogEntry("更新", "Text.dbt", "10", "Greeting", "Text", "Hello", "Second", "First")
+    entries = {commits[0].full_hash: [later], commits[1].full_hash: [early]}
+
+    class FakeHistoryGit:
+        project_root = Path("HistoryFixture")
+        language = "#chinese"
+
+        def list_all_commits(self):
+            return list(commits)
+
+        def entries_for_commit(self, commit: str):
+            return list(entries.get(commit, ()))
+
+        def entries_for_commits(self, hashes):
+            return [entry for commit in hashes for entry in entries.get(commit, ())]
+
+    app = QApplication.instance()
+    created_app = app is None
+    if app is None:
+        app = QApplication([])
+    dialog = HistoryDialog(
+        FakeHistoryGit(),  # type: ignore[arg-type]
+        focus_key=("Text.dbt", "10", "Greeting", "Text"),
+    )
+    dialog.show()
+    try:
+        for _ in range(100):
+            app.processEvents()
+            if dialog.entries.count() == 1 and dialog._index_worker is None:
+                break
+            QTest.qWait(20)
+        if dialog.entries.count() != 1:
+            raise AssertionError("entry-history index did not group repeated changes by translation field")
+        if dialog.entries.currentRow() != 0:
+            raise AssertionError("opening history for a unit did not select its entry timeline")
+        content = dialog.content.toPlainText()
+        if "Greeting" not in content or "First" not in content or "Second" not in content or "2" not in content:
+            raise AssertionError("entry timeline did not show its count and every before/after value")
+
+        dialog.commit_search.setText("Second")
+        app.processEvents()
+        if dialog.commits.item(0).isHidden() or not dialog.commits.item(1).isHidden():
+            raise AssertionError("commit search did not include indexed translation content")
+        dialog.entry_search.setText("Hello Greeting")
+        app.processEvents()
+        if dialog.entries.item(0).isHidden():
+            raise AssertionError("entry-history search did not match source text and label together")
+    finally:
+        dialog.close()
+        dialog.deleteLater()
+        app.processEvents()
+        if created_app:
+            app.quit()
 
 
 def assert_git_subprocess_hides_console() -> None:
@@ -3263,6 +3424,7 @@ def main() -> int:
     assert_local_project_roots_detect_sources_projects()
     assert_discover_game_source_projects_detects_vanilla_and_mods()
     assert_code_reference_index_avoids_db_and_uses_vanilla_fallback()
+    assert_stale_code_index_workers_are_released()
     assert_code_window_context_extracts_window_labels_and_buttons()
     assert_code_preview_unit_lookup_accepts_leading_underscore_labels()
     assert_game_preview_draws_all_buttons()
@@ -3281,6 +3443,7 @@ def main() -> int:
     assert_failed_save_does_not_mutate_loaded_documents(root)
     assert_atomic_write_many_rolls_back_partial_commit()
     assert_recovery_draft_round_trip(root)
+    assert_recovery_draft_limits_match(root)
     assert_project_edit_state_keeps_confirmation_consistent(root)
     assert_large_batch_save_stays_interactive(root)
     assert_entry_clipboard_decoder()
@@ -3301,6 +3464,7 @@ def main() -> int:
     assert_validation_warnings_do_not_block()
     assert_ignore_cache(root)
     assert_source_review_cache(root)
+    assert_workflow_cache_updates_once(root)
     assert_manual_status_cache()
     assert_operation_history()
     assert_ai_token_protection()
@@ -3313,6 +3477,7 @@ def main() -> int:
     assert_llm_suggestion_stream()
     assert_llm_suggestion_context_prompt()
     assert_git_history(root)
+    assert_history_dialog_search_and_entry_timeline()
     assert_git_subprocess_hides_console()
     assert_git_subprocess_timeout_is_reported()
     assert_git_commit_display()

@@ -2,7 +2,6 @@ from __future__ import annotations
 
 from collections import Counter
 from dataclasses import replace
-from difflib import SequenceMatcher
 import html
 import math
 from pathlib import Path
@@ -86,6 +85,15 @@ from .entry_clipboard import ENTRY_CLIPBOARD_MIME, decode_translations, encode_e
 from .git_history import GitCommit, GitError, LanguageGit, TranslationLogEntry
 from .game_theme import GameAssetSet, GameHeaderFrame, GamePanelFrame, install_game_theme_style
 from .history import OperationHistory, TranslationOperation, UnitChange
+from .history_render import (
+    commit_search_blob,
+    entry_meta as _history_entry_meta,
+    entry_search_blob,
+    entry_title as _history_entry_title,
+    history_text as _history_text,
+    inline_diff_html as _history_inline_diff_html,
+    render_entry_timeline_html,
+)
 from .i18n import current_language, history_kind_text, set_language, status_text, todo_reason_text, translate, ui_language_options
 from .project import (
     ENABLE_FONT_GLYPH_VALIDATION,
@@ -1834,6 +1842,48 @@ class HistoryRenderWorker(QRunnable):
             self.signals.failed.emit(self.request_id, translate("error.unexpected", error=exc))
 
 
+class HistoryIndexWorkerSignals(QObject):
+    ready = Signal(int, object)
+    progress = Signal(int, int)
+    failed = Signal(int, str)
+
+
+class HistoryIndexWorker(QRunnable):
+    def __init__(
+        self,
+        request_id: int,
+        git: LanguageGit,
+        commits_newest_first: tuple[GitCommit, ...],
+        cancel_event: threading.Event,
+    ) -> None:
+        super().__init__()
+        self.request_id = request_id
+        self.git = git
+        self.commits_newest_first = commits_newest_first
+        self.cancel_event = cancel_event
+        self.signals = HistoryIndexWorkerSignals()
+
+    def run(self) -> None:
+        events: list[tuple[GitCommit, TranslationLogEntry]] = []
+        total = len(self.commits_newest_first)
+        try:
+            for number, commit in enumerate(self.commits_newest_first, start=1):
+                if self.cancel_event.is_set():
+                    return
+                events.extend((commit, entry) for entry in self.git.entries_for_commit(commit.full_hash))
+                self.signals.progress.emit(number, total)
+        except (GitError, OSError, UnicodeError) as exc:
+            if not self.cancel_event.is_set():
+                self.signals.failed.emit(self.request_id, str(exc))
+            return
+        except Exception as exc:
+            if not self.cancel_event.is_set():
+                self.signals.failed.emit(self.request_id, translate("error.unexpected", error=exc))
+            return
+        if not self.cancel_event.is_set():
+            self.signals.ready.emit(self.request_id, events)
+
+
 class SettingsDialog(QDialog):
     def __init__(self, settings: AppSettings, parent: QWidget | None = None) -> None:
         super().__init__(parent)
@@ -2462,30 +2512,61 @@ class SuggestionDialog(QDialog):
 
 
 class HistoryDialog(QDialog):
-    def __init__(self, git: LanguageGit, parent: QWidget | None = None) -> None:
+    def __init__(
+        self,
+        git: LanguageGit,
+        parent: QWidget | None = None,
+        *,
+        focus_key: tuple[str, str, str, str] | None = None,
+    ) -> None:
         super().__init__(parent)
         self.git = git
+        self._focus_key = focus_key
         self.setObjectName("historyDialog")
         self.setWindowTitle(translate("history.dialog.title", project=git.project_root.name, language=git.language))
         self.resize(1180, 720)
         layout = QHBoxLayout(self)
+        splitter = QSplitter(Qt.Orientation.Horizontal)
+        self.left_tabs = QTabWidget()
+
+        commit_page = QWidget()
+        commit_column = QVBoxLayout(commit_page)
+        commit_column.setContentsMargins(4, 4, 4, 4)
+        self.commit_search = QLineEdit()
+        self.commit_search.setClearButtonEnabled(True)
+        self.commit_search.setPlaceholderText(translate("history.search.commits"))
+        commit_column.addWidget(self.commit_search)
+        selection_hint = QLabel(translate("history.selection_hint"))
+        selection_hint.setObjectName("historyHint")
+        selection_hint.setWordWrap(True)
+        commit_column.addWidget(selection_hint)
         self.commits = QListWidget()
         self.commits.setObjectName("historyList")
         self.commits.setMinimumWidth(370)
         self.commits.setUniformItemSizes(True)
         self.commits.setSpacing(1)
         self.commits.setSelectionMode(QAbstractItemView.SelectionMode.ExtendedSelection)
-        history_column = QVBoxLayout()
-        history_column.setContentsMargins(0, 0, 0, 0)
-        selection_hint = QLabel(translate("history.selection_hint"))
-        selection_hint.setObjectName("historyHint")
-        selection_hint.setWordWrap(True)
-        history_column.addWidget(selection_hint)
-        history_column.addWidget(self.commits, 1)
-        history_panel = QWidget()
-        history_panel.setLayout(history_column)
-        splitter = QSplitter(Qt.Orientation.Horizontal)
-        splitter.addWidget(history_panel)
+        commit_column.addWidget(self.commits, 1)
+        self.left_tabs.addTab(commit_page, translate("history.tab.commits"))
+
+        entry_page = QWidget()
+        entry_column = QVBoxLayout(entry_page)
+        entry_column.setContentsMargins(4, 4, 4, 4)
+        self.entry_search = QLineEdit()
+        self.entry_search.setClearButtonEnabled(True)
+        self.entry_search.setPlaceholderText(translate("history.search.entries"))
+        entry_column.addWidget(self.entry_search)
+        self.entry_status = QLabel(translate("history.entry_index.starting"))
+        self.entry_status.setWordWrap(True)
+        entry_column.addWidget(self.entry_status)
+        self.entries = QListWidget()
+        self.entries.setObjectName("historyEntryList")
+        self.entries.setMinimumWidth(370)
+        self.entries.setSpacing(2)
+        entry_column.addWidget(self.entries, 1)
+        self.left_tabs.addTab(entry_page, translate("history.tab.entries"))
+        splitter.addWidget(self.left_tabs)
+
         self.content = QTextBrowser()
         self.content.setObjectName("historyContent")
         self.content.setOpenExternalLinks(False)
@@ -2494,25 +2575,154 @@ class HistoryDialog(QDialog):
         splitter.setStretchFactor(0, 1)
         splitter.setStretchFactor(1, 2)
         layout.addWidget(splitter)
+
         self._items: list[GitCommit] = []
+        self._commit_blobs: dict[str, str] = {}
+        self._events_by_key: dict[tuple[str, str, str, str], list[tuple[GitCommit, TranslationLogEntry]]] = {}
+        self._entry_keys: list[tuple[str, str, str, str]] = []
+        self._entry_blobs: dict[tuple[str, str, str, str], str] = {}
         self._request_id = 0
         self._selected_rows: tuple[int, ...] = ()
         self._rendered_rows: tuple[int, ...] = ()
         self._history_workers: set[HistoryRenderWorker] = set()
+        self._index_request_id = 1
+        self._index_cancel_event = threading.Event()
+        self._index_worker: HistoryIndexWorker | None = None
         self._selection_timer = QTimer(self)
         self._selection_timer.setSingleShot(True)
         self._selection_timer.setInterval(110)
         self._selection_timer.timeout.connect(self._load_selected_commits)
         try:
-            self._items = git.list_commits()
+            self._items = git.list_all_commits()
             self.commits.addItems([commit.display for commit in self._items])
+            self._commit_blobs = {commit.full_hash: commit_search_blob(commit) for commit in self._items}
         except GitError as exc:
             self.content.setHtml(_history_state_html(translate("history.read_error_title"), str(exc), kind="error"))
+            self.entry_status.setText(str(exc))
         else:
             self.content.setHtml(_history_state_html(translate("history.initial_title"), translate("history.initial_detail")))
+            self._start_entry_index()
         self.commits.itemSelectionChanged.connect(self._show_selected_commits)
+        self.commit_search.textChanged.connect(self._filter_commits)
+        self.entry_search.textChanged.connect(self._filter_entries)
+        self.entries.itemSelectionChanged.connect(self._show_selected_entry)
         if self._items:
             QTimer.singleShot(0, self._select_latest_commit)
+        if focus_key is not None:
+            self.left_tabs.setCurrentIndex(1)
+
+    @staticmethod
+    def _matches_query(blob: str, query: str) -> bool:
+        return all(part in blob for part in query.casefold().split())
+
+    def _filter_commits(self, query: str) -> None:
+        for row, commit in enumerate(self._items):
+            item = self.commits.item(row)
+            if item is not None:
+                item.setHidden(not self._matches_query(self._commit_blobs.get(commit.full_hash, ""), query))
+
+    def _filter_entries(self, query: str) -> None:
+        for row, key in enumerate(self._entry_keys):
+            item = self.entries.item(row)
+            if item is not None:
+                item.setHidden(not self._matches_query(self._entry_blobs.get(key, ""), query))
+
+    def _start_entry_index(self) -> None:
+        worker = HistoryIndexWorker(
+            self._index_request_id,
+            self.git,
+            tuple(self._items),
+            self._index_cancel_event,
+        )
+        self._index_worker = worker
+        worker.signals.progress.connect(self._apply_index_progress)
+        worker.signals.ready.connect(self._apply_history_index)
+        worker.signals.failed.connect(self._apply_index_error)
+        QThreadPool.globalInstance().start(worker)
+
+    def _apply_index_progress(self, current: int, total: int) -> None:
+        self.entry_status.setText(translate("history.entry_index.progress", current=current, total=total))
+
+    def _apply_history_index(self, request_id: int, raw_events: object) -> None:
+        if request_id != self._index_request_id or not isinstance(raw_events, list):
+            return
+        self._index_worker = None
+        events_by_commit: dict[str, list[TranslationLogEntry]] = {}
+        for event in raw_events:
+            if not isinstance(event, tuple) or len(event) != 2:
+                continue
+            commit, entry = event
+            if not isinstance(commit, GitCommit) or not isinstance(entry, TranslationLogEntry):
+                continue
+            self._events_by_key.setdefault(entry.change_key, []).append((commit, entry))
+            events_by_commit.setdefault(commit.full_hash, []).append(entry)
+        for commit in self._items:
+            self._commit_blobs[commit.full_hash] = commit_search_blob(
+                commit,
+                events_by_commit.get(commit.full_hash, ()),
+            )
+        self.entries.clear()
+        self._entry_keys = sorted(
+            self._events_by_key,
+            key=lambda key: (
+                _history_entry_title(self._events_by_key[key][0][1]).casefold(),
+                _history_entry_meta(self._events_by_key[key][0][1]).casefold(),
+            ),
+        )
+        self._entry_blobs.clear()
+        for key in self._entry_keys:
+            events = self._events_by_key[key]
+            entry = events[0][1]
+            self.entries.addItem(
+                translate(
+                    "history.entry_list.item",
+                    title=_history_entry_title(entry),
+                    count=len(events),
+                    meta=_history_entry_meta(entry),
+                )
+            )
+            self._entry_blobs[key] = "\n".join(
+                [entry_search_blob(change) for _commit, change in events]
+                + [commit_search_blob(commit) for commit, _change in events]
+            )
+        self.entry_status.setText(
+            translate("history.entry_index.ready", entries=len(self._entry_keys), changes=len(raw_events))
+        )
+        self._filter_commits(self.commit_search.text())
+        self._filter_entries(self.entry_search.text())
+        if self._focus_key is not None:
+            self._select_entry_key(self._focus_key)
+
+    def _apply_index_error(self, request_id: int, message: str) -> None:
+        if request_id != self._index_request_id:
+            return
+        self._index_worker = None
+        self.entry_status.setText(translate("history.entry_index.failed", error=message))
+
+    def _select_entry_key(self, key: tuple[str, str, str, str]) -> None:
+        try:
+            row = self._entry_keys.index(key)
+        except ValueError:
+            candidates = [
+                index
+                for index, candidate in enumerate(self._entry_keys)
+                if candidate[:3] == key[:3]
+            ]
+            if not candidates:
+                self.entry_status.setText(translate("history.entry_index.not_found"))
+                return
+            row = candidates[0]
+        self.entries.setCurrentRow(row)
+        item = self.entries.item(row)
+        if item is not None:
+            item.setSelected(True)
+            self.entries.scrollToItem(item, QAbstractItemView.ScrollHint.PositionAtCenter)
+
+    def _show_selected_entry(self) -> None:
+        row = self.entries.currentRow()
+        if row < 0 or row >= len(self._entry_keys):
+            return
+        self.content.setHtml(render_entry_timeline_html(self._events_by_key[self._entry_keys[row]]))
 
     def _select_latest_commit(self) -> None:
         if not self._items:
@@ -2565,6 +2775,12 @@ class HistoryDialog(QDialog):
             return
         self._rendered_rows = ()
         self.content.setHtml(_history_state_html(translate("history.read_selected_error_title"), message, kind="error"))
+
+    def closeEvent(self, event) -> None:  # noqa: N802
+        self._selection_timer.stop()
+        self._index_cancel_event.set()
+        self._index_request_id += 1
+        super().closeEvent(event)
 
 
 class TranslatorWindow(QMainWindow):
@@ -2876,7 +3092,6 @@ class TranslatorWindow(QMainWindow):
         self.code_reference_index: CodeReferenceIndex | None = None
         self.code_reference_index_token = 0
         self.code_reference_workers: list[CodeIndexWorker] = []
-        self.code_reference_cache: dict[str, CodeReferenceSet] = {}
         self.source_preview_button.toggled.connect(
             lambda checked: self._on_editor_preview_toggled(False, checked)
         )
@@ -3149,7 +3364,6 @@ class TranslatorWindow(QMainWindow):
 
     def _start_code_reference_index(self) -> None:
         self.code_reference_index = None
-        self.code_reference_cache.clear()
         self.code_reference_index_token += 1
         token = self.code_reference_index_token
         self._update_code_reference_display()
@@ -3160,23 +3374,21 @@ class TranslatorWindow(QMainWindow):
         self.thread_pool.start(worker)
 
     def _code_reference_index_ready(self, token: int, index: object) -> None:
-        if token != self.code_reference_index_token or not isinstance(index, CodeReferenceIndex):
-            return
         self.code_reference_workers = [
             worker for worker in self.code_reference_workers if worker.token != token
         ]
+        if token != self.code_reference_index_token or not isinstance(index, CodeReferenceIndex):
+            return
         self.code_reference_index = index
-        self.code_reference_cache.clear()
         self._update_code_reference_display()
 
     def _code_reference_index_failed(self, token: int, message: str) -> None:
-        if token != self.code_reference_index_token:
-            return
         self.code_reference_workers = [
             worker for worker in self.code_reference_workers if worker.token != token
         ]
+        if token != self.code_reference_index_token:
+            return
         self.code_reference_index = CodeReferenceIndex()
-        self.code_reference_cache.clear()
         self._update_code_reference_display()
         self.statusBar().showMessage(translate("status.code_index_failed", error=message), 4000)
 
@@ -3184,22 +3396,14 @@ class TranslatorWindow(QMainWindow):
         unit = self._current_unit()
         if unit is None or not unit.label or unit.ref.kind != "dbt" or self.code_reference_index is None:
             return CodeReferenceSet()
-        cached = self.code_reference_cache.get(unit.label)
-        if cached is None:
-            cached = self.code_reference_index.references_for(unit.label)
-            self.code_reference_cache[unit.label] = cached
-        return cached
+        return self.code_reference_index.references_for(unit.label)
 
     def _code_references_for_unit(self, unit: TranslationUnit) -> tuple[CodeReference, ...]:
         if not self.settings.preview_use_code_context:
             return ()
         if not unit.label or unit.ref.kind != "dbt" or self.code_reference_index is None:
             return ()
-        cached = self.code_reference_cache.get(unit.label)
-        if cached is None:
-            cached = self.code_reference_index.references_for(unit.label)
-            self.code_reference_cache[unit.label] = cached
-        return cached.active
+        return self.code_reference_index.references_for(unit.label).active
 
     def _project_is_mod(self) -> bool:
         return self.project_root is not None and self.project_root.name.casefold() != VANILLA_PROJECT_NAME.casefold()
@@ -4826,6 +5030,8 @@ class TranslatorWindow(QMainWindow):
         )
         ignored.setEnabled(can_mark_review)
         menu.addSection(translate("menu.translation_edit"))
+        entry_history = menu.addAction(translate("menu.entry_history"))
+        entry_history.setEnabled(count == 1 and self.git is not None)
         copy_translation = menu.addAction(translate("menu.copy_selected_translation", suffix=suffix))
         restore = menu.addAction(translate("menu.restore_loaded", suffix=suffix))
         source = menu.addAction(translate("menu.restore_source", suffix=suffix))
@@ -4842,7 +5048,9 @@ class TranslatorWindow(QMainWindow):
         )
         delete_mark.setEnabled(can_toggle_delete)
         action = menu.exec(global_point)
-        if action == confirm_translated:
+        if action == entry_history:
+            self.show_entry_history(unit)
+        elif action == confirm_translated:
             self._set_units_confirmed(units)
         elif action == need_work:
             self._set_units_need_work(units, not all_need_work)
@@ -5404,7 +5612,18 @@ class TranslatorWindow(QMainWindow):
         if self.git is None:
             QMessageBox.information(self, translate("dialog.history_title"), translate("dialog.history_requires_project"))
             return
-        HistoryDialog(self.git, self).exec()
+        dialog = HistoryDialog(self.git, self)
+        dialog.exec()
+        dialog.deleteLater()
+
+    def show_entry_history(self, unit: TranslationUnit) -> None:
+        if self.git is None:
+            QMessageBox.information(self, translate("dialog.history_title"), translate("dialog.history_requires_project"))
+            return
+        focus_key = (unit.file_rel, unit.record_id or "", unit.label, unit.ref.target_field)
+        dialog = HistoryDialog(self.git, self, focus_key=focus_key)
+        dialog.exec()
+        dialog.deleteLater()
 
     def show_settings(self) -> None:
         dialog = SettingsDialog(self.settings, self)
@@ -5688,31 +5907,6 @@ def _history_state_html(title: str, detail: str, *, kind: str = "info") -> str:
     """
 
 
-def _history_text(text: str) -> str:
-    return html.escape(text.replace("\r", ""))
-
-
-def _history_inline_diff_html(before: str, after: str) -> str:
-    parts: list[str] = []
-    for tag, i1, i2, j1, j2 in SequenceMatcher(None, before, after, autojunk=False).get_opcodes():
-        left = _history_text(before[i1:i2])
-        right = _history_text(after[j1:j2])
-        if tag == "equal":
-            parts.append(right)
-        elif tag == "delete":
-            if left:
-                parts.append(f'<span class="diff-del">{left}</span>')
-        elif tag == "insert":
-            if right:
-                parts.append(f'<span class="diff-add">{right}</span>')
-        else:
-            if left:
-                parts.append(f'<span class="diff-del">{left}</span>')
-            if right:
-                parts.append(f'<span class="diff-add">{right}</span>')
-    return "".join(parts) or f'<span class="diff-empty">{html.escape(translate("history.empty_value"))}</span>'
-
-
 def _history_files_phrase(file_counts: Counter[str]) -> str:
     if not file_counts:
         return translate("history.zero_files")
@@ -5737,23 +5931,6 @@ def _history_entry_sort_key(entry: TranslationLogEntry) -> tuple[int, int | str,
     if entry.record_id.isdigit():
         return (0, int(entry.record_id), entry.label, entry.field_name)
     return (1, entry.record_id, entry.label, entry.field_name)
-
-
-def _history_entry_title(entry: TranslationLogEntry) -> str:
-    title = entry.label if entry.label and entry.label != entry.file_rel else ""
-    if not title:
-        title = f"ID {entry.record_id}" if entry.record_id else Path(entry.file_rel).name
-    hidden_fields = {"body", "text", "translation", "translated", "translator"}
-    if entry.field_name and entry.field_name.lower() not in hidden_fields:
-        title = f"{title} · {entry.field_name}"
-    return title
-
-
-def _history_entry_meta(entry: TranslationLogEntry) -> str:
-    parts = [entry.file_rel]
-    if entry.record_id:
-        parts.append(f"ID {entry.record_id}")
-    return " · ".join(parts)
 
 
 def _render_history_entry(entry: TranslationLogEntry) -> str:

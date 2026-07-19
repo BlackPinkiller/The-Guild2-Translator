@@ -127,6 +127,7 @@ class LanguageGit:
         )
         self._cache_lock = threading.Lock()
         self._commit_list_cache: tuple[GitCommit, ...] | None = None
+        self._all_commit_list_cache: tuple[GitCommit, ...] | None = None
         self._entry_cache: OrderedDict[str, tuple[TranslationLogEntry, ...]] = OrderedDict()
         self._combined_cache: OrderedDict[tuple[str, ...], tuple[TranslationLogEntry, ...]] = OrderedDict()
 
@@ -205,6 +206,22 @@ class LanguageGit:
         if limit == 100:
             with self._cache_lock:
                 self._commit_list_cache = tuple(commits)
+        return commits
+
+    def list_all_commits(self) -> list[GitCommit]:
+        with self._cache_lock:
+            cached = self._all_commit_list_cache
+        if cached is not None:
+            return list(cached)
+        result = self._run("log", "--format=%H%x1f%h%x1f%ct%x1f%s", "--", self._language_pathspec())
+        commits: list[GitCommit] = []
+        for line in result.stdout.splitlines():
+            parts = line.split("\x1f", 3)
+            if len(parts) != 4:
+                continue
+            commits.append(GitCommit(parts[0], parts[1], datetime.fromtimestamp(int(parts[2])), parts[3]))
+        with self._cache_lock:
+            self._all_commit_list_cache = tuple(commits)
         return commits
 
     def entries_for_commit(self, commit: str) -> list[TranslationLogEntry]:
@@ -459,6 +476,7 @@ class LanguageGit:
     def _invalidate_history_cache(self) -> None:
         with self._cache_lock:
             self._commit_list_cache = None
+            self._all_commit_list_cache = None
             self._combined_cache.clear()
 
 
