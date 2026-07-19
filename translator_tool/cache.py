@@ -2,12 +2,13 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
-from typing import Any
+from typing import Any, Iterable, Mapping
 
 from .file_utils import atomic_write
 
 
 CACHE_FILE_NAME = "translator_tool_cache.json"
+WORKFLOW_UID_KEYS = frozenset({"ignored", "source_review", "need_work", "confirmed"})
 
 
 def cache_path(root: Path) -> Path:
@@ -87,19 +88,39 @@ def set_confirmed_many(root: Path, language: str, uids: list[str] | tuple[str, .
 
 
 def _set_uid_set_many(root: Path, language: str, key: str, uids: list[str] | tuple[str, ...], enabled: bool) -> None:
+    update_language_uid_sets(root, language, {key: (uids, enabled)})
+
+
+def update_language_uid_sets(
+    root: Path,
+    language: str,
+    changes: Mapping[str, tuple[Iterable[str], bool]],
+) -> None:
+    """Apply related workflow-state changes with one cache read and one atomic write."""
+    unknown = set(changes) - WORKFLOW_UID_KEYS
+    if unknown:
+        raise ValueError(f"unknown workflow cache keys: {sorted(unknown)}")
+    if not changes:
+        return
     cache = load_cache(root)
     languages = cache.setdefault("languages", {})
     language_data = languages.setdefault(language, {})
     if not isinstance(language_data, dict):
         language_data = {}
         languages[language] = language_data
-    current = language_data.get(key, [])
-    if not isinstance(current, list):
-        current = []
-    values = {str(item) for item in current}
-    if enabled:
-        values.update(str(uid) for uid in uids)
-    else:
-        values.difference_update(str(uid) for uid in uids)
-    language_data[key] = sorted(values)
-    save_cache(root, cache)
+    changed = False
+    for key, (uids, enabled) in changes.items():
+        current = language_data.get(key, [])
+        if not isinstance(current, list):
+            current = []
+        values = {str(item) for item in current}
+        updated = set(values)
+        if enabled:
+            updated.update(str(uid) for uid in uids)
+        else:
+            updated.difference_update(str(uid) for uid in uids)
+        if updated != values or language_data.get(key) != sorted(updated):
+            language_data[key] = sorted(updated)
+            changed = True
+    if changed:
+        save_cache(root, cache)

@@ -48,6 +48,8 @@ def save_recovery_draft(project: Project) -> int:
     if not units:
         clear_recovery_draft(project.root, project.language)
         return 0
+    if len(units) > MAX_RECOVERY_UNITS:
+        raise OSError(f"recovery draft has too many entries: {len(units)}")
     payload = {
         "version": RECOVERY_VERSION,
         "project_root": str(project.root.resolve()),

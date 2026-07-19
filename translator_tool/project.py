@@ -8,10 +8,7 @@ from .cache import (
     confirmed_uids,
     ignored_uids,
     need_work_uids,
-    set_confirmed_many,
-    set_ignored_many,
-    set_need_work_many,
-    set_source_review_many,
+    update_language_uid_sets,
     source_review_uids,
 )
 from .codec_adapter import CodecError, Guild2Codec, load_codec_for_language
@@ -396,10 +393,11 @@ class Project:
                     unit.review_reason = TODO_REASON_NONE
                 unit.pending_delete = False
         if selected:
-            set_ignored_many(self.root, self.language, tuple(unit.uid for unit in selected), ignored)
+            uids = tuple(unit.uid for unit in selected)
+            changes: dict[str, tuple[tuple[str, ...], bool]] = {"ignored": (uids, ignored)}
             if ignored:
-                set_confirmed_many(self.root, self.language, tuple(unit.uid for unit in selected), False)
-                set_need_work_many(self.root, self.language, tuple(unit.uid for unit in selected), False)
+                changes.update({"confirmed": (uids, False), "need_work": (uids, False)})
+            update_language_uid_sets(self.root, self.language, changes)
 
     def set_units_source_review(self, units: Iterable[TranslationUnit], source_changed: bool) -> None:
         selected = tuple(units)
@@ -411,11 +409,11 @@ class Project:
             elif unit.review_reason == TODO_REASON_SOURCE_CHANGED:
                 unit.review_reason = TODO_REASON_NONE
         if selected:
-            set_source_review_many(self.root, self.language, tuple(unit.uid for unit in selected), source_changed)
+            uids = tuple(unit.uid for unit in selected)
+            changes: dict[str, tuple[tuple[str, ...], bool]] = {"source_review": (uids, source_changed)}
             if source_changed:
-                set_confirmed_many(self.root, self.language, tuple(unit.uid for unit in selected), False)
-                set_need_work_many(self.root, self.language, tuple(unit.uid for unit in selected), False)
-                set_ignored_many(self.root, self.language, tuple(unit.uid for unit in selected), False)
+                changes.update({"confirmed": (uids, False), "need_work": (uids, False), "ignored": (uids, False)})
+            update_language_uid_sets(self.root, self.language, changes)
 
     def set_units_need_work(self, units: Iterable[TranslationUnit], need_work: bool) -> None:
         selected = tuple(units)
@@ -429,11 +427,10 @@ class Project:
                 unit.review_reason = TODO_REASON_NONE
         if selected:
             uids = tuple(unit.uid for unit in selected)
-            set_need_work_many(self.root, self.language, uids, need_work)
+            changes: dict[str, tuple[tuple[str, ...], bool]] = {"need_work": (uids, need_work)}
             if need_work:
-                set_confirmed_many(self.root, self.language, uids, False)
-                set_ignored_many(self.root, self.language, uids, False)
-                set_source_review_many(self.root, self.language, uids, False)
+                changes.update({"confirmed": (uids, False), "ignored": (uids, False), "source_review": (uids, False)})
+            update_language_uid_sets(self.root, self.language, changes)
 
     def set_units_confirmed(self, units: Iterable[TranslationUnit], confirmed: bool) -> None:
         selected = tuple(units)
@@ -446,11 +443,10 @@ class Project:
                     unit.review_reason = TODO_REASON_NONE
         if selected:
             uids = tuple(unit.uid for unit in selected)
-            set_confirmed_many(self.root, self.language, uids, confirmed)
+            changes: dict[str, tuple[tuple[str, ...], bool]] = {"confirmed": (uids, confirmed)}
             if confirmed:
-                set_ignored_many(self.root, self.language, uids, False)
-                set_need_work_many(self.root, self.language, uids, False)
-                set_source_review_many(self.root, self.language, uids, False)
+                changes.update({"ignored": (uids, False), "need_work": (uids, False), "source_review": (uids, False)})
+            update_language_uid_sets(self.root, self.language, changes)
 
     def apply_unit_edits(
         self,
