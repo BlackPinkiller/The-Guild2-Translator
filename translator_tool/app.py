@@ -69,11 +69,11 @@ from PySide6.QtWidgets import (
 )
 
 from .ai import (
-    LlmNeighborContext,
     LlmSuggestionContext,
     OpenAICompatibleProvider,
     TranslationProvider,
     TranslationProviderError,
+    build_llm_contexts,
     llm_provider_from_settings,
     provider_from_settings,
 )
@@ -1714,11 +1714,18 @@ class AiWorkerSignals(QObject):
 
 
 class AiWorker(QRunnable):
-    def __init__(self, provider: TranslationProvider, units: Iterable[TranslationUnit], cancel_event: threading.Event) -> None:
+    def __init__(
+        self,
+        provider: TranslationProvider,
+        units: Iterable[TranslationUnit],
+        cancel_event: threading.Event,
+        contexts: dict[str, LlmSuggestionContext] | None = None,
+    ) -> None:
         super().__init__()
         self.provider = provider
         self.units = tuple(units)
         self.cancel_event = cancel_event
+        self.contexts = contexts or {}
         self.signals = AiWorkerSignals()
 
     def run(self) -> None:
@@ -1731,7 +1738,11 @@ class AiWorker(QRunnable):
             if delay > 0 and self.cancel_event.wait(delay):
                 break
             try:
-                translated = self.provider.translate(unit.source_text, dbt_field=unit.ref.kind == "dbt")
+                translated = self.provider.translate(
+                    unit.source_text,
+                    dbt_field=unit.ref.kind == "dbt",
+                    context=self.contexts.get(unit.uid),
+                )
                 last_request = time.monotonic()
                 self.signals.translated.emit(unit.uid, translated)
             except TranslationProviderError as exc:
@@ -5425,40 +5436,14 @@ class TranslatorWindow(QMainWindow):
     def _build_llm_suggestion_context(self, unit: TranslationUnit) -> LlmSuggestionContext:
         project = self.model.project
         if project is None:
-            return LlmSuggestionContext(unit.file_rel, unit.record_id, unit.label)
-        index = next((i for i, candidate in enumerate(project.units) if candidate.uid == unit.uid), -1)
-        if index < 0:
-            return LlmSuggestionContext(unit.file_rel, unit.record_id, unit.label)
-        neighbors: list[LlmNeighborContext] = []
-        previous_units = [
-            candidate
-            for candidate in project.units[:index]
-            if candidate.file_rel == unit.file_rel and candidate.source_text and candidate.uid != unit.uid
-        ]
-        next_units = [
-            candidate
-            for candidate in project.units[index + 1 :]
-            if candidate.file_rel == unit.file_rel and candidate.source_text and candidate.uid != unit.uid
-        ]
-        for offset, candidate in enumerate(previous_units[-2:], start=max(1, len(previous_units) - 1)):
-            neighbors.append(
-                LlmNeighborContext(
-                    relation=f"前{len(previous_units) - offset + 1}条",
-                    label=candidate.label,
-                    source_text=candidate.source_text,
-                    record_id=candidate.record_id,
-                )
+            return LlmSuggestionContext(
+                unit.file_rel, unit.record_id, unit.label, field_name=unit.field_name
             )
-        for offset, candidate in enumerate(next_units[:2], start=1):
-            neighbors.append(
-                LlmNeighborContext(
-                    relation=f"后{offset}条",
-                    label=candidate.label,
-                    source_text=candidate.source_text,
-                    record_id=candidate.record_id,
-                )
-            )
-        return LlmSuggestionContext(unit.file_rel, unit.record_id, unit.label, tuple(neighbors))
+        contexts = build_llm_contexts(project.units, (unit.uid,))
+        return contexts.get(
+            unit.uid,
+            LlmSuggestionContext(unit.file_rel, unit.record_id, unit.label, field_name=unit.field_name),
+        )
 
     def _append_suggestion_chunk(self, chunk: str) -> None:
         if self.suggestion_cancel_event is None or self.suggestion_cancel_event.is_set():
@@ -5543,7 +5528,11 @@ class TranslatorWindow(QMainWindow):
         self.ai_cancelled = False
         if is_batch:
             self.batch_ai_button.set_busy(True, len(units))
-        worker = AiWorker(provider, units, self.ai_cancel_event)
+        contexts: dict[str, LlmSuggestionContext] = {}
+        if isinstance(provider, OpenAICompatibleProvider):
+            context_units = self.model.project.units if self.model.project is not None else units
+            contexts = build_llm_contexts(context_units, (unit.uid for unit in units))
+        worker = AiWorker(provider, units, self.ai_cancel_event, contexts)
         worker.signals.translated.connect(self._collect_ai_result)
         worker.signals.failed.connect(self._collect_ai_failure)
         worker.signals.progress.connect(self._update_ai_progress)

@@ -23,6 +23,7 @@ from .ai import (
     LlmSuggestionContext,
     OpenAICompatibleProvider,
     TranslationProviderError,
+    build_llm_contexts,
 )
 from .cache import cache_path, confirmed_uids, need_work_uids, source_review_uids
 from .code_index import CodeReference, CodeReferenceIndex, build_code_reference_index
@@ -33,6 +34,7 @@ from .history import OperationHistory, TranslationOperation, UnitChange
 from .self_tests.project_refresh import assert_saved_file_refresh
 from .self_tests.git_commit import assert_tracked_git_commit_skips_redundant_add
 from .self_tests.diagnostics import assert_diagnostics_are_bounded_and_content_free
+from .self_tests.performance import AI_CONTEXT_BUILD_LIMIT_SECONDS, assert_within_budget
 from .i18n import set_language, status_text, translate
 from .format_io import load_dbt, load_plain_text, matching_source_field, row_key
 from .preview import GLYPH_MARK, PreviewAtom, PreviewDocument, PreviewService
@@ -2265,8 +2267,13 @@ class FakeGoogleTransport:
 def assert_ai_token_protection() -> None:
     transport = FakeGoogleTransport("测试 __TG_FMT_0000__")
     provider = GoogleTranslateProvider("https://example.invalid/translate", "en", "zh-CN", transport)
-    translated = provider.translate("Cost: %1t", dbt_field=True)
-    if translated != "测试 %1t" or "__TG_FMT_0000__" not in transport.last_url:
+    context = LlmSuggestionContext("Text.dbt", "1", "DoNotSend")
+    translated = provider.translate("Cost: %1t", dbt_field=True, context=context)
+    if (
+        translated != "测试 %1t"
+        or "__TG_FMT_0000__" not in transport.last_url
+        or "DoNotSend" in transport.last_url
+    ):
         raise AssertionError("AI translation did not preserve protected format tokens")
     broken = GoogleTranslateProvider(
         "https://example.invalid/translate", "en", "zh-CN", FakeGoogleTransport("测试内容")
@@ -2276,6 +2283,66 @@ def assert_ai_token_protection() -> None:
     except TranslationProviderError:
         return
     raise AssertionError("AI result missing a protected token was accepted")
+
+
+class CaptureTranslationTransport:
+    def __init__(self) -> None:
+        self.payload = None
+
+    def get_json(self, url: str):
+        raise AssertionError("OpenAI provider must not issue a GET request")
+
+    def post_json(self, url: str, payload, headers):
+        self.payload = payload
+        return {"choices": [{"message": {"content": "译文 __TG_FMT_0000__"}}]}
+
+
+def assert_ai_translation_context() -> None:
+    units = [
+        SimpleNamespace(
+            uid=f"unit-{index}",
+            file_rel="Text.dbt",
+            record_id=str(index),
+            label=f"Label{index}",
+            field_name="Text",
+            source_text=f"Source {index}",
+        )
+        for index in range(5)
+    ]
+    contexts = build_llm_contexts(units, ("unit-2",))
+    context = contexts["unit-2"]
+    expected_relations = ["previous 2", "previous 1", "next 1", "next 2"]
+    if [neighbor.relation for neighbor in context.neighbors] != expected_relations:
+        raise AssertionError("AI context did not retain the two nearest entries on each side")
+    transport = CaptureTranslationTransport()
+    provider = OpenAICompatibleProvider("https://example.invalid/v1", "test-model", "test-key", transport)
+    translated = provider.translate("Cost: %1t", dbt_field=True, context=context)
+    if translated != "译文 %1t":
+        raise AssertionError("contextual AI translation did not restore protected tokens")
+    prompt = transport.payload["messages"][1]["content"]
+    for snippet in ("file: Text.dbt", "id: 2", "label: Label2", "field: Text", "Source 1", "Source 3"):
+        if snippet not in prompt:
+            raise AssertionError(f"AI translation prompt missed context snippet: {snippet}")
+    if "Cost: __TG_FMT_0000__" not in prompt:
+        raise AssertionError("AI translation prompt did not protect the current source")
+
+    large_units = [
+        SimpleNamespace(
+            uid=f"large-{index}",
+            file_rel=f"File{index // 1000}.dbt",
+            record_id=str(index),
+            label=f"Label{index}",
+            field_name="Text",
+            source_text="Source",
+        )
+        for index in range(20_000)
+    ]
+    started = time.perf_counter()
+    large_contexts = build_llm_contexts(large_units, (unit.uid for unit in large_units))
+    elapsed = time.perf_counter() - started
+    if len(large_contexts) != len(large_units):
+        raise AssertionError("AI context builder omitted requested units")
+    assert_within_budget("AI context build", elapsed, AI_CONTEXT_BUILD_LIMIT_SECONDS)
 
 
 def assert_linebreak_format_is_ignored() -> None:
@@ -3548,6 +3615,7 @@ def main() -> int:
     assert_manual_status_cache()
     assert_operation_history()
     assert_ai_token_protection()
+    assert_ai_translation_context()
     assert_linebreak_format_is_ignored()
     assert_guild2_format_grammar()
     assert_format_dialects_are_isolated()
