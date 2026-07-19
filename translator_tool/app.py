@@ -5673,7 +5673,12 @@ class TranslatorWindow(QMainWindow):
         except GitError as exc:
             self._git_pending_forced = True
             commit_note = translate("status.saved_git_failed", error=exc)
-        self.load_project(discard_changes=True)
+        try:
+            self._refresh_saved_project(result.changed_files)
+        except (ProjectError, OSError, ValueError):
+            # The files are already durable. Fall back to the established full
+            # reload instead of leaving a partially refreshed in-memory model.
+            self.load_project(discard_changes=True)
         delete_note = translate("status.saved_delete_note", count=len(result.deleted_units)) if result.deleted_units else ""
         warning_note = translate("status.saved_warning_note", count=format_warning_count) if format_warning_count else ""
         self.statusBar().showMessage(
@@ -5686,6 +5691,21 @@ class TranslatorWindow(QMainWindow):
             ),
             7000,
         )
+
+    def _refresh_saved_project(self, changed_files: Iterable[Path]) -> None:
+        if self.project is None:
+            return
+        selected_uid = self._filter_anchor_uid or self.current_uid
+        self.project.reload_saved_files(changed_files)
+        self._game_preview_cache.clear()
+        self.current_uid = ""
+        self._filter_anchor_uid = selected_uid if self.project.unit_by_uid(selected_uid) is not None else ""
+        self._set_editor_unit(None)
+        self.model.set_project(self.project)
+        self._update_file_choices()
+        self._apply_filters()
+        self._update_pending_state()
+        self._update_window_title()
 
     def retry_commit(self) -> None:
         if self.git is None:

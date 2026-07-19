@@ -157,9 +157,13 @@ class LanguageGit:
         relative_paths = [str(path.resolve().relative_to(self.repo)).replace("\\", "/") for path in changed_files]
         if not relative_paths:
             return None
-        self._run("add", "--", *relative_paths)
-        if not self._has_staged_changes(relative_paths):
+        status = self._run("status", "--porcelain", "-z", "--", *relative_paths).stdout
+        if not status:
             return None
+        # Tracked files do not need `git add` before `commit --only`; doing both
+        # hashes large DBTs twice. New files still need to enter the index once.
+        if any(record.startswith("?? ") for record in status.split("\0") if record):
+            self._run("add", "--", *relative_paths)
         units = tuple(saved_units)
         deleted = len(tuple(deleted_units))
         added = sum(1 for unit in units if unit.translate_text == "")

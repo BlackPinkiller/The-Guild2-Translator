@@ -4,6 +4,7 @@ from __future__ import annotations
 LARGE_BATCH_MIN_ENTRIES = 10_000
 LARGE_BATCH_SAVE_LIMIT_SECONDS = 8.0
 CLIPBOARD_DECODE_LIMIT_SECONDS = 2.0
+SAVED_FILE_REFRESH_LIMIT_SECONDS = 1.5
 
 
 def assert_within_budget(name: str, elapsed: float, limit: float, *, detail: str = "") -> None:

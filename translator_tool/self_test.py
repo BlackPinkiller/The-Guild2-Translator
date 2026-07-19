@@ -30,6 +30,8 @@ from .code_window_context import DARK_PANEL_TEXT, PreviewWindowContext, best_win
 from .codec_adapter import Guild2Codec, load_codec_for_language
 from .git_history import GitCommit, GitError, LanguageGit, TranslationLogEntry, combine_entries, format_entries
 from .history import OperationHistory, TranslationOperation, UnitChange
+from .self_tests.project_refresh import assert_saved_file_refresh
+from .self_tests.git_commit import assert_tracked_git_commit_skips_redundant_add
 from .i18n import set_language, status_text, translate
 from .format_io import load_dbt, load_plain_text, matching_source_field, row_key
 from .preview import GLYPH_MARK, PreviewAtom, PreviewDocument, PreviewService
@@ -1968,6 +1970,52 @@ def assert_editor_undo_stays_local(root: Path) -> None:
         win.history.clear()
         QApplication.clipboard().clear()
 
+        save_candidates = [
+            item
+            for item in win.model.units[len(win.model.units) // 2 :]
+            if item.ref.kind == "dbt" and item.ref.target_row is not None and not item.pending_delete
+        ]
+        save_unit = save_candidates[len(save_candidates) // 2]
+        save_before = save_unit.current_text
+        save_after = save_before + "x"
+        win._filter_anchor_uid = save_unit.uid
+        if not win._restore_selected_row(save_unit.uid):
+            raise AssertionError("save refresh fixture could not select a lower-table translation")
+        win._replace_unit_text(save_unit, save_after, "save refresh smoke test")
+        load_calls = 0
+        original_load_project = win.load_project
+
+        def tracked_load_project(discard_changes: bool = False) -> None:
+            nonlocal load_calls
+            load_calls += 1
+            original_load_project(discard_changes=discard_changes)
+
+        win.load_project = tracked_load_project  # type: ignore[method-assign]
+        win.save_all()
+        win.load_project = original_load_project  # type: ignore[method-assign]
+        app.processEvents()
+        saved_unit = win.project.unit_by_uid(save_unit.uid)
+        if load_calls:
+            raise AssertionError("ordinary save fell back to a full-project reload")
+        if saved_unit is None or saved_unit.current_text != save_after or saved_unit.is_dirty:
+            raise AssertionError("ordinary save did not refresh the durable translation in place")
+        current_index = win.table.currentIndex()
+        if current_index.data(Qt.ItemDataRole.UserRole) != save_unit.uid:
+            raise AssertionError("ordinary save moved away from the selected translation")
+        if not win.table.visualRect(current_index).intersects(win.table.viewport().rect()):
+            raise AssertionError("ordinary save left the selected translation outside the viewport")
+
+        win.table.setFocus(Qt.FocusReason.OtherFocusReason)
+        win.undo()
+        app.processEvents()
+        if win.project.unit_by_uid(save_unit.uid).current_text != save_before:
+            raise AssertionError("save refresh broke UID-based undo for the saved translation")
+        win.redo()
+        app.processEvents()
+        if win.project.unit_by_uid(save_unit.uid).current_text != save_after:
+            raise AssertionError("save refresh broke UID-based redo for the saved translation")
+        win.history.clear()
+
         win.close()
         app.processEvents()
     finally:
@@ -3082,6 +3130,7 @@ def assert_git_history(root: Path) -> None:
             raise AssertionError("a non-empty translation matching its source was incorrectly logged as an addition")
         if same_entry.previous_text != same_previous or same_entry.translated_text != same_as_source.current_text:
             raise AssertionError("same-as-source history did not preserve the real before and after text")
+        project.reload_saved_files(same_result.changed_files)
 
         unit = next(item for item in project.units if item.file_rel == "Text.dbt" and item.filter_status() == STATUS_TRANSLATED)
         unit.set_text(unit.current_text + "测试")
@@ -3470,6 +3519,11 @@ def main() -> int:
     assert_recovery_draft_limits_match(root)
     assert_project_edit_state_keeps_confirmation_consistent(root)
     assert_large_batch_save_stays_interactive(root)
+    refresh_temp = make_temp_project(root, "translator_tool_saved_file_refresh_")
+    try:
+        assert_saved_file_refresh(refresh_temp, tool_root())
+    finally:
+        safe_rmtree(refresh_temp)
     assert_entry_clipboard_decoder()
     assert_missing_insertions_follow_file_order(root)
     assert_unsaved_translation_status(root)
@@ -3504,6 +3558,7 @@ def main() -> int:
     assert_history_dialog_search_and_entry_timeline()
     assert_git_subprocess_hides_console()
     assert_git_subprocess_timeout_is_reported()
+    assert_tracked_git_commit_skips_redundant_add()
     assert_git_commit_display()
     assert_git_pending_is_scoped_to_active_language(root)
     assert_git_history_list_is_scoped_to_active_language(root)

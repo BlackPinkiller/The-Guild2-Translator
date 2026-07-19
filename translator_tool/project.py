@@ -12,7 +12,7 @@ from .cache import (
     source_review_uids,
 )
 from .codec_adapter import CodecError, Guild2Codec, load_codec_for_language
-from .file_utils import atomic_write_many
+from .file_utils import FileChangedError, atomic_write_many
 from .format_io import (
     DbtDocument,
     DbtRow,
@@ -323,17 +323,7 @@ class Project:
             )
         )
 
-        ignored = ignored_uids(root, language)
-        confirmed = confirmed_uids(root, language)
-        need_work = need_work_uids(root, language)
-        source_review = source_review_uids(root, language)
-        for unit in units:
-            unit.ignored = unit.uid in ignored
-            unit.confirmed = unit.uid in confirmed
-            if unit.uid in source_review:
-                unit.review_reason = TODO_REASON_SOURCE_CHANGED
-            elif unit.uid in need_work:
-                unit.review_reason = TODO_REASON_MANUAL_REVIEW
+        _apply_workflow_metadata(units, root, language)
 
         unit_index = {unit.uid: unit for unit in units}
         insertion_anchors = {
@@ -489,6 +479,7 @@ class Project:
         requested = list(self.dirty_units() if supplied is None else [unit for unit in supplied if unit.is_dirty])
         deleted_units = [unit for unit in requested if unit.pending_delete]
         touched_docs: dict[Path, DbtDocument | PlainTextDocument] = {}
+        expected_raw: dict[Path, bytes] = {}
         working_rows: dict[Path, dict[int, DbtRow]] = {}
         deleted_paths: set[Path] = set()
         errors: list[str] = []
@@ -497,6 +488,7 @@ class Project:
             existing = touched_docs.get(document.path)
             if existing is not None:
                 return existing
+            expected_raw[document.path] = document.raw
             if isinstance(document, DbtDocument):
                 copied = replace(
                     document,
@@ -531,6 +523,7 @@ class Project:
                 assert row is not None
                 working_row(ref.target_doc, row).delete()
             elif ref.kind == "text":
+                expected_raw[ref.target_doc.path] = ref.target_doc.raw
                 deleted_paths.add(ref.target_doc.path)
         selected = [unit for unit in requested if not unit.pending_delete]
         if errors:
@@ -629,8 +622,98 @@ class Project:
                 continue
             writes[doc.path] = new_bytes
             changed_files.append(doc.path)
-        atomic_write_many(writes, deleted_paths)
+        try:
+            atomic_write_many(writes, deleted_paths, expected=expected_raw)
+        except FileChangedError as exc:
+            files = ", ".join(path.name for path in exc.paths)
+            raise ProjectError(translate("project.save.files_changed", files=files)) from exc
         return SaveResult(tuple(changed_files), tuple(selected), tuple(deleted_units))
+
+    def reload_saved_files(self, changed_files: Iterable[Path]) -> tuple[TranslationUnit, ...]:
+        """Reload only durable target files changed by save, preserving the rest of the project."""
+        language_root = (self.languages_root / self.language).resolve()
+        replacements: dict[str, list[TranslationUnit]] = {}
+        for changed_path in changed_files:
+            path = changed_path.resolve()
+            try:
+                file_rel = path.relative_to(language_root).as_posix()
+            except ValueError as exc:
+                raise ProjectError(f"saved file is outside the active language directory: {path}") from exc
+
+            suffix = path.suffix.casefold()
+            if suffix == ".dbt":
+                source_doc = self.source_docs.get(file_rel)
+                if source_doc is None:
+                    raise ProjectError(f"saved DBT has no source document: {file_rel}")
+                target_doc = load_dbt(path) if path.exists() else make_virtual_translation_dbt(
+                    source_doc, path, self.language
+                )
+                self.target_dbt_docs[file_rel] = target_doc
+                order = self.source_order[file_rel]
+                replacements[file_rel] = build_dbt_units(
+                    file_rel,
+                    source_doc,
+                    target_doc,
+                    self.codec,
+                    order,
+                    label_match_first=self.root.name.casefold() != "vanilla",
+                )
+                self.insertion_anchors[file_rel] = _build_insertion_anchors(file_rel, order, target_doc)
+                continue
+
+            if suffix != ".txt":
+                raise ProjectError(f"unsupported saved translation file: {file_rel}")
+            source_doc = self.source_text_docs.get(file_rel)
+            if path.exists():
+                target_doc = load_plain_text(path)
+                if source_doc is not None:
+                    target_doc.profile = replace(
+                        source_doc.profile,
+                        path=target_doc.path,
+                        sha256=target_doc.profile.sha256,
+                    )
+                self.target_text_docs[file_rel] = target_doc
+                replacements[file_rel] = [build_plain_text_unit(file_rel, target_doc, source_doc)]
+            elif source_doc is not None:
+                target_doc = load_plain_text_bytes(path, b"")
+                target_doc.profile = replace(
+                    source_doc.profile,
+                    path=target_doc.path,
+                    sha256=target_doc.profile.sha256,
+                )
+                self.target_text_docs[file_rel] = target_doc
+                replacements[file_rel] = [build_plain_text_unit(file_rel, target_doc, source_doc)]
+            else:
+                self.target_text_docs.pop(file_rel, None)
+                replacements[file_rel] = []
+
+        for replacement in replacements.values():
+            replacement.sort(
+                key=lambda unit: (
+                    unit.ref.display_order,
+                    unit.ref.field_order,
+                    unit.uid,
+                )
+            )
+        refreshed = [unit for units in replacements.values() for unit in units]
+        _apply_workflow_metadata(refreshed, self.root, self.language)
+        replaced_uids = {unit.uid for unit in self.units if unit.file_rel in replacements}
+        rebuilt: list[TranslationUnit] = []
+        emitted: set[str] = set()
+        for unit in self.units:
+            replacement = replacements.get(unit.file_rel)
+            if replacement is None:
+                rebuilt.append(unit)
+            elif unit.file_rel not in emitted:
+                rebuilt.extend(replacement)
+                emitted.add(unit.file_rel)
+        for file_rel, replacement in replacements.items():
+            if file_rel not in emitted:
+                rebuilt.extend(replacement)
+        self.units = rebuilt
+        self.unit_index = {unit.uid: unit for unit in rebuilt}
+        self.edit_unconfirmed_uids.difference_update(replaced_uids)
+        return tuple(refreshed)
 
     def _insertion_line_index(self, file_rel: str, missing_key: tuple[int, str]) -> int | None:
         return self.insertion_anchors.get(file_rel, {}).get(missing_key)
@@ -656,6 +739,20 @@ def _build_insertion_anchors(
             cursor -= 1
         anchors[key] = next_line_index
     return anchors
+
+
+def _apply_workflow_metadata(units: Iterable[TranslationUnit], root: Path, language: str) -> None:
+    ignored = ignored_uids(root, language)
+    confirmed = confirmed_uids(root, language)
+    need_work = need_work_uids(root, language)
+    source_review = source_review_uids(root, language)
+    for unit in units:
+        unit.ignored = unit.uid in ignored
+        unit.confirmed = unit.uid in confirmed
+        if unit.uid in source_review:
+            unit.review_reason = TODO_REASON_SOURCE_CHANGED
+        elif unit.uid in need_work:
+            unit.review_reason = TODO_REASON_MANUAL_REVIEW
 
 
 def build_dbt_units(

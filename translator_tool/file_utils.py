@@ -6,15 +6,27 @@ import tempfile
 from typing import Iterable, Mapping
 
 
+class FileChangedError(OSError):
+    def __init__(self, paths: Iterable[Path]) -> None:
+        self.paths = tuple(Path(path) for path in paths)
+        super().__init__("file content changed since it was loaded: " + ", ".join(map(str, self.paths)))
+
+
 def atomic_write(path: Path, data: bytes) -> None:
     """Replace a file without exposing partially written content."""
     atomic_write_many({path: data})
 
 
-def atomic_write_many(writes: Mapping[Path, bytes], deletions: Iterable[Path] = ()) -> None:
+def atomic_write_many(
+    writes: Mapping[Path, bytes],
+    deletions: Iterable[Path] = (),
+    *,
+    expected: Mapping[Path, bytes] | None = None,
+) -> None:
     """Commit several same-volume file changes, rolling back completed replacements on failure."""
     prepared_writes = {Path(path): data for path, data in writes.items()}
     deleted_paths = {Path(path) for path in deletions}
+    expected_raw = {Path(path): data for path, data in (expected or {}).items()}
     overlap = set(prepared_writes) & deleted_paths
     if overlap:
         raise ValueError(f"paths cannot be written and deleted together: {sorted(map(str, overlap))}")
@@ -37,6 +49,14 @@ def atomic_write_many(writes: Mapping[Path, bytes], deletions: Iterable[Path] = 
                 stream.write(data)
                 stream.flush()
                 os.fsync(stream.fileno())
+
+        changed = []
+        for path, original in sorted(expected_raw.items(), key=lambda item: str(item[0])):
+            current = path.read_bytes() if path.exists() else b""
+            if current != original:
+                changed.append(path)
+        if changed:
+            raise FileChangedError(changed)
 
         for path in sorted((*prepared_writes, *deleted_paths), key=str):
             if path in deleted_paths and not path.exists():
