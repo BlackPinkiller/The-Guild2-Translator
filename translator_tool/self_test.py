@@ -1785,6 +1785,37 @@ def assert_editor_undo_stays_local(root: Path) -> None:
         if not win.table.visualRect(restored_proxy_index).intersects(win.table.viewport().rect()):
             raise AssertionError("clearing search kept the selected UID but left its row outside the visible viewport")
 
+        previous_file_filter = win.file_combo.currentData()
+        win.file_combo.setCurrentIndex(win.file_combo.findData(app_module.FILE_FILTER_ALL))
+        win.status_combo.setCurrentIndex(win.status_combo.findData(app_module.STATUS_FILTER_ALL))
+        win.only_missing.setChecked(False)
+        win.search_edit.clear()
+        win._apply_filters()
+        app.processEvents()
+        first_proxy_index = win.proxy.index(0, 0)
+        first_uid = first_proxy_index.data(Qt.ItemDataRole.UserRole)
+        win.table.setCurrentIndex(first_proxy_index)
+        win.table.selectRow(0)
+        app.processEvents()
+        scroll_bar = win.table.verticalScrollBar()
+        scroll_bar.setValue(scroll_bar.maximum())
+        app.processEvents()
+        scroll_before_ai_refresh = scroll_bar.value()
+        if scroll_before_ai_refresh <= 0:
+            raise AssertionError("AI scrolling regression fixture does not contain a scrollable table")
+        if win.table.visualRect(first_proxy_index).intersects(win.table.viewport().rect()):
+            raise AssertionError("AI scrolling regression fixture did not move the selection off-screen")
+        win.ai_filter_refresh_pending = True
+        win._refresh_ai_filter()
+        app.processEvents()
+        if scroll_bar.value() != scroll_before_ai_refresh:
+            raise AssertionError("AI filter refresh overrode the user's manual table scroll position")
+        if win.table.currentIndex().data(Qt.ItemDataRole.UserRole) != first_uid:
+            raise AssertionError("AI filter refresh changed the selected entry while preserving scrolling")
+        win.file_combo.setCurrentIndex(win.file_combo.findData(previous_file_filter))
+        win._apply_filters()
+        app.processEvents()
+
         search_unit = next(
             item
             for item in win.model.units

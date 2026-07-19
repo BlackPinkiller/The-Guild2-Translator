@@ -5570,8 +5570,10 @@ class TranslatorWindow(QMainWindow):
             return
         self.ai_filter_refresh_pending = False
         selected_uid = self._filter_anchor_uid or self.current_uid
-        if self._change_proxy_rows(self.proxy.refresh_rows, selected_uid):
-            self._restore_selected_row(selected_uid)
+        # AI results can arrive repeatedly while the user is reviewing the
+        # table. Refresh filtering without re-centering the selected row, or
+        # every completed translation will fight the user's manual scrolling.
+        self._change_proxy_rows(self.proxy.refresh_rows, selected_uid)
         self._update_counts()
 
     def _finish_ai(self, label: str) -> None:
