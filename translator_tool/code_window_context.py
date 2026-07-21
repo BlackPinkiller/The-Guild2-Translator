@@ -27,6 +27,7 @@ class PreviewWindowContext:
     body_label: str = ""
     buttons: tuple[PreviewWindowButton, ...] = ()
     argument_labels: tuple[str, ...] = ()
+    call_name: str = ""
 
     @property
     def labels(self) -> tuple[str, ...]:
@@ -88,6 +89,7 @@ def window_context_for_reference(reference: CodeReference, current_label: str = 
         body_label=body_label,
         buttons=buttons,
         argument_labels=argument_labels,
+        call_name=call_name,
     )
 
 
@@ -138,9 +140,9 @@ def _kind_for_call(call_name: str) -> str:
 
 
 def _background_for_call(call_name: str) -> str:
-    if call_name in {"msgquick", "msgsay", "msgsaynowait", "msgsayinteraction"}:
-        return "dark_panel"
-    return "parchment"
+    if call_name in {"msgbox", "msgboxnowait", "msgquest"}:
+        return "parchment"
+    return "dark_panel"
 
 
 def _argument_expressions(

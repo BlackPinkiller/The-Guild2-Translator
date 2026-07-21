@@ -27,7 +27,7 @@ from .ai import (
 )
 from .cache import cache_path, confirmed_uids, need_work_uids, source_review_uids
 from .code_index import CodeReference, CodeReferenceIndex, build_code_reference_index
-from .code_window_context import DARK_PANEL_TEXT, PreviewWindowContext, best_window_context
+from .code_window_context import DARK_PANEL_TEXT, PARCHMENT_TEXT, PreviewWindowContext, best_window_context
 from .codec_adapter import Guild2Codec, load_codec_for_language
 from .git_history import GitCommit, GitError, LanguageGit, TranslationLogEntry, combine_entries, format_entries
 from .history import OperationHistory, TranslationOperation, UnitChange
@@ -479,6 +479,8 @@ def assert_code_window_context_extracts_window_labels_and_buttons() -> None:
             raise AssertionError(f"wrong header label from MsgBox context: {context!r}")
         if context.body_label != "measure_wuerdentragerempfangen_body_+1":
             raise AssertionError(f"wrong body label from MsgBox context: {context!r}")
+        if context.call_name != "msgbox":
+            raise AssertionError(f"window context did not retain the rendering call: {context!r}")
         if tuple(button.label for button in context.buttons) != (
             "measure_wuerdentragerempfangen_ask_+0",
             "measure_wuerdentragerempfangen_ask_+1",
@@ -507,6 +509,8 @@ def assert_code_window_context_extracts_window_labels_and_buttons() -> None:
         news_context = best_window_context(news_refs, "KONTOR_MISSIONS_OFFER_ITEMS_TEXT_+2")
         if news_context is None:
             raise AssertionError("code window context was not built for dynamic MsgNewsNoWait labels")
+        if news_context.call_name != "msgnewsnowait" or news_context.background != "dark_panel":
+            raise AssertionError(f"MsgNews should retain its HUD entry style: {news_context!r}")
         if news_context.header_label != "kontor_missions_offer_items_head_+2":
             raise AssertionError(f"dynamic MsgNews head should follow the current concrete suffix: {news_context!r}")
         if news_context.body_label != "kontor_missions_offer_items_text_+2":
@@ -572,7 +576,8 @@ def assert_code_preview_unit_lookup_accepts_leading_underscore_labels() -> None:
 
 
 def assert_game_preview_draws_all_buttons() -> None:
-    from PySide6.QtGui import QImage
+    from PySide6.QtCore import QRect
+    from PySide6.QtGui import QImage, QPainter
 
     service = PreviewService()
     buttons = tuple(
@@ -634,6 +639,41 @@ def assert_game_preview_draws_all_buttons() -> None:
     )
     if "header_red.tga" not in requested_images:
         raise AssertionError("tooltip title preview did not request the game red title bar asset")
+
+    asset_service = PreviewService()
+    requested_assets: list[str] = []
+
+    def fake_asset(name: str) -> QImage:
+        requested_assets.append(name)
+        image = QImage(12, 12, QImage.Format.Format_ARGB32)
+        image.fill(0xFFFFFFFF)
+        return image
+
+    asset_service.ui_image = fake_asset  # type: ignore[method-assign]
+    message = PreviewWindowContext("message", "parchment", PARCHMENT_TEXT, call_name="msgbox")
+    asset_service._game_window_background(message, 344, 240)
+    if requested_assets != ["Hud/messagebox/mbback0.tga"]:
+        raise AssertionError(f"MsgBox should request its actual GUI background: {requested_assets!r}")
+    requested_assets.clear()
+    dialogue_context = PreviewWindowContext(
+        "short",
+        "dark_panel",
+        DARK_PANEL_TEXT,
+        call_name="msgsayinteraction",
+    )
+    asset_service._game_window_background(dialogue_context, 380, 148)
+    if requested_assets != ["Hud/NoCompression/Priority3/PanelBackground_01.tga"]:
+        raise AssertionError(f"MsgSay should request its actual panel texture: {requested_assets!r}")
+    requested_assets.clear()
+    button_canvas = QImage(220, 50, QImage.Format.Format_ARGB32)
+    button_canvas.fill(0)
+    button_painter = QPainter(button_canvas)
+    asset_service._draw_game_button_background(button_painter, QRect(5, 5, 201, 30))
+    button_painter.end()
+    if not requested_assets or requested_assets[0] != "Hud/NoCompression/btn_green_large.tga":
+        raise AssertionError(f"dialog buttons should use the in-game green button texture: {requested_assets!r}")
+    if any("startmenuebutton" in name.casefold() for name in requested_assets):
+        raise AssertionError(f"dialog preview should not use main-menu button assets: {requested_assets!r}")
 
 
 def assert_onscreen_help_preview_pairs_name_and_description() -> None:

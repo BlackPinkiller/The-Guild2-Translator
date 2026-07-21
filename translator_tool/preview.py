@@ -753,6 +753,8 @@ class PreviewService:
             canvas = background.convertToFormat(QImage.Format.Format_ARGB32_Premultiplied)
         painter = QPainter(canvas)
         painter.setRenderHint(QPainter.RenderHint.SmoothPixmapTransform, True)
+        self._draw_game_window_frame(painter, context, canvas.rect())
+        self._draw_game_window_decoration(painter, context, canvas.rect())
         default_color = context.default_color if context is not None else (55, 38, 24, 255)
         top = layout.top
         left_margin = layout.left_margin
@@ -843,7 +845,7 @@ class PreviewService:
             minimum_index = max(minimum_index, 2)
 
         top = 18 if dark_panel else 30
-        left_margin = 26 if dark_panel else 34
+        left_margin = 92 if context is not None and context.kind == "news" else (26 if dark_panel else 34)
         right_margin = 26 if dark_panel else 34
         body_scale = 0.78 if dark_panel else 0.85
         body_line_height = max(12, round(25 * body_scale))
@@ -869,38 +871,96 @@ class PreviewService:
         return GameWindowLayout(width, height, top, left_margin, right_margin, body_scale)
 
     def _game_window_background(self, context: PreviewWindowContext | None, width: int, height: int) -> QImage | None:
-        if context is not None and context.background == "dark_panel":
-            image = self.ui_image("GrayBackground.tga")
-            if image is not None and not image.isNull():
-                return image.scaled(
-                    width,
-                    height,
-                    Qt.AspectRatioMode.IgnoreAspectRatio,
-                    Qt.TransformationMode.SmoothTransformation,
-                )
-        names = ("mbback0.tga", "MessagePerga.tga", "Pamphlet.tga")
-        images = tuple(
-            image
-            for name in names
-            if (image := self.ui_image(name)) is not None and not image.isNull()
-        )
-        if not images:
+        name = self._game_window_background_name(context)
+        if not name:
             return None
-        target_area = width * height
-        target_aspect = width / max(1, height)
-        source = min(
-            images,
-            key=lambda image: (
-                abs(image.width() * image.height() - target_area),
-                abs(image.width() / max(1, image.height()) - target_aspect),
-            ),
-        )
-        return source.scaled(
+        image = self.ui_image(name)
+        if image is None or image.isNull():
+            return None
+        return image.scaled(
             width,
             height,
             Qt.AspectRatioMode.IgnoreAspectRatio,
             Qt.TransformationMode.SmoothTransformation,
         )
+
+    @staticmethod
+    def _game_window_background_name(context: PreviewWindowContext | None) -> str:
+        if context is None or context.kind in {"message", "quest"}:
+            return "Hud/messagebox/mbback0.tga"
+        if context.call_name in {"msgsay", "msgsaynowait", "msgsayinteraction", "showtutorialboxnowait"}:
+            return "Hud/NoCompression/Priority3/PanelBackground_01.tga"
+        if context.kind in {"tooltip", "onscreen_help"}:
+            return "Hud/NoCompression/Priority3/PanelBackground_01.tga"
+        return ""
+
+    def _draw_game_window_frame(
+        self,
+        painter: QPainter,
+        context: PreviewWindowContext | None,
+        rect: QRect,
+    ) -> bool:
+        if context is None or context.call_name not in {
+            "msgsay",
+            "msgsaynowait",
+            "msgsayinteraction",
+            "showtutorialboxnowait",
+        }:
+            return False
+        return self._draw_game_nine_slice(painter, rect, "Hud/borders/Border_Gold_02.tga")
+
+    def _draw_game_window_decoration(
+        self,
+        painter: QPainter,
+        context: PreviewWindowContext | None,
+        rect: QRect,
+    ) -> bool:
+        if context is None or context.kind != "news":
+            return False
+        icon = self.ui_image("Hud/news/default.tga")
+        if icon is None or icon.isNull():
+            return False
+        size = min(64, rect.height() - 36)
+        painter.drawImage(QRect(16, 18, size, size), icon)
+        return True
+
+    def _draw_game_nine_slice(self, painter: QPainter, rect: QRect, prefix: str) -> bool:
+        loaded = [self.ui_image(f"{prefix}{index}") for index in range(9)]
+        if loaded[0] is not None and not loaded[0].isNull():
+            loaded[2] = loaded[2] or loaded[0].mirrored(True, False)
+            loaded[6] = loaded[6] or loaded[0].mirrored(False, True)
+            loaded[8] = loaded[8] or loaded[0].mirrored(True, True)
+        if loaded[3] is not None and not loaded[3].isNull():
+            loaded[5] = loaded[5] or loaded[3].mirrored(True, False)
+        pieces = tuple(loaded)
+        available = tuple(piece for piece in pieces if piece is not None and not piece.isNull())
+        if not available:
+            return False
+        center = pieces[4]
+        if center is not None and not center.isNull():
+            painter.drawImage(rect, center)
+        left = pieces[0].width() if pieces[0] is not None else 0
+        top = pieces[0].height() if pieces[0] is not None else 0
+        right = pieces[2].width() if pieces[2] is not None else left
+        bottom = pieces[6].height() if pieces[6] is not None else top
+        inner_width = max(1, rect.width() - left - right)
+        inner_height = max(1, rect.height() - top - bottom)
+        targets = (
+            QRect(rect.left(), rect.top(), left, top),
+            QRect(rect.left() + left, rect.top(), inner_width, top),
+            QRect(rect.right() - right + 1, rect.top(), right, top),
+            QRect(rect.left(), rect.top() + top, left, inner_height),
+            QRect(rect.left() + left, rect.top() + top, inner_width, inner_height),
+            QRect(rect.right() - right + 1, rect.top() + top, right, inner_height),
+            QRect(rect.left(), rect.bottom() - bottom + 1, left, bottom),
+            QRect(rect.left() + left, rect.bottom() - bottom + 1, inner_width, bottom),
+            QRect(rect.right() - right + 1, rect.bottom() - bottom + 1, right, bottom),
+        )
+        for index, (target, image) in enumerate(zip(targets, pieces)):
+            if index == 4 or image is None or image.isNull():
+                continue
+            painter.drawImage(target, image)
+        return True
 
     def _draw_game_document(
         self,
@@ -1033,10 +1093,11 @@ class PreviewService:
             y += button_height + 6
 
     def _draw_game_button_background(self, painter: QPainter, rect: QRect) -> bool:
-        base = self.ui_image("startmenuebutton1.tga") or self.ui_image("startmenuebutton.tga")
+        base = self.ui_image("Hud/NoCompression/btn_green_large.tga")
         if base is None or base.isNull():
             return False
         painter.drawImage(rect, base)
+        self._draw_game_nine_slice(painter, rect, "Hud/borders/Border_BtnGreen_small.tga")
         return True
 
     def _game_codepoints(self, char: str, target: bool) -> tuple[int, ...]:
