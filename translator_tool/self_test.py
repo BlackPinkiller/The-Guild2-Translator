@@ -62,6 +62,7 @@ from .settings import AppSettings, load_settings, save_settings
 from .self_tests.clipboard import assert_entry_clipboard_decoder
 from .self_tests.code_semantics import (
     assert_code_index_handles_families_and_binary_gui,
+    assert_cross_file_return_labels_flow_only_to_real_callers,
     assert_code_semantics_follow_fields_panels_and_initdata,
     assert_code_semantics_are_scope_and_role_aware,
     assert_placeholder_reference_selection_is_coherent,
@@ -69,6 +70,7 @@ from .self_tests.code_semantics import (
 )
 from .self_tests.code_index_lazy import (
     assert_code_index_requests_selected_and_visible_rows_without_moving_viewport,
+    assert_lazy_code_index_links_cached_cross_file_facts,
     assert_lazy_code_index_prioritizes_requested_labels_and_invalidates_cache,
     assert_lazy_code_index_survives_unwritable_cache,
 )
@@ -3611,10 +3613,12 @@ def main() -> int:
     assert_code_reference_index_avoids_db_and_uses_vanilla_fallback()
     assert_code_semantics_are_scope_and_role_aware()
     assert_code_semantics_follow_fields_panels_and_initdata()
+    assert_cross_file_return_labels_flow_only_to_real_callers()
     assert_code_index_handles_families_and_binary_gui()
     assert_placeholder_reference_selection_is_coherent()
     assert_variadic_runtime_arguments_map_to_placeholder_positions()
     assert_lazy_code_index_prioritizes_requested_labels_and_invalidates_cache()
+    assert_lazy_code_index_links_cached_cross_file_facts()
     assert_lazy_code_index_survives_unwritable_cache()
     assert_code_index_requests_selected_and_visible_rows_without_moving_viewport()
     assert_stale_code_index_workers_are_released()

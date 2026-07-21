@@ -12,7 +12,7 @@ from ..code_index_lazy import LazyCodeIndexBuilder
 def assert_lazy_code_index_prioritizes_requested_labels_and_invalidates_cache() -> None:
     temp = Path(tempfile.mkdtemp(prefix="translator_tool_lazy_code_index_"))
     original_revision = lazy_module.ANALYZER_REVISION
-    original_index_code_file = lazy_module.index_code_file
+    original_analyze_code_file = lazy_module.analyze_code_file
     try:
         game = temp / "game"
         project = temp / "sources" / "Vanilla"
@@ -47,14 +47,14 @@ def assert_lazy_code_index_prioritizes_requested_labels_and_invalidates_cache() 
         def fail_if_reparsed(*_args, **_kwargs):
             raise AssertionError("a valid semantic file cache was reparsed")
 
-        lazy_module.index_code_file = fail_if_reparsed
+        lazy_module.analyze_code_file = fail_if_reparsed
         warm = LazyCodeIndexBuilder(game, project, cache_path=cache_path)
         cached = warm.analyze_labels(("LATER_BODY_+0",))
         if cached.references_for("LATER_BODY_+0").project_count != 1:
             raise AssertionError("warm semantic cache did not return the requested reference")
         warm.close()
 
-        lazy_module.index_code_file = original_index_code_file
+        lazy_module.analyze_code_file = original_analyze_code_file
         later_path = scripts / "Later.lua"
         later_path.write_text(
             'MsgQuick("", "@L_UPDATED_LATER_BODY_+0", ChangedValue)',
@@ -71,10 +71,10 @@ def assert_lazy_code_index_prioritizes_requested_labels_and_invalidates_cache() 
         def count_reparse(*args, **kwargs):
             nonlocal calls
             calls += 1
-            return original_index_code_file(*args, **kwargs)
+            return original_analyze_code_file(*args, **kwargs)
 
         lazy_module.ANALYZER_REVISION = original_revision + "-test"
-        lazy_module.index_code_file = count_reparse
+        lazy_module.analyze_code_file = count_reparse
         revised = LazyCodeIndexBuilder(game, project, cache_path=cache_path)
         revised.analyze_labels(("UPDATED_LATER_BODY_+0",))
         revised.close()
@@ -82,7 +82,7 @@ def assert_lazy_code_index_prioritizes_requested_labels_and_invalidates_cache() 
             raise AssertionError(f"analyzer revision did not invalidate semantic facts: {calls}")
     finally:
         lazy_module.ANALYZER_REVISION = original_revision
-        lazy_module.index_code_file = original_index_code_file
+        lazy_module.analyze_code_file = original_analyze_code_file
         shutil.rmtree(temp, ignore_errors=True)
 
 
@@ -156,4 +156,71 @@ def assert_lazy_code_index_survives_unwritable_cache() -> None:
         if index.references_for("CACHE_FAILURE_BODY_+0").project_count != 1:
             raise AssertionError("cache persistence failure discarded the in-memory code index")
     finally:
+        shutil.rmtree(temp, ignore_errors=True)
+
+
+def assert_lazy_code_index_links_cached_cross_file_facts() -> None:
+    temp = Path(tempfile.mkdtemp(prefix="translator_tool_lazy_cross_file_"))
+    original_analyze_code_file = lazy_module.analyze_code_file
+    try:
+        game = temp / "game"
+        project = temp / "sources" / "Vanilla"
+        scripts = game / "Scripts"
+        scripts.mkdir(parents=True)
+        project.mkdir(parents=True)
+        helper = scripts / "helper.lua"
+        caller = scripts / "caller.lua"
+        helper.write_text(
+            'function MakeBody(kind) local Label="@L_LAZY_REMOTE_+" return Label..kind end',
+            encoding="utf-8",
+        )
+        caller.write_text(
+            'function Main() local Body=helper_MakeBody(Variant) MsgQuick("", Body, Actor) end',
+            encoding="utf-8",
+        )
+        cache_path = temp / "cache.json"
+        cold = LazyCodeIndexBuilder(game, project, cache_path=cache_path)
+        index = cold.analyze_labels(("LAZY_REMOTE_+4",))
+        linked = next(
+            (
+                item
+                for item in index.references_for("LAZY_REMOTE_+4").project
+                if item.call_name == "MsgQuick"
+            ),
+            None,
+        )
+        if linked is None or linked.path != caller:
+            raise AssertionError(f"targeted lazy analysis did not follow the returned-label caller: {linked!r}")
+        if cold.progress.analyzed != 2:
+            raise AssertionError(f"cross-file targeted analysis scanned unrelated files: {cold.progress!r}")
+        cold.close()
+
+        def fail_if_reparsed(*_args, **_kwargs):
+            raise AssertionError("cached cross-file semantic facts were reparsed")
+
+        lazy_module.analyze_code_file = fail_if_reparsed
+        warm = LazyCodeIndexBuilder(game, project, cache_path=cache_path)
+        cached = warm.analyze_labels(("LAZY_REMOTE_+4",))
+        if not any(
+            item.call_name == "MsgQuick"
+            for item in cached.references_for("LAZY_REMOTE_+4").project
+        ):
+            raise AssertionError("warm cache did not relink returned-label facts to their caller")
+        warm.close()
+
+        lazy_module.analyze_code_file = original_analyze_code_file
+        helper.write_text(
+            'function MakeBody(kind) local Label="@L_LAZY_UPDATED_+" return Label..kind end',
+            encoding="utf-8",
+        )
+        changed = LazyCodeIndexBuilder(game, project, cache_path=cache_path)
+        updated = changed.analyze_labels(("LAZY_UPDATED_+4",))
+        if not any(
+            item.call_name == "MsgQuick"
+            for item in updated.references_for("LAZY_UPDATED_+4").project
+        ):
+            raise AssertionError("changed return summary did not invalidate and relink cached callers")
+        changed.close()
+    finally:
+        lazy_module.analyze_code_file = original_analyze_code_file
         shutil.rmtree(temp, ignore_errors=True)

@@ -113,6 +113,35 @@ class SemanticLabelUse:
     confidence: int = 0
 
 
+@dataclass(frozen=True)
+class FunctionReturnLabel:
+    aliases: tuple[str, ...]
+    label: str
+    position: int
+    match_kind: str
+    confidence: int = 62
+
+
+@dataclass(frozen=True)
+class ExternalCallFlow:
+    alias: str
+    position: int
+    call_name: str
+    argument_index: int
+    arguments: tuple[str, ...]
+    role: str
+    runtime_arguments: tuple[str, ...]
+    runtime_argument_values: tuple[tuple[str, ...], ...]
+    confidence: int = 76
+
+
+@dataclass(frozen=True)
+class ScriptSemanticFacts:
+    uses: tuple[SemanticLabelUse, ...]
+    return_labels: tuple[FunctionReturnLabel, ...]
+    external_flows: tuple[ExternalCallFlow, ...]
+
+
 @dataclass
 class _Analysis:
     text: str
@@ -121,6 +150,7 @@ class _Analysis:
     token_starts: tuple[int, ...]
     functions: tuple[ScriptFunction, ...]
     calls: tuple[ScriptCall, ...]
+    call_starts: tuple[int, ...]
     assignments: tuple[Assignment, ...]
     assignments_by_name: dict[tuple[int | None, str], tuple[Assignment, ...]]
     calls_by_alias: dict[str, tuple[int, ...]]
@@ -150,6 +180,15 @@ def analyze_script(
     *,
     label_catalog: frozenset[str] = frozenset(),
 ) -> tuple[SemanticLabelUse, ...]:
+    return analyze_script_facts(text, path, label_catalog=label_catalog).uses
+
+
+def analyze_script_facts(
+    text: str,
+    path: Path,
+    *,
+    label_catalog: frozenset[str] = frozenset(),
+) -> ScriptSemanticFacts:
     tokens = tokenize_lua(text)
     functions = _functions(tokens, path)
     calls = _calls(text, tokens, functions)
@@ -170,11 +209,13 @@ def analyze_script(
         tuple(token.start for token in tokens),
         functions,
         calls,
+        tuple(call.start for call in calls),
         assignments,
         {key: tuple(values) for key, values in assignments_by_name.items()},
         {name: tuple(indices) for name, indices in calls_by_alias.items()},
     )
     uses: list[SemanticLabelUse] = []
+    external_flows: list[ExternalCallFlow] = []
     claimed_ranges: list[tuple[int, int]] = []
     for call in calls:
         contract = call_contract(call.name)
@@ -187,8 +228,6 @@ def analyze_script(
                 end,
                 label_catalog,
             )
-            if not values:
-                continue
             role = (
                 contract.role_for(argument_index, expression)
                 if contract is not None
@@ -197,6 +236,27 @@ def analyze_script(
             runtime_start = contract.runtime_start if contract is not None else argument_index + 1
             runtime_arguments = call.arguments[runtime_start:]
             runtime_argument_values = _runtime_argument_values(analysis, call, runtime_start)
+            if contract is not None or role == "button":
+                for alias, _dependency_position in _external_calls_for_argument(
+                    analysis,
+                    start,
+                    end,
+                    call.start,
+                    call.function_index,
+                    set(),
+                ):
+                    external_flows.append(
+                        ExternalCallFlow(
+                            alias=alias,
+                            position=call.start,
+                            call_name=call.name,
+                            argument_index=argument_index,
+                            arguments=call.arguments,
+                            role=role,
+                            runtime_arguments=runtime_arguments,
+                            runtime_argument_values=runtime_argument_values,
+                        )
+                    )
             for label, position, match_kind, confidence in values:
                 uses.append(
                     SemanticLabelUse(
@@ -212,7 +272,21 @@ def analyze_script(
                         confidence=confidence,
                     )
                 )
-            claimed_ranges.append((start, end))
+            if values:
+                claimed_ranges.append((start, end))
+
+    return_labels = _function_return_labels(analysis, label_catalog)
+    for returned in return_labels:
+        uses.append(
+            SemanticLabelUse(
+                label=returned.label,
+                position=returned.position,
+                role="return_value",
+                match_kind=returned.match_kind,
+                confidence=45,
+            )
+        )
+    claimed_ranges.extend(_return_expression_ranges(analysis))
 
     claimed_ranges.sort()
     claimed_starts = tuple(start for start, _ in claimed_ranges)
@@ -229,7 +303,11 @@ def analyze_script(
                     confidence=35,
                 )
             )
-    return _dedupe_uses(uses)
+    return ScriptSemanticFacts(
+        _dedupe_uses(uses),
+        return_labels,
+        tuple(dict.fromkeys(external_flows)),
+    )
 
 
 def variadic_argument_pack(expression: str) -> str:
@@ -572,7 +650,16 @@ def _expression_end(tokens: tuple[Token, ...], start: int) -> int:
         value = token.value.casefold() if token.kind == "identifier" else token.value
         if index > start and depth == 0:
             previous = tokens[index - 1].value
-            if token.value == ";" or value in {"then", "do", "end", "elseif", "else", "until"}:
+            if token.value == ";" or value in {
+                "then",
+                "do",
+                "end",
+                "elseif",
+                "else",
+                "until",
+                "local",
+                "return",
+            }:
                 break
             if token.line > base_line and previous != "..":
                 break
@@ -773,6 +860,118 @@ def _dependent_label_values(
                 )
             )
     return tuple(dict.fromkeys(candidates))
+
+
+def _external_calls_for_argument(
+    analysis: _Analysis,
+    start: int,
+    end: int,
+    position: int,
+    function_index: int | None,
+    resolving: set[tuple[str, int | None]],
+) -> tuple[tuple[str, int], ...]:
+    values: list[tuple[str, int]] = []
+    first_call = bisect.bisect_left(analysis.call_starts, start)
+    last_call = bisect.bisect_left(analysis.call_starts, end)
+    values.extend(
+        (analysis.calls[index].name.casefold(), analysis.calls[index].start)
+        for index in range(first_call, last_call)
+    )
+    token_indices = _tokens_in_span(analysis, start, end)
+    if not token_indices:
+        return tuple(dict.fromkeys(values))
+    for name in _dependency_names(analysis.tokens, token_indices[0], token_indices[-1] + 1):
+        key = (name.casefold(), function_index)
+        if key in resolving or len(resolving) >= 8:
+            continue
+        next_resolving = set(resolving)
+        next_resolving.add(key)
+        for assignment in analysis.assignments_by_name.get((function_index, name.casefold()), ()):
+            if assignment.position >= position:
+                continue
+            assignment_start = analysis.tokens[assignment.token_start].start
+            assignment_end = analysis.tokens[assignment.token_end - 1].end
+            values.extend(
+                _external_calls_for_argument(
+                    analysis,
+                    assignment_start,
+                    assignment_end,
+                    assignment.position,
+                    function_index,
+                    next_resolving,
+                )
+            )
+    return tuple(dict.fromkeys(values))
+
+
+def _function_return_labels(
+    analysis: _Analysis,
+    catalog: frozenset[str],
+) -> tuple[FunctionReturnLabel, ...]:
+    values: list[FunctionReturnLabel] = []
+    for function_index, start, end, position in _return_expressions(analysis):
+        function = analysis.functions[function_index]
+        for part_start, part_end in _split_token_range(analysis.tokens, start, end, ","):
+            resolved = _evaluate_tokens(
+                analysis,
+                part_start,
+                part_end,
+                position,
+                function_index,
+                set(),
+            )
+            expression = analysis.text[
+                analysis.tokens[part_start].start : analysis.tokens[part_end - 1].end
+            ]
+            dynamic = ".." in expression
+            for resolved_value in resolved:
+                for label, _relative in _literal_labels(
+                    resolved_value,
+                    catalog,
+                    allow_patterns=True,
+                ):
+                    match_kind = (
+                        "dynamic"
+                        if dynamic or "*" in label
+                        else _literal_match_kind(label, catalog)
+                    )
+                    values.append(
+                        FunctionReturnLabel(
+                            aliases=function.aliases,
+                            label=label,
+                            position=position,
+                            match_kind=match_kind,
+                        )
+                    )
+    return tuple(dict.fromkeys(values))
+
+
+def _return_expression_ranges(analysis: _Analysis) -> tuple[tuple[int, int], ...]:
+    return tuple(
+        (
+            analysis.tokens[start].start,
+            analysis.tokens[end - 1].end,
+        )
+        for _function_index, start, end, _position in _return_expressions(analysis)
+        if start < end
+    )
+
+
+def _return_expressions(
+    analysis: _Analysis,
+) -> tuple[tuple[int, int, int, int], ...]:
+    values: list[tuple[int, int, int, int]] = []
+    for index, token in enumerate(analysis.tokens[:-1]):
+        if token.kind != "identifier" or token.value.casefold() != "return":
+            continue
+        function_index = _function_at(analysis.functions, token.start)
+        if function_index is None:
+            continue
+        start = index + 1
+        end = _expression_end(analysis.tokens, start)
+        if start < end:
+            values.append((function_index, start, end, token.start))
+    return tuple(values)
 
 
 def _dependency_names(tokens: tuple[Token, ...], start: int, end: int) -> tuple[str, ...]:

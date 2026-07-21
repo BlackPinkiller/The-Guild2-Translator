@@ -5,7 +5,12 @@ import bisect
 from pathlib import Path
 import re
 
-from .script_semantics import analyze_script
+from .script_semantics import (
+    ExternalCallFlow,
+    FunctionReturnLabel,
+    ScriptSemanticFacts,
+    analyze_script_facts,
+)
 
 
 LABEL_RE = re.compile(
@@ -71,6 +76,40 @@ class CodeFileSpec:
     source: str
 
 
+@dataclass(frozen=True)
+class CodeReturnLabel:
+    path: Path
+    source: str
+    alias: str
+    cross_file: bool
+    label: str
+    match_kind: str
+    confidence: int
+
+
+@dataclass(frozen=True)
+class CodeExternalFlow:
+    path: Path
+    source: str
+    alias: str
+    line: int
+    column: int
+    call_name: str
+    argument_index: int
+    arguments: tuple[str, ...]
+    role: str
+    runtime_arguments: tuple[str, ...]
+    runtime_argument_values: tuple[tuple[str, ...], ...]
+    confidence: int
+
+
+@dataclass(frozen=True)
+class CodeFileAnalysis:
+    index: CodeReferenceIndex
+    return_labels: tuple[CodeReturnLabel, ...] = ()
+    external_flows: tuple[CodeExternalFlow, ...] = ()
+
+
 class CodeReferenceIndex:
     def __init__(
         self,
@@ -105,6 +144,82 @@ class CodeReferenceIndex:
         return not self.project_references and not self.vanilla_references
 
 
+class CrossFileSemanticLinker:
+    """Incrementally joins returned labels to real UI-call data-flow dependencies."""
+
+    def __init__(self) -> None:
+        self._returns: dict[tuple[str, str, Path | None], list[CodeReturnLabel]] = {}
+        self._flows: dict[tuple[str, str, Path | None], list[CodeExternalFlow]] = {}
+        self._emitted: set[tuple[object, ...]] = set()
+
+    def add(self, analysis: CodeFileAnalysis) -> CodeReferenceIndex:
+        result = CodeReferenceIndex()
+        result.merge(analysis.index)
+        for returned in analysis.return_labels:
+            key = (
+                returned.source,
+                returned.alias.casefold(),
+                None if returned.cross_file else returned.path,
+            )
+            self._returns.setdefault(key, []).append(returned)
+            for flow in self._flows.get(key, ()):
+                self._emit(result, returned, flow)
+        for flow in analysis.external_flows:
+            keys = (
+                (flow.source, flow.alias.casefold(), flow.path),
+                (flow.source, flow.alias.casefold(), None),
+            )
+            for key in keys:
+                self._flows.setdefault(key, []).append(flow)
+                for returned in self._returns.get(key, ()):
+                    self._emit(result, returned, flow)
+        return result
+
+    def _emit(
+        self,
+        result: CodeReferenceIndex,
+        returned: CodeReturnLabel,
+        flow: CodeExternalFlow,
+    ) -> None:
+        if not returned.cross_file and returned.path != flow.path:
+            return
+        identity = (
+            returned.source,
+            returned.alias.casefold(),
+            returned.label,
+            flow.path,
+            flow.line,
+            flow.call_name,
+            flow.argument_index,
+        )
+        if identity in self._emitted:
+            return
+        self._emitted.add(identity)
+        reference = CodeReference(
+            label=returned.label,
+            path=flow.path,
+            line=flow.line,
+            column=flow.column,
+            call_name=flow.call_name,
+            argument_index=flow.argument_index,
+            arguments=flow.arguments,
+            source=flow.source,
+            role=flow.role,
+            runtime_arguments=flow.runtime_arguments,
+            runtime_argument_values=flow.runtime_argument_values,
+            match_kind=returned.match_kind,
+            confidence=min(returned.confidence, flow.confidence),
+        )
+        target = (
+            result.vanilla_references
+            if flow.source == "vanilla"
+            else result.project_references
+        )
+        target[reference.label] = _dedupe_references(
+            [*target.get(reference.label, ()), reference]
+        )
+
+
 def build_code_reference_index(
     game_root: Path | None,
     project_root: Path | None,
@@ -118,9 +233,10 @@ def build_code_reference_index(
         project_root,
         vanilla_project_name=vanilla_project_name,
     )
+    linker = CrossFileSemanticLinker()
     result = CodeReferenceIndex()
     for spec in files:
-        partial = index_code_file(spec, label_catalog=label_catalog)
+        partial = linker.add(analyze_code_file(spec, label_catalog=label_catalog))
         result.merge(partial)
     return result
 
@@ -160,15 +276,43 @@ def index_code_file(
     label_catalog: frozenset[str] = frozenset(),
     raw: bytes | None = None,
 ) -> CodeReferenceIndex:
-    references = scan_code_file(
+    return analyze_code_file(
+        spec,
+        label_catalog=label_catalog,
+        raw=raw,
+    ).index
+
+
+def analyze_code_file(
+    spec: CodeFileSpec,
+    *,
+    label_catalog: frozenset[str] = frozenset(),
+    raw: bytes | None = None,
+) -> CodeFileAnalysis:
+    if raw is None:
+        try:
+            raw = spec.path.read_bytes()
+        except OSError:
+            return CodeFileAnalysis(CodeReferenceIndex())
+    references, facts = _scan_code_file(
         spec.path,
         source=spec.source,
         label_catalog=label_catalog,
         raw=raw,
     )
-    if spec.source == "vanilla":
-        return CodeReferenceIndex(vanilla_references=references)
-    return CodeReferenceIndex(project_references=references)
+    index = (
+        CodeReferenceIndex(vanilla_references=references)
+        if spec.source == "vanilla"
+        else CodeReferenceIndex(project_references=references)
+    )
+    if facts is None:
+        return CodeFileAnalysis(index)
+    line_starts = _line_starts(raw.decode("utf-8-sig", errors="ignore"))
+    return CodeFileAnalysis(
+        index,
+        _code_return_labels(spec, facts.return_labels),
+        _code_external_flows(spec, facts.external_flows, line_starts),
+    )
 
 
 def scan_code_roots(
@@ -215,11 +359,27 @@ def scan_code_file(
     label_catalog: frozenset[str] = frozenset(),
     raw: bytes | None = None,
 ) -> dict[str, tuple[CodeReference, ...]]:
+    references, _facts = _scan_code_file(
+        path,
+        source=source,
+        label_catalog=label_catalog,
+        raw=raw,
+    )
+    return references
+
+
+def _scan_code_file(
+    path: Path,
+    *,
+    source: str,
+    label_catalog: frozenset[str],
+    raw: bytes | None,
+) -> tuple[dict[str, tuple[CodeReference, ...]], ScriptSemanticFacts | None]:
     if raw is None:
         try:
             raw = path.read_bytes()
         except OSError:
-            return {}
+            return {}, None
     grouped: dict[str, list[CodeReference]] = {}
     if path.suffix.casefold() == ".gui" and _looks_binary(raw):
         for label, position in _binary_gui_labels(raw):
@@ -236,11 +396,12 @@ def scan_code_file(
                     binary=True,
                 )
             )
-        return {label: tuple(items) for label, items in grouped.items()}
+        return {label: tuple(items) for label, items in grouped.items()}, None
 
     text = raw.decode("utf-8-sig", errors="ignore")
     line_starts = _line_starts(text)
-    for use in analyze_script(text, path, label_catalog=label_catalog):
+    facts = analyze_script_facts(text, path, label_catalog=label_catalog)
+    for use in facts.uses:
         line_number, column = _line_column(line_starts, use.position)
         label = normalize_label(use.label)
         reference = CodeReference(
@@ -259,7 +420,55 @@ def scan_code_file(
             confidence=use.confidence,
         )
         grouped.setdefault(label, []).append(reference)
-    return {label: _dedupe_references(items) for label, items in grouped.items()}
+    return {label: _dedupe_references(items) for label, items in grouped.items()}, facts
+
+
+def _code_return_labels(
+    spec: CodeFileSpec,
+    values: tuple[FunctionReturnLabel, ...],
+) -> tuple[CodeReturnLabel, ...]:
+    returned: list[CodeReturnLabel] = []
+    for value in values:
+        for index, alias in enumerate(value.aliases):
+            returned.append(
+                CodeReturnLabel(
+                    path=spec.path,
+                    source=spec.source,
+                    alias=alias.casefold(),
+                    cross_file=index > 0,
+                    label=normalize_label(value.label),
+                    match_kind=value.match_kind,
+                    confidence=value.confidence,
+                )
+            )
+    return tuple(dict.fromkeys(returned))
+
+
+def _code_external_flows(
+    spec: CodeFileSpec,
+    values: tuple[ExternalCallFlow, ...],
+    line_starts: list[int],
+) -> tuple[CodeExternalFlow, ...]:
+    flows: list[CodeExternalFlow] = []
+    for value in values:
+        line, column = _line_column(line_starts, value.position)
+        flows.append(
+            CodeExternalFlow(
+                path=spec.path,
+                source=spec.source,
+                alias=value.alias.casefold(),
+                line=line,
+                column=column,
+                call_name=value.call_name,
+                argument_index=value.argument_index,
+                arguments=value.arguments,
+                role=value.role,
+                runtime_arguments=value.runtime_arguments,
+                runtime_argument_values=value.runtime_argument_values,
+                confidence=value.confidence,
+            )
+        )
+    return tuple(dict.fromkeys(flows))
 
 
 def _dedupe_references(references: list[CodeReference]) -> tuple[CodeReference, ...]:

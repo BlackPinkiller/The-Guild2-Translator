@@ -9,11 +9,16 @@ import time
 from typing import Callable
 
 from .code_index import (
+    CodeExternalFlow,
+    CodeFileAnalysis,
     CodeFileSpec,
     CodeReference,
     CodeReferenceIndex,
+    CodeReturnLabel,
+    CrossFileSemanticLinker,
+    analyze_code_file,
     code_index_inputs,
-    index_code_file,
+    lookup_labels,
     normalize_label,
 )
 from .file_utils import atomic_write
@@ -22,12 +27,13 @@ from .settings import settings_dir
 
 
 CACHE_FORMAT_VERSION = 1
-LEXICAL_SCHEMA_VERSION = 1
+LEXICAL_SCHEMA_VERSION = 2
 ANALYZER_REVISION = "script-semantics-2026-07-22-1"
 MAX_CACHE_MANIFESTS = 8
 MAX_CACHE_BYTES = 128 * 1024 * 1024
 MAX_CACHED_FILES = 8192
 _LABEL_FRAGMENT_RE = re.compile(rb"@l_[a-z0-9_+*]{5,}|_[a-z][a-z0-9_+*]{5,}")
+_CALL_NAME_RE = re.compile(rb"\b([a-z_][a-z0-9_.:]*)\s*\(", re.IGNORECASE)
 _IMPLEMENTATION_REVISION = ""
 
 
@@ -55,12 +61,12 @@ class CodeFactsCache:
         value = entry.get("lexical")
         return value.encode("ascii") if isinstance(value, str) else None
 
-    def verified_references(
+    def verified_analysis(
         self,
         spec: CodeFileSpec,
         raw: bytes,
         catalog_digest: str,
-    ) -> CodeReferenceIndex | None:
+    ) -> CodeFileAnalysis | None:
         entry = self._valid_stat_entry(spec)
         if entry is None or entry.get("sha256") != _sha256(raw):
             return None
@@ -75,7 +81,25 @@ class CodeFactsCache:
             if isinstance(item, dict)
             if (reference := _reference_from_json(item, spec)) is not None
         )
-        return _index_from_references(references, spec.source)
+        serialized_returns = entry.get("return_labels")
+        serialized_flows = entry.get("external_flows")
+        if not isinstance(serialized_returns, list) or not isinstance(serialized_flows, list):
+            return None
+        return CodeFileAnalysis(
+            _index_from_references(references, spec.source),
+            tuple(
+                returned
+                for item in serialized_returns
+                if isinstance(item, dict)
+                if (returned := _return_from_json(item, spec)) is not None
+            ),
+            tuple(
+                flow
+                for item in serialized_flows
+                if isinstance(item, dict)
+                if (flow := _flow_from_json(item, spec)) is not None
+            ),
+        )
 
     def record_lexical(self, spec: CodeFileSpec, raw: bytes, lexical: bytes) -> None:
         stat = _safe_stat(spec.path)
@@ -95,26 +119,34 @@ class CodeFactsCache:
             "used_ns": time.time_ns(),
         }
         if unchanged:
-            for name in ("analyzer", "catalog", "references"):
+            for name in (
+                "analyzer",
+                "catalog",
+                "references",
+                "return_labels",
+                "external_flows",
+            ):
                 if name in current:
                     entry[name] = current[name]
         self._files[key] = entry
         self._mark_dirty()
 
-    def record_references(
+    def record_analysis(
         self,
         spec: CodeFileSpec,
         raw: bytes,
         lexical: bytes,
         catalog_digest: str,
-        index: CodeReferenceIndex,
+        analysis: CodeFileAnalysis,
     ) -> None:
         self.record_lexical(spec, raw, lexical)
         entry = self._files.get(_spec_key(spec))
         if entry is None:
             return
         references = (
-            index.vanilla_references if spec.source == "vanilla" else index.project_references
+            analysis.index.vanilla_references
+            if spec.source == "vanilla"
+            else analysis.index.project_references
         )
         entry["analyzer"] = _analyzer_revision()
         entry["catalog"] = catalog_digest
@@ -123,6 +155,8 @@ class CodeFactsCache:
             for items in references.values()
             for reference in items
         ]
+        entry["return_labels"] = [_return_to_json(value) for value in analysis.return_labels]
+        entry["external_flows"] = [_flow_to_json(value) for value in analysis.external_flows]
         self._mark_dirty()
 
     def flush_if_needed(self, *, force: bool = False) -> None:
@@ -209,6 +243,9 @@ class LazyCodeIndexBuilder:
         self.cache: CodeFactsCache | None = None
         self._search_blobs: dict[str, bytes] = {}
         self._analyzed: set[str] = set()
+        self._linker = CrossFileSemanticLinker()
+        self._pending_aliases: set[str] = set()
+        self._return_aliases: dict[str, set[str]] = {}
         self._prepared = False
 
     @property
@@ -241,6 +278,13 @@ class LazyCodeIndexBuilder:
         requested = tuple(dict.fromkeys(normalize_label(label) for label in labels if label.strip()))
         if not requested:
             return CodeReferenceIndex()
+        requested_keys = {
+            key
+            for label in requested
+            for key in lookup_labels(label)
+        }
+        processed_aliases: set[str] = set()
+        self._queue_return_aliases(requested_keys, processed_aliases)
         needles = _candidate_needles(requested)
         candidates: list[CodeFileSpec] = []
         for spec in self.files:
@@ -257,6 +301,21 @@ class LazyCodeIndexBuilder:
             if cancelled():
                 break
             result.merge(self._analyze_spec(spec))
+            self._queue_return_aliases(requested_keys, processed_aliases)
+        while self._pending_aliases and not cancelled():
+            aliases = tuple(self._pending_aliases)
+            self._pending_aliases.clear()
+            processed_aliases.update(aliases)
+            call_needles = tuple(f"c:{alias.casefold()}".encode("ascii") for alias in aliases)
+            for spec in self.files:
+                if cancelled():
+                    break
+                if _spec_key(spec) in self._analyzed:
+                    continue
+                blob = self._lexical_blob(spec)
+                if blob is not None and any(needle in blob for needle in call_needles):
+                    result.merge(self._analyze_spec(spec))
+                    self._queue_return_aliases(requested_keys, processed_aliases)
         self._flush_cache(force=True)
         return result
 
@@ -321,12 +380,28 @@ class LazyCodeIndexBuilder:
         lexical = _lexical_blob(raw)
         self._search_blobs[key] = lexical
         assert self.cache is not None
-        cached = self.cache.verified_references(spec, raw, self.catalog_digest)
+        cached = self.cache.verified_analysis(spec, raw, self.catalog_digest)
         if cached is not None:
-            return cached
-        index = index_code_file(spec, label_catalog=self.label_catalog, raw=raw)
-        self.cache.record_references(spec, raw, lexical, self.catalog_digest, index)
-        return index
+            self._remember_return_aliases(cached)
+            return self._linker.add(cached)
+        analysis = analyze_code_file(spec, label_catalog=self.label_catalog, raw=raw)
+        self.cache.record_analysis(spec, raw, lexical, self.catalog_digest, analysis)
+        self._remember_return_aliases(analysis)
+        return self._linker.add(analysis)
+
+    def _remember_return_aliases(self, analysis: CodeFileAnalysis) -> None:
+        for value in analysis.return_labels:
+            if value.cross_file:
+                self._return_aliases.setdefault(value.label, set()).add(value.alias)
+
+    def _queue_return_aliases(
+        self,
+        requested_keys: set[str],
+        processed_aliases: set[str],
+    ) -> None:
+        for label, aliases in self._return_aliases.items():
+            if label in requested_keys:
+                self._pending_aliases.update(aliases - processed_aliases)
 
 
 def default_cache_path(game_root: Path, project_root: Path) -> Path:
@@ -342,8 +417,11 @@ def default_cache_path(game_root: Path, project_root: Path) -> Path:
 
 def _lexical_blob(raw: bytes) -> bytes:
     lowered = raw.lower()
-    fragments = tuple(dict.fromkeys(match.group(0) for match in _LABEL_FRAGMENT_RE.finditer(lowered)))
-    return b"\n".join(fragments)
+    fragments = [
+        *(b"l:" + match.group(0) for match in _LABEL_FRAGMENT_RE.finditer(lowered)),
+        *(b"c:" + match.group(1) for match in _CALL_NAME_RE.finditer(lowered)),
+    ]
+    return b"\n".join(dict.fromkeys(fragments))
 
 
 def _candidate_needles(labels: tuple[str, ...]) -> tuple[bytes, ...]:
@@ -434,6 +512,104 @@ def _reference_from_json(item: dict[str, object], spec: CodeFileSpec) -> CodeRef
     )
 
 
+def _return_to_json(value: CodeReturnLabel) -> dict[str, object]:
+    return {
+        "alias": value.alias,
+        "cross_file": value.cross_file,
+        "label": value.label,
+        "match_kind": value.match_kind,
+        "confidence": value.confidence,
+    }
+
+
+def _return_from_json(
+    item: dict[str, object],
+    spec: CodeFileSpec,
+) -> CodeReturnLabel | None:
+    alias = item.get("alias")
+    label = item.get("label")
+    if not isinstance(alias, str) or not isinstance(label, str):
+        return None
+    return CodeReturnLabel(
+        path=spec.path,
+        source=spec.source,
+        alias=alias,
+        cross_file=item.get("cross_file") is True,
+        label=label,
+        match_kind=(
+            item.get("match_kind") if isinstance(item.get("match_kind"), str) else "exact"
+        ),
+        confidence=item.get("confidence") if isinstance(item.get("confidence"), int) else 0,
+    )
+
+
+def _flow_to_json(value: CodeExternalFlow) -> dict[str, object]:
+    return {
+        "alias": value.alias,
+        "line": value.line,
+        "column": value.column,
+        "call": value.call_name,
+        "argument_index": value.argument_index,
+        "arguments": list(value.arguments),
+        "role": value.role,
+        "runtime_arguments": list(value.runtime_arguments),
+        "runtime_values": [list(values) for values in value.runtime_argument_values],
+        "confidence": value.confidence,
+    }
+
+
+def _flow_from_json(
+    item: dict[str, object],
+    spec: CodeFileSpec,
+) -> CodeExternalFlow | None:
+    alias = item.get("alias")
+    line = item.get("line")
+    column = item.get("column")
+    call = item.get("call")
+    argument_index = item.get("argument_index")
+    if (
+        not isinstance(alias, str)
+        or not isinstance(line, int)
+        or not isinstance(column, int)
+        or not isinstance(call, str)
+        or not isinstance(argument_index, int)
+    ):
+        return None
+    arguments = item.get("arguments")
+    runtime_arguments = item.get("runtime_arguments")
+    runtime_values = item.get("runtime_values")
+    return CodeExternalFlow(
+        path=spec.path,
+        source=spec.source,
+        alias=alias,
+        line=line,
+        column=column,
+        call_name=call,
+        argument_index=argument_index,
+        arguments=(
+            tuple(value for value in arguments if isinstance(value, str))
+            if isinstance(arguments, list)
+            else ()
+        ),
+        role=item.get("role") if isinstance(item.get("role"), str) else "template",
+        runtime_arguments=(
+            tuple(value for value in runtime_arguments if isinstance(value, str))
+            if isinstance(runtime_arguments, list)
+            else ()
+        ),
+        runtime_argument_values=(
+            tuple(
+                tuple(value for value in values if isinstance(value, str))
+                for values in runtime_values
+                if isinstance(values, list)
+            )
+            if isinstance(runtime_values, list)
+            else ()
+        ),
+        confidence=item.get("confidence") if isinstance(item.get("confidence"), int) else 0,
+    )
+
+
 def _catalog_digest(catalog: frozenset[str]) -> str:
     digest = hashlib.sha256()
     for label in sorted(catalog):
@@ -448,7 +624,7 @@ def _analyzer_revision() -> str:
         digest = hashlib.sha256()
         paths = {
             Path(__file__),
-            Path(index_code_file.__code__.co_filename),
+            Path(analyze_code_file.__code__.co_filename),
             Path(_semantic_analyze_script.__code__.co_filename),
         }
         for path in sorted(paths, key=lambda item: str(item).casefold()):

@@ -4,7 +4,14 @@ from pathlib import Path
 import shutil
 import tempfile
 
-from ..code_index import CodeReference, CodeReferenceIndex, scan_scripts_root
+from ..code_index import (
+    CodeFileSpec,
+    CodeReference,
+    CodeReferenceIndex,
+    CrossFileSemanticLinker,
+    analyze_code_file,
+    scan_scripts_root,
+)
 from ..preview_placeholders import _placeholder_expression, select_placeholder_references
 from ..script_semantics import analyze_script
 
@@ -178,3 +185,59 @@ def assert_variadic_runtime_arguments_map_to_placeholder_positions() -> None:
     )
     if _placeholder_expression(unpacked, 9) != "LabelIds[9]":
         raise AssertionError("an unpacked table did not map its ninth value to %9")
+
+
+def assert_cross_file_return_labels_flow_only_to_real_callers() -> None:
+    temp = Path(tempfile.mkdtemp(prefix="translator_tool_cross_file_semantics_"))
+    try:
+        helper = temp / "helper.lua"
+        caller = temp / "caller.lua"
+        dead = temp / "dead.lua"
+        helper.write_text(
+            "\n".join(
+                (
+                    "function MakeBody(kind)",
+                    '    local Label = "@L_REMOTE_BODY_+"',
+                    "    return Label..kind",
+                    "end",
+                )
+            ),
+            encoding="utf-8",
+        )
+        caller.write_text(
+            "\n".join(
+                (
+                    "function Main()",
+                    "    local Body = helper_MakeBody(Variant)",
+                    '    MsgQuick("", Body, Actor)',
+                    "end",
+                )
+            ),
+            encoding="utf-8",
+        )
+        dead.write_text(
+            'function Unused() return "@L_DEAD_RETURN_+0" end',
+            encoding="utf-8",
+        )
+        linker = CrossFileSemanticLinker()
+        index = linker.add(analyze_code_file(CodeFileSpec(caller, "project")))
+        index.merge(linker.add(analyze_code_file(CodeFileSpec(helper, "project"))))
+        references = index.references_for("REMOTE_BODY_+3").project
+        linked = next((item for item in references if item.call_name == "MsgQuick"), None)
+        if linked is None:
+            raise AssertionError(f"returned label did not reach its cross-file UI caller: {references!r}")
+        if linked.path != caller or linked.line != 3 or linked.role != "body":
+            raise AssertionError(f"cross-file label was attached to the wrong call site: {linked!r}")
+        if linked.runtime_arguments != ("Actor",):
+            raise AssertionError(f"cross-file label lost the caller runtime arguments: {linked!r}")
+
+        dead_index = CrossFileSemanticLinker().add(
+            analyze_code_file(CodeFileSpec(dead, "project"))
+        )
+        dead_references = dead_index.references_for("DEAD_RETURN_+0").project
+        if not dead_references or any(item.call_name is not None for item in dead_references):
+            raise AssertionError(f"an uncalled return helper fabricated a UI call: {dead_references!r}")
+        if dead_references[0].role != "return_value":
+            raise AssertionError(f"an uncalled returned label lost its honest source role: {dead_references!r}")
+    finally:
+        shutil.rmtree(temp, ignore_errors=True)
