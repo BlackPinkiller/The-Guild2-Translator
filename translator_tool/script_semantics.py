@@ -109,6 +109,7 @@ class SemanticLabelUse:
     role: str = "unattached"
     runtime_arguments: tuple[str, ...] = ()
     runtime_argument_values: tuple[tuple[str, ...], ...] = ()
+    resolved_arguments: tuple[tuple[str, ...], ...] = ()
     match_kind: str = "exact"
     confidence: int = 0
 
@@ -132,6 +133,7 @@ class ExternalCallFlow:
     role: str
     runtime_arguments: tuple[str, ...]
     runtime_argument_values: tuple[tuple[str, ...], ...]
+    resolved_arguments: tuple[tuple[str, ...], ...]
     confidence: int = 76
 
 
@@ -219,6 +221,7 @@ def analyze_script_facts(
     claimed_ranges: list[tuple[int, int]] = []
     for call in calls:
         contract = call_contract(call.name)
+        resolved_arguments = _resolved_call_arguments(analysis, call)
         for argument_index, ((start, end), expression) in enumerate(zip(call.argument_spans, call.arguments)):
             values = _label_values_for_argument(
                 analysis,
@@ -255,6 +258,7 @@ def analyze_script_facts(
                             role=role,
                             runtime_arguments=runtime_arguments,
                             runtime_argument_values=runtime_argument_values,
+                            resolved_arguments=resolved_arguments,
                         )
                     )
             for label, position, match_kind, confidence in values:
@@ -268,6 +272,7 @@ def analyze_script_facts(
                         role=role,
                         runtime_arguments=runtime_arguments,
                         runtime_argument_values=runtime_argument_values,
+                        resolved_arguments=resolved_arguments,
                         match_kind=match_kind,
                         confidence=confidence,
                     )
@@ -650,7 +655,8 @@ def _expression_end(tokens: tuple[Token, ...], start: int) -> int:
         value = token.value.casefold() if token.kind == "identifier" else token.value
         if index > start and depth == 0:
             previous = tokens[index - 1].value
-            if token.value == ";" or value in {
+            if (token.kind == "symbol" and token.value == ";") or (
+                token.kind == "identifier" and value in {
                 "then",
                 "do",
                 "end",
@@ -659,13 +665,14 @@ def _expression_end(tokens: tuple[Token, ...], start: int) -> int:
                 "until",
                 "local",
                 "return",
-            }:
+                }
+            ):
                 break
             if token.line > base_line and previous != "..":
                 break
-        if token.value in {"(", "[", "{"}:
+        if token.kind == "symbol" and token.value in {"(", "[", "{"}:
             depth += 1
-        elif token.value in {")", "]", "}"}:
+        elif token.kind == "symbol" and token.value in {")", "]", "}"}:
             if depth == 0:
                 break
             depth -= 1
@@ -1013,7 +1020,15 @@ def _resolve_variable(
         return ()
     next_resolving = set(resolving)
     next_resolving.add(key)
-    values: list[str] = []
+    values: list[str] = list(
+        _accumulated_variable_values(
+            analysis,
+            name,
+            position,
+            function_index,
+            next_resolving,
+        )
+    )
     for assignment in analysis.assignments_by_name.get((function_index, name.casefold()), ()):
         if assignment.position < position:
             values.extend(
@@ -1056,6 +1071,59 @@ def _resolve_variable(
                     )
                 )
     return tuple(dict.fromkeys(values))[:64]
+
+
+def _accumulated_variable_values(
+    analysis: _Analysis,
+    name: str,
+    position: int,
+    function_index: int | None,
+    resolving: set[tuple[str, int | None]],
+) -> tuple[str, ...]:
+    current: tuple[str, ...] = ()
+    accumulated = False
+    for assignment in analysis.assignments_by_name.get((function_index, name.casefold()), ()):
+        if assignment.position >= position:
+            continue
+        parts = _split_token_range(
+            analysis.tokens,
+            assignment.token_start,
+            assignment.token_end,
+            "..",
+        )
+        self_append = bool(
+            len(parts) > 1
+            and _lvalue_name(analysis.tokens, parts[0][0], parts[0][1]).casefold()
+            == name.casefold()
+        )
+        if self_append:
+            suffix = _evaluate_tokens(
+                analysis,
+                parts[1][0],
+                assignment.token_end,
+                assignment.position,
+                function_index,
+                resolving,
+            )
+            if not suffix:
+                suffix = ("*",)
+            bases = current or ("",)
+            current = tuple(
+                dict.fromkeys(left + right for left in bases for right in suffix)
+            )[:64]
+            accumulated = True
+            continue
+        resolved = _evaluate_tokens(
+            analysis,
+            assignment.token_start,
+            assignment.token_end,
+            assignment.position,
+            function_index,
+            resolving,
+        )
+        if resolved:
+            current = tuple(dict.fromkeys((*current, *resolved)))[:64]
+    return current if accumulated else ()
 
 
 def _literal_labels(
@@ -1116,6 +1184,7 @@ def _dedupe_uses(uses: list[SemanticLabelUse]) -> tuple[SemanticLabelUse, ...]:
             use.role,
             use.runtime_arguments,
             use.runtime_argument_values,
+            use.resolved_arguments,
         )
         if key not in seen:
             seen.add(key)
@@ -1130,6 +1199,28 @@ def _runtime_argument_values(
 ) -> tuple[tuple[str, ...], ...]:
     values: list[tuple[str, ...]] = []
     for start, end in call.argument_spans[runtime_start:]:
+        token_indices = _tokens_in_span(analysis, start, end)
+        if not token_indices:
+            values.append(())
+            continue
+        resolved = _evaluate_tokens(
+            analysis,
+            token_indices[0],
+            token_indices[-1] + 1,
+            call.start,
+            call.function_index,
+            set(),
+        )
+        values.append(tuple(dict.fromkeys(resolved))[:64])
+    return tuple(values)
+
+
+def _resolved_call_arguments(
+    analysis: _Analysis,
+    call: ScriptCall,
+) -> tuple[tuple[str, ...], ...]:
+    values: list[tuple[str, ...]] = []
+    for start, end in call.argument_spans:
         token_indices = _tokens_in_span(analysis, start, end)
         if not token_indices:
             values.append(())

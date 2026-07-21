@@ -43,6 +43,7 @@ class CodeReference:
     role: str = "unattached"
     runtime_arguments: tuple[str, ...] = ()
     runtime_argument_values: tuple[tuple[str, ...], ...] = ()
+    resolved_arguments: tuple[tuple[str, ...], ...] = ()
     match_kind: str = "exact"
     confidence: int = 0
     binary: bool = False
@@ -100,6 +101,7 @@ class CodeExternalFlow:
     role: str
     runtime_arguments: tuple[str, ...]
     runtime_argument_values: tuple[tuple[str, ...], ...]
+    resolved_arguments: tuple[tuple[str, ...], ...]
     confidence: int
 
 
@@ -207,6 +209,7 @@ class CrossFileSemanticLinker:
             role=flow.role,
             runtime_arguments=flow.runtime_arguments,
             runtime_argument_values=flow.runtime_argument_values,
+            resolved_arguments=flow.resolved_arguments,
             match_kind=returned.match_kind,
             confidence=min(returned.confidence, flow.confidence),
         )
@@ -416,6 +419,7 @@ def _scan_code_file(
             role=use.role,
             runtime_arguments=use.runtime_arguments,
             runtime_argument_values=use.runtime_argument_values,
+            resolved_arguments=use.resolved_arguments,
             match_kind=use.match_kind,
             confidence=use.confidence,
         )
@@ -465,6 +469,7 @@ def _code_external_flows(
                 role=value.role,
                 runtime_arguments=value.runtime_arguments,
                 runtime_argument_values=value.runtime_argument_values,
+                resolved_arguments=value.resolved_arguments,
                 confidence=value.confidence,
             )
         )
@@ -484,6 +489,7 @@ def _dedupe_references(references: list[CodeReference]) -> tuple[CodeReference, 
             reference.role,
             reference.runtime_arguments,
             reference.runtime_argument_values,
+            reference.resolved_arguments,
             reference.match_kind,
         )
         if key in seen:

@@ -420,7 +420,8 @@ def assert_code_window_context_extracts_window_labels_and_buttons() -> None:
     try:
         game_root = temp / "game"
         (game_root / "Scripts").mkdir(parents=True, exist_ok=True)
-        (game_root / "Scripts" / "Window.lua").write_text(
+        window_script = game_root / "Scripts" / "Window.lua"
+        window_script.write_text(
             "\n".join(
                 (
                     'MsgBox("","", "@P"..',
@@ -469,6 +470,7 @@ def assert_code_window_context_extracts_window_labels_and_buttons() -> None:
         project_root = temp / "sources" / "Vanilla"
         project_root.mkdir(parents=True, exist_ok=True)
         index = build_code_reference_index(game_root, project_root)
+        window_script.unlink()
         refs = index.references_for("MEASURE_WUERDENTRAGEREMPFANGEN_BODY_+1").project
         context = best_window_context(refs, "MEASURE_WUERDENTRAGEREMPFANGEN_BODY_+1")
         if context is None:

@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from functools import lru_cache
 import re
 
 from .code_index import CodeReference, LABEL_RE, dynamic_label_patterns, normalize_label
@@ -45,11 +44,8 @@ class PreviewWindowContext:
 
 
 BUTTON_RE = re.compile(r"@B\[(?P<body>[^\]]*)\]", re.IGNORECASE | re.DOTALL)
-CONCAT_BUTTON_RE = re.compile(
-    r"@B\[(?P<identifier>[^,\]]+),\s*['\"]?\s*\.\.\s*(?P<label_var>[A-Za-z_][A-Za-z0-9_]*)\s*\.\.\s*['\"]?\]",
-    re.IGNORECASE | re.DOTALL,
-)
 STRING_LITERAL_RE = re.compile(r"""(?:"([^"\\]*(?:\\.[^"\\]*)*)"|'([^'\\]*(?:\\.[^'\\]*)*)')""")
+RESOLVED_LABEL_RE = re.compile(r"@L_[A-Za-z0-9_+*]+", re.IGNORECASE)
 
 
 def window_context_for_reference(reference: CodeReference, current_label: str = "") -> PreviewWindowContext | None:
@@ -59,8 +55,9 @@ def window_context_for_reference(reference: CodeReference, current_label: str = 
     if not _is_window_call(call_name):
         return None
     arguments = tuple(str(argument) for argument in reference.arguments)
-    buttons = _buttons_from_arguments(arguments, reference)
-    labels_by_arg = _labels_by_argument(arguments)
+    argument_expressions = _argument_expressions(reference, arguments)
+    buttons = _buttons_from_arguments(argument_expressions)
+    labels_by_arg = _labels_by_argument(argument_expressions)
     button_label_set = {button.label for button in buttons if button.label}
     header_label, body_label = _header_body_labels(call_name, labels_by_arg, button_label_set, current_label)
     referenced_label = _context_label(current_label or reference.label)
@@ -146,13 +143,33 @@ def _background_for_call(call_name: str) -> str:
     return "parchment"
 
 
-def _labels_by_argument(arguments: tuple[str, ...]) -> list[tuple[int, tuple[str, ...]]]:
+def _argument_expressions(
+    reference: CodeReference,
+    arguments: tuple[str, ...],
+) -> tuple[tuple[str, ...], ...]:
+    resolved = reference.resolved_arguments
+    return tuple(
+        tuple(dict.fromkeys((*(resolved[index] if index < len(resolved) else ()), argument)))
+        for index, argument in enumerate(arguments)
+    )
+
+
+def _labels_by_argument(
+    arguments: tuple[tuple[str, ...], ...],
+) -> list[tuple[int, tuple[str, ...]]]:
     labels: list[tuple[int, tuple[str, ...]]] = []
-    for index, argument in enumerate(arguments):
-        dynamic = dynamic_label_patterns(argument)
-        found = dynamic or tuple(normalize_label(match.group(0)) for match in LABEL_RE.finditer(argument))
+    for index, expressions in enumerate(arguments):
+        found: list[str] = []
+        for argument in expressions:
+            dynamic = dynamic_label_patterns(argument)
+            candidates = dynamic or tuple(
+                normalize_label(match.group(0)) for match in LABEL_RE.finditer(argument)
+            )
+            for label in candidates:
+                if label not in found:
+                    found.append(label)
         if found:
-            labels.append((index, found))
+            labels.append((index, tuple(found)))
     return labels
 
 
@@ -168,10 +185,13 @@ def context_has_label(context: PreviewWindowContext, label: str) -> bool:
     return _context_has_label(context, _context_label(label))
 
 
-def _buttons_from_arguments(arguments: tuple[str, ...], reference: CodeReference) -> tuple[PreviewWindowButton, ...]:
+def _buttons_from_arguments(
+    arguments: tuple[tuple[str, ...], ...],
+) -> tuple[PreviewWindowButton, ...]:
     buttons: list[PreviewWindowButton] = []
-    for argument in arguments:
-        buttons.extend(_buttons_from_expression(argument, reference))
+    for expressions in arguments:
+        for argument in expressions:
+            buttons.extend(_buttons_from_expression(argument))
     unique: list[PreviewWindowButton] = []
     seen: set[tuple[str, str, str]] = set()
     for button in buttons:
@@ -182,15 +202,10 @@ def _buttons_from_arguments(arguments: tuple[str, ...], reference: CodeReference
     return tuple(unique)
 
 
-def _buttons_from_expression(expression: str, reference: CodeReference) -> tuple[PreviewWindowButton, ...]:
+def _buttons_from_expression(expression: str) -> tuple[PreviewWindowButton, ...]:
     buttons: list[PreviewWindowButton] = []
     for part in _concat_parts(expression):
-        variable = _simple_variable(part)
-        if variable:
-            buttons.extend(_buttons_from_variable(reference, variable))
-        else:
-            buttons.extend(_direct_buttons_from_text(part))
-    buttons.extend(_concat_buttons_from_text(reference, expression))
+        buttons.extend(_direct_buttons_from_text(part))
     return tuple(buttons)
 
 
@@ -205,7 +220,7 @@ def _direct_buttons_from_text(text: str) -> tuple[PreviewWindowButton, ...]:
         label = ""
         text_value = ""
         for part in parts[1:]:
-            label_match = LABEL_RE.search(part)
+            label_match = RESOLVED_LABEL_RE.search(part) or LABEL_RE.search(part)
             if label_match is not None:
                 label = normalize_label(label_match.group(0))
                 break
@@ -216,64 +231,8 @@ def _direct_buttons_from_text(text: str) -> tuple[PreviewWindowButton, ...]:
     return tuple(buttons)
 
 
-def _concat_buttons_from_text(reference: CodeReference, text: str) -> tuple[PreviewWindowButton, ...]:
-    buttons: list[PreviewWindowButton] = []
-    for match in CONCAT_BUTTON_RE.finditer(text):
-        identifier = match.group("identifier").strip()
-        labels = _label_variable_sources(str(reference.path), reference.line, match.group("label_var"))
-        if labels:
-            buttons.extend(PreviewWindowButton(identifier=identifier, label=label) for label in labels)
-        else:
-            buttons.append(PreviewWindowButton(identifier=identifier, text=match.group("label_var")))
-    return tuple(buttons)
-
-
-def _buttons_from_variable(reference: CodeReference, variable: str) -> tuple[PreviewWindowButton, ...]:
-    buttons: list[PreviewWindowButton] = []
-    for expression in _variable_assignment_expressions(str(reference.path), reference.line, variable):
-        buttons.extend(_direct_buttons_from_text(expression))
-        buttons.extend(_concat_buttons_from_text(reference, expression))
-    return tuple(buttons)
-
-
-@lru_cache(maxsize=2048)
-def _variable_assignment_expressions(path: str, line: int, variable: str) -> tuple[str, ...]:
-    try:
-        text = open(path, "r", encoding="utf-8", errors="ignore").read()
-    except OSError:
-        return ()
-    prefix = "\n".join(text.splitlines()[: max(0, line - 1)])
-    assignment_re = re.compile(
-        rf"(?:^|\n)\s*(?:local\s+)?{re.escape(variable)}\s*=\s*(?P<expr>[^\n\r]*)",
-        re.IGNORECASE,
-    )
-    return tuple(match.group("expr") for match in assignment_re.finditer(prefix))
-
-
-@lru_cache(maxsize=2048)
-def _label_variable_sources(path: str, line: int, variable: str) -> tuple[str, ...]:
-    labels: list[str] = []
-    for expression in _variable_assignment_expressions(path, line, variable):
-        dynamic = dynamic_label_patterns(expression)
-        if dynamic:
-            for label in dynamic:
-                if label not in labels:
-                    labels.append(label)
-            continue
-        for match in LABEL_RE.finditer(expression):
-            label = normalize_label(match.group(0))
-            if label not in labels:
-                labels.append(label)
-    return tuple(labels)
-
-
 def _concat_parts(expression: str) -> tuple[str, ...]:
     return tuple(part.strip() for part in expression.split("..") if part.strip())
-
-
-def _simple_variable(value: str) -> str:
-    stripped = value.strip()
-    return stripped if re.match(r"^[A-Za-z_][A-Za-z0-9_]*$", stripped) else ""
 
 
 def _split_button_parts(value: str) -> list[str]:

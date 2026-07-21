@@ -467,6 +467,7 @@ def _reference_to_json(reference: CodeReference) -> dict[str, object]:
         "role": reference.role,
         "runtime_arguments": list(reference.runtime_arguments),
         "runtime_values": [list(values) for values in reference.runtime_argument_values],
+        "resolved_arguments": [list(values) for values in reference.resolved_arguments],
         "match_kind": reference.match_kind,
         "confidence": reference.confidence,
         "binary": reference.binary,
@@ -482,6 +483,7 @@ def _reference_from_json(item: dict[str, object], spec: CodeFileSpec) -> CodeRef
     arguments = item.get("arguments")
     runtime_arguments = item.get("runtime_arguments")
     runtime_values = item.get("runtime_values")
+    resolved_arguments = item.get("resolved_arguments")
     return CodeReference(
         label=label,
         path=spec.path,
@@ -504,6 +506,15 @@ def _reference_from_json(item: dict[str, object], spec: CodeFileSpec) -> CodeRef
                 if isinstance(values, list)
             )
             if isinstance(runtime_values, list)
+            else ()
+        ),
+        resolved_arguments=(
+            tuple(
+                tuple(value for value in values if isinstance(value, str))
+                for values in resolved_arguments
+                if isinstance(values, list)
+            )
+            if isinstance(resolved_arguments, list)
             else ()
         ),
         match_kind=item.get("match_kind") if isinstance(item.get("match_kind"), str) else "exact",
@@ -554,6 +565,7 @@ def _flow_to_json(value: CodeExternalFlow) -> dict[str, object]:
         "role": value.role,
         "runtime_arguments": list(value.runtime_arguments),
         "runtime_values": [list(values) for values in value.runtime_argument_values],
+        "resolved_arguments": [list(values) for values in value.resolved_arguments],
         "confidence": value.confidence,
     }
 
@@ -578,6 +590,7 @@ def _flow_from_json(
     arguments = item.get("arguments")
     runtime_arguments = item.get("runtime_arguments")
     runtime_values = item.get("runtime_values")
+    resolved_arguments = item.get("resolved_arguments")
     return CodeExternalFlow(
         path=spec.path,
         source=spec.source,
@@ -604,6 +617,15 @@ def _flow_from_json(
                 if isinstance(values, list)
             )
             if isinstance(runtime_values, list)
+            else ()
+        ),
+        resolved_arguments=(
+            tuple(
+                tuple(value for value in values if isinstance(value, str))
+                for values in resolved_arguments
+                if isinstance(values, list)
+            )
+            if isinstance(resolved_arguments, list)
             else ()
         ),
         confidence=item.get("confidence") if isinstance(item.get("confidence"), int) else 0,
