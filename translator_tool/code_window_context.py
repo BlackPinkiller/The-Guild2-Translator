@@ -63,9 +63,11 @@ def window_context_for_reference(reference: CodeReference, current_label: str = 
     header_label, body_label = _header_body_labels(call_name, labels_by_arg, button_label_set, current_label)
     referenced_label = _context_label(current_label or reference.label)
     if referenced_label:
-        if reference.role == "header" and not header_label:
+        if reference.role == "header":
             header_label = referenced_label
-        elif reference.role in {"body", "template"} and not body_label:
+        elif reference.role == "body":
+            body_label = referenced_label
+        elif reference.role == "template" and not body_label:
             body_label = referenced_label
         elif reference.role == "button" and not any(
             _equivalent_label(button.label, referenced_label) for button in buttons

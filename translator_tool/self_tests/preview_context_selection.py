@@ -82,6 +82,40 @@ def assert_preview_context_selection_understands_returned_label_roles() -> None:
         raise AssertionError(f"the returned label was not attached to the body slot: {selection.window!r}")
 
 
+def assert_preview_context_selection_keeps_the_current_dynamic_branch() -> None:
+    reference = CodeReference(
+        "messages_slander_speech_theft_+0",
+        Path("Slander.lua"),
+        137,
+        16,
+        "MsgSay",
+        1,
+        ('"Bard"', '"@L_MESSAGES_SLANDER_SPEECH_"..EvidenceLabel.."_+0"', 'GetID("Destination")'),
+        role="body",
+        runtime_arguments=('GetID("Destination")',),
+        resolved_arguments=(
+            ("Bard",),
+            (
+                "@L_MESSAGES_SLANDER_SPEECH_INTRO_+0",
+                "@L_MESSAGES_SLANDER_SPEECH_THEFT_+0",
+                "@L_MESSAGES_SLANDER_SPEECH_MURDER_+0",
+            ),
+            (),
+        ),
+        match_kind="dynamic",
+        confidence=78,
+    )
+    selection = select_preview_context(
+        "%1ST %1SA %1SV is stealing again.",
+        (reference,),
+        "_MESSAGES_SLANDER_SPEECH_THEFT_+0",
+    )
+    if selection.window is None or selection.window.call_name != "msgsay":
+        raise AssertionError(f"a concrete dynamic MsgSay branch lost its dialog style: {selection!r}")
+    if selection.window.body_label != "messages_slander_speech_theft_+0":
+        raise AssertionError(f"a dynamic call selected a sibling branch as its body: {selection.window!r}")
+
+
 def assert_preview_context_selection_prefers_displayed_runtime_labels() -> None:
     init_data = CodeReference(
         "law_level_+0",

@@ -13,7 +13,7 @@ from ..code_index import (
     scan_scripts_root,
 )
 from ..preview_context_selection import select_preview_context
-from ..preview_placeholders import _placeholder_expression
+from ..preview_placeholders import PlaceholderContext, PlaceholderValueBuilder, _placeholder_expression
 from ..script_semantics import analyze_script
 
 
@@ -157,6 +157,118 @@ def assert_placeholder_reference_selection_is_coherent() -> None:
     selected = select_preview_context("%1SN found %2l", (building, item), "SAME").references
     if selected != (item,):
         raise AssertionError(f"placeholder selection mixed or chose the weaker call site: {selected!r}")
+
+    variable_item = CodeReference(
+        "same",
+        Path("VariableItem.lua"),
+        1,
+        1,
+        "MsgQuick",
+        1,
+        ('""', '"@L_SAME_+0"', "Choice"),
+        runtime_arguments=("Choice",),
+        runtime_argument_values=(("ItemLabel[item1]",),),
+        role="body",
+        confidence=100,
+    )
+    variable_character = CodeReference(
+        "same",
+        Path("VariableCharacter.lua"),
+        1,
+        1,
+        "MsgQuick",
+        1,
+        ('""', '"@L_SAME_+0"', "Choice"),
+        runtime_arguments=("Choice",),
+        runtime_argument_values=(('GetID("Owner")',),),
+        role="body",
+        confidence=100,
+    )
+    selected = select_preview_context("Selected %1l", (variable_character, variable_item), "SAME").references
+    if selected != (variable_item,):
+        raise AssertionError(f"resolved custom-variable semantics did not affect placeholder ranking: {selected!r}")
+
+    character_projection = select_preview_context(
+        "%1ST %1SA %1SN",
+        (variable_item, variable_character),
+        "SAME",
+    ).references
+    if character_projection != (variable_character,):
+        raise AssertionError(
+            f"character field suffixes preferred a label value over a sim object: {character_projection!r}"
+        )
+
+
+def assert_placeholder_values_avoid_ambiguous_random_branches() -> None:
+    class Localization:
+        target_language = "en"
+
+        @staticmethod
+        def character_name(_seed: str, _number: int, _target: bool, *, forename_only: bool = False) -> str:
+            return "Alex" if forename_only else "Alex Smith"
+
+        @staticmethod
+        def sample_label(_prefix: str, _suffix: str, _seed: str, _number: int, _target: bool) -> str:
+            return "Supreme Commander"
+
+        @staticmethod
+        def localized(label: str, _target: bool) -> str:
+            return {
+                "_OPTION_BEGGAR_+0": "Beggar",
+                "_OPTION_EMPEROR_+0": "Emperor",
+            }.get(label, label)
+
+    ambiguous = CodeReference(
+        "branch_body_+0",
+        Path("Branches.lua"),
+        10,
+        1,
+        "MsgQuick",
+        1,
+        ('""', '"@L_BRANCH_BODY_+0"', "Choice"),
+        runtime_arguments=("Choice",),
+        runtime_argument_values=(("@L_OPTION_BEGGAR_+0", "@L_OPTION_EMPEROR_+0"),),
+        role="body",
+    )
+    context = PlaceholderContext("BRANCH_BODY_+0", "Text.dbt", False, "en", (ambiguous,))
+    builder = PlaceholderValueBuilder(Localization())
+    value = builder.argument_value(1, "l", context).text
+    if value in {"Beggar", "Emperor"}:
+        raise AssertionError(f"an unresolved runtime branch was presented as a certain value: {value!r}")
+
+    character = CodeReference(
+        "speech_+0",
+        Path("Speech.lua"),
+        20,
+        1,
+        "MsgSay",
+        1,
+        ('"Speaker"', '"@L_SPEECH_+0"', 'GetID("Destination")'),
+        runtime_arguments=('GetID("Destination")',),
+        role="body",
+    )
+    character_context = PlaceholderContext("SPEECH_+0", "Text.dbt", False, "en", (character,))
+    title = builder.argument_value(1, "ST", character_context).text
+    office = builder.argument_value(1, "SA", character_context).text
+    if title == "Supreme Commander" or office == "Supreme Commander":
+        raise AssertionError("character metadata placeholders still sampled unrelated extreme DB entries")
+
+    ambiguous_name = CodeReference(
+        "plain_name_+0",
+        Path("Branches.lua"),
+        30,
+        1,
+        "MsgQuick",
+        1,
+        ('""', '"@L_PLAIN_NAME_+0"', "Choice"),
+        runtime_arguments=("Choice",),
+        runtime_argument_values=(('GetID("City")', 'GetID("WorkBuilding")'),),
+        role="body",
+    )
+    ambiguous_context = PlaceholderContext("PLAIN_NAME_+0", "Text.dbt", False, "en", (ambiguous_name,))
+    plain_name = builder.argument_value(1, "NAME", ambiguous_context).text
+    if plain_name != "Object 1":
+        raise AssertionError(f"an ambiguous NAME branch was forced to one object type: {plain_name!r}")
 
 
 def assert_variadic_runtime_arguments_map_to_placeholder_positions() -> None:

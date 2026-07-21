@@ -5,7 +5,7 @@ from functools import lru_cache
 import re
 from typing import Protocol
 
-from .code_index import dynamic_label_patterns
+from .code_index import dynamic_label_patterns, normalize_label
 from .i18n import translate
 from .script_semantics import variadic_argument_pack
 
@@ -31,7 +31,7 @@ def placeholder_reference_complete(text: str, reference: object) -> bool:
             for match in _NESTED_PLACEHOLDER_RE.finditer(text)
         )
     )
-    return all(_placeholder_expression(reference, number) for number in placeholders)
+    return all(_placeholder_expressions(reference, number) for number in placeholders)
 
 
 def _reference_score(reference: object, placeholders: tuple[tuple[int, str], ...]) -> int:
@@ -49,12 +49,12 @@ def _reference_score(reference: object, placeholders: tuple[tuple[int, str], ...
     score = confidence + role_score
     complete = True
     for number, suffix in placeholders:
-        expression = _placeholder_expression(reference, number)
-        if not expression:
+        expressions = _placeholder_expressions(reference, number)
+        if not expressions:
             complete = False
             score -= 18
             continue
-        score += 5 + _expression_compatibility(expression, suffix)
+        score += 5 + max(_expression_compatibility(expression, suffix) for expression in expressions)
     if complete:
         score += 16
     return score
@@ -63,20 +63,27 @@ def _reference_score(reference: object, placeholders: tuple[tuple[int, str], ...
 def _expression_compatibility(expression: str, suffix: str) -> int:
     lowered = expression.casefold()
     normalized_suffix = suffix.upper()
-    if normalized_suffix in {"SN", "SV", "SZ", "SA", "DN"}:
-        return 8 if "getid(" in lowered or "owner" in lowered or "sim" in lowered else 1
+    if normalized_suffix in {"SN", "SV", "SZ", "SA", "SK", "ST", "SD", "SB", "SL"}:
+        if _plain_name_expression_kind(expression) == "character":
+            return 10
+        if "getid(" in lowered:
+            return 8
+        if "itemlabel" in lowered or "@l_" in lowered or lowered.lstrip().startswith("_"):
+            return -6
+        return 1
+    if normalized_suffix == "DN":
+        if "dynasty" in lowered or "dynid" in lowered:
+            return 10
+        return 3 if "getid(" in lowered else 0
     if normalized_suffix in {"GG", "GN", "GT"}:
         if "building" in lowered or "workbuilding" in lowered:
             return 9
         return 3 if "getid(" in lowered else 0
     if normalized_suffix == "NAME":
-        if "settlement" in lowered or "city" in lowered:
-            return 10
-        if "building" in lowered:
-            return 7
-        return 2 if "getid(" in lowered else 0
-    if normalized_suffix in {"SK", "ST", "SD", "SB", "SL"}:
-        return 8 if "label" in lowered or "@l_" in lowered or lowered.lstrip().startswith("_") else 1
+        semantic = _plain_name_expression_kind(expression)
+        if semantic:
+            return 9
+        return 4 if _looks_like_object_expression(expression) else 0
     if suffix in {"", "l", "s"}:
         if "itemgetlabel" in lowered or "itemlabel" in lowered:
             return 12
@@ -226,7 +233,17 @@ class PlaceholderValueBuilder:
                 )
             if semantic == "building":
                 return PlaceholderValue(_building_name_value(self.localization, number, context))
-            return PlaceholderValue(_city_value(self.localization, number, context))
+            if semantic == "city":
+                return PlaceholderValue(_city_value(self.localization, number, context))
+            if semantic == "dynasty":
+                full = self.localization.character_name(context.seed_key, number, context.target)
+                dynasty = full.rsplit(" ", 1)[-1] if full else ""
+                return PlaceholderValue(
+                    dynasty or translate("preview.value.dynasty", locale=context.locale, number=number)
+                )
+            return PlaceholderValue(
+                translate("preview.value.object_name", locale=context.locale, number=number)
+            )
         if suffix == "GG":
             building_name = _building_name_value(self.localization, number, context)
             building_type = _building_type_value(self.localization, number, context)
@@ -256,6 +273,8 @@ class PlaceholderValueBuilder:
         if sample is None:
             return None
         prefix, label_suffix, fallback_key = sample
+        if context.references:
+            return PlaceholderValue(translate(fallback_key, locale=context.locale, number=number))
         value = self.localization.sample_label(prefix, label_suffix, context.seed_key, number, context.target)
         if value:
             return PlaceholderValue(_clean_sample_text(value))
@@ -308,45 +327,72 @@ def _stable_index(seed: str, size: int) -> int:
 
 
 def _semantic_kind(number: int, context: PlaceholderContext) -> str:
-    priority = {"item": 4, "city": 3, "building": 2, "character": 1}
-    best = ""
+    kinds: set[str] = set()
     for reference in context.references:
-        expression = _placeholder_expression(reference, number)
-        lowered = expression.casefold()
-        if not lowered:
-            continue
-        if "itemgetlabel" in lowered or "itemlabel" in lowered:
-            candidate = "item"
-        elif "citylabel" in lowered or "settlement" in lowered or "city" in lowered:
-            candidate = "city"
-        elif "workbuilding" in lowered or "building" in lowered:
-            candidate = "building"
-        elif "getid(" in lowered or '"owner"' in lowered or "'owner'" in lowered:
-            candidate = "character"
-        else:
-            candidate = ""
-        if priority.get(candidate, 0) > priority.get(best, 0):
-            best = candidate
-    return best
+        for expression in _placeholder_expressions(reference, number):
+            lowered = expression.casefold()
+            if "itemgetlabel" in lowered or "itemlabel" in lowered:
+                candidate = "item"
+            elif "citylabel" in lowered or "settlement" in lowered or "city" in lowered:
+                candidate = "city"
+            elif "workbuilding" in lowered or "building" in lowered:
+                candidate = "building"
+            elif _plain_name_expression_kind(expression) == "character":
+                candidate = "character"
+            else:
+                candidate = ""
+            if candidate:
+                kinds.add(candidate)
+    return next(iter(kinds)) if len(kinds) == 1 else ""
 
 
 def _name_semantic_kind(number: int, context: PlaceholderContext) -> str:
+    kinds: set[str] = set()
     for reference in context.references:
-        expression = _placeholder_expression(reference, number)
-        next_expression = _placeholder_expression(reference, number + 1)
-        lowered = expression.casefold()
-        next_lowered = next_expression.casefold()
-        if "workbuilding" in lowered or "building" in lowered:
-            return "building"
-        if 'getid("")' in lowered:
-            return "building"
-        if "getsettlement" in lowered or "citylabel" in lowered or "settlement" in lowered or "city" in lowered:
-            return "city"
-        if "getsettlement" in next_lowered and "getid(" in lowered:
-            return "city"
-        if '"owner"' in lowered or "'owner'" in lowered:
-            return "character"
+        for expression in _placeholder_expressions(reference, number):
+            candidate = _plain_name_expression_kind(expression)
+            if candidate:
+                kinds.add(candidate)
+    return next(iter(kinds)) if len(kinds) == 1 else ""
+
+
+def _plain_name_expression_kind(expression: str) -> str:
+    """Return an object type only when the caller expression supplies direct evidence.
+
+    ``%NAME`` itself is type-neutral: the game asks the object passed by the caller
+    for its plain name.  A bare ``GetID(...)`` therefore does not prove that the
+    object is a sim, building, or settlement.
+    """
+    lowered = expression.casefold()
+    if "getsettlement" in lowered or "citylabel" in lowered:
+        return "city"
+    if "workbuilding" in lowered or "getbuilding" in lowered:
+        return "building"
+    if "getdynasty" in lowered or "dynastyget" in lowered or "dynid" in lowered:
+        return "dynasty"
+    if "simget" in lowered or "getsim" in lowered:
+        return "character"
+    alias_match = re.search(r"getid\s*\(\s*(['\"])([^'\"]+)\1\s*\)", expression, re.IGNORECASE)
+    if alias_match is None:
+        return ""
+    alias = alias_match.group(2).casefold()
+    if "settlement" in alias or re.search(r"(^|_)city($|_)", alias):
+        return "city"
+    if "building" in alias:
+        return "building"
+    if "dynasty" in alias or alias.startswith("dyn"):
+        return "dynasty"
+    if re.search(r"(^|_)(sim|person|character)($|_)", alias):
+        return "character"
     return ""
+
+
+def _looks_like_object_expression(expression: str) -> bool:
+    lowered = expression.casefold()
+    return any(
+        marker in lowered
+        for marker in ("getid(", "getsettlement", "getbuilding", "getdynasty", "simget", "getsim")
+    )
 
 
 def _placeholder_expression(reference: object, number: int) -> str:
@@ -383,6 +429,22 @@ def _placeholder_expression(reference: object, number: int) -> str:
     if 0 <= index < len(arguments):
         return str(arguments[index])
     return ""
+
+
+def _placeholder_expressions(reference: object, number: int) -> tuple[str, ...]:
+    values: list[str] = []
+    expression = _placeholder_expression(reference, number)
+    if expression:
+        values.append(expression)
+    runtime_values = getattr(reference, "runtime_argument_values", ())
+    if isinstance(runtime_values, tuple) and 0 < number <= len(runtime_values):
+        candidates = runtime_values[number - 1]
+        if isinstance(candidates, tuple):
+            for candidate in candidates:
+                value = str(candidate)
+                if value and value not in values:
+                    values.append(value)
+    return tuple(values)
 
 
 def _is_paired_body_argument(reference: object, expression: str) -> bool:
@@ -479,12 +541,19 @@ def _localized_expression_value(
     number: int,
     context: PlaceholderContext,
 ) -> str:
+    contextual = _contextual_dynamic_label(expression, context.label)
+    if contextual:
+        value = localization.localized(contextual, context.target)
+        if value and value != contextual:
+            return value
     labels = _literal_label_candidates(expression)
     if labels:
-        label = labels[_stable_index(f"{context.seed_key}:{number}:{expression}:label", len(labels))]
-        value = localization.localized(label, context.target)
-        if value and value != label:
-            return value
+        contextual_label = _matching_context_label(labels, context.label)
+        if len(labels) == 1 or contextual_label:
+            label = contextual_label or labels[0]
+            value = localization.localized(label, context.target)
+            if value and value != label:
+                return value
     for prefix, suffix in _dynamic_sample_candidates(expression):
         value = localization.sample_label(prefix, suffix, context.seed_key, number, context.target)
         if value:
@@ -516,10 +585,11 @@ def _localized_variable_value(
                 )
                 if value:
                     resolved_values.append(value)
-    if resolved_values:
-        return resolved_values[
-            _stable_index(f"{context.seed_key}:{number}:{variable}:resolved-label", len(resolved_values))
-        ]
+    resolved_values = list(dict.fromkeys(resolved_values))
+    if len(resolved_values) == 1:
+        return resolved_values[0]
+    if len(resolved_values) > 1:
+        return ""
     path = getattr(reference, "path", None)
     line = getattr(reference, "line", None)
     if path is None or not isinstance(line, int):
@@ -534,9 +604,33 @@ def _localized_variable_value(
         value = localization.sample_label(prefix, suffix, context.seed_key, number, context.target)
         if value:
             values.append(value)
-    if not values:
+    values = list(dict.fromkeys(values))
+    if len(values) != 1:
         return ""
-    return values[_stable_index(f"{context.seed_key}:{number}:{variable}:variable-label", len(values))]
+    return values[0]
+
+
+def _contextual_dynamic_label(expression: str, context_label: str) -> str:
+    if not context_label:
+        return ""
+    normalized = normalize_label(context_label).lstrip("_")
+    for pattern in dynamic_label_patterns(expression):
+        if _wildcard_label_matches(pattern.lstrip("_"), normalized):
+            return context_label if context_label.startswith("_") else "_" + context_label
+    return ""
+
+
+def _matching_context_label(labels: tuple[str, ...], context_label: str) -> str:
+    normalized = normalize_label(context_label).lstrip("_")
+    return next(
+        (label for label in labels if normalize_label(label).lstrip("_") == normalized),
+        "",
+    )
+
+
+def _wildcard_label_matches(pattern: str, label: str) -> bool:
+    regex = "^" + re.escape(pattern).replace(r"\*", ".*") + "$"
+    return re.match(regex, label, re.IGNORECASE) is not None
 
 
 @lru_cache(maxsize=2048)

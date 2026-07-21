@@ -65,6 +65,7 @@ from .self_tests.code_semantics import (
     assert_cross_file_return_labels_flow_only_to_real_callers,
     assert_code_semantics_follow_fields_panels_and_initdata,
     assert_code_semantics_are_scope_and_role_aware,
+    assert_placeholder_values_avoid_ambiguous_random_branches,
     assert_placeholder_reference_selection_is_coherent,
     assert_variadic_runtime_arguments_map_to_placeholder_positions,
 )
@@ -82,6 +83,7 @@ from .self_tests.performance import (
 from .self_tests.preview_context_selection import (
     assert_game_preview_parts_use_the_selected_call_site,
     assert_preview_context_selection_keeps_arguments_and_style_coherent,
+    assert_preview_context_selection_keeps_the_current_dynamic_branch,
     assert_preview_context_selection_prefers_displayed_runtime_labels,
     assert_preview_context_selection_understands_returned_label_roles,
 )
@@ -2776,8 +2778,10 @@ def assert_preview_i18n_and_symbol_mapping() -> None:
                 ),
             ),
         )
-        if "Jack Smith" not in head_body_semantic.display_text:
-            raise AssertionError("head/body paired labels did not skip the body label when mapping placeholders")
+        if head_body_semantic.display_text != "Object 1":
+            raise AssertionError(
+                "head/body argument mapping forced an unproven object type for plain NAME"
+            )
         dynamic_label_argument = service.render(
             "%1l hereby demands %3t from %2DN. signed %4l",
             unit_key="same-entry",
@@ -3027,13 +3031,36 @@ def assert_preview_i18n_and_symbol_mapping() -> None:
                     1,
                     1,
                     "MsgNews",
-                    1,
-                    ('"@L_NAME_CITY"', 'GetID("Officer")', 'GetSettlementID("Officer")'),
+                    0,
+                    ('"@L_NAME_CITY"', 'GetSettlementID("Officer")'),
                 ),
             ),
         )
         if "London" not in name_city.display_text:
-            raise AssertionError("NAME should use settlement context instead of blindly treating GetID as a character")
+            raise AssertionError("NAME should use a city only when its own caller argument proves settlement semantics")
+        name_unknown = service.render(
+            "%1NAME",
+            unit_key="same-entry",
+            label="NAME_UNKNOWN",
+            file_rel="Text.dbt",
+            kind="dbt",
+            target=False,
+            references=(
+                CodeReference(
+                    "NAME_UNKNOWN",
+                    temp / "Scripts" / "Ship.lua",
+                    1,
+                    1,
+                    "MsgNews",
+                    0,
+                    ('"@L_NAME_UNKNOWN"', 'GetID("Destination")'),
+                ),
+            ),
+        )
+        if name_unknown.display_text != "Object 1":
+            raise AssertionError(
+                f"NAME inferred a concrete object type without caller evidence: {name_unknown.display_text!r}"
+            )
         weak_priority = service.render(
             "%2l",
             unit_key="same-entry",
@@ -3664,8 +3691,10 @@ def main() -> int:
     assert_cross_file_return_labels_flow_only_to_real_callers()
     assert_code_index_handles_families_and_binary_gui()
     assert_placeholder_reference_selection_is_coherent()
+    assert_placeholder_values_avoid_ambiguous_random_branches()
     assert_variadic_runtime_arguments_map_to_placeholder_positions()
     assert_preview_context_selection_keeps_arguments_and_style_coherent()
+    assert_preview_context_selection_keeps_the_current_dynamic_branch()
     assert_preview_context_selection_prefers_displayed_runtime_labels()
     assert_preview_context_selection_understands_returned_label_roles()
     assert_game_preview_parts_use_the_selected_call_site()
