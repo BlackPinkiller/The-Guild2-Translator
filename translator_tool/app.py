@@ -79,7 +79,7 @@ from .ai import (
 )
 from .code_index import CodeReference, CodeReferenceIndex, CodeReferenceSet, label_group_key, normalize_label
 from .code_index_lazy import LazyCodeIndexBuilder, LazyIndexProgress
-from .code_window_context import DARK_PANEL_TEXT, PreviewWindowContext, best_window_context
+from .code_window_context import DARK_PANEL_TEXT, PreviewWindowContext
 from .code_open import open_code_reference
 from .codec_adapter import CodecError, Guild2Codec, load_codec_for_language, language_uses_codec
 from .diagnostics import configure_diagnostics, log_exception, log_failure, log_metrics, shutdown_diagnostics
@@ -114,6 +114,7 @@ from .project import (
     TranslationUnit,
 )
 from .preview import GLYPH_MARK, PREVIEW_MARK, PreviewAtom, PreviewDocument, PreviewService
+from .preview_context_selection import rank_preview_references, select_preview_context
 from .recovery import apply_recovery_draft, clear_recovery_draft, load_recovery_draft, save_recovery_draft
 from .search import SearchClause, parse_search_query, search_blob as _search_blob, search_field_values as _search_field_values
 from .settings import AppSettings, load_settings, protect_secret, reveal_secret, save_settings
@@ -3598,7 +3599,18 @@ class TranslatorWindow(QMainWindow):
             return ()
         if not unit.label or unit.ref.kind != "dbt" or self.code_reference_index is None:
             return ()
-        return self.code_reference_index.references_for(unit.label).active
+        return rank_preview_references(
+            unit.source_text,
+            self.code_reference_index.references_for(unit.label).active,
+            unit.label,
+        )
+
+    def _current_ranked_code_references(self) -> tuple[CodeReference, ...]:
+        unit = self._current_unit()
+        if unit is None:
+            return ()
+        references = self._current_code_reference_set().active
+        return rank_preview_references(unit.source_text, references, unit.label)
 
     def _project_is_mod(self) -> bool:
         return self.project_root is not None and self.project_root.name.casefold() != VANILLA_PROJECT_NAME.casefold()
@@ -3636,7 +3648,7 @@ class TranslatorWindow(QMainWindow):
 
     def _handle_code_button_event(self, event: QEvent) -> bool:
         if event.type() == QEvent.Type.MouseButtonPress and event.button() == Qt.MouseButton.LeftButton:
-            references = self._current_code_reference_set().active
+            references = self._current_ranked_code_references()
             if not references:
                 return True
             self.code_button_hold_timer.stop()
@@ -3684,7 +3696,7 @@ class TranslatorWindow(QMainWindow):
             self._open_code_reference(reference)
 
     def _show_code_reference_popup(self) -> None:
-        references = self._current_code_reference_set().active
+        references = self._current_ranked_code_references()
         if len(references) <= 1:
             return
         self.code_reference_popup.clear()
@@ -3729,7 +3741,7 @@ class TranslatorWindow(QMainWindow):
         self.code_reference_popup.raise_()
 
     def _open_first_code_reference(self) -> None:
-        references = self._current_code_reference_set().active
+        references = self._current_ranked_code_references()
         if references:
             self._open_code_reference(references[0])
 
@@ -3823,7 +3835,7 @@ class TranslatorWindow(QMainWindow):
         unit = self._current_unit()
         if unit is None:
             return None
-        context, header_unit, body_unit, button_units = self._game_preview_parts(unit)
+        context, header_unit, body_unit, button_units, context_references = self._game_preview_parts(unit)
         cache_key = (
             target,
             unit.uid,
@@ -3832,6 +3844,7 @@ class TranslatorWindow(QMainWindow):
             context.header_label if context is not None else "",
             context.body_label if context is not None else "",
             tuple((button.label, button.text) for button in context.buttons) if context is not None else (),
+            context_references,
             header_unit.uid if header_unit is not None else "",
             header_unit.current_text if target and header_unit is not None else (
                 header_unit.source_text if header_unit is not None else ""
@@ -3865,7 +3878,7 @@ class TranslatorWindow(QMainWindow):
                     file_rel=unit.file_rel,
                     kind=unit.ref.kind,
                     target=target,
-                    references=self._code_references_for_unit(unit),
+                    references=context_references or self._code_references_for_unit(unit),
                 )
             text = candidate.current_text if target else candidate.source_text
             if target and not text:
@@ -3877,7 +3890,7 @@ class TranslatorWindow(QMainWindow):
                 file_rel=candidate.file_rel,
                 kind=candidate.ref.kind,
                 target=target,
-                references=self._code_references_for_unit(candidate),
+                references=context_references or self._code_references_for_unit(candidate),
             )
 
         image = self.preview_service.game_window_image(
@@ -3895,8 +3908,19 @@ class TranslatorWindow(QMainWindow):
     def _game_preview_parts(
         self,
         unit: TranslationUnit,
-    ) -> tuple[PreviewWindowContext | None, TranslationUnit | None, TranslationUnit | None, tuple[TranslationUnit | str, ...]]:
-        context = best_window_context(self._code_references_for_unit(unit), unit.label)
+    ) -> tuple[
+        PreviewWindowContext | None,
+        TranslationUnit | None,
+        TranslationUnit | None,
+        tuple[TranslationUnit | str, ...],
+        tuple[CodeReference, ...],
+    ]:
+        selection = select_preview_context(
+            str(getattr(unit, "source_text", "") or ""),
+            self._code_references_for_unit(unit),
+            unit.label,
+        )
+        context = selection.window
         if context is None:
             header_unit, body_unit = self._paired_preview_units(unit)
             is_onscreen_help = TranslatorWindow._is_onscreen_help_label(unit.label)
@@ -3908,7 +3932,7 @@ class TranslatorWindow(QMainWindow):
                     header_label=normalize_label(header_unit.label) if header_unit is not None else "",
                     body_label=normalize_label(body_unit.label) if body_unit is not None else "",
                 )
-            return context, header_unit, body_unit, ()
+            return context, header_unit, body_unit, (), selection.references
         header_unit = self._unit_for_context_label(unit, context.header_label)
         body_unit = self._unit_for_context_label(unit, context.body_label)
         button_units: list[TranslationUnit | str] = []
@@ -3924,7 +3948,7 @@ class TranslatorWindow(QMainWindow):
             header_unit, body_unit = self._paired_preview_units(unit)
         if header_unit is None and body_unit is None:
             body_unit = unit
-        return context, header_unit, body_unit, tuple(button_units)
+        return context, header_unit, body_unit, tuple(button_units), selection.references
 
     def _unit_for_context_label(
         self,

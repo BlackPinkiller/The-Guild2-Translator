@@ -12,7 +12,8 @@ from ..code_index import (
     analyze_code_file,
     scan_scripts_root,
 )
-from ..preview_placeholders import _placeholder_expression, select_placeholder_references
+from ..preview_context_selection import select_preview_context
+from ..preview_placeholders import _placeholder_expression
 from ..script_semantics import analyze_script
 
 
@@ -153,7 +154,7 @@ def assert_placeholder_reference_selection_is_coherent() -> None:
         role="body",
         confidence=100,
     )
-    selected = select_placeholder_references("%1SN found %2l", (building, item))
+    selected = select_preview_context("%1SN found %2l", (building, item), "SAME").references
     if selected != (item,):
         raise AssertionError(f"placeholder selection mixed or chose the weaker call site: {selected!r}")
 

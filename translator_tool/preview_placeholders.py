@@ -14,25 +14,24 @@ GLYPH_MARK = "\ufffc"
 _NESTED_PLACEHOLDER_RE = re.compile(r"%(\d+)([A-Za-z]*)")
 
 
-def select_placeholder_references(text: str, references: tuple[object, ...]) -> tuple[object, ...]:
-    if len(references) <= 1:
-        return references
+def placeholder_reference_score(text: str, reference: object) -> int:
     placeholders = tuple(
         dict.fromkeys(
             (int(match.group(1)), match.group(2) or "")
             for match in _NESTED_PLACEHOLDER_RE.finditer(text)
         )
     )
-    if not placeholders:
-        return references[:1]
-    ranked = sorted(
-        enumerate(references),
-        key=lambda item: (
-            -_reference_score(item[1], placeholders),
-            item[0],
-        ),
+    return _reference_score(reference, placeholders)
+
+
+def placeholder_reference_complete(text: str, reference: object) -> bool:
+    placeholders = tuple(
+        dict.fromkeys(
+            int(match.group(1))
+            for match in _NESTED_PLACEHOLDER_RE.finditer(text)
+        )
     )
-    return (ranked[0][1],)
+    return all(_placeholder_expression(reference, number) for number in placeholders)
 
 
 def _reference_score(reference: object, placeholders: tuple[tuple[int, str], ...]) -> int:

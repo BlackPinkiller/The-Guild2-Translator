@@ -63,7 +63,23 @@ def window_context_for_reference(reference: CodeReference, current_label: str = 
     labels_by_arg = _labels_by_argument(arguments)
     button_label_set = {button.label for button in buttons if button.label}
     header_label, body_label = _header_body_labels(call_name, labels_by_arg, button_label_set, current_label)
+    referenced_label = _context_label(current_label or reference.label)
+    if referenced_label:
+        if reference.role == "header" and not header_label:
+            header_label = referenced_label
+        elif reference.role in {"body", "template"} and not body_label:
+            body_label = referenced_label
+        elif reference.role == "button" and not any(
+            _equivalent_label(button.label, referenced_label) for button in buttons
+        ):
+            buttons = (*buttons, PreviewWindowButton(identifier="", label=referenced_label))
     argument_labels = _runtime_argument_labels(labels_by_arg, (header_label, body_label), button_label_set)
+    if (
+        referenced_label
+        and reference.role == "runtime_label"
+        and not any(_equivalent_label(label, referenced_label) for label in argument_labels)
+    ):
+        argument_labels = (*argument_labels, referenced_label)
     if not header_label and not body_label and not buttons:
         return None
     background = _background_for_call(call_name)
@@ -146,6 +162,10 @@ def _context_label(label: str) -> str:
 
 def _context_has_label(context: PreviewWindowContext, label: str) -> bool:
     return any(_equivalent_label(candidate, label) for candidate in context.labels)
+
+
+def context_has_label(context: PreviewWindowContext, label: str) -> bool:
+    return _context_has_label(context, _context_label(label))
 
 
 def _buttons_from_arguments(arguments: tuple[str, ...], reference: CodeReference) -> tuple[PreviewWindowButton, ...]:

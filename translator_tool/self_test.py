@@ -79,6 +79,12 @@ from .self_tests.performance import (
     LARGE_BATCH_SAVE_LIMIT_SECONDS,
     assert_within_budget,
 )
+from .self_tests.preview_context_selection import (
+    assert_game_preview_parts_use_the_selected_call_site,
+    assert_preview_context_selection_keeps_arguments_and_style_coherent,
+    assert_preview_context_selection_prefers_displayed_runtime_labels,
+    assert_preview_context_selection_understands_returned_label_roles,
+)
 from .source_sync import (
     discover_game_source_projects,
     local_project_roots,
@@ -659,7 +665,7 @@ def assert_name_tooltip_preview_pairs_title_and_body() -> None:
     paired_name, paired_tooltip = TranslatorWindow._paired_preview_units(window, tooltip)
     if paired_name is not name or paired_tooltip is not tooltip:
         raise AssertionError("TOOLTIP should pair back to the matching NAME title")
-    context, header, body, buttons = TranslatorWindow._game_preview_parts(window, tooltip)
+    context, header, body, buttons, _references = TranslatorWindow._game_preview_parts(window, tooltip)
     if context is None or context.kind != "tooltip" or context.background != "dark_panel":
         raise AssertionError(f"NAME/TOOLTIP pairs should use the tooltip preview profile: {context!r}")
     if context.default_color != DARK_PANEL_TEXT:
@@ -3617,6 +3623,10 @@ def main() -> int:
     assert_code_index_handles_families_and_binary_gui()
     assert_placeholder_reference_selection_is_coherent()
     assert_variadic_runtime_arguments_map_to_placeholder_positions()
+    assert_preview_context_selection_keeps_arguments_and_style_coherent()
+    assert_preview_context_selection_prefers_displayed_runtime_labels()
+    assert_preview_context_selection_understands_returned_label_roles()
+    assert_game_preview_parts_use_the_selected_call_site()
     assert_lazy_code_index_prioritizes_requested_labels_and_invalidates_cache()
     assert_lazy_code_index_links_cached_cross_file_facts()
     assert_lazy_code_index_survives_unwritable_cache()

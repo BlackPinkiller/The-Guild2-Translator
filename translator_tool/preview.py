@@ -16,7 +16,8 @@ from PySide6.QtGui import QColor, QFont, QFontMetrics, QImage, QPainter, qRgba
 from .code_window_context import PreviewWindowContext
 from .format_io import load_dbt, translatable_fields
 from .i18n import translate
-from .preview_placeholders import PlaceholderContext, PlaceholderValueBuilder, select_placeholder_references
+from .preview_context_selection import select_preview_context
+from .preview_placeholders import PlaceholderContext, PlaceholderValueBuilder
 from .preview_profiles import PreviewProfile, preview_profile
 from .validation import (
     COLOR_TOKEN_RE,
@@ -640,7 +641,7 @@ class PreviewService:
         target: bool,
         references: tuple[object, ...] = (),
     ) -> PreviewDocument:
-        references = select_placeholder_references(text, references)
+        references = select_preview_context(text, references, label).references
         key = (unit_key, label, file_rel, kind, target, references, text)
         cached = self._render_cache.get(key)
         if cached is not None:
