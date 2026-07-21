@@ -67,6 +67,11 @@ from .self_tests.code_semantics import (
     assert_placeholder_reference_selection_is_coherent,
     assert_variadic_runtime_arguments_map_to_placeholder_positions,
 )
+from .self_tests.code_index_lazy import (
+    assert_code_index_requests_selected_and_visible_rows_without_moving_viewport,
+    assert_lazy_code_index_prioritizes_requested_labels_and_invalidates_cache,
+    assert_lazy_code_index_survives_unwritable_cache,
+)
 from .self_tests.performance import (
     LARGE_BATCH_MIN_ENTRIES,
     LARGE_BATCH_SAVE_LIMIT_SECONDS,
@@ -3609,6 +3614,9 @@ def main() -> int:
     assert_code_index_handles_families_and_binary_gui()
     assert_placeholder_reference_selection_is_coherent()
     assert_variadic_runtime_arguments_map_to_placeholder_positions()
+    assert_lazy_code_index_prioritizes_requested_labels_and_invalidates_cache()
+    assert_lazy_code_index_survives_unwritable_cache()
+    assert_code_index_requests_selected_and_visible_rows_without_moving_viewport()
     assert_stale_code_index_workers_are_released()
     assert_code_window_context_extracts_window_labels_and_buttons()
     assert_code_preview_unit_lookup_accepts_leading_underscore_labels()

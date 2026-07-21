@@ -77,7 +77,8 @@ from .ai import (
     llm_provider_from_settings,
     provider_from_settings,
 )
-from .code_index import CodeReference, CodeReferenceIndex, CodeReferenceSet, build_code_reference_index, label_group_key, normalize_label
+from .code_index import CodeReference, CodeReferenceIndex, CodeReferenceSet, label_group_key, normalize_label
+from .code_index_lazy import LazyCodeIndexBuilder, LazyIndexProgress
 from .code_window_context import DARK_PANEL_TEXT, PreviewWindowContext, best_window_context
 from .code_open import open_code_reference
 from .codec_adapter import CodecError, Guild2Codec, load_codec_for_language, language_uses_codec
@@ -1756,7 +1757,8 @@ class AiWorker(QRunnable):
 
 
 class CodeIndexWorkerSignals(QObject):
-    ready = Signal(int, object)
+    partial = Signal(int, object, object)
+    finished = Signal(int)
     failed = Signal(int, str)
 
 
@@ -1768,22 +1770,80 @@ class CodeIndexWorker(QRunnable):
         self.game_root = game_root
         self.project_root = project_root
         self.signals = CodeIndexWorkerSignals()
+        self.cancel_event = threading.Event()
+        self._request_lock = threading.Lock()
+        self._requested: dict[str, int] = {}
+
+    def request_labels(self, labels: Iterable[str], priority: int) -> None:
+        with self._request_lock:
+            for label in labels:
+                normalized = normalize_label(label)
+                if not normalized:
+                    continue
+                current = self._requested.get(normalized)
+                if current is None or priority < current:
+                    self._requested[normalized] = priority
+
+    def cancel(self) -> None:
+        self.cancel_event.set()
+
+    def _take_requested(self) -> tuple[str, ...]:
+        with self._request_lock:
+            if not self._requested:
+                return ()
+            priority = min(self._requested.values())
+            labels = tuple(
+                label
+                for label, requested_priority in self._requested.items()
+                if requested_priority == priority
+            )
+            for label in labels:
+                self._requested.pop(label, None)
+            return labels
+
+    def _has_requested(self) -> bool:
+        with self._request_lock:
+            return bool(self._requested)
 
     def run(self) -> None:
+        if self.game_root is None or self.project_root is None:
+            self.signals.finished.emit(self.token)
+            return
+        builder = LazyCodeIndexBuilder(
+            self.game_root,
+            self.project_root,
+            vanilla_project_name=VANILLA_PROJECT_NAME,
+        )
         try:
-            index = build_code_reference_index(
-                self.game_root,
-                self.project_root,
-                vanilla_project_name=VANILLA_PROJECT_NAME,
-            )
+            while not self.cancel_event.is_set():
+                labels = self._take_requested()
+                if labels:
+                    index = builder.analyze_labels(
+                        labels,
+                        cancelled=self.cancel_event.is_set,
+                    )
+                else:
+                    index = builder.analyze_next_batch(
+                        12,
+                        cancelled=lambda: self.cancel_event.is_set() or self._has_requested(),
+                    )
+                progress = builder.progress
+                if not index.is_empty:
+                    self.signals.partial.emit(self.token, index, progress)
+                if progress.complete:
+                    break
         except Exception as exc:
             try:
                 self.signals.failed.emit(self.token, str(exc))
             except RuntimeError:
                 pass
             return
+        finally:
+            builder.close()
+        if self.cancel_event.is_set():
+            return
         try:
-            self.signals.ready.emit(self.token, index)
+            self.signals.finished.emit(self.token)
         except RuntimeError:
             pass
 
@@ -3145,8 +3205,16 @@ class TranslatorWindow(QMainWindow):
         self.code_button_hold_timer.setInterval(260)
         self.code_button_hold_timer.timeout.connect(self._show_code_reference_popup)
         self.code_reference_index: CodeReferenceIndex | None = None
+        self.code_reference_index_complete = False
         self.code_reference_index_token = 0
         self.code_reference_workers: list[CodeIndexWorker] = []
+        self.code_index_visible_timer = QTimer(self)
+        self.code_index_visible_timer.setSingleShot(True)
+        self.code_index_visible_timer.setInterval(90)
+        self.code_index_visible_timer.timeout.connect(self._request_visible_code_contexts)
+        self.table.verticalScrollBar().valueChanged.connect(
+            lambda _value: self.code_index_visible_timer.start()
+        )
         self.source_preview_button.toggled.connect(
             lambda checked: self._on_editor_preview_toggled(False, checked)
         )
@@ -3268,6 +3336,10 @@ class TranslatorWindow(QMainWindow):
                     return True
         table = getattr(self, "table", None)
         if isinstance(table, QTableView) and (watched is table or watched is table.viewport()):
+            if watched is table.viewport() and event.type() == QEvent.Type.Resize:
+                visible_timer = getattr(self, "code_index_visible_timer", None)
+                if isinstance(visible_timer, QTimer):
+                    visible_timer.start()
             if event.type() == QEvent.Type.ShortcutOverride and isinstance(event, QKeyEvent):
                 if event.matches(QKeySequence.StandardKey.Copy) or event.matches(QKeySequence.StandardKey.Paste):
                     event.accept()
@@ -3418,24 +3490,61 @@ class TranslatorWindow(QMainWindow):
         self.table_layout.setContentsMargins(margin, margin, margin, margin)
 
     def _start_code_reference_index(self) -> None:
-        self.code_reference_index = None
+        for stale_worker in self.code_reference_workers:
+            stale_worker.cancel()
+        self.code_reference_workers.clear()
+        self.code_reference_index = CodeReferenceIndex()
+        self.code_reference_index_complete = False
         self.code_reference_index_token += 1
         token = self.code_reference_index_token
         self._update_code_reference_display()
         worker = CodeIndexWorker(token, self.game_root, self.project_root)
-        worker.signals.ready.connect(self._code_reference_index_ready)
+        worker.signals.partial.connect(self._code_reference_index_partial)
+        worker.signals.finished.connect(self._code_reference_index_finished)
         worker.signals.failed.connect(self._code_reference_index_failed)
         self.code_reference_workers.append(worker)
         self.thread_pool.start(worker)
+        unit = self._current_unit()
+        if unit is not None:
+            self._request_code_context_for_unit(unit)
+        self.code_index_visible_timer.start()
 
-    def _code_reference_index_ready(self, token: int, index: object) -> None:
+    def _code_reference_index_partial(
+        self,
+        token: int,
+        index: object,
+        progress: object,
+    ) -> None:
+        if token != self.code_reference_index_token or not isinstance(index, CodeReferenceIndex):
+            return
+        if self.code_reference_index is None:
+            self.code_reference_index = CodeReferenceIndex()
+        self.code_reference_index.merge(index)
+        if isinstance(progress, LazyIndexProgress):
+            self.code_reference_index_complete = progress.complete
+        self._update_code_reference_display()
+        self._refresh_preview_presentations()
+
+    def _code_reference_index_finished(self, token: int) -> None:
         self.code_reference_workers = [
             worker for worker in self.code_reference_workers if worker.token != token
         ]
-        if token != self.code_reference_index_token or not isinstance(index, CodeReferenceIndex):
+        if token != self.code_reference_index_token:
             return
-        self.code_reference_index = index
+        self.code_reference_index_complete = True
         self._update_code_reference_display()
+        self._refresh_preview_presentations()
+
+    def _code_reference_index_ready(self, token: int, index: object) -> None:
+        """Compatibility entry point for stale-worker cleanup tests and old signals."""
+        if isinstance(index, CodeReferenceIndex):
+            TranslatorWindow._code_reference_index_partial(
+                self,
+                token,
+                index,
+                LazyIndexProgress(0, 0, True),
+            )
+        TranslatorWindow._code_reference_index_finished(self, token)
 
     def _code_reference_index_failed(self, token: int, message: str) -> None:
         self.code_reference_workers = [
@@ -3444,8 +3553,39 @@ class TranslatorWindow(QMainWindow):
         if token != self.code_reference_index_token:
             return
         self.code_reference_index = CodeReferenceIndex()
+        self.code_reference_index_complete = True
         self._update_code_reference_display()
         self.statusBar().showMessage(translate("status.code_index_failed", error=message), 4000)
+
+    def _request_code_context_for_unit(self, unit: TranslationUnit) -> None:
+        if unit.ref.kind != "dbt" or not unit.label or not self.code_reference_workers:
+            return
+        self.code_reference_workers[-1].request_labels((unit.label,), 0)
+
+    def _request_visible_code_contexts(self) -> None:
+        if (
+            not self.code_reference_workers
+            or not self.table_frame.isVisible()
+            or self.proxy.rowCount() <= 0
+        ):
+            return
+        viewport = self.table.viewport()
+        first = self.table.rowAt(0)
+        last = self.table.rowAt(max(0, viewport.height() - 1))
+        if first < 0:
+            first = 0
+        if last < first:
+            visible_count = max(1, viewport.height() // max(1, self.table.verticalHeader().defaultSectionSize()))
+            last = min(self.proxy.rowCount() - 1, first + visible_count - 1)
+        margin = max(1, last - first + 1)
+        start = max(0, first - margin)
+        stop = min(self.proxy.rowCount(), last + margin + 1)
+        labels: list[str] = []
+        for row in range(start, stop):
+            unit = self._unit_from_proxy_index(self.proxy.index(row, 0))
+            if unit is not None and unit.ref.kind == "dbt" and unit.label:
+                labels.append(unit.label)
+        self.code_reference_workers[-1].request_labels(labels, 1)
 
     def _current_code_reference_set(self) -> CodeReferenceSet:
         unit = self._current_unit()
@@ -3484,8 +3624,11 @@ class TranslatorWindow(QMainWindow):
             elif self._project_is_mod() and references.vanilla_count:
                 self.code_reference_label.setText(translate("code.references.vanilla_count", count=references.vanilla_count))
                 self.source_code_button.setEnabled(True)
-            else:
+            elif self.code_reference_index_complete:
                 self.code_reference_label.setText(translate("code.references.zero"))
+                self.source_code_button.setEnabled(False)
+            else:
+                self.code_reference_label.setText(translate("code.references.loading"))
                 self.source_code_button.setEnabled(False)
         self.source_code_button.setToolTip(self.code_reference_label.text())
         if isinstance(self.source_box, EditorGroupBox):
@@ -4660,6 +4803,7 @@ class TranslatorWindow(QMainWindow):
         )
         self.last_applied_query = query.strip()
         self._update_counts()
+        self.code_index_visible_timer.start()
         if self._sync_document_layout():
             return
         if previous_document_mode:
@@ -4699,6 +4843,7 @@ class TranslatorWindow(QMainWindow):
         self.reset_sort_button.setVisible(sorted_view)
         if self._filter_anchor_uid:
             self._restore_selected_row(self._filter_anchor_uid)
+        self.code_index_visible_timer.start()
 
     def _reset_table_sort(self) -> None:
         self.proxy.sort(-1)
@@ -4706,6 +4851,7 @@ class TranslatorWindow(QMainWindow):
         self.reset_sort_button.hide()
         if self._filter_anchor_uid:
             self._restore_selected_row(self._filter_anchor_uid)
+        self.code_index_visible_timer.start()
 
     def _on_search_changed(self, text: str) -> None:
         # Do not apply an empty intermediate value synchronously. Replacing a
@@ -4821,6 +4967,8 @@ class TranslatorWindow(QMainWindow):
         self.current_uid = unit.uid if unit else ""
         if unit is not None:
             self._filter_anchor_uid = unit.uid
+            self._request_code_context_for_unit(unit)
+            self.code_index_visible_timer.start()
         self._set_editor_unit(unit)
         self._update_window_title()
 
@@ -5970,12 +6118,15 @@ class TranslatorWindow(QMainWindow):
         self.counts_refresh_timer.stop()
         self.ai_filter_refresh_timer.stop()
         self.code_button_hold_timer.stop()
+        self.code_index_visible_timer.stop()
         self.source_preview_tooltip_filter.cancel()
         self.translation_preview_tooltip_filter.cancel()
         if self.ai_cancel_event is not None:
             self.ai_cancel_event.set()
         if self.suggestion_cancel_event is not None:
             self.suggestion_cancel_event.set()
+        for worker in self.code_reference_workers:
+            worker.cancel()
         self.code_reference_index_token += 1
 
 
