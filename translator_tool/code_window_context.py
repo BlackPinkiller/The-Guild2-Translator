@@ -5,6 +5,7 @@ from functools import lru_cache
 import re
 
 from .code_index import CodeReference, LABEL_RE, dynamic_label_patterns, normalize_label
+from .script_semantics import call_contract
 
 
 PARCHMENT_TEXT = (55, 38, 24, 255)
@@ -306,6 +307,33 @@ def _header_body_labels(
                 candidates.append((argument_index, label))
     if not candidates:
         return "", ""
+    contract = call_contract(call_name)
+    if contract is not None:
+        role_by_index = dict(contract.label_roles)
+        header_candidates = [
+            (index, label)
+            for index, label in candidates
+            if role_by_index.get(index) == "header"
+        ]
+        body_candidates = [
+            (index, label)
+            for index, label in candidates
+            if role_by_index.get(index) == "body"
+        ]
+        header_values = (
+            _specialize_candidates(header_candidates, current_label, minimum_argument_index=0)
+            if header_candidates
+            else []
+        )
+        body_values = (
+            _specialize_candidates(body_candidates, current_label, minimum_argument_index=0)
+            if body_candidates
+            else []
+        )
+        if header_values or body_values:
+            header = _nearest_or_first_label(header_values, current_label) if header_values else ""
+            body = _nearest_or_first_label(body_values, current_label) if body_values else ""
+            return header, body
     if call_name.startswith("feedback_message"):
         return _labels_from_first_two(_specialize_candidates(candidates, current_label, minimum_argument_index=1))
     if call_name == "msgsayinteraction":

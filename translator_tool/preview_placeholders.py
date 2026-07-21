@@ -7,10 +7,94 @@ from typing import Protocol
 
 from .code_index import dynamic_label_patterns
 from .i18n import translate
+from .script_semantics import variadic_argument_pack
 
 
 GLYPH_MARK = "\ufffc"
 _NESTED_PLACEHOLDER_RE = re.compile(r"%(\d+)([A-Za-z]*)")
+
+
+def select_placeholder_references(text: str, references: tuple[object, ...]) -> tuple[object, ...]:
+    if len(references) <= 1:
+        return references
+    placeholders = tuple(
+        dict.fromkeys(
+            (int(match.group(1)), match.group(2) or "")
+            for match in _NESTED_PLACEHOLDER_RE.finditer(text)
+        )
+    )
+    if not placeholders:
+        return references[:1]
+    ranked = sorted(
+        enumerate(references),
+        key=lambda item: (
+            -_reference_score(item[1], placeholders),
+            item[0],
+        ),
+    )
+    return (ranked[0][1],)
+
+
+def _reference_score(reference: object, placeholders: tuple[tuple[int, str], ...]) -> int:
+    confidence = int(getattr(reference, "confidence", 0) or 0)
+    role = str(getattr(reference, "role", "") or "")
+    role_score = {
+        "body": 18,
+        "header": 18,
+        "template": 14,
+        "runtime_label": 8,
+        "button": 5,
+        "assignment": -8,
+        "gui_resource": -20,
+    }.get(role, 0)
+    score = confidence + role_score
+    complete = True
+    for number, suffix in placeholders:
+        expression = _placeholder_expression(reference, number)
+        if not expression:
+            complete = False
+            score -= 18
+            continue
+        score += 5 + _expression_compatibility(expression, suffix)
+    if complete:
+        score += 16
+    return score
+
+
+def _expression_compatibility(expression: str, suffix: str) -> int:
+    lowered = expression.casefold()
+    normalized_suffix = suffix.upper()
+    if normalized_suffix in {"SN", "SV", "SZ", "SA", "DN"}:
+        return 8 if "getid(" in lowered or "owner" in lowered or "sim" in lowered else 1
+    if normalized_suffix in {"GG", "GN", "GT"}:
+        if "building" in lowered or "workbuilding" in lowered:
+            return 9
+        return 3 if "getid(" in lowered else 0
+    if normalized_suffix == "NAME":
+        if "settlement" in lowered or "city" in lowered:
+            return 10
+        if "building" in lowered:
+            return 7
+        return 2 if "getid(" in lowered else 0
+    if normalized_suffix in {"SK", "ST", "SD", "SB", "SL"}:
+        return 8 if "label" in lowered or "@l_" in lowered or lowered.lstrip().startswith("_") else 1
+    if suffix in {"", "l", "s"}:
+        if "itemgetlabel" in lowered or "itemlabel" in lowered:
+            return 12
+        if "label" in lowered or "@l_" in lowered or lowered.lstrip().startswith("_"):
+            return 8
+        if "settlement" in lowered or "city" in lowered:
+            return 5
+        if "getid(" in lowered:
+            return -1
+        return 1
+    if suffix in {"n", "i", "f", "t", "c", "z", "j"}:
+        if re.fullmatch(r"[-+]?\d+(?:\.\d+)?", expression.strip()):
+            return 6
+        if "getid(" in lowered or "@l_" in lowered:
+            return -4
+        return 2
+    return 0
 
 
 class PlaceholderLocalization(Protocol):
@@ -267,6 +351,18 @@ def _name_semantic_kind(number: int, context: PlaceholderContext) -> str:
 
 
 def _placeholder_expression(reference: object, number: int) -> str:
+    runtime_arguments = getattr(reference, "runtime_arguments", ())
+    if isinstance(runtime_arguments, tuple) and runtime_arguments:
+        remaining = number
+        for index, expression in enumerate(runtime_arguments):
+            value = str(expression)
+            pack = variadic_argument_pack(value) if index == len(runtime_arguments) - 1 else ""
+            if pack:
+                return f"{pack}[{remaining}]" if remaining > 0 else ""
+            if remaining == 1:
+                return value
+            remaining -= 1
+        return ""
     argument_index = getattr(reference, "argument_index", None)
     arguments = getattr(reference, "arguments", ())
     if not isinstance(argument_index, int) or not isinstance(arguments, tuple):
@@ -407,6 +503,24 @@ def _localized_variable_value(
     variable = expression.strip()
     if not re.match(r"^[A-Za-z_][A-Za-z0-9_]*$", variable):
         return ""
+    runtime_values = getattr(reference, "runtime_argument_values", ())
+    resolved_values: list[str] = []
+    if isinstance(runtime_values, tuple) and 0 < number <= len(runtime_values):
+        candidates = runtime_values[number - 1]
+        if isinstance(candidates, tuple):
+            for candidate in candidates:
+                value = _localized_expression_value(
+                    localization,
+                    str(candidate),
+                    number,
+                    context,
+                )
+                if value:
+                    resolved_values.append(value)
+    if resolved_values:
+        return resolved_values[
+            _stable_index(f"{context.seed_key}:{number}:{variable}:resolved-label", len(resolved_values))
+        ]
     path = getattr(reference, "path", None)
     line = getattr(reference, "line", None)
     if path is None or not isinstance(line, int):

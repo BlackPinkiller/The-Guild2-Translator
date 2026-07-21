@@ -60,6 +60,13 @@ from .project import (
 )
 from .settings import AppSettings, load_settings, save_settings
 from .self_tests.clipboard import assert_entry_clipboard_decoder
+from .self_tests.code_semantics import (
+    assert_code_index_handles_families_and_binary_gui,
+    assert_code_semantics_follow_fields_panels_and_initdata,
+    assert_code_semantics_are_scope_and_role_aware,
+    assert_placeholder_reference_selection_is_coherent,
+    assert_variadic_runtime_arguments_map_to_placeholder_positions,
+)
 from .self_tests.performance import (
     LARGE_BATCH_MIN_ENTRIES,
     LARGE_BATCH_SAVE_LIMIT_SECONDS,
@@ -3597,6 +3604,11 @@ def main() -> int:
     assert_local_project_roots_detect_sources_projects()
     assert_discover_game_source_projects_detects_vanilla_and_mods()
     assert_code_reference_index_avoids_db_and_uses_vanilla_fallback()
+    assert_code_semantics_are_scope_and_role_aware()
+    assert_code_semantics_follow_fields_panels_and_initdata()
+    assert_code_index_handles_families_and_binary_gui()
+    assert_placeholder_reference_selection_is_coherent()
+    assert_variadic_runtime_arguments_map_to_placeholder_positions()
     assert_stale_code_index_workers_are_released()
     assert_code_window_context_extracts_window_labels_and_buttons()
     assert_code_preview_unit_lookup_accepts_leading_underscore_labels()
