@@ -1348,6 +1348,7 @@ class PreviewPlainTextEdit(QTextEdit):
         self._raw_text = ""
         self._preview_enabled = False
         self._editing_raw = False
+        self._uses_application_undo_history = False
         self._preview_builder: Callable[[str], PreviewDocument] | None = None
         self._glyph_provider: Callable[[int], object | None] | None = None
         self._text_glyph_provider: Callable[[str, tuple[int, int, int, int] | None], object | None] | None = None
@@ -1362,6 +1363,16 @@ class PreviewPlainTextEdit(QTextEdit):
     @property
     def rendered_preview(self) -> PreviewDocument:
         return self._preview_document
+
+    def use_application_undo_history(self) -> None:
+        self._uses_application_undo_history = True
+        self._sync_native_undo()
+
+    def _sync_native_undo(self) -> None:
+        enabled = not self._preview_enabled and not self.isReadOnly() and not self._uses_application_undo_history
+        self.setUndoRedoEnabled(enabled)
+        if not enabled:
+            self.document().clearUndoRedoStacks()
 
     def set_preview_builder(
         self,
@@ -1392,7 +1403,7 @@ class PreviewPlainTextEdit(QTextEdit):
             self._raw_text = QTextEdit.toPlainText(self)
             raw_position = self.textCursor().position()
             self._preview_enabled = True
-            self.setUndoRedoEnabled(False)
+            self._sync_native_undo()
             self._render_preview(raw_position)
         else:
             raw_position = self._preview_document.raw_position(self.textCursor().position())
@@ -1403,8 +1414,7 @@ class PreviewPlainTextEdit(QTextEdit):
             cursor.setPosition(min(raw_position, len(self._raw_text)))
             self.setTextCursor(cursor)
             del blocker
-            self.setUndoRedoEnabled(not self.isReadOnly())
-            self.document().clearUndoRedoStacks()
+            self._sync_native_undo()
         self.previewRendered.emit()
 
     def refresh_preview(self) -> None:
@@ -2948,7 +2958,6 @@ class TranslatorWindow(QMainWindow):
         self.typing_uid = ""
         self.typing_before = ""
         self.typing_before_deleted = False
-        self._replaying_editor_history = False
         self.editor_zoom_steps = self.settings.editor_zoom_steps
         self.typing_timer = QTimer(self)
         self.typing_timer.setSingleShot(True)
@@ -3249,7 +3258,7 @@ class TranslatorWindow(QMainWindow):
             self.settings.preview_game_font_in_editors,
             lambda char, color: self.preview_service.text_glyph_image(char, True, color),
         )
-        self.translation_edit.setUndoRedoEnabled(True)
+        self.translation_edit.use_application_undo_history()
         self.source_edit.installEventFilter(self)
         self.source_edit.viewport().installEventFilter(self)
         self.translation_edit.installEventFilter(self)
@@ -3383,13 +3392,6 @@ class TranslatorWindow(QMainWindow):
             Qt.KeyboardModifier.ControlModifier | Qt.KeyboardModifier.ShiftModifier
         )
 
-    def _focused_editor(self) -> PreviewPlainTextEdit | None:
-        focus = QApplication.focusWidget()
-        for editor in self._editor_widgets():
-            if focus is editor or (focus is not None and editor.isAncestorOf(focus)):
-                return editor
-        return None
-
     def _watched_editor(self, watched: QObject) -> PreviewPlainTextEdit | None:
         for editor in self._editor_widgets():
             if watched is editor or watched is editor.viewport():
@@ -3405,42 +3407,6 @@ class TranslatorWindow(QMainWindow):
         if isinstance(translation, PreviewPlainTextEdit):
             editors.append(translation)
         return tuple(editors)
-
-    def _try_editor_undo(self) -> bool:
-        editor = self._focused_editor()
-        if editor is None:
-            return False
-        if editor is not self.translation_edit:
-            return False
-        if not editor.document().isUndoAvailable():
-            # A redoable editor command means local undo just reached the
-            # entry's initial text.  Do not replay the same typing through the
-            # application-level history.  When both stacks are empty (for
-            # example after a Guides/dbt switch), the normal fallback remains.
-            return editor.document().isRedoAvailable()
-        self._cancel_pending_typing_operation()
-        self._replaying_editor_history = True
-        try:
-            editor.undo()
-        finally:
-            self._replaying_editor_history = False
-        return True
-
-    def _try_editor_redo(self) -> bool:
-        editor = self._focused_editor()
-        if editor is None:
-            return False
-        if editor is not self.translation_edit:
-            return False
-        if not editor.document().isRedoAvailable():
-            return False
-        self._cancel_pending_typing_operation()
-        self._replaying_editor_history = True
-        try:
-            editor.redo()
-        finally:
-            self._replaying_editor_history = False
-        return True
 
     def _apply_editor_zoom(self) -> None:
         factor = max(0.2, 1.0 + self.editor_zoom_steps * 0.1)
@@ -5077,16 +5043,15 @@ class TranslatorWindow(QMainWindow):
         if unit is None:
             return
         text = self.translation_edit.toPlainText()
-        if not self._replaying_editor_history:
-            if not self.typing_uid:
-                self.typing_uid = unit.uid
-                self.typing_before = unit.current_text
-                self.typing_before_deleted = unit.pending_delete
-            elif self.typing_uid != unit.uid:
-                self._commit_typing_operation()
-                self.typing_uid = unit.uid
-                self.typing_before = unit.current_text
-                self.typing_before_deleted = unit.pending_delete
+        if not self.typing_uid:
+            self.typing_uid = unit.uid
+            self.typing_before = unit.current_text
+            self.typing_before_deleted = unit.pending_delete
+        elif self.typing_uid != unit.uid:
+            self._commit_typing_operation()
+            self.typing_uid = unit.uid
+            self.typing_before = unit.current_text
+            self.typing_before_deleted = unit.pending_delete
         before_status = unit.filter_status()
         self._set_unit_text(unit, text)
         self.model.refresh_unit(unit)
@@ -5097,8 +5062,7 @@ class TranslatorWindow(QMainWindow):
         self._schedule_counts_update()
         self._update_window_title()
         self._schedule_recovery_snapshot()
-        if not self._replaying_editor_history:
-            self.typing_timer.start()
+        self.typing_timer.start()
 
     def _commit_typing_operation(self) -> None:
         self.typing_timer.stop()
@@ -5163,6 +5127,10 @@ class TranslatorWindow(QMainWindow):
         self._schedule_recovery_snapshot()
 
     def _apply_operation_changes(self, changes: tuple[UnitChange, ...], *, use_after: bool) -> None:
+        cursor = self.translation_edit.textCursor()
+        cursor_position = cursor.position()
+        old_display_length = max(0, self.translation_edit.document().characterCount() - 1)
+        cursor_was_at_end = cursor_position >= old_display_length
         changed: list[tuple[TranslationUnit, str, bool]] = []
         edit_states: list[tuple[TranslationUnit, str, bool | None]] = []
         changed_uids: set[str] = set()
@@ -5190,12 +5158,18 @@ class TranslatorWindow(QMainWindow):
             self._update_recent_translation_marker(unit, before_status, notify=False)
         changed_units = tuple(unit for unit, _before_status, _pending_delete in changed)
         self.model.refresh_units(changed_units)
-        selected_uid = self._filter_anchor_uid or self.current_uid
+        selected_uid = self.current_uid or self._filter_anchor_uid
         if self._change_proxy_rows(self.proxy.refresh_rows, selected_uid):
             self._restore_selected_row(selected_uid)
         current = self.model.unit_for_uid(self.current_uid) if self.current_uid else None
         if current is not None and current.uid in changed_uids:
             self._set_editor_unit(current)
+            new_display_length = max(0, self.translation_edit.document().characterCount() - 1)
+            restored_cursor = self.translation_edit.textCursor()
+            restored_cursor.setPosition(
+                new_display_length if cursor_was_at_end else min(cursor_position, new_display_length)
+            )
+            self.translation_edit.setTextCursor(restored_cursor)
         self._update_counts()
         self._update_window_title()
         self._schedule_recovery_snapshot()
@@ -5263,8 +5237,6 @@ class TranslatorWindow(QMainWindow):
         )
 
     def undo(self) -> None:
-        if self._try_editor_undo():
-            return
         self._commit_typing_operation()
         operation = self.history.take_undo()
         if operation:
@@ -5272,8 +5244,6 @@ class TranslatorWindow(QMainWindow):
             self.statusBar().showMessage(translate("status.undo", label=operation.label), 2500)
 
     def redo(self) -> None:
-        if self._try_editor_redo():
-            return
         self._commit_typing_operation()
         operation = self.history.take_redo()
         if operation:

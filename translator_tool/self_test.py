@@ -1632,6 +1632,8 @@ def assert_editor_undo_stays_local(root: Path) -> None:
         app.processEvents()
         if win.translation_edit.toPlainText() != original + "x":
             raise AssertionError("editor typing smoke test did not update the translation editor")
+        if win.translation_edit.document().isUndoAvailable():
+            raise AssertionError("translation editor retained a second native undo stack")
 
         undo_calls = 0
         original_undo = win.undo
@@ -1779,12 +1781,26 @@ def assert_editor_undo_stays_local(root: Path) -> None:
         if second.current_text != cycle_baseline:
             raise AssertionError("exhausted editor undo replayed the same typing through entry history")
 
+        other_before = unit.current_text
+        win._replace_unit_text(unit, other_before + " external", "external edit after local undo")
+        app.processEvents()
+        QTest.keyClick(win.translation_edit, Qt.Key.Key_Z, Qt.KeyboardModifier.ControlModifier)
+        app.processEvents()
+        if unit.current_text != other_before:
+            raise AssertionError(
+                "an exhausted editor-local stack swallowed undo for the latest application operation"
+            )
+
         win.only_missing.setChecked(False)
         win.status_combo.setCurrentIndex(win.status_combo.findData(app_module.STATUS_FILTER_ALL))
         win._apply_filters()
         app.processEvents()
         translated_for_filter = next(
-            item for item in win.model.units if item.filter_status() == STATUS_TRANSLATED and item.source_text
+            item
+            for item in win.model.units
+            if item.filter_status() == STATUS_TRANSLATED
+            and item.source_text
+            and not win.model.is_recently_translated(item)
         )
         win._restore_selected_row(translated_for_filter.uid)
         app.processEvents()
