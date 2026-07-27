@@ -8,6 +8,7 @@ from pathlib import Path
 
 STRING_COLUMN_RE = re.compile(r'"([^"]+)"\s+(INT|STRING)', re.IGNORECASE)
 ROW_ID_RE = re.compile(r"\s*(\d+)\b")
+DBT_ROW_VALUE_RE = re.compile(r'"([^"]*)"|(\([^)]*\))|([^\s|]+)')
 
 
 @dataclass(frozen=True)
@@ -68,6 +69,15 @@ class DbtRow:
             if item.name in self.updates:
                 line = line[: item.start] + self.updates[item.name] + line[item.end :]
         return line
+
+
+def dbt_row_values(row: DbtRow) -> tuple[str, ...]:
+    """Return a DBT row's ordered scalar values without changing its raw representation."""
+    values: list[str] = []
+    for match in DBT_ROW_VALUE_RE.finditer(row.original_line):
+        quoted, list_value, scalar = match.groups()
+        values.append(quoted if quoted is not None else list_value if list_value is not None else scalar)
+    return tuple(values)
 
 
 @dataclass

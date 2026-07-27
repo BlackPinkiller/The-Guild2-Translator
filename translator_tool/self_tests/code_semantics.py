@@ -13,7 +13,12 @@ from ..code_index import (
     scan_scripts_root,
 )
 from ..preview_context_selection import select_preview_context
-from ..preview_placeholders import PlaceholderContext, PlaceholderValueBuilder, _placeholder_expression
+from ..preview_placeholders import (
+    PlaceholderContext,
+    PlaceholderLabelRecord,
+    PlaceholderValueBuilder,
+    _placeholder_expression,
+)
 from ..script_semantics import analyze_script
 
 
@@ -208,14 +213,48 @@ def assert_placeholder_values_avoid_ambiguous_random_branches() -> None:
             return "Alex" if forename_only else "Alex Smith"
 
         @staticmethod
+        def character_name_parts(_seed: str, _number: int, _target: bool) -> tuple[str, str, str]:
+            return "Alex", "Smith", "male"
+
+        @staticmethod
         def sample_label(_prefix: str, _suffix: str, _seed: str, _number: int, _target: bool) -> str:
             return "Supreme Commander"
+
+        @staticmethod
+        def sample_label_record(
+            prefix: str,
+            _suffixes: tuple[str, ...],
+            _seed: str,
+            _number: int,
+            _target: bool,
+        ) -> PlaceholderLabelRecord:
+            if prefix == "_CHARACTERS_1_CLASSES_":
+                return PlaceholderLabelRecord(
+                    "_CHARACTERS_1_CLASSES_patron",
+                    ("Patron", "Worker"),
+                )
+            return PlaceholderLabelRecord("_BUILDING_Bakery", ("Bakery", "Bread & Butter"))
+
+        @staticmethod
+        def sample_character_profession(
+            _class_identity: str,
+            _seed: str,
+            _number: int,
+            _target: bool,
+        ) -> str:
+            return "Baker"
+
+        @staticmethod
+        def sample_character_office(_seed: str, _number: int, _target: bool) -> str:
+            return "Mayor"
 
         @staticmethod
         def localized(label: str, _target: bool) -> str:
             return {
                 "_OPTION_BEGGAR_+0": "Beggar",
                 "_OPTION_EMPEROR_+0": "Emperor",
+                "_CHARACTERS_3_TITLES_NAME_+9": "Citizen",
+                "SubstSimFullDescOffice_+0": "%1ST %1SV %1SD, %1SA in %2NAME",
             }.get(label, label)
 
     ambiguous = CodeReference(
@@ -247,7 +286,14 @@ def assert_placeholder_values_avoid_ambiguous_random_branches() -> None:
         runtime_arguments=('GetID("Destination")',),
         role="body",
     )
-    character_context = PlaceholderContext("SPEECH_+0", "Text.dbt", False, "en", (character,))
+    character_context = PlaceholderContext(
+        "SPEECH_+0",
+        "Text.dbt",
+        False,
+        "en",
+        (character,),
+        ((1, ("ST", "SA")),),
+    )
     title = builder.argument_value(1, "ST", character_context).text
     office = builder.argument_value(1, "SA", character_context).text
     if title == "Supreme Commander" or office == "Supreme Commander":

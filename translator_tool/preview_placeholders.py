@@ -115,6 +115,13 @@ class PlaceholderLocalization(Protocol):
         forename_only: bool = False,
     ) -> str: ...
 
+    def character_name_parts(
+        self,
+        seed_key: str,
+        number: int,
+        target: bool,
+    ) -> tuple[str, str, str]: ...
+
     def sample_label(self, prefix: str, suffix: str, seed_key: str, number: int, target: bool) -> str: ...
 
     def sample_label_record(
@@ -124,7 +131,22 @@ class PlaceholderLocalization(Protocol):
         seed_key: str,
         number: int,
         target: bool,
-    ) -> tuple[str, ...]: ...
+    ) -> PlaceholderLabelRecord: ...
+
+    def sample_character_profession(
+        self,
+        class_identity: str,
+        seed_key: str,
+        number: int,
+        target: bool,
+    ) -> str: ...
+
+    def sample_character_office(
+        self,
+        seed_key: str,
+        number: int,
+        target: bool,
+    ) -> str: ...
 
     def localized(self, label: str, target: bool) -> str: ...
 
@@ -136,16 +158,29 @@ class PlaceholderContext:
     target: bool
     locale: str
     references: tuple[object, ...] = ()
+    argument_suffixes: tuple[tuple[int, tuple[str, ...]], ...] = ()
 
     @property
     def seed_key(self) -> str:
         return self.label or self.file_rel
+
+    def suffixes_for(self, number: int) -> tuple[str, ...]:
+        return next(
+            (suffixes for argument_number, suffixes in self.argument_suffixes if argument_number == number),
+            (),
+        )
 
 
 @dataclass(frozen=True)
 class PlaceholderValue:
     text: str
     glyph_id: int | None = None
+
+
+@dataclass(frozen=True)
+class PlaceholderLabelRecord:
+    identity: str
+    values: tuple[str, ...]
 
 
 @dataclass(frozen=True)
@@ -159,6 +194,54 @@ class BuildingPreviewEntity:
         return self.type_name or self.proper_name
 
 
+@dataclass(frozen=True)
+class CharacterPreviewEntity:
+    forename: str
+    surname: str
+    title: str
+    office: str
+    class_name: str
+    profession: str
+    level: str
+    city: str
+    full_description_template: str
+
+    @property
+    def full_name(self) -> str:
+        return " ".join(part for part in (self.forename, self.surname) if part)
+
+    def full_description(self) -> str:
+        values = {
+            "ST": self.title,
+            "SV": self.forename,
+            "SD": self.surname,
+            "SA": self.office,
+            "NAME": self.city,
+        }
+
+        return re.sub(
+            r"%1(ST|SV|SD|SA)|%2(NAME)",
+            lambda match: values.get(match.group(1) or match.group(2), match.group(0)),
+            self.full_description_template,
+        )
+
+    def project(self, suffix: str) -> str:
+        return {
+            "SN": self.full_name,
+            "Sn": self.full_name,
+            "SV": self.forename,
+            "Sv": self.forename,
+            "SZ": self.full_description(),
+            "Sz": self.full_description(),
+            "SK": self.class_name,
+            "ST": self.title,
+            "SA": self.office,
+            "SD": self.surname,
+            "SB": self.profession,
+            "SL": self.level,
+        }.get(suffix, "")
+
+
 class PlaceholderEntityResolver:
     """Build one coherent preview entity before projecting placeholder fields."""
 
@@ -166,18 +249,72 @@ class PlaceholderEntityResolver:
         self.localization = localization
 
     def building(self, number: int, context: PlaceholderContext) -> BuildingPreviewEntity:
-        type_name, proper_name = self.localization.sample_label_record(
+        record = self.localization.sample_label_record(
             "_BUILDING_",
             ("_NAME_+0", "_POOL_+0"),
             context.seed_key,
             number,
             context.target,
         )
+        type_name, proper_name = record.values
         return BuildingPreviewEntity(
             _clean_sample_text(type_name)
             or translate("preview.value.building_type", locale=context.locale, number=number),
             _clean_sample_text(proper_name)
             or translate("preview.value.building_name", locale=context.locale, number=number),
+        )
+
+    def character(self, number: int, context: PlaceholderContext) -> CharacterPreviewEntity:
+        forename, surname, gender = self.localization.character_name_parts(
+            context.seed_key,
+            number,
+            context.target,
+        )
+        class_record = self.localization.sample_label_record(
+            "_CHARACTERS_1_CLASSES_",
+            ("_NAME_+0", "_LEVEL_+0"),
+            context.seed_key,
+            number,
+            context.target,
+        )
+        class_name, level = class_record.values
+        title_label = "_CHARACTERS_3_TITLES_NAME_+8" if gender == "female" else "_CHARACTERS_3_TITLES_NAME_+9"
+        title = self.localization.localized(title_label, context.target)
+        if title == title_label:
+            title = translate("preview.value.title", locale=context.locale, number=number)
+        needs_office = "SA" in context.suffixes_for(number)
+        office = (
+            self.localization.sample_character_office(
+                context.seed_key,
+                number,
+                context.target,
+            )
+            if needs_office
+            else ""
+        )
+        profession = self.localization.sample_character_profession(
+            class_record.identity,
+            context.seed_key,
+            number,
+            context.target,
+        )
+        template_label = "SubstSimFullDescOffice_+0" if office else "SubstSimFullDescNoOffice_+0"
+        template = self.localization.localized(template_label, context.target)
+        if template == template_label:
+            template = "%1ST %1SV %1SD, %1SA in %2NAME" if office else "%1ST %1SV %1SD"
+        return CharacterPreviewEntity(
+            forename=forename,
+            surname=surname,
+            title=_clean_sample_text(title),
+            office=_clean_sample_text(office),
+            class_name=_clean_sample_text(class_name)
+            or translate("preview.value.class", locale=context.locale, number=number),
+            profession=_clean_sample_text(profession)
+            or translate("preview.value.profession", locale=context.locale, number=number),
+            level=_clean_sample_text(level)
+            or translate("preview.value.level", locale=context.locale, number=number),
+            city=_city_value(self.localization, number, context),
+            full_description_template=template,
         )
 
 
@@ -193,19 +330,8 @@ class PlaceholderValueBuilder:
         context: PlaceholderContext,
         _depth: int = 0,
     ) -> PlaceholderValue:
-        if suffix in {"SN", "Sn", "SZ", "Sz"}:
-            return PlaceholderValue(
-                self.localization.character_name(context.seed_key, number, context.target)
-            )
-        if suffix in {"SV", "Sv"}:
-            return PlaceholderValue(
-                self.localization.character_name(
-                    context.seed_key,
-                    number,
-                    context.target,
-                    forename_only=True,
-                )
-            )
+        if suffix in {"SN", "Sn", "SV", "Sv", "SZ", "Sz", "SK", "ST", "SA", "SD", "SB", "SL"}:
+            return PlaceholderValue(self.entities.character(number, context).project(suffix))
         if suffix == "DS":
             return PlaceholderValue(GLYPH_MARK, 2029 + _stable_index(f"{context.seed_key}:{number}:crest", 17))
         explicit = self._explicit_argument_value(number, suffix, context)
@@ -293,30 +419,10 @@ class PlaceholderValueBuilder:
             return PlaceholderValue(self.entities.building(number, context).proper_name)
         if suffix == "GT":
             return PlaceholderValue(self.entities.building(number, context).type_name)
-        if suffix == "SL":
-            value = self.localization.sample_label("_CHARACTERS_1_CLASSES_", "_LEVEL_+0", context.seed_key, number, context.target)
-            return PlaceholderValue(_clean_sample_text(value) if value else translate("preview.value.level", locale=context.locale, number=number))
         if suffix == "DN":
-            full = self.localization.character_name(context.seed_key, number, context.target)
-            dynasty = full.rsplit(" ", 1)[-1] if full else ""
+            dynasty = self.entities.character(number, context).surname
             return PlaceholderValue(dynasty or translate("preview.value.dynasty", locale=context.locale, number=number))
-        samples = {
-            "SK": ("_CHARACTERS_1_CLASSES_", "_NAME_+0", "preview.value.class"),
-            "ST": ("_CHARACTERS_3_TITLES_NAME_+", "", "preview.value.title"),
-            "SA": ("_CHARACTERS_3_OFFICES_NAME_", "_+0", "preview.value.office"),
-            "SD": ("_CHARACTERS_3_TITLES_NAME_+", "", "preview.value.nobility"),
-            "SB": ("_CHARACTERS_2_PROFESSIONS_", "_NAME_+0", "preview.value.profession"),
-        }
-        sample = samples.get(suffix)
-        if sample is None:
-            return None
-        prefix, label_suffix, fallback_key = sample
-        if context.references:
-            return PlaceholderValue(translate(fallback_key, locale=context.locale, number=number))
-        value = self.localization.sample_label(prefix, label_suffix, context.seed_key, number, context.target)
-        if value:
-            return PlaceholderValue(_clean_sample_text(value))
-        return PlaceholderValue(translate(fallback_key, locale=context.locale, number=number))
+        return None
 
     def named_value(self, token: str, context: PlaceholderContext) -> PlaceholderValue:
         name = token[1:-1]

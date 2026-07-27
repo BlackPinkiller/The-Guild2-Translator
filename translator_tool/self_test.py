@@ -2677,6 +2677,9 @@ def assert_preview_i18n_and_symbol_mapping() -> None:
             '14 "_MEASURE_WUERDENTRAGEREMPFANGEN_BODY_+2" "The diplomat from %2l is impressed." |\n'
             '15 "_DIPLOMAT_NAME_DENMARK_+0" "Denmark" |\n'
             '16 "_WAR_MERC_TROOPER_MALE_+0" "Trooper" |\n'
+            '17 "_CHARACTERS_3_TITLES_NAME_+9" "Citizen" |\n'
+            '18 "SubstSimFullDescOffice_+0" "%1ST %1SV %1SD, %1SA in %2NAME" |\n'
+            '19 "SubstSimFullDescNoOffice_+0" "%1ST %1SV %1SD" |\n'
         )
         rows_target = (
             '1 "_NAMES_ENGLISH_MALE_+0" "杰克" |\n'
@@ -2684,9 +2687,47 @@ def assert_preview_i18n_and_symbol_mapping() -> None:
             '3 "_PREVIEW_LABEL_+0" "预览标签" |\n'
             '4 "_BUILDING_Church2b_NAME_+0" "天主教堂" |\n'
             '5 "_BUILDING_Church2b_POOL_+0" "全能的上帝" |\n'
+            '6 "_CHARACTERS_1_CLASSES_patron_NAME_+0" "庇护者" |\n'
+            '7 "_CHARACTERS_1_CLASSES_patron_LEVEL_+0" "工人" |\n'
+            '8 "_CHARACTERS_2_PROFESSIONS_baker_NAME_+0" "面包师" |\n'
+            '9 "_CHARACTERS_3_OFFICES_NAME_Mayor_+0" "市长" |\n'
+            '10 "_CHARACTERS_3_TITLES_NAME_+9" "市民" |\n'
+            '11 "SubstSimFullDescOffice_+0" "%1ST %1SV·%1SD，%2NAME的%1SA" |\n'
+            '12 "SubstSimFullDescNoOffice_+0" "%1ST %1SV·%1SD" |\n'
         )
         (source_root / "Text.dbt").write_text(header_source + rows_source, encoding="utf-8")
         (target_root / "Text.dbt").write_text(header_target + rows_target, encoding="utf-8")
+        (temp / "DB" / "Classes.dbt").write_text(
+            (
+                "// Table File\n"
+                "Table Description:\n"
+                '"id" INT -1 | "name" STRING 0 |\n'
+                "Data:\n"
+                '1 "patron" |\n'
+            ),
+            encoding="utf-8",
+        )
+        (temp / "DB" / "Professions.dbt").write_text(
+            (
+                "// Table File\n"
+                "Table Description:\n"
+                '"id" INT -1 | "name" STRING 0 | "classid" INT 0 |\n'
+                "Data:\n"
+                '4 "baker" 1 |\n'
+            ),
+            encoding="utf-8",
+        )
+        (temp / "DB" / "Offices.dbt").write_text(
+            (
+                "// Table File\n"
+                "Table Description:\n"
+                '"id" INT -1 | "title" STRING 0 | "settlementlevel" INT 0 | '
+                '"income" INT 0 | "level" INT 0 |\n'
+                "Data:\n"
+                '1 "Mayor" 2 250 1 |\n'
+            ),
+            encoding="utf-8",
+        )
 
         service = PreviewService(temp, "#chinese")
         raw = "%1SN $S[2012] %2t @L_PREVIEW_LABEL_+0"
@@ -2719,7 +2760,7 @@ def assert_preview_i18n_and_symbol_mapping() -> None:
         if not any(atom.glyph_id == 2002 for atom in source.atoms):
             raise AssertionError("%2t did not preview the game's coin symbol")
         strong_placeholders = service.render(
-            "%1GG | %1GN | %1GT | %4SK | %5ST | %6SA | %7SD | %8SB | %9SL | %10DN",
+            "%1GG | %1GN | %1GT | %4SN | %4SV | %4SZ | %4SK | %4ST | %4SA | %4SD | %4SB | %4SL",
             unit_key="same-entry",
             label="STRONG_PLACEHOLDERS",
             file_rel="Text.dbt",
@@ -2746,9 +2787,44 @@ def assert_preview_i18n_and_symbol_mapping() -> None:
                 "localized building placeholders did not retain the same entity and game format: "
                 f"{target_building.display_text!r}"
             )
-        for snippet in ("Patron", "Serf", "Mayor", "Baker", "Worker", "Smith"):
-            if snippet not in strong_placeholders.display_text:
-                raise AssertionError(f"strong placeholder preview did not sample DB text: {strong_placeholders.display_text!r}")
+        character_projection = (
+            "Jack Smith | Jack | Citizen Jack Smith, Mayor in London | "
+            "Patron | Citizen | Mayor | Smith | Baker | Worker"
+        )
+        if character_projection not in strong_placeholders.display_text:
+            raise AssertionError(
+                "character placeholders did not project one coherent character entity: "
+                f"{strong_placeholders.display_text!r}"
+            )
+        target_character = service.render(
+            "%4SN | %4SV | %4SZ | %4SK | %4ST | %4SA | %4SD | %4SB | %4SL",
+            unit_key="same-entry",
+            label="STRONG_PLACEHOLDERS",
+            file_rel="Text.dbt",
+            kind="dbt",
+            target=True,
+        )
+        if target_character.display_text != (
+            "杰克 史密斯 | 杰克 | 市民 杰克·史密斯，伦敦的市长 | "
+            "庇护者 | 市民 | 市长 | 史密斯 | 面包师 | 工人"
+        ):
+            raise AssertionError(
+                "localized character placeholders did not use the game description template: "
+                f"{target_character.display_text!r}"
+            )
+        target_description_without_office = service.render(
+            "%4SZ",
+            unit_key="same-entry",
+            label="STRONG_PLACEHOLDERS",
+            file_rel="Text.dbt",
+            kind="dbt",
+            target=True,
+        )
+        if target_description_without_office.display_text != "市民 杰克·史密斯":
+            raise AssertionError(
+                "full character descriptions invented an office without placeholder evidence: "
+                f"{target_description_without_office.display_text!r}"
+            )
 
         quoted_placeholder = service.render(
             "with >%2l< and %1NAMEsuffix",

@@ -14,10 +14,10 @@ from PySide6.QtCore import QBuffer, QIODevice, QRect, Qt
 from PySide6.QtGui import QColor, QFont, QFontMetrics, QImage, QPainter, qRgba
 
 from .code_window_context import PreviewWindowContext
-from .format_io import load_dbt, translatable_fields
+from .format_io import dbt_row_values, load_dbt, translatable_fields
 from .i18n import translate
 from .preview_context_selection import select_preview_context
-from .preview_placeholders import PlaceholderContext, PlaceholderValueBuilder
+from .preview_placeholders import PlaceholderContext, PlaceholderLabelRecord, PlaceholderValueBuilder
 from .preview_profiles import PreviewProfile, preview_profile
 from .validation import (
     COLOR_TOKEN_RE,
@@ -411,9 +411,11 @@ class GameLocalization:
         self.target: dict[str, str] = {}
         self.first_name_keys: tuple[str, ...] = ()
         self.surname_keys: tuple[str, ...] = ()
+        self.profession_keys_by_class: dict[str, tuple[str, ...]] = {}
+        self.office_keys: tuple[str, ...] = ()
         self._label_record_cache: dict[
             tuple[str, tuple[str, ...]],
-            tuple[tuple[str, ...], ...],
+            tuple[tuple[str, tuple[str, ...]], ...],
         ] = {}
         self._load()
 
@@ -452,6 +454,55 @@ class GameLocalization:
         keys = tuple(sorted(key for key in self.source if key.startswith("_NAMES_")))
         self.first_name_keys = tuple(key for key in keys if "_MALE_+" in key or "_FEMALE_+" in key)
         self.surname_keys = tuple(key for key in keys if "_SURNAMES_+" in key)
+        self._load_character_metadata()
+
+    @staticmethod
+    def _table_rows(path: Path) -> tuple[tuple[str, ...], ...]:
+        try:
+            return tuple(dbt_row_values(row) for row in load_dbt(path).rows)
+        except (OSError, UnicodeError, ValueError):
+            return ()
+
+    def _load_character_metadata(self) -> None:
+        if self.game_root is None:
+            return
+        db_root = self.game_root / "DB"
+        class_names = {
+            int(row[0]): row[1]
+            for row in self._table_rows(db_root / "Classes.dbt")
+            if len(row) >= 2 and row[0].lstrip("-").isdigit()
+        }
+        professions: dict[str, list[str]] = {}
+        for row in self._table_rows(db_root / "Professions.dbt"):
+            if len(row) < 3:
+                continue
+            raw_class = row[2]
+            if not raw_class.lstrip("-").isdigit():
+                continue
+            class_name = class_names.get(int(raw_class), "")
+            profession_name = row[1]
+            key = f"_CHARACTERS_2_PROFESSIONS_{profession_name}_NAME_+0"
+            if class_name and self.source.get(key):
+                professions.setdefault(class_name, []).append(key)
+        self.profession_keys_by_class = {
+            class_name: tuple(sorted(dict.fromkeys(keys)))
+            for class_name, keys in professions.items()
+        }
+
+        office_keys: list[str] = []
+        for row in self._table_rows(db_root / "Offices.dbt"):
+            if len(row) < 5:
+                continue
+            settlement_level = row[2]
+            office_level = row[4]
+            if not settlement_level.lstrip("-").isdigit() or not office_level.lstrip("-").isdigit():
+                continue
+            if int(settlement_level) > 3 or int(office_level) > 2:
+                continue
+            key = f"_CHARACTERS_3_OFFICES_NAME_{row[1]}_+0"
+            if self.source.get(key):
+                office_keys.append(key)
+        self.office_keys = tuple(sorted(dict.fromkeys(office_keys)))
 
     @staticmethod
     def _index(seed: str, size: int) -> int:
@@ -469,17 +520,22 @@ class GameLocalization:
         return self.source.get(label) or label
 
     def character_name(self, unit_key: str, number: int, target: bool, *, forename_only: bool = False) -> str:
+        first, surname, _ = self.character_name_parts(unit_key, number, target)
+        if forename_only or not surname:
+            return first
+        return f"{first} {surname}".strip()
+
+    def character_name_parts(self, unit_key: str, number: int, target: bool) -> tuple[str, str, str]:
         seed = f"{unit_key}:{number}"
         first_key = self._pick(self.first_name_keys, seed + ":first")
         surname_key = self._pick(self.surname_keys, seed + ":surname")
         if not first_key:
             locale = self.target_language if target else "en"
-            return translate("preview.value.character", locale=locale, number=number)
+            return translate("preview.value.character", locale=locale, number=number), "", "male"
         first = self.localized(first_key, target)
-        if forename_only or not surname_key:
-            return first
-        surname = self.localized(surname_key, target)
-        return f"{first} {surname}".strip()
+        surname = self.localized(surname_key, target) if surname_key else ""
+        gender = "female" if "_FEMALE_+" in first_key else "male"
+        return first, surname, gender
 
     def sample_label(self, prefix: str, suffix: str, unit_key: str, number: int, target: bool) -> str:
         keys = tuple(
@@ -503,7 +559,7 @@ class GameLocalization:
         unit_key: str,
         number: int,
         target: bool,
-    ) -> tuple[str, ...]:
+    ) -> PlaceholderLabelRecord:
         cache_key = (prefix, field_suffixes)
         complete = self._label_record_cache.get(cache_key)
         if complete is None:
@@ -522,8 +578,8 @@ class GameLocalization:
                         records.setdefault(stem, {})[field_suffix] = key
                         break
             complete = tuple(
-                tuple(fields[field_suffix] for field_suffix in field_suffixes)
-                for _, fields in sorted(records.items())
+                (stem, tuple(fields[field_suffix] for field_suffix in field_suffixes))
+                for stem, fields in sorted(records.items())
                 if all(field_suffix in fields for field_suffix in field_suffixes)
             )
             if len(self._label_record_cache) >= 64:
@@ -531,8 +587,49 @@ class GameLocalization:
             self._label_record_cache[cache_key] = complete
         record = self._pick(complete, f"{unit_key}:{number}:{prefix}:record")
         if not record:
-            return tuple("" for _ in field_suffixes)
-        return tuple(self.localized(key, target) for key in record)
+            return PlaceholderLabelRecord("", tuple("" for _ in field_suffixes))
+        identity, keys = record
+        return PlaceholderLabelRecord(
+            identity,
+            tuple(self.localized(key, target) for key in keys),
+        )
+
+    def sample_character_profession(
+        self,
+        class_identity: str,
+        unit_key: str,
+        number: int,
+        target: bool,
+    ) -> str:
+        class_name = class_identity.removeprefix("_CHARACTERS_1_CLASSES_")
+        keys = self.profession_keys_by_class.get(class_name, ())
+        key = self._pick(keys, f"{unit_key}:{number}:character:profession")
+        if key:
+            return self.localized(key, target)
+        return self.sample_label(
+            "_CHARACTERS_2_PROFESSIONS_",
+            "_NAME_+0",
+            unit_key,
+            number,
+            target,
+        )
+
+    def sample_character_office(
+        self,
+        unit_key: str,
+        number: int,
+        target: bool,
+    ) -> str:
+        key = self._pick(self.office_keys, f"{unit_key}:{number}:character:office")
+        if key:
+            return self.localized(key, target)
+        return self.sample_label(
+            "_CHARACTERS_3_OFFICES_NAME_",
+            "_+0",
+            unit_key,
+            number,
+            target,
+        )
 
 
 class PreviewService:
@@ -604,8 +701,18 @@ class PreviewService:
         suffix: str,
         target: bool,
         references: tuple[object, ...] = (),
+        argument_suffixes: tuple[tuple[int, tuple[str, ...]], ...] = (),
     ) -> tuple[str, int | None]:
-        return self._placeholder_argument_value(unit_key, label, file_rel, number, suffix, target, references)
+        return self._placeholder_argument_value(
+            unit_key,
+            label,
+            file_rel,
+            number,
+            suffix,
+            target,
+            references,
+            argument_suffixes,
+        )
 
     def _named_value(
         self,
@@ -624,6 +731,7 @@ class PreviewService:
         file_rel: str,
         target: bool,
         references: tuple[object, ...] = (),
+        argument_suffixes: tuple[tuple[int, tuple[str, ...]], ...] = (),
     ) -> PlaceholderContext:
         return PlaceholderContext(
             label=label,
@@ -631,6 +739,7 @@ class PreviewService:
             target=target,
             locale=self.locale(target),
             references=references,
+            argument_suffixes=argument_suffixes,
         )
 
     def _placeholder_builder(self) -> PlaceholderValueBuilder:
@@ -645,11 +754,18 @@ class PreviewService:
         suffix: str,
         target: bool,
         references: tuple[object, ...] = (),
+        argument_suffixes: tuple[tuple[int, tuple[str, ...]], ...] = (),
     ) -> tuple[str, int | None]:
         value = self._placeholder_builder().argument_value(
             number,
             suffix,
-            self._placeholder_context(label or unit_key, file_rel, target, references),
+            self._placeholder_context(
+                label or unit_key,
+                file_rel,
+                target,
+                references,
+                argument_suffixes,
+            ),
         )
         return value.text, value.glyph_id
 
@@ -1266,8 +1382,20 @@ class _PreviewCompiler:
         self.color: tuple[int, int, int, int] | None = None
         self.guide_rgb = {"r": 60, "g": 60, "b": 60}
         self.quote_re = re.compile(QUOTE_STYLE_TOKEN)
+        self.argument_suffixes: tuple[tuple[int, tuple[str, ...]], ...] = ()
 
     def compile(self, text: str) -> PreviewDocument:
+        suffixes: dict[int, list[str]] = {}
+        for match in ARG_PREVIEW_RE.finditer(text):
+            number = int(match.group(1))
+            suffix = match.group(2) or ""
+            values = suffixes.setdefault(number, [])
+            if suffix not in values:
+                values.append(suffix)
+        self.argument_suffixes = tuple(
+            (number, tuple(values))
+            for number, values in sorted(suffixes.items())
+        )
         if self.dialect == FORMAT_GUIDE:
             self._compile_matches(text, GUIDE_TOKEN_RE, self._guide_token)
         elif self.dialect == FORMAT_TOOLTIP:
@@ -1437,6 +1565,7 @@ class _PreviewCompiler:
                 argument.group(2),
                 self.target,
                 self.references,
+                self.argument_suffixes,
             )
             self._emit(value, start, end, replacement=True, glyph_id=glyph_id)
             return
@@ -1465,6 +1594,7 @@ class _PreviewCompiler:
                 argument.group(2),
                 self.target,
                 self.references,
+                self.argument_suffixes,
             )
             self._emit(value, start, end, replacement=True, glyph_id=glyph_id)
             return
