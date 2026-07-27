@@ -4460,6 +4460,18 @@ class TranslatorWindow(QMainWindow):
         self.current_uid = ""
         self._filter_anchor_uid = ""
         self.model.set_project(self.project)
+        self.preview_service.set_project_localization(
+            {
+                unit.label: unit.source_text
+                for unit in project.units
+                if unit.label
+            },
+            {
+                unit.label: unit.current_text
+                for unit in project.units
+                if unit.label
+            },
+        )
         self.translation_highlighter.set_glyph_codec(self.project.codec if ENABLE_FONT_GLYPH_VALIDATION else None)
         self._start_code_reference_index()
         self._update_file_choices()
@@ -5118,6 +5130,7 @@ class TranslatorWindow(QMainWindow):
         else:
             unit.set_text(text)
             unit.set_pending_delete(pending_delete)
+        self._update_preview_localization((unit,))
         self.model.refresh_unit(unit)
         self._update_recent_translation_marker(unit, before_status)
         if uid == self.current_uid:
@@ -5154,6 +5167,10 @@ class TranslatorWindow(QMainWindow):
                 unit.set_text(text)
                 if pending_delete is not None:
                     unit.set_pending_delete(pending_delete)
+        self._update_preview_localization(
+            unit
+            for unit, _before_status, _pending_delete in changed
+        )
         for unit, before_status, _pending_delete in changed:
             self._update_recent_translation_marker(unit, before_status, notify=False)
         changed_units = tuple(unit for unit, _before_status, _pending_delete in changed)
@@ -5177,8 +5194,26 @@ class TranslatorWindow(QMainWindow):
     def _set_unit_text(self, unit: TranslationUnit, text: str) -> None:
         if self.project is None:
             unit.set_text(text)
+            self._update_preview_localization((unit,))
             return
         self.project.apply_unit_edits(((unit, text, None),))
+        self._update_preview_localization((unit,))
+
+    def _update_preview_localization(
+        self,
+        units: Iterable[TranslationUnit],
+    ) -> None:
+        changed = tuple(units)
+        if not changed:
+            return
+        for unit in changed:
+            if unit.label:
+                self.preview_service.update_project_localization(
+                    unit.label,
+                    unit.source_text,
+                    unit.current_text,
+                )
+        self._game_preview_cache.clear()
 
     def _update_recent_translation_marker(self, unit: TranslationUnit, before_status: str, *, notify: bool = True) -> None:
         current_status = unit.filter_status()

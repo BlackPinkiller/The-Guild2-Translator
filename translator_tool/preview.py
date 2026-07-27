@@ -409,6 +409,8 @@ class GameLocalization:
         self.target_language = target_language
         self.source: dict[str, str] = {}
         self.target: dict[str, str] = {}
+        self._game_source: dict[str, str] = {}
+        self._game_target: dict[str, str] = {}
         self.first_name_keys: tuple[str, ...] = ()
         self.surname_keys: tuple[str, ...] = ()
         self.profession_keys_by_class: dict[str, tuple[str, ...]] = {}
@@ -448,13 +450,41 @@ class GameLocalization:
         if self.game_root is None:
             return
         languages = self.game_root / "DB" / "Languages"
-        self.source = self._read_labels(languages / "Text.dbt")
+        self._game_source = self._read_labels(languages / "Text.dbt")
         folder = self._language_folder(self.target_language)
-        self.target = self._read_labels(languages / folder / "Text.dbt") if folder else {}
+        self._game_target = self._read_labels(languages / folder / "Text.dbt") if folder else {}
+        self.source = dict(self._game_source)
+        self.target = dict(self._game_target)
+        self._refresh_name_keys()
+        self._load_character_metadata()
+
+    def set_project_labels(
+        self,
+        source: dict[str, str],
+        target: dict[str, str],
+    ) -> None:
+        self.source = {**self._game_source, **source}
+        self.target = {**self._game_target, **target}
+        self._label_record_cache.clear()
+        self._refresh_name_keys()
+        self._load_character_metadata()
+
+    def update_project_label(
+        self,
+        label: str,
+        source: str,
+        target: str,
+    ) -> None:
+        self.source[label] = source
+        self.target[label] = target
+        self._label_record_cache.clear()
+        if label.startswith("_NAMES_"):
+            self._refresh_name_keys()
+
+    def _refresh_name_keys(self) -> None:
         keys = tuple(sorted(key for key in self.source if key.startswith("_NAMES_")))
         self.first_name_keys = tuple(key for key in keys if "_MALE_+" in key or "_FEMALE_+" in key)
         self.surname_keys = tuple(key for key in keys if "_SURNAMES_+" in key)
-        self._load_character_metadata()
 
     @staticmethod
     def _table_rows(path: Path) -> tuple[tuple[str, ...], ...]:
@@ -645,6 +675,8 @@ class PreviewService:
         self.translation_font_dir = translation_font_dir
         self.ui_assets_dir = ui_assets_dir
         self._localization: GameLocalization | None = None
+        self._project_source_labels: dict[str, str] = {}
+        self._project_target_labels: dict[str, str] = {}
         self._atlases: dict[bool, GameGlyphAtlas | None] = {}
         self._ui_atlas: GameUiAtlas | None = None
         self._ui_image_cache: dict[str, QImage | None] = {}
@@ -682,7 +714,37 @@ class PreviewService:
     def localization(self) -> GameLocalization:
         if self._localization is None:
             self._localization = GameLocalization(self.game_root, self.target_language)
+            self._localization.set_project_labels(
+                self._project_source_labels,
+                self._project_target_labels,
+            )
         return self._localization
+
+    def set_project_localization(
+        self,
+        source: dict[str, str],
+        target: dict[str, str],
+    ) -> None:
+        self._project_source_labels = dict(source)
+        self._project_target_labels = dict(target)
+        if self._localization is not None:
+            self._localization.set_project_labels(
+                self._project_source_labels,
+                self._project_target_labels,
+            )
+        self._render_cache.clear()
+
+    def update_project_localization(
+        self,
+        label: str,
+        source: str,
+        target: str,
+    ) -> None:
+        self._project_source_labels[label] = source
+        self._project_target_labels[label] = target
+        if self._localization is not None:
+            self._localization.update_project_label(label, source, target)
+        self._render_cache.clear()
 
     def locale(self, target: bool) -> str:
         if not target:

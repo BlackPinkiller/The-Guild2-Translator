@@ -91,6 +91,10 @@ from .self_tests.preview_context_selection import (
     assert_preview_context_selection_prefers_displayed_runtime_labels,
     assert_preview_context_selection_understands_returned_label_roles,
 )
+from .self_tests.preview_localization import (
+    assert_editor_changes_reach_preview_localization,
+    assert_project_localization_updates_invalidate_placeholder_previews,
+)
 from .source_sync import (
     discover_game_source_projects,
     local_project_roots,
@@ -3879,6 +3883,8 @@ def main() -> int:
     assert_preview_context_selection_keeps_the_current_dynamic_branch()
     assert_preview_context_selection_prefers_displayed_runtime_labels()
     assert_preview_context_selection_understands_returned_label_roles()
+    assert_project_localization_updates_invalidate_placeholder_previews()
+    assert_editor_changes_reach_preview_localization()
     assert_game_preview_parts_use_the_selected_call_site()
     assert_lazy_code_index_prioritizes_requested_labels_and_invalidates_cache()
     assert_lazy_code_index_links_cached_cross_file_facts()
