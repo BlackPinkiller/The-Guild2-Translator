@@ -122,6 +122,12 @@ def assert_code_semantics_resolve_local_function_returns() -> None:
             '        Place = GetHomeBuildingId("")',
             "    end",
             '    MsgQuick("", "@L_BODY_AMBIGUOUS_OBJECT_+0", Place)',
+            '    GetSettlement("", "AnyPlace")',
+            '    MsgQuick("", "@L_BODY_ALIAS_SETTLEMENT_+0", GetID("AnyPlace"))',
+            '    GetDynasty("", "AnyFamily")',
+            '    MsgQuick("", "@L_BODY_ALIAS_DYNASTY_+0", GetID("AnyFamily"))',
+            '    MsgQuick("", "@L_BODY_FIXED_CITY_+0", GetID("City"))',
+            '    MsgQuick("", "@L_BODY_UNKNOWN_ALIAS_+0", GetID("TemporaryAlias"))',
             "end",
         )
     )
@@ -214,6 +220,24 @@ def assert_code_semantics_resolve_local_function_returns() -> None:
         raise AssertionError(
             "branching runtime object types did not remain explicitly ambiguous"
         )
+    if by_label["body_alias_settlement_+0"].runtime_argument_kinds != (
+        ("settlement",),
+    ):
+        raise AssertionError(
+            "GetID did not consume the type established by GetSettlement"
+        )
+    if by_label["body_alias_dynasty_+0"].runtime_argument_kinds != (
+        ("dynasty",),
+    ):
+        raise AssertionError(
+            "GetID did not consume the type established by GetDynasty"
+        )
+    if by_label["body_fixed_city_+0"].runtime_argument_kinds != (
+        ("settlement",),
+    ):
+        raise AssertionError("GetID did not recognize a fixed engine alias")
+    if by_label["body_unknown_alias_+0"].runtime_argument_kinds != ((),):
+        raise AssertionError("an unproven temporary alias was typed from its name")
 
     branch_script = "\n".join(
         (

@@ -175,6 +175,10 @@ class _Analysis:
     functions_by_alias: dict[str, tuple[int, ...]]
     returns_by_function: dict[int, tuple[tuple[int, int, int], ...]]
     branch_paths: dict[int, tuple[tuple[int, int], ...]]
+    alias_type_events: dict[
+        tuple[int | None, str],
+        tuple[tuple[int, int, str], ...],
+    ]
 
 
 LABEL_RE = re.compile(
@@ -215,6 +219,25 @@ _NATIVE_OBJECT_RETURN_KINDS = {
     "simgetservantdynastyid": SEMANTIC_DYNASTY,
     "simgetworkingplaceid": SEMANTIC_BUILDING,
     "squadgetleaderid": SEMANTIC_CHARACTER,
+}
+
+_NATIVE_ALIAS_OUTPUT_KINDS = {
+    "buildinggetcity": ((1, SEMANTIC_SETTLEMENT),),
+    "citygetrandombuilding": ((6, SEMANTIC_BUILDING),),
+    "dynastygetmember": ((2, SEMANTIC_CHARACTER),),
+    "getdynasty": ((1, SEMANTIC_DYNASTY),),
+    "gethomebuilding": ((1, SEMANTIC_BUILDING),),
+    "getinsidebuilding": ((1, SEMANTIC_BUILDING),),
+    "getsettlement": ((1, SEMANTIC_SETTLEMENT),),
+}
+
+_FIXED_ALIAS_KINDS = {
+    "building": SEMANTIC_BUILDING,
+    "city": SEMANTIC_SETTLEMENT,
+    "dynasty": SEMANTIC_DYNASTY,
+    "settlement": SEMANTIC_SETTLEMENT,
+    "sim": SEMANTIC_CHARACTER,
+    "workbuilding": SEMANTIC_BUILDING,
 }
 
 
@@ -274,6 +297,7 @@ def analyze_script_facts(
         {name: tuple(indices) for name, indices in functions_by_alias.items()},
         _return_expressions_by_function(tokens, functions),
         _conditional_branch_paths(tokens, branch_path_tokens),
+        _native_alias_type_events(tokens, calls, token_starts),
     )
     uses: list[SemanticLabelUse] = []
     external_flows: list[ExternalCallFlow] = []
@@ -1197,6 +1221,17 @@ def _evaluate_local_function_call(
     parameter_bindings: dict[tuple[int, str], tuple[str, ...]] | None,
     required_branches: tuple[tuple[int, int], ...],
 ) -> tuple[str, ...]:
+    if re.split(r"[.:]", call.name)[-1].casefold() == "getid":
+        object_kinds = _getid_object_kinds(
+            analysis,
+            call,
+            required_branches,
+        )
+        if object_kinds:
+            return tuple(
+                _semantic_candidate(SemanticValue(kind, ""))
+                for kind in object_kinds
+            )
     target_indices = analysis.functions_by_alias.get(call.name.casefold(), ())
     if not target_indices and native_semantic_function_name(call.name) is None:
         return ()
@@ -1263,6 +1298,77 @@ def _evaluate_local_function_call(
                 )
             )
     return tuple(dict.fromkeys(values))[:64]
+
+
+def _getid_object_kinds(
+    analysis: _Analysis,
+    call: ScriptCall,
+    required_branches: tuple[tuple[int, int], ...],
+) -> tuple[str, ...]:
+    if not call.argument_spans:
+        return ()
+    start, end = call.argument_spans[0]
+    token_indices = _tokens_in_span(analysis, start, end)
+    if len(token_indices) != 1:
+        return ()
+    token = analysis.tokens[token_indices[0]]
+    if token.kind != "string":
+        return ()
+    alias = token.value.casefold()
+    kinds: list[str] = []
+    fixed = _FIXED_ALIAS_KINDS.get(alias)
+    if fixed is not None:
+        kinds.append(fixed)
+    for position, producer_token, kind in analysis.alias_type_events.get(
+        (call.function_index, alias),
+        (),
+    ):
+        if position >= call.start:
+            break
+        if required_branches and not _branches_compatible(
+            _branch_path_for_token(analysis, producer_token),
+            required_branches,
+        ):
+            continue
+        kinds.append(kind)
+    return tuple(dict.fromkeys(kinds))[:64]
+
+
+def _native_alias_type_events(
+    tokens: tuple[Token, ...],
+    calls: tuple[ScriptCall, ...],
+    token_starts: tuple[int, ...],
+) -> dict[tuple[int | None, str], tuple[tuple[int, int, str], ...]]:
+    grouped: dict[
+        tuple[int | None, str],
+        list[tuple[int, int, str]],
+    ] = {}
+    for call in calls:
+        name = re.split(r"[.:]", call.name)[-1].casefold()
+        for argument_index, kind in _NATIVE_ALIAS_OUTPUT_KINDS.get(name, ()):
+            if argument_index >= len(call.argument_spans):
+                continue
+            start, end = call.argument_spans[argument_index]
+            first = bisect.bisect_left(token_starts, start)
+            last = bisect.bisect_left(token_starts, end)
+            indices = tuple(
+                index
+                for index in range(first, last)
+                if tokens[index].end <= end
+            )
+            if len(indices) != 1 or tokens[indices[0]].kind != "string":
+                continue
+            grouped.setdefault(
+                (call.function_index, tokens[indices[0]].value.casefold()),
+                [],
+            ).append(
+                (
+                    call.start,
+                    bisect.bisect_left(token_starts, call.start),
+                    kind,
+                )
+            )
+    return {key: tuple(events) for key, events in grouped.items()}
 
 
 def _dependent_label_values(
