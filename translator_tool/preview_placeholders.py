@@ -819,6 +819,12 @@ def _localized_runtime_argument_value(
         return ""
     values: list[str] = []
     for candidate in candidates:
+        if str(candidate) == "":
+            values.append("\u200b")
+            continue
+        if str(candidate) == "$N":
+            values.append(" ")
+            continue
         value = _localized_expression_value(
             localization,
             str(candidate),

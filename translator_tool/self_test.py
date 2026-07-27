@@ -62,6 +62,8 @@ from .settings import AppSettings, load_settings, save_settings
 from .self_tests.clipboard import assert_entry_clipboard_decoder
 from .self_tests.code_semantics import (
     assert_code_index_handles_families_and_binary_gui,
+    assert_cross_file_function_summaries_bind_arguments_and_expand_returns,
+    assert_cross_file_function_summaries_follow_nested_dependencies,
     assert_cross_file_return_labels_flow_only_to_real_callers,
     assert_code_semantics_follow_fields_panels_and_initdata,
     assert_code_semantics_are_scope_and_role_aware,
@@ -72,6 +74,7 @@ from .self_tests.code_semantics import (
 )
 from .self_tests.code_index_lazy import (
     assert_code_index_requests_selected_and_visible_rows_without_moving_viewport,
+    assert_lazy_code_index_loads_cached_value_providers,
     assert_lazy_code_index_links_cached_cross_file_facts,
     assert_lazy_code_index_prioritizes_requested_labels_and_invalidates_cache,
     assert_lazy_code_index_survives_unwritable_cache,
@@ -3866,6 +3869,8 @@ def main() -> int:
     assert_code_semantics_resolve_local_function_returns()
     assert_code_semantics_follow_fields_panels_and_initdata()
     assert_cross_file_return_labels_flow_only_to_real_callers()
+    assert_cross_file_function_summaries_bind_arguments_and_expand_returns()
+    assert_cross_file_function_summaries_follow_nested_dependencies()
     assert_code_index_handles_families_and_binary_gui()
     assert_placeholder_reference_selection_is_coherent()
     assert_placeholder_values_avoid_ambiguous_random_branches()
@@ -3877,6 +3882,7 @@ def main() -> int:
     assert_game_preview_parts_use_the_selected_call_site()
     assert_lazy_code_index_prioritizes_requested_labels_and_invalidates_cache()
     assert_lazy_code_index_links_cached_cross_file_facts()
+    assert_lazy_code_index_loads_cached_value_providers()
     assert_lazy_code_index_survives_unwritable_cache()
     assert_code_index_requests_selected_and_visible_rows_without_moving_viewport()
     assert_stale_code_index_workers_are_released()

@@ -138,10 +138,18 @@ class ExternalCallFlow:
 
 
 @dataclass(frozen=True)
+class FunctionValueSummary:
+    aliases: tuple[str, ...]
+    parameters: tuple[str, ...]
+    return_values: tuple[tuple[str, ...], ...]
+
+
+@dataclass(frozen=True)
 class ScriptSemanticFacts:
     uses: tuple[SemanticLabelUse, ...]
     return_labels: tuple[FunctionReturnLabel, ...]
     external_flows: tuple[ExternalCallFlow, ...]
+    function_summaries: tuple[FunctionValueSummary, ...]
 
 
 @dataclass
@@ -176,6 +184,9 @@ _CALL_EXPRESSION_RE = re.compile(
     r"^(?P<name>[A-Za-z_][A-Za-z0-9_.:]*)\s*\((?P<arguments>.*)\)$",
     re.DOTALL,
 )
+SUMMARY_LITERAL_PREFIX = "\x1d"
+SUMMARY_EXPRESSION_PREFIX = "\x1e"
+SUMMARY_PARAMETER_PREFIX = "\x1f"
 
 
 def analyze_script(
@@ -320,6 +331,7 @@ def analyze_script_facts(
         _dedupe_uses(uses),
         return_labels,
         tuple(dict.fromkeys(external_flows)),
+        _function_value_summaries(analysis),
     )
 
 
@@ -1155,6 +1167,73 @@ def _return_expressions_by_function(
     for function_index, start, end, position in values:
         grouped.setdefault(function_index, []).append((start, end, position))
     return {function_index: tuple(expressions) for function_index, expressions in grouped.items()}
+
+
+def _function_value_summaries(
+    analysis: _Analysis,
+) -> tuple[FunctionValueSummary, ...]:
+    summaries: list[FunctionValueSummary] = []
+    for function_index, function in enumerate(analysis.functions):
+        returns = analysis.returns_by_function.get(function_index, ())
+        if not returns:
+            continue
+        bindings = {
+            (function_index, parameter.casefold()): (
+                f"{SUMMARY_PARAMETER_PREFIX}{parameter_index}{SUMMARY_PARAMETER_PREFIX}",
+            )
+            for parameter_index, parameter in enumerate(function.parameters)
+        }
+        positions: list[list[str]] = []
+        for return_start, return_end, return_position in returns:
+            return_parts = _split_token_range(
+                analysis.tokens,
+                return_start,
+                return_end,
+                ",",
+            )
+            for return_index, (part_start, part_end) in enumerate(return_parts):
+                while len(positions) <= return_index:
+                    positions.append([])
+                expression = analysis.text[
+                    analysis.tokens[part_start].start : analysis.tokens[part_end - 1].end
+                ]
+                resolved = _evaluate_tokens(
+                    analysis,
+                    part_start,
+                    part_end,
+                    return_position,
+                    function_index,
+                    set(),
+                    bindings,
+                )
+                if resolved and not (
+                    return_index == len(return_parts) - 1
+                    and _CALL_EXPRESSION_RE.fullmatch(expression.strip())
+                ):
+                    candidates = tuple(
+                        SUMMARY_LITERAL_PREFIX + value
+                        for value in resolved
+                    )
+                else:
+                    for parameter_index, parameter in enumerate(function.parameters):
+                        expression = re.sub(
+                            rf"\b{re.escape(parameter)}\b",
+                            f"{SUMMARY_PARAMETER_PREFIX}{parameter_index}{SUMMARY_PARAMETER_PREFIX}",
+                            expression,
+                        )
+                    candidates = (SUMMARY_EXPRESSION_PREFIX + expression,)
+                positions[return_index].extend(candidates)
+        summaries.append(
+            FunctionValueSummary(
+                aliases=function.aliases,
+                parameters=function.parameters,
+                return_values=tuple(
+                    tuple(dict.fromkeys(values))[:64]
+                    for values in positions
+                ),
+            )
+        )
+    return tuple(summaries)
 
 
 def _dependency_names(tokens: tuple[Token, ...], start: int, end: int) -> tuple[str, ...]:

@@ -335,6 +335,7 @@ def assert_placeholder_values_avoid_ambiguous_random_branches() -> None:
                 "_OPTION_BEGGAR_+0": "Beggar",
                 "_OPTION_EMPEROR_+0": "Emperor",
                 "_ITEM_BoozyBreathBeer_NAME_+0": "Drunkard Brew beer",
+                "_PRIVILEGE_CanTrade_MESSAGETEXT_+0": "May trade goods",
                 "_CHARACTERS_3_TITLES_NAME_+9": "Citizen",
                 "SubstSimFullDescOffice_+0": "%1ST %1SV %1SD, %1SA in %2NAME",
             }.get(label, label)
@@ -519,6 +520,38 @@ def assert_placeholder_values_avoid_ambiguous_random_branches() -> None:
     if builder.argument_value(1, "l", function_label_context).text != "Drunkard Brew beer":
         raise AssertionError("preview ignored a proven localization value returned by a function")
 
+    privilege_values = CodeReference(
+        "privilege_values_+0",
+        Path("PrivilegeValues.lua"),
+        70,
+        1,
+        "MsgQuick",
+        1,
+        runtime_arguments=("chr_GeneratePrivilegeListLabels(Privileges())",),
+        runtime_argument_values=(
+            ("_PRIVILEGE_CanTrade_MESSAGETEXT_+0",),
+            ("$N",),
+            ("",),
+        ),
+        role="body",
+    )
+    privilege_context = PlaceholderContext(
+        "PRIVILEGE_VALUES_+0",
+        "Text.dbt",
+        False,
+        "en",
+        (privilege_values,),
+        ((1, ("l",)), (2, ("l",)), (3, ("l",))),
+    )
+    projected = tuple(
+        builder.argument_value(number, "l", privilege_context).text
+        for number in (1, 2, 3)
+    )
+    if projected != ("May trade goods", "", "\u200b"):
+        raise AssertionError(
+            f"localized multi-return labels or structural blank slots were wrong: {projected!r}"
+        )
+
 
 def assert_variadic_runtime_arguments_map_to_placeholder_positions() -> None:
     privileges = CodeReference(
@@ -601,5 +634,113 @@ def assert_cross_file_return_labels_flow_only_to_real_callers() -> None:
             raise AssertionError(f"an uncalled return helper fabricated a UI call: {dead_references!r}")
         if dead_references[0].role != "return_value":
             raise AssertionError(f"an uncalled returned label lost its honest source role: {dead_references!r}")
+    finally:
+        shutil.rmtree(temp, ignore_errors=True)
+
+
+def assert_cross_file_function_summaries_bind_arguments_and_expand_returns() -> None:
+    temp = Path(tempfile.mkdtemp(prefix="translator_tool_cross_file_values_"))
+    try:
+        helper = temp / "helper.lua"
+        caller = temp / "caller.lua"
+        helper.write_text(
+            "\n".join(
+                (
+                    "function MakeValues(kind)",
+                    '    local First = "@L_ITEM_"..kind.."_NAME_+0"',
+                    '    return First, "@L_ITEM_SECOND_NAME_+0"',
+                    "end",
+                )
+            ),
+            encoding="utf-8",
+        )
+        caller.write_text(
+            "\n".join(
+                (
+                    "function Main()",
+                    '    MsgQuick("", "@L_REMOTE_VALUES_BODY_+0", helper_MakeValues("BREAD"))',
+                    "end",
+                )
+            ),
+            encoding="utf-8",
+        )
+        linker = CrossFileSemanticLinker()
+        index = linker.add(analyze_code_file(CodeFileSpec(caller, "project")))
+        if ("project", "helper_makevalues") not in linker.unresolved_value_aliases():
+            raise AssertionError("the caller did not expose its missing cross-file value provider")
+        index.merge(linker.add(analyze_code_file(CodeFileSpec(helper, "project"))))
+        references = index.references_for("REMOTE_VALUES_BODY_+0").project
+        resolved = next(
+            (
+                item
+                for item in references
+                if item.runtime_argument_values
+                == (
+                    ("@L_ITEM_BREAD_NAME_+0",),
+                    ("@L_ITEM_SECOND_NAME_+0",),
+                )
+            ),
+            None,
+        )
+        if resolved is None:
+            raise AssertionError(
+                f"cross-file function arguments or multi-return positions were lost: {references!r}"
+            )
+        if ("project", "helper_makevalues") in linker.unresolved_value_aliases():
+            raise AssertionError("a loaded function summary remained marked as unresolved")
+    finally:
+        shutil.rmtree(temp, ignore_errors=True)
+
+
+def assert_cross_file_function_summaries_follow_nested_dependencies() -> None:
+    temp = Path(tempfile.mkdtemp(prefix="translator_tool_nested_values_"))
+    try:
+        rank0 = temp / "rank0.lua"
+        rank1 = temp / "rank1.lua"
+        caller = temp / "caller.lua"
+        rank0.write_text(
+            'function GetPrivileges() return "CanTrade" end',
+            encoding="utf-8",
+        )
+        rank1.write_text(
+            'function GetPrivileges() return "CanApplyForOffice", rank0_GetPrivileges() end',
+            encoding="utf-8",
+        )
+        caller.write_text(
+            "\n".join(
+                (
+                    "function Main()",
+                    '    MsgQuick("", "@L_PRIVILEGE_BODY_+0",',
+                    "        chr_GeneratePrivilegeListLabels(rank1_GetPrivileges()))",
+                    "end",
+                )
+            ),
+            encoding="utf-8",
+        )
+        linker = CrossFileSemanticLinker()
+        index = linker.add(analyze_code_file(CodeFileSpec(caller, "project")))
+        index.merge(linker.add(analyze_code_file(CodeFileSpec(rank1, "project"))))
+        if ("project", "rank0_getprivileges") not in linker.unresolved_value_aliases():
+            raise AssertionError("a dependency discovered inside a loaded summary was not queued")
+        index.merge(linker.add(analyze_code_file(CodeFileSpec(rank0, "project"))))
+        references = index.references_for("PRIVILEGE_BODY_+0").project
+        values = next(
+            (
+                item.runtime_argument_values
+                for item in references
+                if len(item.runtime_argument_values) == 21
+                and item.runtime_argument_values[0]
+                == ("_PRIVILEGE_CanApplyForOffice_MESSAGETEXT_+0",)
+                and item.runtime_argument_values[2]
+                == ("_PRIVILEGE_CanTrade_MESSAGETEXT_+0",)
+            ),
+            None,
+        )
+        if values is None:
+            raise AssertionError(
+                f"nested summaries did not produce the privilege helper's 21 return slots: {references!r}"
+            )
+        if values[1] != ("$N",) or any(value != ("",) for value in values[4:]):
+            raise AssertionError(f"privilege separator or padding slots were wrong: {values!r}")
     finally:
         shutil.rmtree(temp, ignore_errors=True)

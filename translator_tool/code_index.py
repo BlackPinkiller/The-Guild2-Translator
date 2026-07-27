@@ -1,13 +1,19 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
+from collections.abc import Iterable
+from dataclasses import dataclass, replace
 import bisect
+from itertools import product
 from pathlib import Path
 import re
 
 from .script_semantics import (
     ExternalCallFlow,
+    FunctionValueSummary,
     FunctionReturnLabel,
+    SUMMARY_EXPRESSION_PREFIX,
+    SUMMARY_LITERAL_PREFIX,
+    SUMMARY_PARAMETER_PREFIX,
     ScriptSemanticFacts,
     analyze_script_facts,
 )
@@ -106,10 +112,21 @@ class CodeExternalFlow:
 
 
 @dataclass(frozen=True)
+class CodeFunctionSummary:
+    path: Path
+    source: str
+    alias: str
+    cross_file: bool
+    parameters: tuple[str, ...]
+    return_values: tuple[tuple[str, ...], ...]
+
+
+@dataclass(frozen=True)
 class CodeFileAnalysis:
     index: CodeReferenceIndex
     return_labels: tuple[CodeReturnLabel, ...] = ()
     external_flows: tuple[CodeExternalFlow, ...] = ()
+    function_summaries: tuple[CodeFunctionSummary, ...] = ()
 
 
 class CodeReferenceIndex:
@@ -153,10 +170,40 @@ class CrossFileSemanticLinker:
         self._returns: dict[tuple[str, str, Path | None], list[CodeReturnLabel]] = {}
         self._flows: dict[tuple[str, str, Path | None], list[CodeExternalFlow]] = {}
         self._emitted: set[tuple[object, ...]] = set()
+        self._summaries: dict[tuple[str, str, Path | None], list[CodeFunctionSummary]] = {}
+        self._value_references: dict[
+            tuple[str, str, Path | None],
+            set[CodeReference],
+        ] = {}
+        self._seen_value_references: set[tuple[object, ...]] = set()
+        self._emitted_values: set[tuple[object, ...]] = set()
 
     def add(self, analysis: CodeFileAnalysis) -> CodeReferenceIndex:
         result = CodeReferenceIndex()
         result.merge(analysis.index)
+        changed_aliases: set[tuple[str, str, Path | None]] = set()
+        for summary in analysis.function_summaries:
+            key = (
+                summary.source,
+                summary.alias.casefold(),
+                None if summary.cross_file else summary.path,
+            )
+            values = self._summaries.setdefault(key, [])
+            if summary not in values:
+                values.append(summary)
+                changed_aliases.add(key)
+        for key in changed_aliases:
+            for reference in self._value_references.get(key, ()):
+                self._emit_resolved_values(result, reference)
+        reference_maps = (
+            analysis.index.project_references,
+            analysis.index.vanilla_references,
+        )
+        for references in reference_maps:
+            for items in references.values():
+                for reference in items:
+                    self._remember_value_reference(reference)
+                    self._emit_resolved_values(result, reference)
         for returned in analysis.return_labels:
             key = (
                 returned.source,
@@ -176,6 +223,224 @@ class CrossFileSemanticLinker:
                 for returned in self._returns.get(key, ()):
                     self._emit(result, returned, flow)
         return result
+
+    def unresolved_value_aliases(self) -> tuple[tuple[str, str], ...]:
+        """Return callable dependencies that do not yet have a reusable summary."""
+        missing: list[tuple[str, str]] = []
+        for source, alias, path in self._value_references:
+            if path is None:
+                continue
+            if _semantic_function_name(alias) is not None:
+                continue
+            if (
+                (source, alias, path) in self._summaries
+                or (source, alias, None) in self._summaries
+            ):
+                continue
+            value = (source, alias)
+            if value not in missing:
+                missing.append(value)
+        return tuple(missing)
+
+    def _remember_value_reference(self, reference: CodeReference) -> None:
+        identity = (
+            reference.source,
+            reference.path,
+            reference.line,
+            reference.column,
+            reference.label,
+            reference.runtime_arguments,
+        )
+        if identity in self._seen_value_references:
+            return
+        self._seen_value_references.add(identity)
+        self._register_value_dependencies(
+            reference,
+            (
+                (reference.source, alias.casefold(), reference.path)
+                for expression in reference.runtime_arguments
+                for alias in _expression_call_aliases(expression)
+            ),
+        )
+
+    def _register_value_dependencies(
+        self,
+        reference: CodeReference,
+        dependencies: Iterable[tuple[str, str, Path]],
+    ) -> None:
+        for dependency in dependencies:
+            for key in (dependency, (dependency[0], dependency[1], None)):
+                self._value_references.setdefault(key, set()).add(reference)
+
+    def _emit_resolved_values(
+        self,
+        result: CodeReferenceIndex,
+        reference: CodeReference,
+    ) -> None:
+        resolved, dependencies = self._resolve_runtime_values(reference)
+        self._register_value_dependencies(reference, dependencies)
+        if resolved is None or resolved == reference.runtime_argument_values:
+            return
+        identity = (
+            reference.source,
+            reference.path,
+            reference.line,
+            reference.column,
+            reference.label,
+            resolved,
+        )
+        if identity in self._emitted_values:
+            return
+        self._emitted_values.add(identity)
+        enhanced = replace(reference, runtime_argument_values=resolved)
+        target = (
+            result.vanilla_references
+            if reference.source == "vanilla"
+            else result.project_references
+        )
+        target[reference.label] = _dedupe_references(
+            [*target.get(reference.label, ()), enhanced]
+        )
+
+    def _resolve_runtime_values(
+        self,
+        reference: CodeReference,
+    ) -> tuple[
+        tuple[tuple[str, ...], ...] | None,
+        set[tuple[str, str, Path]],
+    ]:
+        values: list[tuple[str, ...]] = []
+        changed = False
+        dependencies: set[tuple[str, str, Path]] = set()
+        for index, expression in enumerate(reference.runtime_arguments):
+            resolved = self._resolve_expression(
+                reference.source,
+                reference.path,
+                expression,
+                set(),
+                dependencies,
+            )
+            existing = (
+                reference.runtime_argument_values[index]
+                if index < len(reference.runtime_argument_values)
+                else ()
+            )
+            if not resolved:
+                values.append(existing)
+                continue
+            if index == len(reference.runtime_arguments) - 1 and len(resolved) > 1:
+                values.extend(resolved)
+            else:
+                values.append(resolved[0])
+            changed = True
+        return (tuple(values) if changed else None), dependencies
+
+    def _resolve_expression(
+        self,
+        source: str,
+        path: Path,
+        expression: str,
+        resolving: set[tuple[str, str]],
+        dependencies: set[tuple[str, str, Path]],
+    ) -> tuple[tuple[str, ...], ...] | None:
+        stripped = expression.strip()
+        literal = _string_literal_text(stripped)
+        if literal is not None:
+            return ((literal,),)
+        if re.fullmatch(r"[-+]?\d+(?:\.\d+)?|true|false", stripped, re.IGNORECASE):
+            return ((stripped,),)
+        call = _value_call_parts(stripped)
+        if call is None:
+            if stripped.startswith(("@L_", "_")) or SUMMARY_PARAMETER_PREFIX in stripped:
+                return ((stripped,),)
+            return None
+        alias, arguments = call
+        key = (source, alias.casefold())
+        dependencies.add((source, alias.casefold(), path))
+        if key in resolving or len(resolving) >= 16:
+            return None
+        next_resolving = set(resolving)
+        next_resolving.add(key)
+        argument_values: list[tuple[str, ...]] = []
+        for index, argument in enumerate(arguments):
+            resolved = self._resolve_expression(
+                source,
+                path,
+                argument,
+                next_resolving,
+                dependencies,
+            )
+            if not resolved:
+                argument_values.append(("*",))
+            elif index == len(arguments) - 1 and len(resolved) > 1:
+                argument_values.extend(resolved)
+            else:
+                argument_values.append(resolved[0])
+        native = _resolve_semantic_function(alias, tuple(argument_values))
+        if native is not None:
+            return native
+        summaries = (
+            *self._summaries.get((source, alias.casefold(), path), ()),
+            *self._summaries.get((source, alias.casefold(), None), ()),
+        )
+        if not summaries:
+            return None
+        positions: list[list[str]] = []
+        for summary in summaries:
+            resolved_summary = self._resolve_summary(
+                summary,
+                tuple(argument_values),
+                next_resolving,
+                dependencies,
+            )
+            for index, candidates in enumerate(resolved_summary):
+                while len(positions) <= index:
+                    positions.append([])
+                positions[index].extend(candidates)
+        return tuple(
+            tuple(dict.fromkeys(candidates))[:64]
+            for candidates in positions
+        )
+
+    def _resolve_summary(
+        self,
+        summary: CodeFunctionSummary,
+        argument_values: tuple[tuple[str, ...], ...],
+        resolving: set[tuple[str, str]],
+        dependencies: set[tuple[str, str, Path]],
+    ) -> tuple[tuple[str, ...], ...]:
+        positions: list[list[str]] = []
+        for return_index, candidates in enumerate(summary.return_values):
+            resolved_candidates: list[tuple[tuple[str, ...], ...]] = []
+            for candidate in candidates:
+                for instantiated in _instantiate_summary_value(candidate, argument_values):
+                    if instantiated.startswith(SUMMARY_LITERAL_PREFIX):
+                        resolved_candidates.append(((instantiated[1:],),))
+                    elif instantiated.startswith(SUMMARY_EXPRESSION_PREFIX):
+                        resolved = self._resolve_expression(
+                            summary.source,
+                            summary.path,
+                            instantiated[1:],
+                            resolving,
+                            dependencies,
+                        )
+                        if resolved:
+                            resolved_candidates.append(resolved)
+            if not resolved_candidates:
+                continue
+            while len(positions) <= return_index:
+                positions.append([])
+            for resolved in resolved_candidates:
+                positions[return_index].extend(resolved[0])
+                if return_index == len(summary.return_values) - 1:
+                    for offset, extra in enumerate(resolved[1:], start=1):
+                        while len(positions) <= return_index + offset:
+                            positions.append([])
+                        positions[return_index + offset].extend(extra)
+        return tuple(
+            tuple(dict.fromkeys(candidates))[:64]
+            for candidates in positions
+        )
 
     def _emit(
         self,
@@ -221,6 +486,95 @@ class CrossFileSemanticLinker:
         target[reference.label] = _dedupe_references(
             [*target.get(reference.label, ()), reference]
         )
+
+
+def _expression_call_aliases(expression: str) -> tuple[str, ...]:
+    return tuple(
+        dict.fromkeys(
+            match.group(1).casefold()
+            for match in re.finditer(
+                r"([A-Za-z_][A-Za-z0-9_.:]*)\s*\(",
+                expression,
+            )
+        )
+    )
+
+
+def _value_call_parts(expression: str) -> tuple[str, tuple[str, ...]] | None:
+    match = re.fullmatch(
+        r"(?P<name>[A-Za-z_][A-Za-z0-9_.:]*)\s*\((?P<arguments>.*)\)",
+        expression,
+        re.DOTALL,
+    )
+    if match is None:
+        return None
+    return match.group("name"), _split_top_level_arguments(match.group("arguments"))
+
+
+def _instantiate_summary_value(
+    candidate: str,
+    argument_values: tuple[tuple[str, ...], ...],
+) -> tuple[str, ...]:
+    parameter_indices = tuple(
+        dict.fromkeys(
+            int(match.group(1))
+            for match in re.finditer(
+                re.escape(SUMMARY_PARAMETER_PREFIX) + r"(\d+)" + re.escape(SUMMARY_PARAMETER_PREFIX),
+                candidate,
+            )
+        )
+    )
+    values = (candidate,)
+    for parameter_index in parameter_indices:
+        marker = f"{SUMMARY_PARAMETER_PREFIX}{parameter_index}{SUMMARY_PARAMETER_PREFIX}"
+        replacements = (
+            argument_values[parameter_index]
+            if parameter_index < len(argument_values) and argument_values[parameter_index]
+            else ("*",)
+        )
+        values = tuple(
+            dict.fromkeys(
+                value.replace(marker, replacement)
+                for value, replacement in product(values, replacements)
+            )
+        )[:64]
+    return values
+
+
+def _resolve_semantic_function(
+    alias: str,
+    argument_values: tuple[tuple[str, ...], ...],
+) -> tuple[tuple[str, ...], ...] | None:
+    if _semantic_function_name(alias) != "generateprivilegelistlabels":
+        return None
+    positions: list[tuple[str, ...]] = []
+    for candidates in argument_values:
+        privileges = tuple(
+            value
+            for value in candidates
+            if value and value != "*" and re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", value)
+        )
+        if not privileges:
+            continue
+        positions.append(
+            tuple(
+                f"_PRIVILEGE_{privilege}_MESSAGETEXT_+0"
+                for privilege in privileges
+            )
+        )
+        positions.append(("$N",))
+    if not positions:
+        return None
+    while len(positions) < 21:
+        positions.append(("",))
+    return tuple(positions[:21])
+
+
+def _semantic_function_name(alias: str) -> str | None:
+    name = re.split(r"[.:]", alias)[-1].casefold().split("_")[-1]
+    if name == "generateprivilegelistlabels":
+        return name
+    return None
 
 
 def build_code_reference_index(
@@ -315,6 +669,7 @@ def analyze_code_file(
         index,
         _code_return_labels(spec, facts.return_labels),
         _code_external_flows(spec, facts.external_flows, line_starts),
+        _code_function_summaries(spec, facts.function_summaries),
     )
 
 
@@ -474,6 +829,26 @@ def _code_external_flows(
             )
         )
     return tuple(dict.fromkeys(flows))
+
+
+def _code_function_summaries(
+    spec: CodeFileSpec,
+    values: tuple[FunctionValueSummary, ...],
+) -> tuple[CodeFunctionSummary, ...]:
+    summaries: list[CodeFunctionSummary] = []
+    for value in values:
+        for index, alias in enumerate(value.aliases):
+            summaries.append(
+                CodeFunctionSummary(
+                    path=spec.path,
+                    source=spec.source,
+                    alias=alias.casefold(),
+                    cross_file=index > 0,
+                    parameters=value.parameters,
+                    return_values=value.return_values,
+                )
+            )
+    return tuple(dict.fromkeys(summaries))
 
 
 def _dedupe_references(references: list[CodeReference]) -> tuple[CodeReference, ...]:
@@ -694,6 +1069,7 @@ def _rank_references(references: tuple[CodeReference, ...]) -> tuple[CodeReferen
             key=lambda reference: (
                 -reference.confidence,
                 -role_score.get(reference.role, 0),
+                -sum(bool(values) for values in reference.runtime_argument_values),
                 not bool(reference.runtime_arguments),
                 reference.path.as_posix().casefold(),
                 reference.line,

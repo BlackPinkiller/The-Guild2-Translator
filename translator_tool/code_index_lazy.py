@@ -12,6 +12,7 @@ from .code_index import (
     CodeExternalFlow,
     CodeFileAnalysis,
     CodeFileSpec,
+    CodeFunctionSummary,
     CodeReference,
     CodeReferenceIndex,
     CodeReturnLabel,
@@ -27,13 +28,17 @@ from .settings import settings_dir
 
 
 CACHE_FORMAT_VERSION = 1
-LEXICAL_SCHEMA_VERSION = 2
+LEXICAL_SCHEMA_VERSION = 3
 ANALYZER_REVISION = "script-semantics-2026-07-22-1"
 MAX_CACHE_MANIFESTS = 8
 MAX_CACHE_BYTES = 128 * 1024 * 1024
 MAX_CACHED_FILES = 8192
 _LABEL_FRAGMENT_RE = re.compile(rb"@l_[a-z0-9_+*]{5,}|_[a-z][a-z0-9_+*]{5,}")
 _CALL_NAME_RE = re.compile(rb"\b([a-z_][a-z0-9_.:]*)\s*\(", re.IGNORECASE)
+_FUNCTION_NAME_RE = re.compile(
+    rb"\bfunction\s+([a-z_][a-z0-9_.:]*)\s*\(",
+    re.IGNORECASE,
+)
 _IMPLEMENTATION_REVISION = ""
 
 
@@ -83,7 +88,12 @@ class CodeFactsCache:
         )
         serialized_returns = entry.get("return_labels")
         serialized_flows = entry.get("external_flows")
-        if not isinstance(serialized_returns, list) or not isinstance(serialized_flows, list):
+        serialized_summaries = entry.get("function_summaries")
+        if (
+            not isinstance(serialized_returns, list)
+            or not isinstance(serialized_flows, list)
+            or not isinstance(serialized_summaries, list)
+        ):
             return None
         return CodeFileAnalysis(
             _index_from_references(references, spec.source),
@@ -98,6 +108,12 @@ class CodeFactsCache:
                 for item in serialized_flows
                 if isinstance(item, dict)
                 if (flow := _flow_from_json(item, spec)) is not None
+            ),
+            tuple(
+                summary
+                for item in serialized_summaries
+                if isinstance(item, dict)
+                if (summary := _summary_from_json(item, spec)) is not None
             ),
         )
 
@@ -125,6 +141,7 @@ class CodeFactsCache:
                 "references",
                 "return_labels",
                 "external_flows",
+                "function_summaries",
             ):
                 if name in current:
                     entry[name] = current[name]
@@ -157,6 +174,10 @@ class CodeFactsCache:
         ]
         entry["return_labels"] = [_return_to_json(value) for value in analysis.return_labels]
         entry["external_flows"] = [_flow_to_json(value) for value in analysis.external_flows]
+        entry["function_summaries"] = [
+            _summary_to_json(value)
+            for value in analysis.function_summaries
+        ]
         self._mark_dirty()
 
     def flush_if_needed(self, *, force: bool = False) -> None:
@@ -245,6 +266,7 @@ class LazyCodeIndexBuilder:
         self._analyzed: set[str] = set()
         self._linker = CrossFileSemanticLinker()
         self._pending_aliases: set[str] = set()
+        self._pending_value_aliases: set[tuple[str, str]] = set()
         self._return_aliases: dict[str, set[str]] = {}
         self._prepared = False
 
@@ -284,7 +306,9 @@ class LazyCodeIndexBuilder:
             for key in lookup_labels(label)
         }
         processed_aliases: set[str] = set()
+        processed_value_aliases: set[tuple[str, str]] = set()
         self._queue_return_aliases(requested_keys, processed_aliases)
+        self._queue_value_aliases(processed_value_aliases)
         needles = _candidate_needles(requested)
         candidates: list[CodeFileSpec] = []
         for spec in self.files:
@@ -302,10 +326,16 @@ class LazyCodeIndexBuilder:
                 break
             result.merge(self._analyze_spec(spec))
             self._queue_return_aliases(requested_keys, processed_aliases)
-        while self._pending_aliases and not cancelled():
+            self._queue_value_aliases(processed_value_aliases)
+        while (
+            self._pending_aliases or self._pending_value_aliases
+        ) and not cancelled():
             aliases = tuple(self._pending_aliases)
+            value_aliases = tuple(self._pending_value_aliases)
             self._pending_aliases.clear()
+            self._pending_value_aliases.clear()
             processed_aliases.update(aliases)
+            processed_value_aliases.update(value_aliases)
             call_needles = tuple(f"c:{alias.casefold()}".encode("ascii") for alias in aliases)
             for spec in self.files:
                 if cancelled():
@@ -313,9 +343,16 @@ class LazyCodeIndexBuilder:
                 if _spec_key(spec) in self._analyzed:
                     continue
                 blob = self._lexical_blob(spec)
-                if blob is not None and any(needle in blob for needle in call_needles):
+                if blob is not None and (
+                    any(needle in blob for needle in call_needles)
+                    or any(
+                        _spec_provides_value_alias(spec, blob, source, alias)
+                        for source, alias in value_aliases
+                    )
+                ):
                     result.merge(self._analyze_spec(spec))
                     self._queue_return_aliases(requested_keys, processed_aliases)
+                    self._queue_value_aliases(processed_value_aliases)
         self._flush_cache(force=True)
         return result
 
@@ -403,6 +440,14 @@ class LazyCodeIndexBuilder:
             if label in requested_keys:
                 self._pending_aliases.update(aliases - processed_aliases)
 
+    def _queue_value_aliases(
+        self,
+        processed_aliases: set[tuple[str, str]],
+    ) -> None:
+        self._pending_value_aliases.update(
+            set(self._linker.unresolved_value_aliases()) - processed_aliases
+        )
+
 
 def default_cache_path(game_root: Path, project_root: Path) -> Path:
     identity = "\0".join(
@@ -420,8 +465,28 @@ def _lexical_blob(raw: bytes) -> bytes:
     fragments = [
         *(b"l:" + match.group(0) for match in _LABEL_FRAGMENT_RE.finditer(lowered)),
         *(b"c:" + match.group(1) for match in _CALL_NAME_RE.finditer(lowered)),
+        *(b"f:" + match.group(1) for match in _FUNCTION_NAME_RE.finditer(lowered)),
     ]
     return b"\n".join(dict.fromkeys(fragments))
+
+
+def _spec_provides_value_alias(
+    spec: CodeFileSpec,
+    blob: bytes,
+    source: str,
+    alias: str,
+) -> bool:
+    if spec.source != source:
+        return False
+    normalized = alias.casefold()
+    if f"f:{normalized}".encode("ascii") in blob:
+        return True
+    stem = spec.path.stem.casefold()
+    prefix = stem + "_"
+    if not normalized.startswith(prefix):
+        return False
+    local_name = normalized[len(prefix) :]
+    return f"f:{local_name}".encode("ascii") in blob
 
 
 def _candidate_needles(labels: tuple[str, ...]) -> tuple[bytes, ...]:
@@ -551,6 +616,42 @@ def _return_from_json(
             item.get("match_kind") if isinstance(item.get("match_kind"), str) else "exact"
         ),
         confidence=item.get("confidence") if isinstance(item.get("confidence"), int) else 0,
+    )
+
+
+def _summary_to_json(value: CodeFunctionSummary) -> dict[str, object]:
+    return {
+        "alias": value.alias,
+        "cross_file": value.cross_file,
+        "parameters": list(value.parameters),
+        "return_values": [list(values) for values in value.return_values],
+    }
+
+
+def _summary_from_json(
+    item: dict[str, object],
+    spec: CodeFileSpec,
+) -> CodeFunctionSummary | None:
+    alias = item.get("alias")
+    parameters = item.get("parameters")
+    return_values = item.get("return_values")
+    if (
+        not isinstance(alias, str)
+        or not isinstance(parameters, list)
+        or not isinstance(return_values, list)
+    ):
+        return None
+    return CodeFunctionSummary(
+        path=spec.path,
+        source=spec.source,
+        alias=alias,
+        cross_file=item.get("cross_file") is True,
+        parameters=tuple(value for value in parameters if isinstance(value, str)),
+        return_values=tuple(
+            tuple(value for value in values if isinstance(value, str))
+            for values in return_values
+            if isinstance(values, list)
+        ),
     )
 
 

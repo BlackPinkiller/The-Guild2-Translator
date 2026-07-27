@@ -224,3 +224,68 @@ def assert_lazy_code_index_links_cached_cross_file_facts() -> None:
     finally:
         lazy_module.analyze_code_file = original_analyze_code_file
         shutil.rmtree(temp, ignore_errors=True)
+
+
+def assert_lazy_code_index_loads_cached_value_providers() -> None:
+    temp = Path(tempfile.mkdtemp(prefix="translator_tool_lazy_values_"))
+    original_analyze_code_file = lazy_module.analyze_code_file
+    try:
+        game = temp / "game"
+        project = temp / "sources" / "Vanilla"
+        scripts = game / "Scripts"
+        scripts.mkdir(parents=True)
+        project.mkdir(parents=True)
+        (scripts / "helper.lua").write_text(
+            "\n".join(
+                (
+                    "function MakeValues(kind)",
+                    '    return "@L_ITEM_"..kind.."_NAME_+0", "Tail"',
+                    "end",
+                )
+            ),
+            encoding="utf-8",
+        )
+        (scripts / "caller.lua").write_text(
+            'function Main() MsgQuick("", "@L_LAZY_VALUE_BODY_+0", helper_MakeValues("BREAD")) end',
+            encoding="utf-8",
+        )
+        (scripts / "unrelated.lua").write_text(
+            'function Unrelated() return "@L_NOT_REQUESTED_+0" end',
+            encoding="utf-8",
+        )
+        cache_path = temp / "cache.json"
+        cold = LazyCodeIndexBuilder(game, project, cache_path=cache_path)
+        index = cold.analyze_labels(("LAZY_VALUE_BODY_+0",))
+        resolved = next(
+            (
+                item
+                for item in index.references_for("LAZY_VALUE_BODY_+0").project
+                if item.runtime_argument_values
+                == (("@L_ITEM_BREAD_NAME_+0",), ("Tail",))
+            ),
+            None,
+        )
+        if resolved is None:
+            raise AssertionError("targeted lazy analysis did not load the value provider summary")
+        if cold.progress.analyzed != 2:
+            raise AssertionError(
+                f"value-provider analysis scanned unrelated files: {cold.progress!r}"
+            )
+        cold.close()
+
+        def fail_if_reparsed(*_args, **_kwargs):
+            raise AssertionError("cached function value summaries were reparsed")
+
+        lazy_module.analyze_code_file = fail_if_reparsed
+        warm = LazyCodeIndexBuilder(game, project, cache_path=cache_path)
+        cached = warm.analyze_labels(("LAZY_VALUE_BODY_+0",))
+        if not any(
+            item.runtime_argument_values
+            == (("@L_ITEM_BREAD_NAME_+0",), ("Tail",))
+            for item in cached.references_for("LAZY_VALUE_BODY_+0").project
+        ):
+            raise AssertionError("warm cache did not restore and link function value summaries")
+        warm.close()
+    finally:
+        lazy_module.analyze_code_file = original_analyze_code_file
+        shutil.rmtree(temp, ignore_errors=True)
