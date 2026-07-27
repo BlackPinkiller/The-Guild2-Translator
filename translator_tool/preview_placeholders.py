@@ -117,6 +117,15 @@ class PlaceholderLocalization(Protocol):
 
     def sample_label(self, prefix: str, suffix: str, seed_key: str, number: int, target: bool) -> str: ...
 
+    def sample_label_record(
+        self,
+        prefix: str,
+        field_suffixes: tuple[str, ...],
+        seed_key: str,
+        number: int,
+        target: bool,
+    ) -> tuple[str, ...]: ...
+
     def localized(self, label: str, target: bool) -> str: ...
 
 
@@ -139,9 +148,43 @@ class PlaceholderValue:
     glyph_id: int | None = None
 
 
+@dataclass(frozen=True)
+class BuildingPreviewEntity:
+    type_name: str
+    proper_name: str
+
+    def full_name(self) -> str:
+        if self.type_name and self.proper_name:
+            return f"{self.type_name}『{self.proper_name}』"
+        return self.type_name or self.proper_name
+
+
+class PlaceholderEntityResolver:
+    """Build one coherent preview entity before projecting placeholder fields."""
+
+    def __init__(self, localization: PlaceholderLocalization) -> None:
+        self.localization = localization
+
+    def building(self, number: int, context: PlaceholderContext) -> BuildingPreviewEntity:
+        type_name, proper_name = self.localization.sample_label_record(
+            "_BUILDING_",
+            ("_NAME_+0", "_POOL_+0"),
+            context.seed_key,
+            number,
+            context.target,
+        )
+        return BuildingPreviewEntity(
+            _clean_sample_text(type_name)
+            or translate("preview.value.building_type", locale=context.locale, number=number),
+            _clean_sample_text(proper_name)
+            or translate("preview.value.building_name", locale=context.locale, number=number),
+        )
+
+
 class PlaceholderValueBuilder:
     def __init__(self, localization: PlaceholderLocalization) -> None:
         self.localization = localization
+        self.entities = PlaceholderEntityResolver(localization)
 
     def argument_value(
         self,
@@ -184,7 +227,7 @@ class PlaceholderValueBuilder:
                 if item:
                     return PlaceholderValue(_clean_sample_text(item))
             if semantic == "building":
-                return PlaceholderValue(_building_name_value(self.localization, number, context))
+                return PlaceholderValue(self.entities.building(number, context).proper_name)
             if semantic == "city":
                 return PlaceholderValue(_city_value(self.localization, number, context))
         values = {
@@ -232,7 +275,7 @@ class PlaceholderValueBuilder:
                     self.localization.character_name(context.seed_key, number, context.target)
                 )
             if semantic == "building":
-                return PlaceholderValue(_building_name_value(self.localization, number, context))
+                return PlaceholderValue(self.entities.building(number, context).proper_name)
             if semantic == "city":
                 return PlaceholderValue(_city_value(self.localization, number, context))
             if semantic == "dynasty":
@@ -245,16 +288,11 @@ class PlaceholderValueBuilder:
                 translate("preview.value.object_name", locale=context.locale, number=number)
             )
         if suffix == "GG":
-            building_name = _building_name_value(self.localization, number, context)
-            building_type = _building_type_value(self.localization, number, context)
-            if building_name and building_type and building_type.casefold() not in building_name.casefold():
-                return PlaceholderValue(f"{building_name} {building_type}")
-            value = building_name or building_type or translate("preview.value.building_full", locale=context.locale, number=number)
-            return PlaceholderValue(value)
+            return PlaceholderValue(self.entities.building(number, context).full_name())
         if suffix == "GN":
-            return PlaceholderValue(_building_name_value(self.localization, number, context))
+            return PlaceholderValue(self.entities.building(number, context).proper_name)
         if suffix == "GT":
-            return PlaceholderValue(_building_type_value(self.localization, number, context))
+            return PlaceholderValue(self.entities.building(number, context).type_name)
         if suffix == "SL":
             value = self.localization.sample_label("_CHARACTERS_1_CLASSES_", "_LEVEL_+0", context.seed_key, number, context.target)
             return PlaceholderValue(_clean_sample_text(value) if value else translate("preview.value.level", locale=context.locale, number=number))
@@ -696,16 +734,6 @@ _LABEL_LITERAL_RE = re.compile(
 def _city_value(localization: PlaceholderLocalization, number: int, context: PlaceholderContext) -> str:
     value = localization.sample_label("_CITY_NAME_", "_+0", context.seed_key, number, context.target)
     return _clean_sample_text(value) if value else translate("preview.value.city", locale=context.locale, number=number)
-
-
-def _building_name_value(localization: PlaceholderLocalization, number: int, context: PlaceholderContext) -> str:
-    value = localization.sample_label("_BUILDING_", "_POOL_+0", context.seed_key, number, context.target)
-    return _clean_sample_text(value) if value else translate("preview.value.building_name", locale=context.locale, number=number)
-
-
-def _building_type_value(localization: PlaceholderLocalization, number: int, context: PlaceholderContext) -> str:
-    value = localization.sample_label("_BUILDING_", "_NAME_+0", context.seed_key, number, context.target)
-    return _clean_sample_text(value) if value else translate("preview.value.building_type", locale=context.locale, number=number)
 
 
 def _clean_sample_text(value: str) -> str:

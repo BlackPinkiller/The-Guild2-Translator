@@ -2665,8 +2665,8 @@ def assert_preview_i18n_and_symbol_mapping() -> None:
             '2 "_NAMES_ENGLISH_SURNAMES_+0" "Smith" |\n'
             '3 "_PREVIEW_LABEL_+0" "Preview label" |\n'
             '4 "_ITEM_RING_NAME_+0" "Ruby ring" |\n'
-            '5 "_BUILDING_Bakery_NAME_+0" "Bakery" |\n'
-            '6 "_BUILDING_Bakery_POOL_+0" "Bread & Butter" |\n'
+            '5 "_BUILDING_Church2b_NAME_+0" "Catholic church" |\n'
+            '6 "_BUILDING_Church2b_POOL_+0" "The Almighty" |\n'
             '7 "_CHARACTERS_1_CLASSES_patron_NAME_+0" "Patron" |\n'
             '8 "_CHARACTERS_1_CLASSES_patron_LEVEL_+0" "Worker" |\n'
             '9 "_CHARACTERS_2_PROFESSIONS_baker_NAME_+0" "Baker" |\n'
@@ -2682,6 +2682,8 @@ def assert_preview_i18n_and_symbol_mapping() -> None:
             '1 "_NAMES_ENGLISH_MALE_+0" "杰克" |\n'
             '2 "_NAMES_ENGLISH_SURNAMES_+0" "史密斯" |\n'
             '3 "_PREVIEW_LABEL_+0" "预览标签" |\n'
+            '4 "_BUILDING_Church2b_NAME_+0" "天主教堂" |\n'
+            '5 "_BUILDING_Church2b_POOL_+0" "全能的上帝" |\n'
         )
         (source_root / "Text.dbt").write_text(header_source + rows_source, encoding="utf-8")
         (target_root / "Text.dbt").write_text(header_target + rows_target, encoding="utf-8")
@@ -2717,14 +2719,34 @@ def assert_preview_i18n_and_symbol_mapping() -> None:
         if not any(atom.glyph_id == 2002 for atom in source.atoms):
             raise AssertionError("%2t did not preview the game's coin symbol")
         strong_placeholders = service.render(
-            "%1GG | %2GN | %3GT | %4SK | %5ST | %6SA | %7SD | %8SB | %9SL | %10DN",
+            "%1GG | %1GN | %1GT | %4SK | %5ST | %6SA | %7SD | %8SB | %9SL | %10DN",
             unit_key="same-entry",
             label="STRONG_PLACEHOLDERS",
             file_rel="Text.dbt",
             kind="dbt",
             target=False,
         )
-        for snippet in ("Bread & Butter", "Bakery", "Patron", "Serf", "Mayor", "Baker", "Worker", "Smith"):
+        if not strong_placeholders.display_text.startswith(
+            "Catholic church『The Almighty』 | The Almighty | Catholic church"
+        ):
+            raise AssertionError(
+                "building placeholders did not project one coherent building entity: "
+                f"{strong_placeholders.display_text!r}"
+            )
+        target_building = service.render(
+            "%1GG | %1GN | %1GT",
+            unit_key="same-entry",
+            label="STRONG_PLACEHOLDERS",
+            file_rel="Text.dbt",
+            kind="dbt",
+            target=True,
+        )
+        if target_building.display_text != "天主教堂『全能的上帝』 | 全能的上帝 | 天主教堂":
+            raise AssertionError(
+                "localized building placeholders did not retain the same entity and game format: "
+                f"{target_building.display_text!r}"
+            )
+        for snippet in ("Patron", "Serf", "Mayor", "Baker", "Worker", "Smith"):
             if snippet not in strong_placeholders.display_text:
                 raise AssertionError(f"strong placeholder preview did not sample DB text: {strong_placeholders.display_text!r}")
 

@@ -411,6 +411,10 @@ class GameLocalization:
         self.target: dict[str, str] = {}
         self.first_name_keys: tuple[str, ...] = ()
         self.surname_keys: tuple[str, ...] = ()
+        self._label_record_cache: dict[
+            tuple[str, tuple[str, ...]],
+            tuple[tuple[str, ...], ...],
+        ] = {}
         self._load()
 
     @staticmethod
@@ -491,6 +495,44 @@ class GameLocalization:
         )
         key = self._pick(keys, f"{unit_key}:{number}:{prefix}:{suffix}")
         return self.localized(key, target) if key else ""
+
+    def sample_label_record(
+        self,
+        prefix: str,
+        field_suffixes: tuple[str, ...],
+        unit_key: str,
+        number: int,
+        target: bool,
+    ) -> tuple[str, ...]:
+        cache_key = (prefix, field_suffixes)
+        complete = self._label_record_cache.get(cache_key)
+        if complete is None:
+            records: dict[str, dict[str, str]] = {}
+            for key, value in self.source.items():
+                if (
+                    not key.startswith(prefix)
+                    or not value
+                    or "_ATHMO_" in key
+                    or "_TEMPLATE_" in key
+                ):
+                    continue
+                for field_suffix in field_suffixes:
+                    if key.endswith(field_suffix):
+                        stem = key[: -len(field_suffix)]
+                        records.setdefault(stem, {})[field_suffix] = key
+                        break
+            complete = tuple(
+                tuple(fields[field_suffix] for field_suffix in field_suffixes)
+                for _, fields in sorted(records.items())
+                if all(field_suffix in fields for field_suffix in field_suffixes)
+            )
+            if len(self._label_record_cache) >= 64:
+                self._label_record_cache.clear()
+            self._label_record_cache[cache_key] = complete
+        record = self._pick(complete, f"{unit_key}:{number}:{prefix}:record")
+        if not record:
+            return tuple("" for _ in field_suffixes)
+        return tuple(self.localized(key, target) for key in record)
 
 
 class PreviewService:
