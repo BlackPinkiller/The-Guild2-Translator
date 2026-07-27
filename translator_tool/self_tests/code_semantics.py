@@ -55,6 +55,86 @@ def assert_code_semantics_are_scope_and_role_aware() -> None:
         raise AssertionError("MsgBox header and body did not share the same runtime argument list")
 
 
+def assert_code_semantics_resolve_local_function_returns() -> None:
+    script = "\n".join(
+        (
+            "function MakeItemLabel(kind, suffix)",
+            '    local prefix = "@L_ITEM_"',
+            '    local label = prefix..kind.."_NAME_+"..suffix',
+            "    return label",
+            "end",
+            "function BranchLabel()",
+            '    if Enabled then return "@L_OPTION_ENABLED_+0" end',
+            '    return "@L_OPTION_DISABLED_+0"',
+            "end",
+            "function RecursiveLabel(value)",
+            "    return RecursiveLabel(value)",
+            "end",
+            "function Main()",
+            '    MsgQuick("", "@L_BODY_BREAD_+0", MakeItemLabel("BREAD", "0"))',
+            '    MsgQuick("", "@L_BODY_CAKE_+0", MakeItemLabel("CAKE", "1"))',
+            '    MsgQuick("", "@L_BODY_BRANCH_+0", BranchLabel())',
+            '    MsgQuick("", "@L_BODY_RECURSIVE_+0", RecursiveLabel("BREAD"))',
+            '    MsgQuick("", "@L_BODY_ITEM_+0", ItemGetLabel("BoozyBreathBeer", true))',
+            '    MsgQuick("", "@L_BODY_ITEM_NUMERIC_+0", ItemGetLabel("BoozyBreathBeer", 1))',
+            '    MsgQuick("", "@L_BODY_ITEM_PLURAL_+0", ItemGetLabel(ItemId, false))',
+            "end",
+        )
+    )
+    uses = analyze_script(
+        script,
+        Path("FunctionValues.lua"),
+        label_catalog=frozenset(
+            {
+                "body_bread_+0",
+                "body_cake_+0",
+                "body_branch_+0",
+                "body_recursive_+0",
+                "body_item_+0",
+                "body_item_numeric_+0",
+                "body_item_plural_+0",
+                "item_bread_name_+0",
+                "item_cake_name_+1",
+                "_item_boozybreathbeer_name_+0",
+                "option_enabled_+0",
+                "option_disabled_+0",
+            }
+        ),
+    )
+    by_label = {
+        use.label: use
+        for use in uses
+        if use.role == "body"
+    }
+    if by_label["body_bread_+0"].runtime_argument_values != (("@L_ITEM_BREAD_NAME_+0",),):
+        raise AssertionError(
+            "a local function return did not bind the first call's concrete parameters"
+        )
+    if by_label["body_cake_+0"].runtime_argument_values != (("@L_ITEM_CAKE_NAME_+1",),):
+        raise AssertionError(
+            "a local function return leaked parameter values from another call site"
+        )
+    if set(by_label["body_branch_+0"].runtime_argument_values[0]) != {
+        "@L_OPTION_ENABLED_+0",
+        "@L_OPTION_DISABLED_+0",
+    }:
+        raise AssertionError("branching function returns did not remain an explicit candidate set")
+    if by_label["body_recursive_+0"].runtime_argument_values != ((),):
+        raise AssertionError("recursive label evaluation did not stop at the bounded call guard")
+    if by_label["body_item_+0"].runtime_argument_values != (
+        ("_ITEM_BoozyBreathBeer_NAME_+0",),
+    ):
+        raise AssertionError("ItemGetLabel did not apply its documented singular label contract")
+    if by_label["body_item_numeric_+0"].runtime_argument_values != (
+        ("_ITEM_BoozyBreathBeer_NAME_+0",),
+    ):
+        raise AssertionError("ItemGetLabel did not recognize the game's numeric true convention")
+    if by_label["body_item_plural_+0"].runtime_argument_values != (
+        ("_ITEM_*_NAME_+1",),
+    ):
+        raise AssertionError("an unknown item did not retain its documented plural label family")
+
+
 def assert_code_semantics_follow_fields_panels_and_initdata() -> None:
     script = "\n".join(
         (
@@ -254,6 +334,7 @@ def assert_placeholder_values_avoid_ambiguous_random_branches() -> None:
             return {
                 "_OPTION_BEGGAR_+0": "Beggar",
                 "_OPTION_EMPEROR_+0": "Emperor",
+                "_ITEM_BoozyBreathBeer_NAME_+0": "Drunkard Brew beer",
                 "_CHARACTERS_3_TITLES_NAME_+9": "Citizen",
                 "SubstSimFullDescOffice_+0": "%1ST %1SV %1SD, %1SA in %2NAME",
             }.get(label, label)
@@ -414,6 +495,29 @@ def assert_placeholder_values_avoid_ambiguous_random_branches() -> None:
     )
     if builder.argument_value(1, "n", branching_context).text in {"1", "2"}:
         raise AssertionError("an ambiguous numeric branch was presented as a certain caller value")
+
+    function_label = CodeReference(
+        "function_label_+0",
+        Path("FunctionLabel.lua"),
+        60,
+        1,
+        "MsgQuick",
+        1,
+        ('""', '"@L_FUNCTION_LABEL_+0"', 'ItemGetLabel("BoozyBreathBeer", true)'),
+        runtime_arguments=('ItemGetLabel("BoozyBreathBeer", true)',),
+        runtime_argument_values=(("_ITEM_BoozyBreathBeer_NAME_+0",),),
+        role="body",
+    )
+    function_label_context = PlaceholderContext(
+        "FUNCTION_LABEL_+0",
+        "Text.dbt",
+        False,
+        "en",
+        (function_label,),
+        ((1, ("l",)),),
+    )
+    if builder.argument_value(1, "l", function_label_context).text != "Drunkard Brew beer":
+        raise AssertionError("preview ignored a proven localization value returned by a function")
 
 
 def assert_variadic_runtime_arguments_map_to_placeholder_positions() -> None:

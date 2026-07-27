@@ -792,10 +792,44 @@ def _localized_argument_value(
         expression = _placeholder_expression(reference, number)
         value = _localized_expression_value(localization, expression, number, context)
         if not value:
+            value = _localized_runtime_argument_value(
+                localization,
+                reference,
+                number,
+                context,
+            )
+        if not value:
             value = _localized_variable_value(localization, reference, expression, number, context)
         if value:
             return value
     return ""
+
+
+def _localized_runtime_argument_value(
+    localization: PlaceholderLocalization,
+    reference: object,
+    number: int,
+    context: PlaceholderContext,
+) -> str:
+    runtime_values = getattr(reference, "runtime_argument_values", ())
+    if not isinstance(runtime_values, tuple) or not (0 < number <= len(runtime_values)):
+        return ""
+    candidates = runtime_values[number - 1]
+    if not isinstance(candidates, tuple) or not candidates:
+        return ""
+    values: list[str] = []
+    for candidate in candidates:
+        value = _localized_expression_value(
+            localization,
+            str(candidate),
+            number,
+            context,
+        )
+        if not value:
+            return ""
+        values.append(value)
+    unique_values = tuple(dict.fromkeys(values))
+    return unique_values[0] if len(unique_values) == 1 else ""
 
 
 def _localized_expression_value(

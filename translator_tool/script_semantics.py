@@ -156,6 +156,8 @@ class _Analysis:
     assignments: tuple[Assignment, ...]
     assignments_by_name: dict[tuple[int | None, str], tuple[Assignment, ...]]
     calls_by_alias: dict[str, tuple[int, ...]]
+    functions_by_alias: dict[str, tuple[int, ...]]
+    returns_by_function: dict[int, tuple[tuple[int, int, int], ...]]
 
 
 LABEL_RE = re.compile(
@@ -204,6 +206,10 @@ def analyze_script_facts(
     calls_by_alias: dict[str, list[int]] = {}
     for index, call in enumerate(calls):
         calls_by_alias.setdefault(call.name.casefold(), []).append(index)
+    functions_by_alias: dict[str, list[int]] = {}
+    for index, function in enumerate(functions):
+        for alias in function.aliases:
+            functions_by_alias.setdefault(alias.casefold(), []).append(index)
     analysis = _Analysis(
         text,
         path,
@@ -215,6 +221,8 @@ def analyze_script_facts(
         assignments,
         {key: tuple(values) for key, values in assignments_by_name.items()},
         {name: tuple(indices) for name, indices in calls_by_alias.items()},
+        {name: tuple(indices) for name, indices in functions_by_alias.items()},
+        _return_expressions_by_function(tokens, functions),
     )
     uses: list[SemanticLabelUse] = []
     external_flows: list[ExternalCallFlow] = []
@@ -782,6 +790,7 @@ def _evaluate_tokens(
     position: int,
     function_index: int | None,
     resolving: set[tuple[str, int | None]],
+    parameter_bindings: dict[tuple[int, str], tuple[str, ...]] | None = None,
 ) -> tuple[str, ...]:
     while start < end and analysis.tokens[start].value == "(":
         close = _matching_token(analysis.tokens, start, "(", ")")
@@ -794,7 +803,15 @@ def _evaluate_tokens(
     if len(parts) > 1:
         combined = ("",)
         for part_start, part_end in parts:
-            part_values = _evaluate_tokens(analysis, part_start, part_end, position, function_index, resolving)
+            part_values = _evaluate_tokens(
+                analysis,
+                part_start,
+                part_end,
+                position,
+                function_index,
+                resolving,
+                parameter_bindings,
+            )
             if not part_values:
                 part_values = ("*",)
             combined = tuple(
@@ -805,16 +822,161 @@ def _evaluate_tokens(
                 )
             )[:64]
         return combined
+    call = _call_for_token_range(analysis, start, end)
+    if call is not None:
+        return _evaluate_local_function_call(
+            analysis,
+            call,
+            position,
+            function_index,
+            resolving,
+            parameter_bindings,
+        )
     if end - start == 1:
         token = analysis.tokens[start]
-        if token.kind == "string":
+        if token.kind in {"string", "number"}:
             return (token.value,)
         if token.kind == "identifier":
-            return _resolve_variable(analysis, token.value, position, function_index, resolving)
+            if token.value.casefold() in {"true", "false"}:
+                return (token.value.casefold(),)
+            return _resolve_variable(
+                analysis,
+                token.value,
+                position,
+                function_index,
+                resolving,
+                parameter_bindings,
+            )
     lvalue = _lvalue_name(analysis.tokens, start, end)
     if lvalue:
-        return _resolve_variable(analysis, lvalue, position, function_index, resolving)
+        return _resolve_variable(
+            analysis,
+            lvalue,
+            position,
+            function_index,
+            resolving,
+            parameter_bindings,
+        )
     return ()
+
+
+def _call_for_token_range(
+    analysis: _Analysis,
+    start: int,
+    end: int,
+) -> ScriptCall | None:
+    if start >= end:
+        return None
+    expression_start = analysis.tokens[start].start
+    expression_end = analysis.tokens[end - 1].end
+    call_index = bisect.bisect_left(analysis.call_starts, expression_start)
+    if call_index >= len(analysis.calls):
+        return None
+    call = analysis.calls[call_index]
+    return call if call.start == expression_start and call.end == expression_end else None
+
+
+def _evaluate_local_function_call(
+    analysis: _Analysis,
+    call: ScriptCall,
+    position: int,
+    function_index: int | None,
+    resolving: set[tuple[str, int | None]],
+    parameter_bindings: dict[tuple[int, str], tuple[str, ...]] | None,
+) -> tuple[str, ...]:
+    target_indices = analysis.functions_by_alias.get(call.name.casefold(), ())
+    native_name = re.split(r"[.:]", call.name)[-1].casefold()
+    if not target_indices and native_name != "itemgetlabel":
+        return ()
+    argument_values: list[tuple[str, ...]] = []
+    for start, end in call.argument_spans:
+        token_indices = _tokens_in_span(analysis, start, end)
+        if not token_indices:
+            argument_values.append(())
+            continue
+        argument_values.append(
+            _evaluate_tokens(
+                analysis,
+                token_indices[0],
+                token_indices[-1] + 1,
+                position,
+                function_index,
+                resolving,
+                parameter_bindings,
+            )
+        )
+    if not target_indices:
+        return _evaluate_native_label_call(call, tuple(argument_values))
+
+    values: list[str] = []
+    for target_index in target_indices:
+        target = analysis.functions[target_index]
+        recursion_key = (f"@call:{target.name.casefold()}", target_index)
+        if recursion_key in resolving or len(resolving) >= 8:
+            continue
+        next_resolving = set(resolving)
+        next_resolving.add(recursion_key)
+        next_bindings = dict(parameter_bindings or {})
+        for parameter_index, parameter in enumerate(target.parameters):
+            next_bindings[(target_index, parameter.casefold())] = (
+                argument_values[parameter_index]
+                if parameter_index < len(argument_values)
+                else ()
+            )
+        for return_start, return_end, return_position in analysis.returns_by_function.get(target_index, ()):
+            parts = _split_token_range(analysis.tokens, return_start, return_end, ",")
+            if not parts:
+                continue
+            first_start, first_end = parts[0]
+            values.extend(
+                _evaluate_tokens(
+                    analysis,
+                    first_start,
+                    first_end,
+                    return_position,
+                    target_index,
+                    next_resolving,
+                    next_bindings,
+                )
+            )
+    return tuple(dict.fromkeys(values))[:64]
+
+
+def _evaluate_native_label_call(
+    call: ScriptCall,
+    argument_values: tuple[tuple[str, ...], ...],
+) -> tuple[str, ...]:
+    """Evaluate documented engine functions that return localization identities.
+
+    These are function-level contracts, not call-site exceptions. Unknown
+    runtime inputs remain wildcard label families for downstream sampling.
+    """
+    name = re.split(r"[.:]", call.name)[-1].casefold()
+    if name != "itemgetlabel":
+        return ()
+
+    item_values = argument_values[0] if argument_values else ()
+    singular_values = argument_values[1] if len(argument_values) > 1 else ()
+    item_names = tuple(
+        value
+        for value in item_values
+        if re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", value)
+        and value.casefold() not in {"true", "false"}
+    ) or ("*",)
+    suffixes: tuple[str, ...]
+    if singular_values and set(singular_values) <= {"true", "1"}:
+        suffixes = ("0",)
+    elif singular_values and set(singular_values) <= {"false", "0"}:
+        suffixes = ("1",)
+    else:
+        suffixes = ("0", "1")
+    return tuple(
+        dict.fromkeys(
+            f"_ITEM_{item_name}_NAME_+{suffix}"
+            for item_name in item_names
+            for suffix in suffixes
+        )
+    )[:64]
 
 
 def _dependent_label_values(
@@ -967,18 +1129,32 @@ def _return_expression_ranges(analysis: _Analysis) -> tuple[tuple[int, int], ...
 def _return_expressions(
     analysis: _Analysis,
 ) -> tuple[tuple[int, int, int, int], ...]:
+    return tuple(
+        (function_index, start, end, position)
+        for function_index, expressions in analysis.returns_by_function.items()
+        for start, end, position in expressions
+    )
+
+
+def _return_expressions_by_function(
+    tokens: tuple[Token, ...],
+    functions: tuple[ScriptFunction, ...],
+) -> dict[int, tuple[tuple[int, int, int], ...]]:
     values: list[tuple[int, int, int, int]] = []
-    for index, token in enumerate(analysis.tokens[:-1]):
+    for index, token in enumerate(tokens[:-1]):
         if token.kind != "identifier" or token.value.casefold() != "return":
             continue
-        function_index = _function_at(analysis.functions, token.start)
+        function_index = _function_at(functions, token.start)
         if function_index is None:
             continue
         start = index + 1
-        end = _expression_end(analysis.tokens, start)
+        end = _expression_end(tokens, start)
         if start < end:
             values.append((function_index, start, end, token.start))
-    return tuple(values)
+    grouped: dict[int, list[tuple[int, int, int]]] = {}
+    for function_index, start, end, position in values:
+        grouped.setdefault(function_index, []).append((start, end, position))
+    return {function_index: tuple(expressions) for function_index, expressions in grouped.items()}
 
 
 def _dependency_names(tokens: tuple[Token, ...], start: int, end: int) -> tuple[str, ...]:
@@ -1014,6 +1190,7 @@ def _resolve_variable(
     position: int,
     function_index: int | None,
     resolving: set[tuple[str, int | None]],
+    parameter_bindings: dict[tuple[int, str], tuple[str, ...]] | None = None,
 ) -> tuple[str, ...]:
     key = (name.casefold(), function_index)
     if key in resolving or len(resolving) >= 8:
@@ -1027,6 +1204,7 @@ def _resolve_variable(
             position,
             function_index,
             next_resolving,
+            parameter_bindings,
         )
     )
     for assignment in analysis.assignments_by_name.get((function_index, name.casefold()), ()):
@@ -1039,12 +1217,16 @@ def _resolve_variable(
                     assignment.position,
                     function_index,
                     next_resolving,
+                    parameter_bindings,
                 )
             )
     if values:
         return tuple(dict.fromkeys(values))[:64]
     if function_index is None or not (0 <= function_index < len(analysis.functions)):
         return ()
+    bound = (parameter_bindings or {}).get((function_index, name.casefold()))
+    if bound is not None:
+        return bound
     function = analysis.functions[function_index]
     parameter_index = next(
         (index for index, parameter in enumerate(function.parameters) if parameter.casefold() == name.casefold()),
@@ -1068,6 +1250,7 @@ def _resolve_variable(
                         call.start,
                         call.function_index,
                         next_resolving,
+                        parameter_bindings,
                     )
                 )
     return tuple(dict.fromkeys(values))[:64]
@@ -1079,6 +1262,7 @@ def _accumulated_variable_values(
     position: int,
     function_index: int | None,
     resolving: set[tuple[str, int | None]],
+    parameter_bindings: dict[tuple[int, str], tuple[str, ...]] | None = None,
 ) -> tuple[str, ...]:
     current: tuple[str, ...] = ()
     accumulated = False
@@ -1104,6 +1288,7 @@ def _accumulated_variable_values(
                 assignment.position,
                 function_index,
                 resolving,
+                parameter_bindings,
             )
             if not suffix:
                 suffix = ("*",)
@@ -1120,6 +1305,7 @@ def _accumulated_variable_values(
             assignment.position,
             function_index,
             resolving,
+            parameter_bindings,
         )
         if resolved:
             current = tuple(dict.fromkeys((*current, *resolved)))[:64]

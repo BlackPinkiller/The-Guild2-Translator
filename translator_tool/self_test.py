@@ -65,6 +65,7 @@ from .self_tests.code_semantics import (
     assert_cross_file_return_labels_flow_only_to_real_callers,
     assert_code_semantics_follow_fields_panels_and_initdata,
     assert_code_semantics_are_scope_and_role_aware,
+    assert_code_semantics_resolve_local_function_returns,
     assert_placeholder_values_avoid_ambiguous_random_branches,
     assert_placeholder_reference_selection_is_coherent,
     assert_variadic_runtime_arguments_map_to_placeholder_positions,
@@ -3862,6 +3863,7 @@ def main() -> int:
     assert_discover_game_source_projects_detects_vanilla_and_mods()
     assert_code_reference_index_avoids_db_and_uses_vanilla_fallback()
     assert_code_semantics_are_scope_and_role_aware()
+    assert_code_semantics_resolve_local_function_returns()
     assert_code_semantics_follow_fields_panels_and_initdata()
     assert_cross_file_return_labels_flow_only_to_real_callers()
     assert_code_index_handles_families_and_binary_gui()
