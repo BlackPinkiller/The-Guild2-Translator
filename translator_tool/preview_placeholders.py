@@ -898,13 +898,24 @@ def _localized_runtime_argument_value(
     candidates = runtime_values[number - 1]
     if not isinstance(candidates, tuple) or not candidates:
         return ""
-    values: list[str] = []
-    for candidate in candidates:
+    runtime_kinds = getattr(reference, "runtime_argument_kinds", ())
+    kinds = (
+        runtime_kinds[number - 1]
+        if isinstance(runtime_kinds, tuple) and number <= len(runtime_kinds)
+        else ()
+    )
+    values: list[tuple[str, str]] = []
+    for index, candidate in enumerate(candidates):
+        kind = (
+            str(kinds[index])
+            if isinstance(kinds, tuple) and index < len(kinds)
+            else ""
+        )
         if str(candidate) == "":
-            values.append("\u200b")
+            values.append((kind, "\u200b"))
             continue
         if str(candidate) == "$N":
-            values.append(" ")
+            values.append((kind, " "))
             continue
         value = _localized_expression_value(
             localization,
@@ -922,8 +933,17 @@ def _localized_runtime_argument_value(
                 value = localized
         if not value:
             return ""
-        values.append(value)
-    unique_values = tuple(dict.fromkeys(values))
+        values.append((kind, value))
+    meaningful_values = tuple(
+        dict.fromkeys(
+            value
+            for kind, value in values
+            if kind != SEMANTIC_STRUCTURE
+        )
+    )
+    if len(meaningful_values) == 1:
+        return meaningful_values[0]
+    unique_values = tuple(dict.fromkeys(value for _kind, value in values))
     return unique_values[0] if len(unique_values) == 1 else ""
 
 

@@ -160,6 +160,41 @@ def assert_code_semantics_resolve_local_function_returns() -> None:
             "an uncertain local engine result guessed an exact title label"
         )
 
+    branch_script = "\n".join(
+        (
+            "function Main()",
+            "    local BodyLabel",
+            "    local SubstLabel",
+            "    if IsMale then",
+            '        BodyLabel = "@L_BIRTH_BODY_SON_+0"',
+            '        SubstLabel = "@L_BIRTH_PROMPT_SON_+0"',
+            "    else",
+            '        BodyLabel = "@L_BIRTH_BODY_DAUGHTER_+0"',
+            '        SubstLabel = "@L_BIRTH_PROMPT_DAUGHTER_+0"',
+            "    end",
+            "    if NameAlreadySet then SubstLabel = \"\" end",
+            '    MsgQuick("", BodyLabel, GetID("Child"), SubstLabel)',
+            "end",
+        )
+    )
+    branch_uses = {
+        use.label: use
+        for use in analyze_script(branch_script, Path("BranchCorrelation.lua"))
+        if use.role == "body"
+    }
+    son_values = branch_uses["birth_body_son_+0"].runtime_argument_values[1]
+    daughter_values = branch_uses[
+        "birth_body_daughter_+0"
+    ].runtime_argument_values[1]
+    if son_values != ("@L_BIRTH_PROMPT_SON_+0", ""):
+        raise AssertionError(
+            f"the son message inherited an incompatible branch value: {son_values!r}"
+        )
+    if daughter_values != ("@L_BIRTH_PROMPT_DAUGHTER_+0", ""):
+        raise AssertionError(
+            f"the daughter message inherited an incompatible branch value: {daughter_values!r}"
+        )
+
 
 def assert_code_semantics_follow_fields_panels_and_initdata() -> None:
     script = "\n".join(
@@ -370,6 +405,7 @@ def assert_placeholder_values_avoid_ambiguous_random_branches() -> None:
                 "_PRIVILEGE_CanTrade_MESSAGETEXT_+0": "May trade goods",
                 "PlainOfficeKey": "Bailiff",
                 "_CHARACTERS_3_TITLES_NAME_+9": "Citizen",
+                "_BIRTH_PROMPT_DAUGHTER_+0": "What do you want to name your daughter?",
                 "SubstSimFullDescOffice_+0": "%1ST %1SV %1SD, %1SA in %2NAME",
             }.get(label, label)
 
@@ -390,6 +426,37 @@ def assert_placeholder_values_avoid_ambiguous_random_branches() -> None:
     value = builder.argument_value(1, "l", context).text
     if value in {"Beggar", "Emperor"}:
         raise AssertionError(f"an unresolved runtime branch was presented as a certain value: {value!r}")
+
+    optional_label = CodeReference(
+        "birth_body_daughter_+0",
+        Path("Birth.lua"),
+        15,
+        1,
+        "MsgQuick",
+        1,
+        runtime_arguments=('GetID("Child")', "SubstLabel"),
+        runtime_argument_values=(
+            (),
+            ("@L_BIRTH_PROMPT_DAUGHTER_+0", ""),
+        ),
+        runtime_argument_kinds=((), ("label", "structure")),
+        role="body",
+    )
+    optional_context = PlaceholderContext(
+        "BIRTH_BODY_DAUGHTER_+0",
+        "Text.dbt",
+        False,
+        "en",
+        (optional_label,),
+        ((2, ("l",)),),
+    )
+    if (
+        builder.argument_value(2, "l", optional_context).text
+        != "What do you want to name your daughter?"
+    ):
+        raise AssertionError(
+            "an optional structural blank hid the one semantically compatible label"
+        )
 
     character = CodeReference(
         "speech_+0",

@@ -174,6 +174,7 @@ class _Analysis:
     calls_by_alias: dict[str, tuple[int, ...]]
     functions_by_alias: dict[str, tuple[int, ...]]
     returns_by_function: dict[int, tuple[tuple[int, int, int], ...]]
+    branch_paths: dict[int, tuple[tuple[int, int], ...]]
 
 
 LABEL_RE = re.compile(
@@ -232,11 +233,21 @@ def analyze_script_facts(
     for index, function in enumerate(functions):
         for alias in function.aliases:
             functions_by_alias.setdefault(alias.casefold(), []).append(index)
+    token_starts = tuple(token.start for token in tokens)
+    branch_path_tokens = frozenset(
+        (
+            *(assignment.token_start for assignment in assignments),
+            *(
+                bisect.bisect_left(token_starts, call.start)
+                for call in calls
+            ),
+        )
+    )
     analysis = _Analysis(
         text,
         path,
         tokens,
-        tuple(token.start for token in tokens),
+        token_starts,
         functions,
         calls,
         tuple(call.start for call in calls),
@@ -245,6 +256,7 @@ def analyze_script_facts(
         {name: tuple(indices) for name, indices in calls_by_alias.items()},
         {name: tuple(indices) for name, indices in functions_by_alias.items()},
         _return_expressions_by_function(tokens, functions),
+        _conditional_branch_paths(tokens, branch_path_tokens),
     )
     uses: list[SemanticLabelUse] = []
     external_flows: list[ExternalCallFlow] = []
@@ -270,6 +282,15 @@ def analyze_script_facts(
             runtime_arguments = call.arguments[runtime_start:]
             runtime_argument_values = _runtime_argument_values(analysis, call, runtime_start)
             runtime_argument_kinds = _semantic_value_kinds(runtime_argument_values)
+            path_sensitive = bool(values and runtime_arguments) and (
+                _argument_has_conditional_assignments(
+                    analysis,
+                    start,
+                    end,
+                    call.start,
+                    call.function_index,
+                )
+            )
             if contract is not None or role == "button":
                 for alias, _dependency_position in _external_calls_for_argument(
                     analysis,
@@ -293,7 +314,28 @@ def analyze_script_facts(
                             resolved_arguments=resolved_arguments,
                         )
                     )
+            origin_paths_by_label = (
+                _label_origin_branch_map(
+                    analysis,
+                    call,
+                    argument_index,
+                    label_catalog,
+                )
+                if path_sensitive
+                else {}
+            )
             for label, position, match_kind, confidence in values:
+                if path_sensitive:
+                    origin_paths = origin_paths_by_label.get(label, ())
+                    contextual_runtime_values = _runtime_argument_values_for_paths(
+                        analysis,
+                        call,
+                        runtime_start,
+                        origin_paths
+                        or (_branch_path_at_position(analysis, call.start),),
+                    )
+                else:
+                    contextual_runtime_values = runtime_argument_values
                 uses.append(
                     SemanticLabelUse(
                         label=label,
@@ -303,8 +345,10 @@ def analyze_script_facts(
                         arguments=call.arguments,
                         role=role,
                         runtime_arguments=runtime_arguments,
-                        runtime_argument_values=runtime_argument_values,
-                        runtime_argument_kinds=runtime_argument_kinds,
+                        runtime_argument_values=contextual_runtime_values,
+                        runtime_argument_kinds=_semantic_value_kinds(
+                            contextual_runtime_values
+                        ),
                         resolved_arguments=resolved_arguments,
                         match_kind=match_kind,
                         confidence=confidence,
@@ -558,6 +602,72 @@ def _token_span(tokens: tuple[Token, ...], start: int, end: int, empty_position:
     return tokens[start].start, tokens[end - 1].end
 
 
+def _conditional_branch_paths(
+    tokens: tuple[Token, ...],
+    tracked_indices: frozenset[int],
+) -> dict[int, tuple[tuple[int, int], ...]]:
+    """Map tokens to lexical conditional arms for lightweight path-sensitive flow."""
+    stack: list[list[object]] = []
+    paths: dict[int, tuple[tuple[int, int], ...]] = {}
+    for index, token in enumerate(tokens):
+        value = token.value.casefold() if token.kind == "identifier" else ""
+        if value in {"elseif", "else"}:
+            if stack and stack[-1][0] == "if":
+                stack[-1][2] = int(stack[-1][2]) + 1
+        elif value == "end":
+            if stack:
+                stack.pop()
+        elif value == "until":
+            if stack and stack[-1][0] == "repeat":
+                stack.pop()
+        elif value == "if":
+            stack.append(["if", index, 0, False])
+        elif value in {"for", "while"}:
+            stack.append([value, index, 0, True])
+        elif value == "function":
+            stack.append(["function", index, 0, False])
+        elif value == "repeat":
+            stack.append(["repeat", index, 0, False])
+        elif value == "do":
+            if stack and stack[-1][3] is True:
+                stack[-1][3] = False
+            else:
+                stack.append(["do", index, 0, False])
+        if index in tracked_indices:
+            paths[index] = tuple(
+                (int(frame[1]), int(frame[2]))
+                for frame in stack
+                if frame[0] == "if"
+            )
+    return paths
+
+
+def _branch_path_for_token(
+    analysis: _Analysis,
+    token_index: int,
+) -> tuple[tuple[int, int], ...]:
+    return analysis.branch_paths.get(token_index, ())
+
+
+def _branch_path_at_position(
+    analysis: _Analysis,
+    position: int,
+) -> tuple[tuple[int, int], ...]:
+    token_index = bisect.bisect_right(analysis.token_starts, position) - 1
+    return _branch_path_for_token(analysis, token_index)
+
+
+def _branches_compatible(
+    left: tuple[tuple[int, int], ...],
+    right: tuple[tuple[int, int], ...],
+) -> bool:
+    right_arms = dict(right)
+    return all(
+        branch not in right_arms or right_arms[branch] == arm
+        for branch, arm in left
+    )
+
+
 def _assignments(tokens: tuple[Token, ...], functions: tuple[ScriptFunction, ...]) -> tuple[Assignment, ...]:
     values: list[Assignment] = []
     for index, token in enumerate(tokens[:-1]):
@@ -773,6 +883,115 @@ def _label_values_for_argument(
     return _best_label_candidates(candidates)
 
 
+def _label_origin_branch_map(
+    analysis: _Analysis,
+    call: ScriptCall,
+    argument_index: int,
+    catalog: frozenset[str],
+) -> dict[str, tuple[tuple[tuple[int, int], ...], ...]]:
+    if not (0 <= argument_index < len(call.argument_spans)):
+        return {}
+    start, end = call.argument_spans[argument_index]
+    token_indices = _tokens_in_span(analysis, start, end)
+    if not token_indices:
+        return {}
+    found: dict[str, list[tuple[tuple[int, int], ...]]] = {}
+    _collect_label_origin_paths(
+        analysis,
+        token_indices[0],
+        token_indices[-1] + 1,
+        call.start,
+        call.function_index,
+        catalog,
+        set(),
+        found,
+    )
+    return {
+        label: tuple(dict.fromkeys(paths))
+        for label, paths in found.items()
+    }
+
+
+def _argument_has_conditional_assignments(
+    analysis: _Analysis,
+    start: int,
+    end: int,
+    position: int,
+    function_index: int | None,
+) -> bool:
+    token_indices = _tokens_in_span(analysis, start, end)
+    if not token_indices:
+        return False
+    for name in _dependency_names(
+        analysis.tokens,
+        token_indices[0],
+        token_indices[-1] + 1,
+    ):
+        for assignment in analysis.assignments_by_name.get(
+            (function_index, name.casefold()),
+            (),
+        ):
+            if (
+                assignment.position < position
+                and _branch_path_for_token(analysis, assignment.token_start)
+            ):
+                return True
+    return False
+
+
+def _collect_label_origin_paths(
+    analysis: _Analysis,
+    start: int,
+    end: int,
+    position: int,
+    function_index: int | None,
+    catalog: frozenset[str],
+    resolving: set[tuple[str, int | None]],
+    found: dict[str, list[tuple[tuple[int, int], ...]]],
+) -> None:
+    for name in _dependency_names(analysis.tokens, start, end):
+        key = (name.casefold(), function_index)
+        if key in resolving or len(resolving) >= 8:
+            continue
+        next_resolving = set(resolving)
+        next_resolving.add(key)
+        for assignment in analysis.assignments_by_name.get(
+            (function_index, name.casefold()),
+            (),
+        ):
+            if assignment.position >= position:
+                continue
+            resolved = _evaluate_tokens(
+                analysis,
+                assignment.token_start,
+                assignment.token_end,
+                assignment.position,
+                function_index,
+                next_resolving,
+            )
+            assignment_path = _branch_path_for_token(
+                analysis,
+                assignment.token_start,
+            )
+            for value in resolved:
+                for candidate, _relative in _literal_labels(
+                    value,
+                    catalog,
+                    allow_patterns=True,
+                ):
+                    found.setdefault(candidate, []).append(assignment_path)
+            _collect_label_origin_paths(
+                analysis,
+                assignment.token_start,
+                assignment.token_end,
+                assignment.position,
+                function_index,
+                catalog,
+                next_resolving,
+                found,
+            )
+
+
 def _best_label_candidates(
     candidates: list[tuple[str, int, str, int]],
 ) -> tuple[tuple[str, int, str, int], ...]:
@@ -817,6 +1036,7 @@ def _evaluate_tokens(
     function_index: int | None,
     resolving: set[tuple[str, int | None]],
     parameter_bindings: dict[tuple[int, str], tuple[str, ...]] | None = None,
+    required_branches: tuple[tuple[int, int], ...] = (),
 ) -> tuple[str, ...]:
     while start < end and analysis.tokens[start].value == "(":
         close = _matching_token(analysis.tokens, start, "(", ")")
@@ -837,6 +1057,7 @@ def _evaluate_tokens(
                 function_index,
                 resolving,
                 parameter_bindings,
+                required_branches,
             )
             if not part_values:
                 part_values = ("*",)
@@ -857,6 +1078,7 @@ def _evaluate_tokens(
             function_index,
             resolving,
             parameter_bindings,
+            required_branches,
         )
     if end - start == 1:
         token = analysis.tokens[start]
@@ -872,6 +1094,7 @@ def _evaluate_tokens(
                 function_index,
                 resolving,
                 parameter_bindings,
+                required_branches,
             )
     lvalue = _lvalue_name(analysis.tokens, start, end)
     if lvalue:
@@ -882,6 +1105,7 @@ def _evaluate_tokens(
             function_index,
             resolving,
             parameter_bindings,
+            required_branches,
         )
     return ()
 
@@ -909,8 +1133,11 @@ def _evaluate_local_function_call(
     function_index: int | None,
     resolving: set[tuple[str, int | None]],
     parameter_bindings: dict[tuple[int, str], tuple[str, ...]] | None,
+    required_branches: tuple[tuple[int, int], ...],
 ) -> tuple[str, ...]:
     target_indices = analysis.functions_by_alias.get(call.name.casefold(), ())
+    if not target_indices and native_semantic_function_name(call.name) is None:
+        return ()
     argument_values: list[tuple[str, ...]] = []
     for start, end in call.argument_spans:
         token_indices = _tokens_in_span(analysis, start, end)
@@ -926,6 +1153,7 @@ def _evaluate_local_function_call(
                 function_index,
                 resolving,
                 parameter_bindings,
+                required_branches,
             )
         )
     if not target_indices:
@@ -969,6 +1197,7 @@ def _evaluate_local_function_call(
                     target_index,
                     next_resolving,
                     next_bindings,
+                    (),
                 )
             )
     return tuple(dict.fromkeys(values))[:64]
@@ -1364,6 +1593,7 @@ def _resolve_variable(
     function_index: int | None,
     resolving: set[tuple[str, int | None]],
     parameter_bindings: dict[tuple[int, str], tuple[str, ...]] | None = None,
+    required_branches: tuple[tuple[int, int], ...] = (),
 ) -> tuple[str, ...]:
     key = (name.casefold(), function_index)
     if key in resolving or len(resolving) >= 8:
@@ -1378,10 +1608,20 @@ def _resolve_variable(
             function_index,
             next_resolving,
             parameter_bindings,
+            required_branches,
         )
     )
     for assignment in analysis.assignments_by_name.get((function_index, name.casefold()), ()):
-        if assignment.position < position:
+        if (
+            assignment.position < position
+            and (
+                not required_branches
+                or _branches_compatible(
+                    _branch_path_for_token(analysis, assignment.token_start),
+                    required_branches,
+                )
+            )
+        ):
             values.extend(
                 _evaluate_tokens(
                     analysis,
@@ -1391,6 +1631,7 @@ def _resolve_variable(
                     function_index,
                     next_resolving,
                     parameter_bindings,
+                    required_branches,
                 )
             )
     if values:
@@ -1424,6 +1665,7 @@ def _resolve_variable(
                         call.function_index,
                         next_resolving,
                         parameter_bindings,
+                        (),
                     )
                 )
     return tuple(dict.fromkeys(values))[:64]
@@ -1436,11 +1678,21 @@ def _accumulated_variable_values(
     function_index: int | None,
     resolving: set[tuple[str, int | None]],
     parameter_bindings: dict[tuple[int, str], tuple[str, ...]] | None = None,
+    required_branches: tuple[tuple[int, int], ...] = (),
 ) -> tuple[str, ...]:
     current: tuple[str, ...] = ()
     accumulated = False
     for assignment in analysis.assignments_by_name.get((function_index, name.casefold()), ()):
-        if assignment.position >= position:
+        if (
+            assignment.position >= position
+            or (
+                required_branches
+                and not _branches_compatible(
+                    _branch_path_for_token(analysis, assignment.token_start),
+                    required_branches,
+                )
+            )
+        ):
             continue
         parts = _split_token_range(
             analysis.tokens,
@@ -1462,6 +1714,7 @@ def _accumulated_variable_values(
                 function_index,
                 resolving,
                 parameter_bindings,
+                required_branches,
             )
             if not suffix:
                 suffix = ("*",)
@@ -1479,6 +1732,7 @@ def _accumulated_variable_values(
             function_index,
             resolving,
             parameter_bindings,
+            required_branches,
         )
         if resolved:
             current = tuple(dict.fromkeys((*current, *resolved)))[:64]
@@ -1556,6 +1810,8 @@ def _runtime_argument_values(
     analysis: _Analysis,
     call: ScriptCall,
     runtime_start: int,
+    *,
+    required_branches: tuple[tuple[int, int], ...] = (),
 ) -> tuple[tuple[str, ...], ...]:
     values: list[tuple[str, ...]] = []
     for start, end in call.argument_spans[runtime_start:]:
@@ -1570,9 +1826,34 @@ def _runtime_argument_values(
             call.start,
             call.function_index,
             set(),
+            required_branches=required_branches,
         )
         values.append(tuple(dict.fromkeys(resolved))[:64])
     return tuple(values)
+
+
+def _runtime_argument_values_for_paths(
+    analysis: _Analysis,
+    call: ScriptCall,
+    runtime_start: int,
+    paths: tuple[tuple[tuple[int, int], ...], ...],
+) -> tuple[tuple[str, ...], ...]:
+    merged: list[list[str]] = []
+    for path in paths:
+        values = _runtime_argument_values(
+            analysis,
+            call,
+            runtime_start,
+            required_branches=path,
+        )
+        while len(merged) < len(values):
+            merged.append([])
+        for index, candidates in enumerate(values):
+            merged[index].extend(candidates)
+    return tuple(
+        tuple(dict.fromkeys(candidates))[:64]
+        for candidates in merged
+    )
 
 
 def _semantic_value_kinds(
