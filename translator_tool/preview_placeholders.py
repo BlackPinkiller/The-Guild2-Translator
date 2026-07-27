@@ -12,6 +12,10 @@ from .script_semantics import variadic_argument_pack
 
 GLYPH_MARK = "\ufffc"
 _NESTED_PLACEHOLDER_RE = re.compile(r"%(\d+)([A-Za-z]*)")
+_CHARACTER_SUFFIXES = frozenset(
+    {"SN", "SV", "SZ", "SK", "ST", "SA", "SD", "SB", "SL"}
+)
+_BUILDING_SUFFIXES = frozenset({"GG", "GN", "GT"})
 
 
 def placeholder_reference_score(text: str, reference: object) -> int:
@@ -195,6 +199,12 @@ class BuildingPreviewEntity:
 
 
 @dataclass(frozen=True)
+class DynastyPreviewEntity:
+    name: str
+    crest_glyph_id: int
+
+
+@dataclass(frozen=True)
 class CharacterPreviewEntity:
     forename: str
     surname: str
@@ -317,6 +327,21 @@ class PlaceholderEntityResolver:
             full_description_template=template,
         )
 
+    def dynasty(self, number: int, context: PlaceholderContext) -> DynastyPreviewEntity:
+        _forename, surname, _gender = self.localization.character_name_parts(
+            context.seed_key,
+            number,
+            context.target,
+        )
+        return DynastyPreviewEntity(
+            name=_clean_sample_text(surname)
+            or translate("preview.value.dynasty", locale=context.locale, number=number),
+            crest_glyph_id=2029 + _stable_index(
+                f"{context.seed_key}:{number}:dynasty",
+                17,
+            ),
+        )
+
 
 class PlaceholderValueBuilder:
     def __init__(self, localization: PlaceholderLocalization) -> None:
@@ -330,10 +355,10 @@ class PlaceholderValueBuilder:
         context: PlaceholderContext,
         _depth: int = 0,
     ) -> PlaceholderValue:
-        if suffix in {"SN", "Sn", "SV", "Sv", "SZ", "Sz", "SK", "ST", "SA", "SD", "SB", "SL"}:
+        if suffix.upper() in _CHARACTER_SUFFIXES:
             return PlaceholderValue(self.entities.character(number, context).project(suffix))
         if suffix == "DS":
-            return PlaceholderValue(GLYPH_MARK, 2029 + _stable_index(f"{context.seed_key}:{number}:crest", 17))
+            return PlaceholderValue(GLYPH_MARK, self.entities.dynasty(number, context).crest_glyph_id)
         explicit = self._explicit_argument_value(number, suffix, context)
         if explicit is not None:
             return explicit
@@ -405,11 +430,7 @@ class PlaceholderValueBuilder:
             if semantic == "city":
                 return PlaceholderValue(_city_value(self.localization, number, context))
             if semantic == "dynasty":
-                full = self.localization.character_name(context.seed_key, number, context.target)
-                dynasty = full.rsplit(" ", 1)[-1] if full else ""
-                return PlaceholderValue(
-                    dynasty or translate("preview.value.dynasty", locale=context.locale, number=number)
-                )
+                return PlaceholderValue(self.entities.dynasty(number, context).name)
             return PlaceholderValue(
                 translate("preview.value.object_name", locale=context.locale, number=number)
             )
@@ -420,8 +441,7 @@ class PlaceholderValueBuilder:
         if suffix == "GT":
             return PlaceholderValue(self.entities.building(number, context).type_name)
         if suffix == "DN":
-            dynasty = self.entities.character(number, context).surname
-            return PlaceholderValue(dynasty or translate("preview.value.dynasty", locale=context.locale, number=number))
+            return PlaceholderValue(self.entities.dynasty(number, context).name)
         return None
 
     def named_value(self, token: str, context: PlaceholderContext) -> PlaceholderValue:
@@ -491,6 +511,21 @@ def _semantic_kind(number: int, context: PlaceholderContext) -> str:
 
 
 def _name_semantic_kind(number: int, context: PlaceholderContext) -> str:
+    suffixes = {suffix.upper() for suffix in context.suffixes_for(number)}
+    projected_kinds: set[str] = set()
+    if suffixes & _CHARACTER_SUFFIXES:
+        projected_kinds.add("character")
+    if suffixes & _BUILDING_SUFFIXES:
+        projected_kinds.add("building")
+    if len(projected_kinds) == 1:
+        return next(iter(projected_kinds))
+    if len(projected_kinds) > 1:
+        return ""
+    # A crest is also projected by sims, carts, and buildings.  Only the
+    # dynasty-name projection proves that the object itself is a dynasty.
+    if "DN" in suffixes:
+        return "dynasty"
+
     kinds: set[str] = set()
     for reference in context.references:
         for expression in _placeholder_expressions(reference, number):

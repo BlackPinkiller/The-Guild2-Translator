@@ -14,6 +14,7 @@ from ..code_index import (
 )
 from ..preview_context_selection import select_preview_context
 from ..preview_placeholders import (
+    GLYPH_MARK,
     PlaceholderContext,
     PlaceholderLabelRecord,
     PlaceholderValueBuilder,
@@ -315,6 +316,55 @@ def assert_placeholder_values_avoid_ambiguous_random_branches() -> None:
     plain_name = builder.argument_value(1, "NAME", ambiguous_context).text
     if plain_name != "Object 1":
         raise AssertionError(f"an ambiguous NAME branch was forced to one object type: {plain_name!r}")
+
+    character_name_context = PlaceholderContext(
+        "CHARACTER_NAME_+0",
+        "Text.dbt",
+        False,
+        "en",
+        (character,),
+        ((1, ("SN", "NAME")),),
+    )
+    if builder.argument_value(1, "NAME", character_name_context).text != "Alex Smith":
+        raise AssertionError("NAME did not reuse direct character-suffix evidence from the same argument")
+
+    building_name_context = PlaceholderContext(
+        "BUILDING_NAME_+0",
+        "Text.dbt",
+        False,
+        "en",
+        (character,),
+        ((1, ("GG", "NAME")),),
+    )
+    if builder.argument_value(1, "NAME", building_name_context).text != "Bread & Butter":
+        raise AssertionError("NAME did not reuse direct building-suffix evidence from the same argument")
+
+    dynasty_context = PlaceholderContext(
+        "DYNASTY_NAME_+0",
+        "Text.dbt",
+        False,
+        "en",
+        (character,),
+        ((1, ("DN", "NAME", "DS")),),
+    )
+    if builder.argument_value(1, "DN", dynasty_context).text != "Smith":
+        raise AssertionError("DN did not project the dynasty name from its coherent entity")
+    if builder.argument_value(1, "NAME", dynasty_context).text != "Smith":
+        raise AssertionError("NAME did not reuse direct dynasty-name evidence from the same argument")
+    crest = builder.argument_value(1, "DS", dynasty_context)
+    if crest.text != GLYPH_MARK or crest.glyph_id is None:
+        raise AssertionError("DS did not project the dynasty crest from its coherent entity")
+
+    crest_only_context = PlaceholderContext(
+        "CREST_OWNER_+0",
+        "Text.dbt",
+        False,
+        "en",
+        (character,),
+        ((1, ("DS", "NAME")),),
+    )
+    if builder.argument_value(1, "NAME", crest_only_context).text != "Object 1":
+        raise AssertionError("DS alone incorrectly forced its owner object to be a dynasty")
 
 
 def assert_variadic_runtime_arguments_map_to_placeholder_positions() -> None:

@@ -2825,6 +2825,31 @@ def assert_preview_i18n_and_symbol_mapping() -> None:
                 "full character descriptions invented an office without placeholder evidence: "
                 f"{target_description_without_office.display_text!r}"
             )
+        cross_suffix_projection = service.render(
+            "%1GG | %1NAME | %4SN | %4NAME | %5DN | %5NAME | %5DS",
+            unit_key="same-entry",
+            label="CROSS_SUFFIX_PLACEHOLDERS",
+            file_rel="Text.dbt",
+            kind="dbt",
+            target=False,
+        )
+        cross_parts = cross_suffix_projection.display_text.split(" | ")
+        if cross_parts[1:6] != [
+            "The Almighty",
+            "Jack Smith",
+            "Jack Smith",
+            "Smith",
+            "Smith",
+        ]:
+            raise AssertionError(
+                "NAME did not reuse the strongest semantic projection for the same argument: "
+                f"{cross_suffix_projection.display_text!r}"
+            )
+        if not any(
+            atom.text == GLYPH_MARK and atom.glyph_id is not None
+            for atom in cross_suffix_projection.atoms
+        ):
+            raise AssertionError("the dynasty entity did not project a crest glyph for DS")
 
         quoted_placeholder = service.render(
             "with >%2l< and %1NAMEsuffix",
