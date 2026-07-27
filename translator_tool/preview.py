@@ -1547,10 +1547,19 @@ class _PreviewCompiler:
         if argument is not None:
             number = int(argument.group(1))
             if argument.group(2) == "t":
-                locale = self.service.locale(self.target)
                 split = max(start, end - 1)
+                value, _glyph_id = self.service._argument_value(
+                    self.unit_key,
+                    self.label,
+                    self.file_rel,
+                    number,
+                    "t",
+                    self.target,
+                    self.references,
+                    self.argument_suffixes,
+                )
                 self._emit(
-                    translate("preview.value.money_plain", locale=locale, number=number),
+                    value,
                     start,
                     split,
                     replacement=True,
@@ -1586,6 +1595,21 @@ class _PreviewCompiler:
         argument = ARG_PREVIEW_RE.fullmatch(token)
         if argument is not None:
             number = int(argument.group(1))
+            if argument.group(2) == "t":
+                split = max(start, end - 1)
+                value, _glyph_id = self.service._argument_value(
+                    self.unit_key,
+                    self.label,
+                    self.file_rel,
+                    number,
+                    "t",
+                    self.target,
+                    self.references,
+                    self.argument_suffixes,
+                )
+                self._emit(value, start, split, replacement=True)
+                self._emit(GLYPH_MARK, split, end, replacement=True, glyph_id=2002)
+                return
             value, glyph_id = self.service._argument_value(
                 self.unit_key,
                 self.label,

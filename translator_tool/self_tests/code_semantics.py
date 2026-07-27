@@ -366,6 +366,55 @@ def assert_placeholder_values_avoid_ambiguous_random_branches() -> None:
     if builder.argument_value(1, "NAME", crest_only_context).text != "Object 1":
         raise AssertionError("DS alone incorrectly forced its owner object to be a dynasty")
 
+    literal_reference = CodeReference(
+        "literal_values_+0",
+        Path("LiteralValues.lua"),
+        40,
+        1,
+        "MsgQuick",
+        1,
+        ('""', '"@L_LITERAL_VALUES_+0"', "42", "7", "3.50", "1250", '"ready"'),
+        runtime_arguments=("42", "7", "3.50", "1250", '"ready"'),
+        role="body",
+    )
+    literal_context = PlaceholderContext(
+        "LITERAL_VALUES_+0",
+        "Text.dbt",
+        False,
+        "en",
+        (literal_reference,),
+        ((1, ("n",)), (2, ("i",)), (3, ("f",)), (4, ("t",)), (5, ("s",))),
+    )
+    literal_values = tuple(
+        builder.argument_value(number, suffix, literal_context).text
+        for number, suffix in ((1, "n"), (2, "i"), (3, "f"), (4, "t"), (5, "s"))
+    )
+    if literal_values != ("42", "7", "3.5", "1250", "ready"):
+        raise AssertionError(f"direct scalar caller evidence was not preserved: {literal_values!r}")
+
+    branching_number = CodeReference(
+        "branching_number_+0",
+        Path("LiteralValues.lua"),
+        50,
+        1,
+        "MsgQuick",
+        1,
+        ('""', '"@L_BRANCHING_NUMBER_+0"', "Count"),
+        runtime_arguments=("Count",),
+        runtime_argument_values=(("1", "2"),),
+        role="body",
+    )
+    branching_context = PlaceholderContext(
+        "BRANCHING_NUMBER_+0",
+        "Text.dbt",
+        False,
+        "en",
+        (branching_number,),
+        ((1, ("n",)),),
+    )
+    if builder.argument_value(1, "n", branching_context).text in {"1", "2"}:
+        raise AssertionError("an ambiguous numeric branch was presented as a certain caller value")
+
 
 def assert_variadic_runtime_arguments_map_to_placeholder_positions() -> None:
     privileges = CodeReference(

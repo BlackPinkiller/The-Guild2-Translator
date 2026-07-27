@@ -2850,6 +2850,42 @@ def assert_preview_i18n_and_symbol_mapping() -> None:
             for atom in cross_suffix_projection.atoms
         ):
             raise AssertionError("the dynasty entity did not project a crest glyph for DS")
+        literal_projection = service.render(
+            "%1n | %2i | %3f | %4t | %5s",
+            unit_key="same-entry",
+            label="LITERAL_PLACEHOLDERS",
+            file_rel="Text.dbt",
+            kind="dbt",
+            target=False,
+            references=(
+                CodeReference(
+                    "LITERAL_PLACEHOLDERS",
+                    temp / "Scripts" / "LiteralValues.lua",
+                    1,
+                    1,
+                    "MsgQuick",
+                    1,
+                    (
+                        '""',
+                        '"@L_LITERAL_PLACEHOLDERS"',
+                        "42",
+                        "7",
+                        "3.50",
+                        "1250",
+                        '"ready"',
+                    ),
+                    runtime_arguments=("42", "7", "3.50", "1250", '"ready"'),
+                    role="body",
+                ),
+            ),
+        )
+        if literal_projection.display_text.replace(GLYPH_MARK, "") != "42 | 7 | 3.5 | 1250 | ready":
+            raise AssertionError(
+                "preview did not display direct scalar values supplied by the caller: "
+                f"{literal_projection.display_text!r}"
+            )
+        if not any(atom.glyph_id == 2002 for atom in literal_projection.atoms):
+            raise AssertionError("literal money preview lost the game's coin symbol")
 
         quoted_placeholder = service.render(
             "with >%2l< and %1NAMEsuffix",

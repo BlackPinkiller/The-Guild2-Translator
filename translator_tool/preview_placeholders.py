@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from decimal import Decimal, InvalidOperation
 from functools import lru_cache
 import re
 from typing import Protocol
@@ -419,6 +420,9 @@ class PlaceholderValueBuilder:
         suffix: str,
         context: PlaceholderContext,
     ) -> PlaceholderValue | None:
+        literal = _literal_scalar_argument_value(number, suffix, context)
+        if literal is not None:
+            return PlaceholderValue(literal)
         if suffix == "NAME":
             semantic = _name_semantic_kind(number, context)
             if semantic == "character":
@@ -572,6 +576,86 @@ def _looks_like_object_expression(expression: str) -> bool:
         marker in lowered
         for marker in ("getid(", "getsettlement", "getbuilding", "getdynasty", "simget", "getsim")
     )
+
+
+def _literal_scalar_argument_value(
+    number: int,
+    suffix: str,
+    context: PlaceholderContext,
+) -> str | None:
+    if suffix not in {"n", "i", "f", "t", "s"}:
+        return None
+
+    resolved: list[tuple[object, str]] = []
+    for reference in context.references:
+        expressions = _resolved_argument_expressions(reference, number)
+        if not expressions:
+            continue
+        for expression in expressions:
+            parsed = _parse_scalar_literal(expression, suffix)
+            if parsed is None:
+                return None
+            resolved.append(parsed)
+    if not resolved:
+        return None
+    canonical_values = {canonical for canonical, _display in resolved}
+    if len(canonical_values) != 1:
+        return None
+    return resolved[0][1]
+
+
+def _resolved_argument_expressions(reference: object, number: int) -> tuple[str, ...]:
+    runtime_values = getattr(reference, "runtime_argument_values", ())
+    if isinstance(runtime_values, tuple) and 0 < number <= len(runtime_values):
+        candidates = runtime_values[number - 1]
+        if isinstance(candidates, tuple) and candidates:
+            return tuple(str(candidate) for candidate in candidates if str(candidate))
+    expression = _placeholder_expression(reference, number)
+    return (expression,) if expression else ()
+
+
+def _parse_scalar_literal(expression: str, suffix: str) -> tuple[object, str] | None:
+    stripped = expression.strip()
+    if suffix == "s":
+        value = _quoted_scalar_text(stripped)
+        if value is None or value.startswith("@L_"):
+            return None
+        return ("string", value), value
+
+    pattern = r"[-+]?\d+" if suffix == "i" else r"[-+]?\d+(?:\.\d+)?"
+    if re.fullmatch(pattern, stripped) is None:
+        return None
+    try:
+        number = Decimal(stripped)
+    except InvalidOperation:
+        return None
+    if suffix == "i":
+        display = str(int(number))
+    else:
+        display = format(number, "f")
+        if "." in display:
+            display = display.rstrip("0").rstrip(".")
+    return ("number", number), display
+
+
+def _quoted_scalar_text(expression: str) -> str | None:
+    if len(expression) < 2 or expression[0] not in {"'", '"'} or expression[-1] != expression[0]:
+        return None
+    body = expression[1:-1]
+    result: list[str] = []
+    index = 0
+    escapes = {"n": "\n", "r": "\r", "t": "\t", "\\": "\\", "'": "'", '"': '"'}
+    while index < len(body):
+        character = body[index]
+        if character != "\\":
+            result.append(character)
+            index += 1
+            continue
+        if index + 1 >= len(body) or body[index + 1] not in escapes:
+            return None
+        result.append(escapes[body[index + 1]])
+        index += 2
+    return "".join(result)
 
 
 def _placeholder_expression(reference: object, number: int) -> str:
