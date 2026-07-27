@@ -911,9 +911,6 @@ def _evaluate_local_function_call(
     parameter_bindings: dict[tuple[int, str], tuple[str, ...]] | None,
 ) -> tuple[str, ...]:
     target_indices = analysis.functions_by_alias.get(call.name.casefold(), ())
-    native_name = re.split(r"[.:]", call.name)[-1].casefold()
-    if not target_indices and native_name != "itemgetlabel":
-        return ()
     argument_values: list[tuple[str, ...]] = []
     for start, end in call.argument_spans:
         token_indices = _tokens_in_span(analysis, start, end)
@@ -932,7 +929,16 @@ def _evaluate_local_function_call(
             )
         )
     if not target_indices:
-        return _evaluate_native_label_call(call, tuple(argument_values))
+        semantic_arguments = tuple(
+            tuple(semantic_literal(value) for value in candidates)
+            if candidates
+            else (SemanticValue(SEMANTIC_EXPRESSION, "*"),)
+            for candidates in argument_values
+        )
+        resolved = resolve_native_semantic_function(call.name, semantic_arguments)
+        if not resolved:
+            return ()
+        return tuple(value.text for value in resolved[0])
 
     values: list[str] = []
     for target_index in target_indices:
@@ -966,43 +972,6 @@ def _evaluate_local_function_call(
                 )
             )
     return tuple(dict.fromkeys(values))[:64]
-
-
-def _evaluate_native_label_call(
-    call: ScriptCall,
-    argument_values: tuple[tuple[str, ...], ...],
-) -> tuple[str, ...]:
-    """Evaluate documented engine functions that return localization identities.
-
-    These are function-level contracts, not call-site exceptions. Unknown
-    runtime inputs remain wildcard label families for downstream sampling.
-    """
-    name = re.split(r"[.:]", call.name)[-1].casefold()
-    if name != "itemgetlabel":
-        return ()
-
-    item_values = argument_values[0] if argument_values else ()
-    singular_values = argument_values[1] if len(argument_values) > 1 else ()
-    item_names = tuple(
-        value
-        for value in item_values
-        if re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", value)
-        and value.casefold() not in {"true", "false"}
-    ) or ("*",)
-    suffixes: tuple[str, ...]
-    if singular_values and set(singular_values) <= {"true", "1"}:
-        suffixes = ("0",)
-    elif singular_values and set(singular_values) <= {"false", "0"}:
-        suffixes = ("1",)
-    else:
-        suffixes = ("0", "1")
-    return tuple(
-        dict.fromkeys(
-            f"_ITEM_{item_name}_NAME_+{suffix}"
-            for item_name in item_names
-            for suffix in suffixes
-        )
-    )[:64]
 
 
 def _dependent_label_values(
@@ -1263,6 +1232,102 @@ def semantic_literal(value: str) -> SemanticValue:
     else:
         kind = SEMANTIC_TEXT
     return SemanticValue(kind, value)
+
+
+def native_semantic_function_name(alias: str) -> str | None:
+    name = re.split(r"[.:]", alias)[-1].casefold().split("_")[-1]
+    if name in {
+        "citylevel2label",
+        "generateprivilegelistlabels",
+        "getnobilitytitlelabel",
+        "itemgetlabel",
+    }:
+        return name
+    return None
+
+
+def resolve_native_semantic_function(
+    alias: str,
+    argument_values: tuple[tuple[SemanticValue, ...], ...],
+) -> tuple[tuple[SemanticValue, ...], ...] | None:
+    """Apply engine function contracts shared by local and cross-file evaluation."""
+    name = native_semantic_function_name(alias)
+    if name == "itemgetlabel":
+        item_values = argument_values[0] if argument_values else ()
+        singular_values = argument_values[1] if len(argument_values) > 1 else ()
+        item_names = tuple(
+            value.text
+            for value in item_values
+            if re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", value.text)
+            and value.text.casefold() not in {"true", "false"}
+        ) or ("*",)
+        singular_text = {value.text.casefold() for value in singular_values}
+        if singular_text and singular_text <= {"true", "1"}:
+            suffixes = ("0",)
+        elif singular_text and singular_text <= {"false", "0"}:
+            suffixes = ("1",)
+        else:
+            suffixes = ("0", "1")
+        return (
+            tuple(
+                semantic_literal(f"_ITEM_{item_name}_NAME_+{suffix}")
+                for item_name in item_names
+                for suffix in suffixes
+            )[:64],
+        )
+    if name == "citylevel2label":
+        levels = _semantic_integer_candidates(argument_values, 0)
+        return (
+            tuple(
+                semantic_literal(f"_GENERAL_INFORMATION_CITY_LEVEL_NAME_+{level}")
+                for level in levels
+            )
+            or (semantic_literal("_GENERAL_INFORMATION_CITY_LEVEL_NAME_+*"),),
+        )
+    if name == "getnobilitytitlelabel":
+        # The engine also selects a gendered title variant. The title number
+        # proves the label family, but not one exact localized member.
+        return ((semantic_literal("_CHARACTERS_3_TITLES_NAME_+*"),),)
+    if name != "generateprivilegelistlabels":
+        return None
+    positions: list[tuple[SemanticValue, ...]] = []
+    for candidates in argument_values:
+        privileges = tuple(
+            value.text
+            for value in candidates
+            if value.text
+            and value.text != "*"
+            and re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", value.text)
+        )
+        if not privileges:
+            continue
+        positions.append(
+            tuple(
+                semantic_literal(f"_PRIVILEGE_{privilege}_MESSAGETEXT_+0")
+                for privilege in privileges
+            )
+        )
+        positions.append((semantic_literal("$N"),))
+    if not positions:
+        return None
+    while len(positions) < 21:
+        positions.append((semantic_literal(""),))
+    return tuple(positions[:21])
+
+
+def _semantic_integer_candidates(
+    argument_values: tuple[tuple[SemanticValue, ...], ...],
+    index: int,
+) -> tuple[int, ...]:
+    if not (0 <= index < len(argument_values)):
+        return ()
+    values: list[int] = []
+    for candidate in argument_values[index]:
+        if re.fullmatch(r"[-+]?\d+", candidate.text):
+            value = int(candidate.text)
+            if value not in values:
+                values.append(value)
+    return tuple(values)
 
 
 def _dependency_names(tokens: tuple[Token, ...], start: int, end: int) -> tuple[str, ...]:

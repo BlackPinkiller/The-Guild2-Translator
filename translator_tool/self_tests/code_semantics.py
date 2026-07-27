@@ -78,6 +78,10 @@ def assert_code_semantics_resolve_local_function_returns() -> None:
             '    MsgQuick("", "@L_BODY_ITEM_+0", ItemGetLabel("BoozyBreathBeer", true))',
             '    MsgQuick("", "@L_BODY_ITEM_NUMERIC_+0", ItemGetLabel("BoozyBreathBeer", 1))',
             '    MsgQuick("", "@L_BODY_ITEM_PLURAL_+0", ItemGetLabel(ItemId, false))',
+            "    local citylabel = CityLevel2Label(2)",
+            '    MsgQuick("", "@L_BODY_CITY_+0", citylabel)',
+            "    local titlelabel = GetNobilityTitleLabel(CurrentTitle)",
+            '    MsgQuick("", "@L_BODY_TITLE_+0", titlelabel)',
             "end",
         )
     )
@@ -93,6 +97,8 @@ def assert_code_semantics_resolve_local_function_returns() -> None:
                 "body_item_+0",
                 "body_item_numeric_+0",
                 "body_item_plural_+0",
+                "body_city_+0",
+                "body_title_+0",
                 "item_bread_name_+0",
                 "item_cake_name_+1",
                 "_item_boozybreathbeer_name_+0",
@@ -139,6 +145,20 @@ def assert_code_semantics_resolve_local_function_returns() -> None:
         ("_ITEM_*_NAME_+1",),
     ):
         raise AssertionError("an unknown item did not retain its documented plural label family")
+    if by_label["body_city_+0"].runtime_argument_values != (
+        ("_GENERAL_INFORMATION_CITY_LEVEL_NAME_+2",),
+    ):
+        raise AssertionError(
+            "a shared engine contract did not resolve through a local variable"
+        )
+    if by_label["body_city_+0"].runtime_argument_kinds != (("label",),):
+        raise AssertionError("a local engine label result lost its semantic type")
+    if by_label["body_title_+0"].runtime_argument_values != (
+        ("_CHARACTERS_3_TITLES_NAME_+*",),
+    ):
+        raise AssertionError(
+            "an uncertain local engine result guessed an exact title label"
+        )
 
 
 def assert_code_semantics_follow_fields_panels_and_initdata() -> None:

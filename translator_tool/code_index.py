@@ -16,6 +16,8 @@ from .script_semantics import (
     SemanticValue,
     ScriptSemanticFacts,
     analyze_script_facts,
+    native_semantic_function_name,
+    resolve_native_semantic_function,
     semantic_literal,
 )
 
@@ -233,7 +235,7 @@ class CrossFileSemanticLinker:
         for source, alias, path in self._value_references:
             if path is None:
                 continue
-            if _semantic_function_name(alias) is not None:
+            if native_semantic_function_name(alias) is not None:
                 continue
             if (
                 (source, alias, path) in self._summaries
@@ -406,7 +408,7 @@ class CrossFileSemanticLinker:
                 argument_values.extend(resolved)
             else:
                 argument_values.append(resolved[0])
-        native = _resolve_semantic_function(alias, tuple(argument_values))
+        native = resolve_native_semantic_function(alias, tuple(argument_values))
         if native is not None:
             return native
         summaries = (
@@ -589,81 +591,6 @@ def _instantiate_summary_value(
             )
         )[:64]
     return values
-
-
-def _resolve_semantic_function(
-    alias: str,
-    argument_values: tuple[tuple[SemanticValue, ...], ...],
-) -> tuple[tuple[SemanticValue, ...], ...] | None:
-    name = _semantic_function_name(alias)
-    if name == "citylevel2label":
-        levels = _integer_argument_candidates(argument_values, 0)
-        return (
-            tuple(
-                semantic_literal(
-                    f"_GENERAL_INFORMATION_CITY_LEVEL_NAME_+{level}"
-                )
-                for level in levels
-            )
-            or (semantic_literal("_GENERAL_INFORMATION_CITY_LEVEL_NAME_+*"),),
-        )
-    if name == "getnobilitytitlelabel":
-        # The engine also selects a gendered title variant.  The numeric title
-        # argument alone therefore proves the family, not one exact member.
-        return ((semantic_literal("_CHARACTERS_3_TITLES_NAME_+*"),),)
-    if name != "generateprivilegelistlabels":
-        return None
-    positions: list[tuple[SemanticValue, ...]] = []
-    for candidates in argument_values:
-        privileges = tuple(
-            value.text
-            for value in candidates
-            if value.text
-            and value.text != "*"
-            and re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", value.text)
-        )
-        if not privileges:
-            continue
-        positions.append(
-            tuple(
-                semantic_literal(
-                    f"_PRIVILEGE_{privilege}_MESSAGETEXT_+0"
-                )
-                for privilege in privileges
-            )
-        )
-        positions.append((semantic_literal("$N"),))
-    if not positions:
-        return None
-    while len(positions) < 21:
-        positions.append((semantic_literal(""),))
-    return tuple(positions[:21])
-
-
-def _integer_argument_candidates(
-    argument_values: tuple[tuple[SemanticValue, ...], ...],
-    index: int,
-) -> tuple[int, ...]:
-    if not (0 <= index < len(argument_values)):
-        return ()
-    values: list[int] = []
-    for candidate in argument_values[index]:
-        if re.fullmatch(r"[-+]?\d+", candidate.text):
-            value = int(candidate.text)
-            if value not in values:
-                values.append(value)
-    return tuple(values)
-
-
-def _semantic_function_name(alias: str) -> str | None:
-    name = re.split(r"[.:]", alias)[-1].casefold().split("_")[-1]
-    if name in {
-        "citylevel2label",
-        "generateprivilegelistlabels",
-        "getnobilitytitlelabel",
-    }:
-        return name
-    return None
 
 
 def build_code_reference_index(
