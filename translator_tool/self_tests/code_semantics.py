@@ -298,7 +298,13 @@ def assert_placeholder_values_avoid_ambiguous_random_branches() -> None:
             return "Alex", "Smith", "male"
 
         @staticmethod
-        def sample_label(_prefix: str, _suffix: str, _seed: str, _number: int, _target: bool) -> str:
+        def sample_label(prefix: str, _suffix: str, _seed: str, _number: int, _target: bool) -> str:
+            if prefix == "_CITY_NAME_":
+                return "York"
+            if prefix == "_GENERAL_INFORMATION_CITY_LEVEL_NAME_+":
+                return "Town"
+            if prefix == "_CHARACTERS_3_TITLES_NAME_+":
+                return "Citizen"
             return "Supreme Commander"
 
         @staticmethod
@@ -336,6 +342,7 @@ def assert_placeholder_values_avoid_ambiguous_random_branches() -> None:
                 "_OPTION_EMPEROR_+0": "Emperor",
                 "_ITEM_BoozyBreathBeer_NAME_+0": "Drunkard Brew beer",
                 "_PRIVILEGE_CanTrade_MESSAGETEXT_+0": "May trade goods",
+                "PlainOfficeKey": "Bailiff",
                 "_CHARACTERS_3_TITLES_NAME_+9": "Citizen",
                 "SubstSimFullDescOffice_+0": "%1ST %1SV %1SD, %1SA in %2NAME",
             }.get(label, label)
@@ -552,6 +559,65 @@ def assert_placeholder_values_avoid_ambiguous_random_branches() -> None:
             f"localized multi-return labels or structural blank slots were wrong: {projected!r}"
         )
 
+    typed_values = CodeReference(
+        "typed_values_+0",
+        Path("TypedValues.lua"),
+        80,
+        1,
+        "MsgQuick",
+        1,
+        runtime_arguments=(
+            "LabelValue",
+            "TextValue",
+            'ItemGetLabel("BoozyBreathBeer", true)',
+            "CityLevel",
+        ),
+        runtime_argument_values=(
+            ("PlainOfficeKey",),
+            ("PlainOfficeKey",),
+            ("_ITEM_BoozyBreathBeer_NAME_+0",),
+            ("_GENERAL_INFORMATION_CITY_LEVEL_NAME_+*",),
+        ),
+        role="body",
+    )
+    typed_context = PlaceholderContext(
+        "TYPED_VALUES_+0",
+        "Text.dbt",
+        False,
+        "en",
+        (typed_values,),
+        ((1, ("l",)), (2, ("s",)), (3, ("s",)), (4, ("l",))),
+    )
+    if builder.argument_value(1, "l", typed_context).text != "Bailiff":
+        raise AssertionError("%l did not localize a proven plain label key")
+    if builder.argument_value(2, "s", typed_context).text != "PlainOfficeKey":
+        raise AssertionError("%s localized a plain runtime string instead of displaying it")
+    if builder.argument_value(3, "s", typed_context).text == "Drunkard Brew beer":
+        raise AssertionError("%s incorrectly consumed a localization-label runtime value")
+    if builder.argument_value(4, "l", typed_context).text != "Town":
+        raise AssertionError("%l did not sample a proven dynamic label family")
+
+    named_string = CodeReference(
+        "named_string_+0",
+        Path("NamedString.lua"),
+        90,
+        1,
+        "MsgQuick",
+        1,
+        runtime_arguments=("GetName(CityAlias)",),
+        role="body",
+    )
+    named_string_context = PlaceholderContext(
+        "NAMED_STRING_+0",
+        "Text.dbt",
+        False,
+        "en",
+        (named_string,),
+        ((1, ("s",)),),
+    )
+    if builder.argument_value(1, "s", named_string_context).text != "York":
+        raise AssertionError("%s did not project the object name proven by its caller")
+
 
 def assert_variadic_runtime_arguments_map_to_placeholder_positions() -> None:
     privileges = CodeReference(
@@ -659,6 +725,8 @@ def assert_cross_file_function_summaries_bind_arguments_and_expand_returns() -> 
                 (
                     "function Main()",
                     '    MsgQuick("", "@L_REMOTE_VALUES_BODY_+0", helper_MakeValues("BREAD"))',
+                    '    MsgQuick("", "@L_CITY_LEVEL_BODY_+0", CityLevel2Label(2))',
+                    '    MsgQuick("", "@L_TITLE_LABEL_BODY_+0", GetNobilityTitleLabel(7))',
                     "end",
                 )
             ),
@@ -688,6 +756,20 @@ def assert_cross_file_function_summaries_bind_arguments_and_expand_returns() -> 
             )
         if ("project", "helper_makevalues") in linker.unresolved_value_aliases():
             raise AssertionError("a loaded function summary remained marked as unresolved")
+        city = index.references_for("CITY_LEVEL_BODY_+0").project[0]
+        if city.runtime_argument_values != (
+            ("_GENERAL_INFORMATION_CITY_LEVEL_NAME_+2",),
+        ):
+            raise AssertionError(
+                f"CityLevel2Label did not expose its exact label semantics: {city!r}"
+            )
+        title = index.references_for("TITLE_LABEL_BODY_+0").project[0]
+        if title.runtime_argument_values != (
+            ("_CHARACTERS_3_TITLES_NAME_+*",),
+        ):
+            raise AssertionError(
+                f"GetNobilityTitleLabel guessed an exact gendered title: {title!r}"
+            )
     finally:
         shutil.rmtree(temp, ignore_errors=True)
 

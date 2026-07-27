@@ -364,12 +364,26 @@ class PlaceholderValueBuilder:
         if explicit is not None:
             return explicit
         if suffix in {"", "l", "s"}:
-            localized = _localized_argument_value(self.localization, number, context)
-            if localized:
+            rendered = (
+                _plain_string_argument_value(number, context)
+                if suffix == "s"
+                else _localized_argument_value(self.localization, number, context)
+            )
+            if rendered:
                 if _depth < 3:
-                    localized = self._resolve_nested_placeholders(localized, number, suffix, context, _depth + 1)
-                return PlaceholderValue(_clean_sample_text(localized))
-            semantic = _semantic_kind(number, context)
+                    rendered = self._resolve_nested_placeholders(
+                        rendered,
+                        number,
+                        suffix,
+                        context,
+                        _depth + 1,
+                    )
+                return PlaceholderValue(_clean_sample_text(rendered))
+            semantic = (
+                _plain_string_semantic_kind(number, context)
+                if suffix == "s"
+                else _semantic_kind(number, context)
+            )
             if semantic == "character":
                 return PlaceholderValue(
                     self.localization.character_name(context.seed_key, number, context.target)
@@ -511,6 +525,29 @@ def _semantic_kind(number: int, context: PlaceholderContext) -> str:
                 candidate = ""
             if candidate:
                 kinds.add(candidate)
+    return next(iter(kinds)) if len(kinds) == 1 else ""
+
+
+def _plain_string_semantic_kind(
+    number: int,
+    context: PlaceholderContext,
+) -> str:
+    """Infer an object type for %s only from an expression that returns a name."""
+    kinds: set[str] = set()
+    for reference in context.references:
+        for expression in _placeholder_expressions(reference, number):
+            lowered = expression.casefold()
+            if "itemgetname(" in lowered:
+                kinds.add("item")
+                continue
+            if "getname(" not in lowered:
+                continue
+            if "settlement" in lowered or "city" in lowered:
+                kinds.add("city")
+            elif "building" in lowered:
+                kinds.add("building")
+            elif any(marker in lowered for marker in ("sim", "person", "character")):
+                kinds.add("character")
     return next(iter(kinds)) if len(kinds) == 1 else ""
 
 
@@ -805,6 +842,48 @@ def _localized_argument_value(
     return ""
 
 
+def _plain_string_argument_value(
+    number: int,
+    context: PlaceholderContext,
+) -> str:
+    """Return only a proven runtime string; localization labels are not strings."""
+    for reference in context.references:
+        runtime_values = getattr(reference, "runtime_argument_values", ())
+        if not isinstance(runtime_values, tuple) or not (0 < number <= len(runtime_values)):
+            continue
+        candidates = runtime_values[number - 1]
+        if not isinstance(candidates, tuple) or not candidates:
+            continue
+        values: list[str] = []
+        for candidate in candidates:
+            value = str(candidate)
+            if value == "":
+                values.append("\u200b")
+            elif value == "$N":
+                values.append(" ")
+            elif _runtime_preview_value_kind(value) == "text":
+                values.append(value)
+            else:
+                return ""
+        unique = tuple(dict.fromkeys(values))
+        if len(unique) == 1:
+            return unique[0]
+    return ""
+
+
+def _runtime_preview_value_kind(value: str) -> str:
+    stripped = value.strip()
+    if not stripped:
+        return "structure"
+    if (
+        _literal_label_candidates(stripped)
+        or dynamic_label_patterns(stripped)
+        or stripped.startswith("@L_")
+    ):
+        return "label"
+    return "text"
+
+
 def _localized_runtime_argument_value(
     localization: PlaceholderLocalization,
     reference: object,
@@ -831,6 +910,14 @@ def _localized_runtime_argument_value(
             number,
             context,
         )
+        if (
+            not value
+            and re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", str(candidate))
+        ):
+            label = str(candidate)
+            localized = localization.localized(label, context.target)
+            if localized and localized != label:
+                value = localized
         if not value:
             return ""
         values.append(value)
@@ -857,11 +944,37 @@ def _localized_expression_value(
             value = localization.localized(label, context.target)
             if value and value != label:
                 return value
+            sample = _wildcard_label_sample(
+                localization,
+                label,
+                number,
+                context,
+            )
+            if sample:
+                return sample
     for prefix, suffix in _dynamic_sample_candidates(expression):
         value = localization.sample_label(prefix, suffix, context.seed_key, number, context.target)
         if value:
             return value
     return ""
+
+
+def _wildcard_label_sample(
+    localization: PlaceholderLocalization,
+    label: str,
+    number: int,
+    context: PlaceholderContext,
+) -> str:
+    star_index = label.find("*")
+    if star_index < 0:
+        return ""
+    return localization.sample_label(
+        label[:star_index],
+        label[star_index + 1 :],
+        context.seed_key,
+        number,
+        context.target,
+    )
 
 
 def _localized_variable_value(

@@ -545,7 +545,21 @@ def _resolve_semantic_function(
     alias: str,
     argument_values: tuple[tuple[str, ...], ...],
 ) -> tuple[tuple[str, ...], ...] | None:
-    if _semantic_function_name(alias) != "generateprivilegelistlabels":
+    name = _semantic_function_name(alias)
+    if name == "citylevel2label":
+        levels = _integer_argument_candidates(argument_values, 0)
+        return (
+            tuple(
+                f"_GENERAL_INFORMATION_CITY_LEVEL_NAME_+{level}"
+                for level in levels
+            )
+            or ("_GENERAL_INFORMATION_CITY_LEVEL_NAME_+*",),
+        )
+    if name == "getnobilitytitlelabel":
+        # The engine also selects a gendered title variant.  The numeric title
+        # argument alone therefore proves the family, not one exact member.
+        return (("_CHARACTERS_3_TITLES_NAME_+*",),)
+    if name != "generateprivilegelistlabels":
         return None
     positions: list[tuple[str, ...]] = []
     for candidates in argument_values:
@@ -570,9 +584,28 @@ def _resolve_semantic_function(
     return tuple(positions[:21])
 
 
+def _integer_argument_candidates(
+    argument_values: tuple[tuple[str, ...], ...],
+    index: int,
+) -> tuple[int, ...]:
+    if not (0 <= index < len(argument_values)):
+        return ()
+    values: list[int] = []
+    for candidate in argument_values[index]:
+        if re.fullmatch(r"[-+]?\d+", candidate):
+            value = int(candidate)
+            if value not in values:
+                values.append(value)
+    return tuple(values)
+
+
 def _semantic_function_name(alias: str) -> str | None:
     name = re.split(r"[.:]", alias)[-1].casefold().split("_")[-1]
-    if name == "generateprivilegelistlabels":
+    if name in {
+        "citylevel2label",
+        "generateprivilegelistlabels",
+        "getnobilitytitlelabel",
+    }:
         return name
     return None
 
