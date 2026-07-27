@@ -109,6 +109,7 @@ class SemanticLabelUse:
     role: str = "unattached"
     runtime_arguments: tuple[str, ...] = ()
     runtime_argument_values: tuple[tuple[str, ...], ...] = ()
+    runtime_argument_kinds: tuple[tuple[str, ...], ...] = ()
     resolved_arguments: tuple[tuple[str, ...], ...] = ()
     match_kind: str = "exact"
     confidence: int = 0
@@ -133,15 +134,22 @@ class ExternalCallFlow:
     role: str
     runtime_arguments: tuple[str, ...]
     runtime_argument_values: tuple[tuple[str, ...], ...]
+    runtime_argument_kinds: tuple[tuple[str, ...], ...]
     resolved_arguments: tuple[tuple[str, ...], ...]
     confidence: int = 76
+
+
+@dataclass(frozen=True)
+class SemanticValue:
+    kind: str
+    text: str
 
 
 @dataclass(frozen=True)
 class FunctionValueSummary:
     aliases: tuple[str, ...]
     parameters: tuple[str, ...]
-    return_values: tuple[tuple[str, ...], ...]
+    return_values: tuple[tuple[SemanticValue, ...], ...]
 
 
 @dataclass(frozen=True)
@@ -184,9 +192,12 @@ _CALL_EXPRESSION_RE = re.compile(
     r"^(?P<name>[A-Za-z_][A-Za-z0-9_.:]*)\s*\((?P<arguments>.*)\)$",
     re.DOTALL,
 )
-SUMMARY_LITERAL_PREFIX = "\x1d"
-SUMMARY_EXPRESSION_PREFIX = "\x1e"
 SUMMARY_PARAMETER_PREFIX = "\x1f"
+SEMANTIC_EXPRESSION = "expression"
+SEMANTIC_LABEL = "label"
+SEMANTIC_NUMBER = "number"
+SEMANTIC_STRUCTURE = "structure"
+SEMANTIC_TEXT = "text"
 
 
 def analyze_script(
@@ -258,6 +269,7 @@ def analyze_script_facts(
             runtime_start = contract.runtime_start if contract is not None else argument_index + 1
             runtime_arguments = call.arguments[runtime_start:]
             runtime_argument_values = _runtime_argument_values(analysis, call, runtime_start)
+            runtime_argument_kinds = _semantic_value_kinds(runtime_argument_values)
             if contract is not None or role == "button":
                 for alias, _dependency_position in _external_calls_for_argument(
                     analysis,
@@ -277,6 +289,7 @@ def analyze_script_facts(
                             role=role,
                             runtime_arguments=runtime_arguments,
                             runtime_argument_values=runtime_argument_values,
+                            runtime_argument_kinds=runtime_argument_kinds,
                             resolved_arguments=resolved_arguments,
                         )
                     )
@@ -291,6 +304,7 @@ def analyze_script_facts(
                         role=role,
                         runtime_arguments=runtime_arguments,
                         runtime_argument_values=runtime_argument_values,
+                        runtime_argument_kinds=runtime_argument_kinds,
                         resolved_arguments=resolved_arguments,
                         match_kind=match_kind,
                         confidence=confidence,
@@ -1183,7 +1197,7 @@ def _function_value_summaries(
             )
             for parameter_index, parameter in enumerate(function.parameters)
         }
-        positions: list[list[str]] = []
+        positions: list[list[SemanticValue]] = []
         for return_start, return_end, return_position in returns:
             return_parts = _split_token_range(
                 analysis.tokens,
@@ -1211,7 +1225,7 @@ def _function_value_summaries(
                     and _CALL_EXPRESSION_RE.fullmatch(expression.strip())
                 ):
                     candidates = tuple(
-                        SUMMARY_LITERAL_PREFIX + value
+                        semantic_literal(value)
                         for value in resolved
                     )
                 else:
@@ -1221,7 +1235,9 @@ def _function_value_summaries(
                             f"{SUMMARY_PARAMETER_PREFIX}{parameter_index}{SUMMARY_PARAMETER_PREFIX}",
                             expression,
                         )
-                    candidates = (SUMMARY_EXPRESSION_PREFIX + expression,)
+                    candidates = (
+                        SemanticValue(SEMANTIC_EXPRESSION, expression),
+                    )
                 positions[return_index].extend(candidates)
         summaries.append(
             FunctionValueSummary(
@@ -1234,6 +1250,19 @@ def _function_value_summaries(
             )
         )
     return tuple(summaries)
+
+
+def semantic_literal(value: str) -> SemanticValue:
+    stripped = value.strip()
+    if value in {"", "$N"}:
+        kind = SEMANTIC_STRUCTURE
+    elif stripped.startswith(("@L_", "_")):
+        kind = SEMANTIC_LABEL
+    elif re.fullmatch(r"[-+]?\d+(?:\.\d+)?|true|false", stripped, re.IGNORECASE):
+        kind = SEMANTIC_NUMBER
+    else:
+        kind = SEMANTIC_TEXT
+    return SemanticValue(kind, value)
 
 
 def _dependency_names(tokens: tuple[Token, ...], start: int, end: int) -> tuple[str, ...]:
@@ -1449,6 +1478,7 @@ def _dedupe_uses(uses: list[SemanticLabelUse]) -> tuple[SemanticLabelUse, ...]:
             use.role,
             use.runtime_arguments,
             use.runtime_argument_values,
+            use.runtime_argument_kinds,
             use.resolved_arguments,
         )
         if key not in seen:
@@ -1478,6 +1508,15 @@ def _runtime_argument_values(
         )
         values.append(tuple(dict.fromkeys(resolved))[:64])
     return tuple(values)
+
+
+def _semantic_value_kinds(
+    values: tuple[tuple[str, ...], ...],
+) -> tuple[tuple[str, ...], ...]:
+    return tuple(
+        tuple(semantic_literal(value).kind for value in candidates)
+        for candidates in values
+    )
 
 
 def _resolved_call_arguments(

@@ -11,11 +11,12 @@ from .script_semantics import (
     ExternalCallFlow,
     FunctionValueSummary,
     FunctionReturnLabel,
-    SUMMARY_EXPRESSION_PREFIX,
-    SUMMARY_LITERAL_PREFIX,
     SUMMARY_PARAMETER_PREFIX,
+    SEMANTIC_EXPRESSION,
+    SemanticValue,
     ScriptSemanticFacts,
     analyze_script_facts,
+    semantic_literal,
 )
 
 
@@ -49,6 +50,7 @@ class CodeReference:
     role: str = "unattached"
     runtime_arguments: tuple[str, ...] = ()
     runtime_argument_values: tuple[tuple[str, ...], ...] = ()
+    runtime_argument_kinds: tuple[tuple[str, ...], ...] = ()
     resolved_arguments: tuple[tuple[str, ...], ...] = ()
     match_kind: str = "exact"
     confidence: int = 0
@@ -107,6 +109,7 @@ class CodeExternalFlow:
     role: str
     runtime_arguments: tuple[str, ...]
     runtime_argument_values: tuple[tuple[str, ...], ...]
+    runtime_argument_kinds: tuple[tuple[str, ...], ...]
     resolved_arguments: tuple[tuple[str, ...], ...]
     confidence: int
 
@@ -118,7 +121,7 @@ class CodeFunctionSummary:
     alias: str
     cross_file: bool
     parameters: tuple[str, ...]
-    return_values: tuple[tuple[str, ...], ...]
+    return_values: tuple[tuple[SemanticValue, ...], ...]
 
 
 @dataclass(frozen=True)
@@ -250,6 +253,8 @@ class CrossFileSemanticLinker:
             reference.column,
             reference.label,
             reference.runtime_arguments,
+            reference.runtime_argument_values,
+            reference.runtime_argument_kinds,
         )
         if identity in self._seen_value_references:
             return
@@ -277,9 +282,15 @@ class CrossFileSemanticLinker:
         result: CodeReferenceIndex,
         reference: CodeReference,
     ) -> None:
-        resolved, dependencies = self._resolve_runtime_values(reference)
+        resolved, kinds, dependencies = self._resolve_runtime_values(reference)
         self._register_value_dependencies(reference, dependencies)
-        if resolved is None or resolved == reference.runtime_argument_values:
+        if (
+            resolved is None
+            or (
+                resolved == reference.runtime_argument_values
+                and kinds == reference.runtime_argument_kinds
+            )
+        ):
             return
         identity = (
             reference.source,
@@ -288,11 +299,16 @@ class CrossFileSemanticLinker:
             reference.column,
             reference.label,
             resolved,
+            kinds,
         )
         if identity in self._emitted_values:
             return
         self._emitted_values.add(identity)
-        enhanced = replace(reference, runtime_argument_values=resolved)
+        enhanced = replace(
+            reference,
+            runtime_argument_values=resolved,
+            runtime_argument_kinds=kinds,
+        )
         target = (
             result.vanilla_references
             if reference.source == "vanilla"
@@ -307,9 +323,11 @@ class CrossFileSemanticLinker:
         reference: CodeReference,
     ) -> tuple[
         tuple[tuple[str, ...], ...] | None,
+        tuple[tuple[str, ...], ...],
         set[tuple[str, str, Path]],
     ]:
         values: list[tuple[str, ...]] = []
+        kinds: list[tuple[str, ...]] = []
         changed = False
         dependencies: set[tuple[str, str, Path]] = set()
         for index, expression in enumerate(reference.runtime_arguments):
@@ -325,15 +343,27 @@ class CrossFileSemanticLinker:
                 if index < len(reference.runtime_argument_values)
                 else ()
             )
+            existing_kinds = (
+                reference.runtime_argument_kinds[index]
+                if index < len(reference.runtime_argument_kinds)
+                else ()
+            )
             if not resolved:
                 values.append(existing)
+                kinds.append(existing_kinds)
                 continue
             if index == len(reference.runtime_arguments) - 1 and len(resolved) > 1:
-                values.extend(resolved)
+                values.extend(_semantic_text_candidates(item) for item in resolved)
+                kinds.extend(_semantic_kind_candidates(item) for item in resolved)
             else:
-                values.append(resolved[0])
+                values.append(_semantic_text_candidates(resolved[0]))
+                kinds.append(_semantic_kind_candidates(resolved[0]))
             changed = True
-        return (tuple(values) if changed else None), dependencies
+        return (
+            tuple(values) if changed else None,
+            tuple(kinds),
+            dependencies,
+        )
 
     def _resolve_expression(
         self,
@@ -342,17 +372,17 @@ class CrossFileSemanticLinker:
         expression: str,
         resolving: set[tuple[str, str]],
         dependencies: set[tuple[str, str, Path]],
-    ) -> tuple[tuple[str, ...], ...] | None:
+    ) -> tuple[tuple[SemanticValue, ...], ...] | None:
         stripped = expression.strip()
         literal = _string_literal_text(stripped)
         if literal is not None:
-            return ((literal,),)
+            return ((semantic_literal(literal),),)
         if re.fullmatch(r"[-+]?\d+(?:\.\d+)?|true|false", stripped, re.IGNORECASE):
-            return ((stripped,),)
+            return ((semantic_literal(stripped),),)
         call = _value_call_parts(stripped)
         if call is None:
             if stripped.startswith(("@L_", "_")) or SUMMARY_PARAMETER_PREFIX in stripped:
-                return ((stripped,),)
+                return ((semantic_literal(stripped),),)
             return None
         alias, arguments = call
         key = (source, alias.casefold())
@@ -361,7 +391,7 @@ class CrossFileSemanticLinker:
             return None
         next_resolving = set(resolving)
         next_resolving.add(key)
-        argument_values: list[tuple[str, ...]] = []
+        argument_values: list[tuple[SemanticValue, ...]] = []
         for index, argument in enumerate(arguments):
             resolved = self._resolve_expression(
                 source,
@@ -371,7 +401,7 @@ class CrossFileSemanticLinker:
                 dependencies,
             )
             if not resolved:
-                argument_values.append(("*",))
+                argument_values.append((SemanticValue(SEMANTIC_EXPRESSION, "*"),))
             elif index == len(arguments) - 1 and len(resolved) > 1:
                 argument_values.extend(resolved)
             else:
@@ -385,7 +415,7 @@ class CrossFileSemanticLinker:
         )
         if not summaries:
             return None
-        positions: list[list[str]] = []
+        positions: list[list[SemanticValue]] = []
         for summary in summaries:
             resolved_summary = self._resolve_summary(
                 summary,
@@ -405,27 +435,27 @@ class CrossFileSemanticLinker:
     def _resolve_summary(
         self,
         summary: CodeFunctionSummary,
-        argument_values: tuple[tuple[str, ...], ...],
+        argument_values: tuple[tuple[SemanticValue, ...], ...],
         resolving: set[tuple[str, str]],
         dependencies: set[tuple[str, str, Path]],
-    ) -> tuple[tuple[str, ...], ...]:
-        positions: list[list[str]] = []
+    ) -> tuple[tuple[SemanticValue, ...], ...]:
+        positions: list[list[SemanticValue]] = []
         for return_index, candidates in enumerate(summary.return_values):
-            resolved_candidates: list[tuple[tuple[str, ...], ...]] = []
+            resolved_candidates: list[tuple[tuple[SemanticValue, ...], ...]] = []
             for candidate in candidates:
                 for instantiated in _instantiate_summary_value(candidate, argument_values):
-                    if instantiated.startswith(SUMMARY_LITERAL_PREFIX):
-                        resolved_candidates.append(((instantiated[1:],),))
-                    elif instantiated.startswith(SUMMARY_EXPRESSION_PREFIX):
+                    if instantiated.kind == SEMANTIC_EXPRESSION:
                         resolved = self._resolve_expression(
                             summary.source,
                             summary.path,
-                            instantiated[1:],
+                            instantiated.text,
                             resolving,
                             dependencies,
                         )
                         if resolved:
                             resolved_candidates.append(resolved)
+                    else:
+                        resolved_candidates.append(((instantiated,),))
             if not resolved_candidates:
                 continue
             while len(positions) <= return_index:
@@ -474,6 +504,7 @@ class CrossFileSemanticLinker:
             role=flow.role,
             runtime_arguments=flow.runtime_arguments,
             runtime_argument_values=flow.runtime_argument_values,
+            runtime_argument_kinds=flow.runtime_argument_kinds,
             resolved_arguments=flow.resolved_arguments,
             match_kind=returned.match_kind,
             confidence=min(returned.confidence, flow.confidence),
@@ -511,16 +542,28 @@ def _value_call_parts(expression: str) -> tuple[str, tuple[str, ...]] | None:
     return match.group("name"), _split_top_level_arguments(match.group("arguments"))
 
 
-def _instantiate_summary_value(
-    candidate: str,
-    argument_values: tuple[tuple[str, ...], ...],
+def _semantic_text_candidates(
+    values: tuple[SemanticValue, ...],
 ) -> tuple[str, ...]:
+    return tuple(value.text for value in values)
+
+
+def _semantic_kind_candidates(
+    values: tuple[SemanticValue, ...],
+) -> tuple[str, ...]:
+    return tuple(value.kind for value in values)
+
+
+def _instantiate_summary_value(
+    candidate: SemanticValue,
+    argument_values: tuple[tuple[SemanticValue, ...], ...],
+) -> tuple[SemanticValue, ...]:
     parameter_indices = tuple(
         dict.fromkeys(
             int(match.group(1))
             for match in re.finditer(
                 re.escape(SUMMARY_PARAMETER_PREFIX) + r"(\d+)" + re.escape(SUMMARY_PARAMETER_PREFIX),
-                candidate,
+                candidate.text,
             )
         )
     )
@@ -530,11 +573,18 @@ def _instantiate_summary_value(
         replacements = (
             argument_values[parameter_index]
             if parameter_index < len(argument_values) and argument_values[parameter_index]
-            else ("*",)
+            else (SemanticValue(SEMANTIC_EXPRESSION, "*"),)
         )
         values = tuple(
             dict.fromkeys(
-                value.replace(marker, replacement)
+                (
+                    replacement
+                    if value.text == marker
+                    else SemanticValue(
+                        value.kind,
+                        value.text.replace(marker, replacement.text),
+                    )
+                )
                 for value, replacement in product(values, replacements)
             )
         )[:64]
@@ -543,57 +593,63 @@ def _instantiate_summary_value(
 
 def _resolve_semantic_function(
     alias: str,
-    argument_values: tuple[tuple[str, ...], ...],
-) -> tuple[tuple[str, ...], ...] | None:
+    argument_values: tuple[tuple[SemanticValue, ...], ...],
+) -> tuple[tuple[SemanticValue, ...], ...] | None:
     name = _semantic_function_name(alias)
     if name == "citylevel2label":
         levels = _integer_argument_candidates(argument_values, 0)
         return (
             tuple(
-                f"_GENERAL_INFORMATION_CITY_LEVEL_NAME_+{level}"
+                semantic_literal(
+                    f"_GENERAL_INFORMATION_CITY_LEVEL_NAME_+{level}"
+                )
                 for level in levels
             )
-            or ("_GENERAL_INFORMATION_CITY_LEVEL_NAME_+*",),
+            or (semantic_literal("_GENERAL_INFORMATION_CITY_LEVEL_NAME_+*"),),
         )
     if name == "getnobilitytitlelabel":
         # The engine also selects a gendered title variant.  The numeric title
         # argument alone therefore proves the family, not one exact member.
-        return (("_CHARACTERS_3_TITLES_NAME_+*",),)
+        return ((semantic_literal("_CHARACTERS_3_TITLES_NAME_+*"),),)
     if name != "generateprivilegelistlabels":
         return None
-    positions: list[tuple[str, ...]] = []
+    positions: list[tuple[SemanticValue, ...]] = []
     for candidates in argument_values:
         privileges = tuple(
-            value
+            value.text
             for value in candidates
-            if value and value != "*" and re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", value)
+            if value.text
+            and value.text != "*"
+            and re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", value.text)
         )
         if not privileges:
             continue
         positions.append(
             tuple(
-                f"_PRIVILEGE_{privilege}_MESSAGETEXT_+0"
+                semantic_literal(
+                    f"_PRIVILEGE_{privilege}_MESSAGETEXT_+0"
+                )
                 for privilege in privileges
             )
         )
-        positions.append(("$N",))
+        positions.append((semantic_literal("$N"),))
     if not positions:
         return None
     while len(positions) < 21:
-        positions.append(("",))
+        positions.append((semantic_literal(""),))
     return tuple(positions[:21])
 
 
 def _integer_argument_candidates(
-    argument_values: tuple[tuple[str, ...], ...],
+    argument_values: tuple[tuple[SemanticValue, ...], ...],
     index: int,
 ) -> tuple[int, ...]:
     if not (0 <= index < len(argument_values)):
         return ()
     values: list[int] = []
     for candidate in argument_values[index]:
-        if re.fullmatch(r"[-+]?\d+", candidate):
-            value = int(candidate)
+        if re.fullmatch(r"[-+]?\d+", candidate.text):
+            value = int(candidate.text)
             if value not in values:
                 values.append(value)
     return tuple(values)
@@ -807,6 +863,7 @@ def _scan_code_file(
             role=use.role,
             runtime_arguments=use.runtime_arguments,
             runtime_argument_values=use.runtime_argument_values,
+            runtime_argument_kinds=use.runtime_argument_kinds,
             resolved_arguments=use.resolved_arguments,
             match_kind=use.match_kind,
             confidence=use.confidence,
@@ -857,6 +914,7 @@ def _code_external_flows(
                 role=value.role,
                 runtime_arguments=value.runtime_arguments,
                 runtime_argument_values=value.runtime_argument_values,
+                runtime_argument_kinds=value.runtime_argument_kinds,
                 resolved_arguments=value.resolved_arguments,
                 confidence=value.confidence,
             )
@@ -897,6 +955,7 @@ def _dedupe_references(references: list[CodeReference]) -> tuple[CodeReference, 
             reference.role,
             reference.runtime_arguments,
             reference.runtime_argument_values,
+            reference.runtime_argument_kinds,
             reference.resolved_arguments,
             reference.match_kind,
         )

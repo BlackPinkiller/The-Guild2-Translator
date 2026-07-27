@@ -267,6 +267,10 @@ def assert_lazy_code_index_loads_cached_value_providers() -> None:
         )
         if resolved is None:
             raise AssertionError("targeted lazy analysis did not load the value provider summary")
+        if resolved.runtime_argument_kinds != (("label",), ("text",)):
+            raise AssertionError(
+                f"targeted lazy analysis lost semantic value types: {resolved!r}"
+            )
         if cold.progress.analyzed != 2:
             raise AssertionError(
                 f"value-provider analysis scanned unrelated files: {cold.progress!r}"
@@ -282,6 +286,7 @@ def assert_lazy_code_index_loads_cached_value_providers() -> None:
         if not any(
             item.runtime_argument_values
             == (("@L_ITEM_BREAD_NAME_+0",), ("Tail",))
+            and item.runtime_argument_kinds == (("label",), ("text",))
             for item in cached.references_for("LAZY_VALUE_BODY_+0").project
         ):
             raise AssertionError("warm cache did not restore and link function value summaries")

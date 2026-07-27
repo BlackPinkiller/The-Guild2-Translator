@@ -23,7 +23,7 @@ from .code_index import (
     normalize_label,
 )
 from .file_utils import atomic_write
-from .script_semantics import analyze_script as _semantic_analyze_script
+from .script_semantics import SemanticValue, analyze_script as _semantic_analyze_script
 from .settings import settings_dir
 
 
@@ -532,6 +532,7 @@ def _reference_to_json(reference: CodeReference) -> dict[str, object]:
         "role": reference.role,
         "runtime_arguments": list(reference.runtime_arguments),
         "runtime_values": [list(values) for values in reference.runtime_argument_values],
+        "runtime_kinds": [list(values) for values in reference.runtime_argument_kinds],
         "resolved_arguments": [list(values) for values in reference.resolved_arguments],
         "match_kind": reference.match_kind,
         "confidence": reference.confidence,
@@ -548,6 +549,7 @@ def _reference_from_json(item: dict[str, object], spec: CodeFileSpec) -> CodeRef
     arguments = item.get("arguments")
     runtime_arguments = item.get("runtime_arguments")
     runtime_values = item.get("runtime_values")
+    runtime_kinds = item.get("runtime_kinds")
     resolved_arguments = item.get("resolved_arguments")
     return CodeReference(
         label=label,
@@ -571,6 +573,15 @@ def _reference_from_json(item: dict[str, object], spec: CodeFileSpec) -> CodeRef
                 if isinstance(values, list)
             )
             if isinstance(runtime_values, list)
+            else ()
+        ),
+        runtime_argument_kinds=(
+            tuple(
+                tuple(value for value in values if isinstance(value, str))
+                for values in runtime_kinds
+                if isinstance(values, list)
+            )
+            if isinstance(runtime_kinds, list)
             else ()
         ),
         resolved_arguments=(
@@ -624,7 +635,13 @@ def _summary_to_json(value: CodeFunctionSummary) -> dict[str, object]:
         "alias": value.alias,
         "cross_file": value.cross_file,
         "parameters": list(value.parameters),
-        "return_values": [list(values) for values in value.return_values],
+        "return_values": [
+            [
+                {"kind": candidate.kind, "text": candidate.text}
+                for candidate in values
+            ]
+            for values in value.return_values
+        ],
     }
 
 
@@ -648,7 +665,13 @@ def _summary_from_json(
         cross_file=item.get("cross_file") is True,
         parameters=tuple(value for value in parameters if isinstance(value, str)),
         return_values=tuple(
-            tuple(value for value in values if isinstance(value, str))
+            tuple(
+                SemanticValue(kind, text)
+                for value in values
+                if isinstance(value, dict)
+                if isinstance((kind := value.get("kind")), str)
+                if isinstance((text := value.get("text")), str)
+            )
             for values in return_values
             if isinstance(values, list)
         ),
@@ -666,6 +689,7 @@ def _flow_to_json(value: CodeExternalFlow) -> dict[str, object]:
         "role": value.role,
         "runtime_arguments": list(value.runtime_arguments),
         "runtime_values": [list(values) for values in value.runtime_argument_values],
+        "runtime_kinds": [list(values) for values in value.runtime_argument_kinds],
         "resolved_arguments": [list(values) for values in value.resolved_arguments],
         "confidence": value.confidence,
     }
@@ -691,6 +715,7 @@ def _flow_from_json(
     arguments = item.get("arguments")
     runtime_arguments = item.get("runtime_arguments")
     runtime_values = item.get("runtime_values")
+    runtime_kinds = item.get("runtime_kinds")
     resolved_arguments = item.get("resolved_arguments")
     return CodeExternalFlow(
         path=spec.path,
@@ -718,6 +743,15 @@ def _flow_from_json(
                 if isinstance(values, list)
             )
             if isinstance(runtime_values, list)
+            else ()
+        ),
+        runtime_argument_kinds=(
+            tuple(
+                tuple(value for value in values if isinstance(value, str))
+                for values in runtime_kinds
+                if isinstance(values, list)
+            )
+            if isinstance(runtime_kinds, list)
             else ()
         ),
         resolved_arguments=(

@@ -8,7 +8,11 @@ from typing import Protocol
 
 from .code_index import dynamic_label_patterns, normalize_label
 from .i18n import translate
-from .script_semantics import variadic_argument_pack
+from .script_semantics import (
+    SEMANTIC_STRUCTURE,
+    SEMANTIC_TEXT,
+    variadic_argument_pack,
+)
 
 
 GLYPH_MARK = "\ufffc"
@@ -849,19 +853,30 @@ def _plain_string_argument_value(
     """Return only a proven runtime string; localization labels are not strings."""
     for reference in context.references:
         runtime_values = getattr(reference, "runtime_argument_values", ())
+        runtime_kinds = getattr(reference, "runtime_argument_kinds", ())
         if not isinstance(runtime_values, tuple) or not (0 < number <= len(runtime_values)):
             continue
         candidates = runtime_values[number - 1]
         if not isinstance(candidates, tuple) or not candidates:
             continue
+        kinds = (
+            runtime_kinds[number - 1]
+            if isinstance(runtime_kinds, tuple) and number <= len(runtime_kinds)
+            else ()
+        )
         values: list[str] = []
-        for candidate in candidates:
+        for index, candidate in enumerate(candidates):
             value = str(candidate)
-            if value == "":
+            kind = (
+                str(kinds[index])
+                if isinstance(kinds, tuple) and index < len(kinds)
+                else ""
+            )
+            if kind == SEMANTIC_STRUCTURE and value == "":
                 values.append("\u200b")
-            elif value == "$N":
+            elif kind == SEMANTIC_STRUCTURE and value == "$N":
                 values.append(" ")
-            elif _runtime_preview_value_kind(value) == "text":
+            elif kind == SEMANTIC_TEXT:
                 values.append(value)
             else:
                 return ""
@@ -869,19 +884,6 @@ def _plain_string_argument_value(
         if len(unique) == 1:
             return unique[0]
     return ""
-
-
-def _runtime_preview_value_kind(value: str) -> str:
-    stripped = value.strip()
-    if not stripped:
-        return "structure"
-    if (
-        _literal_label_candidates(stripped)
-        or dynamic_label_patterns(stripped)
-        or stripped.startswith("@L_")
-    ):
-        return "label"
-    return "text"
 
 
 def _localized_runtime_argument_value(

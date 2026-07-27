@@ -110,6 +110,10 @@ def assert_code_semantics_resolve_local_function_returns() -> None:
         raise AssertionError(
             "a local function return did not bind the first call's concrete parameters"
         )
+    if by_label["body_bread_+0"].runtime_argument_kinds != (("label",),):
+        raise AssertionError(
+            "the semantic analyzer did not type a local label-returning function"
+        )
     if by_label["body_cake_+0"].runtime_argument_values != (("@L_ITEM_CAKE_NAME_+1",),):
         raise AssertionError(
             "a local function return leaked parameter values from another call site"
@@ -119,6 +123,8 @@ def assert_code_semantics_resolve_local_function_returns() -> None:
         "@L_OPTION_DISABLED_+0",
     }:
         raise AssertionError("branching function returns did not remain an explicit candidate set")
+    if by_label["body_branch_+0"].runtime_argument_kinds != (("label", "label"),):
+        raise AssertionError("branching label candidates lost their semantic type")
     if by_label["body_recursive_+0"].runtime_argument_values != ((),):
         raise AssertionError("recursive label evaluation did not stop at the bounded call guard")
     if by_label["body_item_+0"].runtime_argument_values != (
@@ -578,6 +584,12 @@ def assert_placeholder_values_avoid_ambiguous_random_branches() -> None:
             ("_ITEM_BoozyBreathBeer_NAME_+0",),
             ("_GENERAL_INFORMATION_CITY_LEVEL_NAME_+*",),
         ),
+        runtime_argument_kinds=(
+            ("text",),
+            ("text",),
+            ("label",),
+            ("label",),
+        ),
         role="body",
     )
     typed_context = PlaceholderContext(
@@ -716,6 +728,9 @@ def assert_cross_file_function_summaries_bind_arguments_and_expand_returns() -> 
                     '    local First = "@L_ITEM_"..kind.."_NAME_+0"',
                     '    return First, "@L_ITEM_SECOND_NAME_+0"',
                     "end",
+                    "function MakeText(name)",
+                    '    return "Office "..name',
+                    "end",
                 )
             ),
             encoding="utf-8",
@@ -725,6 +740,7 @@ def assert_cross_file_function_summaries_bind_arguments_and_expand_returns() -> 
                 (
                     "function Main()",
                     '    MsgQuick("", "@L_REMOTE_VALUES_BODY_+0", helper_MakeValues("BREAD"))',
+                    '    MsgQuick("", "@L_REMOTE_TEXT_BODY_+0", helper_MakeText("Bailiff"))',
                     '    MsgQuick("", "@L_CITY_LEVEL_BODY_+0", CityLevel2Label(2))',
                     '    MsgQuick("", "@L_TITLE_LABEL_BODY_+0", GetNobilityTitleLabel(7))',
                     "end",
@@ -736,7 +752,30 @@ def assert_cross_file_function_summaries_bind_arguments_and_expand_returns() -> 
         index = linker.add(analyze_code_file(CodeFileSpec(caller, "project")))
         if ("project", "helper_makevalues") not in linker.unresolved_value_aliases():
             raise AssertionError("the caller did not expose its missing cross-file value provider")
-        index.merge(linker.add(analyze_code_file(CodeFileSpec(helper, "project"))))
+        helper_analysis = analyze_code_file(CodeFileSpec(helper, "project"))
+        value_summary = next(
+            summary
+            for summary in helper_analysis.function_summaries
+            if summary.alias == "helper_makevalues"
+        )
+        if {
+            candidate.kind
+            for values in value_summary.return_values
+            for candidate in values
+        } != {"label"}:
+            raise AssertionError(
+                f"label-producing returns lost their semantic type: {value_summary!r}"
+            )
+        text_summary = next(
+            summary
+            for summary in helper_analysis.function_summaries
+            if summary.alias == "helper_maketext"
+        )
+        if text_summary.return_values[0][0].kind != "text":
+            raise AssertionError(
+                f"plain text return was encoded as a label or string marker: {text_summary!r}"
+            )
+        index.merge(linker.add(helper_analysis))
         references = index.references_for("REMOTE_VALUES_BODY_+0").project
         resolved = next(
             (
@@ -754,6 +793,19 @@ def assert_cross_file_function_summaries_bind_arguments_and_expand_returns() -> 
             raise AssertionError(
                 f"cross-file function arguments or multi-return positions were lost: {references!r}"
             )
+        if resolved.runtime_argument_kinds != (("label",), ("label",)):
+            raise AssertionError(
+                f"cross-file label types did not reach the caller: {resolved!r}"
+            )
+        text_reference = index.references_for("REMOTE_TEXT_BODY_+0").project[0]
+        if text_reference.runtime_argument_values != (("Office Bailiff",),):
+            raise AssertionError(
+                f"typed text summary did not bind its caller argument: {text_reference!r}"
+            )
+        if text_reference.runtime_argument_kinds != (("text",),):
+            raise AssertionError(
+                f"cross-file text type did not reach the caller: {text_reference!r}"
+            )
         if ("project", "helper_makevalues") in linker.unresolved_value_aliases():
             raise AssertionError("a loaded function summary remained marked as unresolved")
         city = index.references_for("CITY_LEVEL_BODY_+0").project[0]
@@ -763,6 +815,8 @@ def assert_cross_file_function_summaries_bind_arguments_and_expand_returns() -> 
             raise AssertionError(
                 f"CityLevel2Label did not expose its exact label semantics: {city!r}"
             )
+        if city.runtime_argument_kinds != (("label",),):
+            raise AssertionError(f"engine label type was not preserved: {city!r}")
         title = index.references_for("TITLE_LABEL_BODY_+0").project[0]
         if title.runtime_argument_values != (
             ("_CHARACTERS_3_TITLES_NAME_+*",),
