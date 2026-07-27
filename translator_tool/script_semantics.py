@@ -194,11 +194,28 @@ _CALL_EXPRESSION_RE = re.compile(
     re.DOTALL,
 )
 SUMMARY_PARAMETER_PREFIX = "\x1f"
+_SEMANTIC_KIND_PREFIX = "\x1e"
 SEMANTIC_EXPRESSION = "expression"
+SEMANTIC_BUILDING = "building"
+SEMANTIC_CHARACTER = "character"
+SEMANTIC_DYNASTY = "dynasty"
 SEMANTIC_LABEL = "label"
 SEMANTIC_NUMBER = "number"
+SEMANTIC_SETTLEMENT = "settlement"
 SEMANTIC_STRUCTURE = "structure"
 SEMANTIC_TEXT = "text"
+
+_NATIVE_OBJECT_RETURN_KINDS = {
+    "getdynastyid": SEMANTIC_DYNASTY,
+    "gethomebuildingid": SEMANTIC_BUILDING,
+    "getinsidebuildingid": SEMANTIC_BUILDING,
+    "getsettlementid": SEMANTIC_SETTLEMENT,
+    "scenariogetimperialcapitalid": SEMANTIC_SETTLEMENT,
+    "simgetid": SEMANTIC_CHARACTER,
+    "simgetservantdynastyid": SEMANTIC_DYNASTY,
+    "simgetworkingplaceid": SEMANTIC_BUILDING,
+    "squadgetleaderid": SEMANTIC_CHARACTER,
+}
 
 
 def analyze_script(
@@ -284,8 +301,9 @@ def analyze_script_facts(
             )
             runtime_start = contract.runtime_start if contract is not None else argument_index + 1
             runtime_arguments = call.arguments[runtime_start:]
-            runtime_argument_values = _runtime_argument_values(analysis, call, runtime_start)
-            runtime_argument_kinds = _semantic_value_kinds(runtime_argument_values)
+            runtime_argument_values, runtime_argument_kinds = (
+                _runtime_argument_semantics(analysis, call, runtime_start)
+            )
             path_sensitive = bool(values and runtime_arguments) and (
                 _argument_has_conditional_assignments(
                     analysis,
@@ -331,7 +349,10 @@ def analyze_script_facts(
             for label, position, match_kind, confidence in values:
                 if path_sensitive:
                     origin_paths = origin_paths_by_label.get(label, ())
-                    contextual_runtime_values = _runtime_argument_values_for_paths(
+                    (
+                        contextual_runtime_values,
+                        contextual_runtime_kinds,
+                    ) = _runtime_argument_semantics_for_paths(
                         analysis,
                         call,
                         runtime_start,
@@ -340,6 +361,7 @@ def analyze_script_facts(
                     )
                 else:
                     contextual_runtime_values = runtime_argument_values
+                    contextual_runtime_kinds = runtime_argument_kinds
                 uses.append(
                     SemanticLabelUse(
                         label=label,
@@ -350,9 +372,7 @@ def analyze_script_facts(
                         role=role,
                         runtime_arguments=runtime_arguments,
                         runtime_argument_values=contextual_runtime_values,
-                        runtime_argument_kinds=_semantic_value_kinds(
-                            contextual_runtime_values
-                        ),
+                        runtime_argument_kinds=contextual_runtime_kinds,
                         resolved_arguments=resolved_arguments,
                         match_kind=match_kind,
                         confidence=confidence,
@@ -1208,7 +1228,7 @@ def _evaluate_local_function_call(
         resolved = resolve_native_semantic_function(call.name, semantic_arguments)
         if not resolved:
             return ()
-        return tuple(value.text for value in resolved[0])
+        return tuple(_semantic_candidate(value) for value in resolved[0])
 
     values: list[str] = []
     for target_index in target_indices:
@@ -1507,6 +1527,9 @@ def _function_value_summaries(
 
 
 def semantic_literal(value: str) -> SemanticValue:
+    marker_kind = _semantic_marker_kind(value)
+    if marker_kind:
+        return SemanticValue(marker_kind, "")
     stripped = value.strip()
     if value in {"", "$N"}:
         kind = SEMANTIC_STRUCTURE
@@ -1519,8 +1542,23 @@ def semantic_literal(value: str) -> SemanticValue:
     return SemanticValue(kind, value)
 
 
+def _semantic_candidate(value: SemanticValue) -> str:
+    if value.kind in _NATIVE_OBJECT_RETURN_KINDS.values() and not value.text:
+        return _SEMANTIC_KIND_PREFIX + value.kind
+    return value.text
+
+
+def _semantic_marker_kind(value: str) -> str:
+    if not value.startswith(_SEMANTIC_KIND_PREFIX):
+        return ""
+    kind = value[len(_SEMANTIC_KIND_PREFIX) :]
+    return kind if kind in _NATIVE_OBJECT_RETURN_KINDS.values() else ""
+
+
 def native_semantic_function_name(alias: str) -> str | None:
     name = re.split(r"[.:]", alias)[-1].casefold().split("_")[-1]
+    if name in _NATIVE_OBJECT_RETURN_KINDS:
+        return name
     if name in {
         "citylevel2label",
         "generateprivilegelistlabels",
@@ -1537,6 +1575,9 @@ def resolve_native_semantic_function(
 ) -> tuple[tuple[SemanticValue, ...], ...] | None:
     """Apply engine function contracts shared by local and cross-file evaluation."""
     name = native_semantic_function_name(alias)
+    object_kind = _NATIVE_OBJECT_RETURN_KINDS.get(name or "")
+    if object_kind is not None:
+        return ((SemanticValue(object_kind, ""),),)
     if name == "itemgetlabel":
         item_values = argument_values[0] if argument_values else ()
         singular_values = argument_values[1] if len(argument_values) > 1 else ()
@@ -1862,18 +1903,20 @@ def _dedupe_uses(uses: list[SemanticLabelUse]) -> tuple[SemanticLabelUse, ...]:
     return tuple(values)
 
 
-def _runtime_argument_values(
+def _runtime_argument_semantics(
     analysis: _Analysis,
     call: ScriptCall,
     runtime_start: int,
     *,
     required_branches: tuple[tuple[int, int], ...] = (),
-) -> tuple[tuple[str, ...], ...]:
+) -> tuple[tuple[tuple[str, ...], ...], tuple[tuple[str, ...], ...]]:
     values: list[tuple[str, ...]] = []
+    kinds: list[tuple[str, ...]] = []
     for start, end in call.argument_spans[runtime_start:]:
         token_indices = _tokens_in_span(analysis, start, end)
         if not token_indices:
             values.append(())
+            kinds.append(())
             continue
         resolved = _evaluate_tokens(
             analysis,
@@ -1884,31 +1927,52 @@ def _runtime_argument_values(
             set(),
             required_branches=required_branches,
         )
-        values.append(tuple(dict.fromkeys(resolved))[:64])
-    return tuple(values)
+        candidates = tuple(dict.fromkeys(resolved))[:64]
+        values.append(
+            tuple("" if _semantic_marker_kind(value) else value for value in candidates)
+        )
+        kinds.append(
+            tuple(
+                _semantic_marker_kind(value) or semantic_literal(value).kind
+                for value in candidates
+            )
+        )
+    return tuple(values), tuple(kinds)
 
 
-def _runtime_argument_values_for_paths(
+def _runtime_argument_semantics_for_paths(
     analysis: _Analysis,
     call: ScriptCall,
     runtime_start: int,
     paths: tuple[tuple[tuple[int, int], ...], ...],
-) -> tuple[tuple[str, ...], ...]:
-    merged: list[list[str]] = []
+) -> tuple[tuple[tuple[str, ...], ...], tuple[tuple[str, ...], ...]]:
+    merged_values: list[list[str]] = []
+    merged_kinds: list[list[str]] = []
     for path in paths:
-        values = _runtime_argument_values(
+        values, kinds = _runtime_argument_semantics(
             analysis,
             call,
             runtime_start,
             required_branches=path,
         )
-        while len(merged) < len(values):
-            merged.append([])
+        while len(merged_values) < len(values):
+            merged_values.append([])
+            merged_kinds.append([])
         for index, candidates in enumerate(values):
-            merged[index].extend(candidates)
-    return tuple(
-        tuple(dict.fromkeys(candidates))[:64]
-        for candidates in merged
+            for candidate_index, candidate in enumerate(candidates):
+                kind = (
+                    kinds[index][candidate_index]
+                    if index < len(kinds) and candidate_index < len(kinds[index])
+                    else semantic_literal(candidate).kind
+                )
+                pair = (candidate, kind)
+                existing = tuple(zip(merged_values[index], merged_kinds[index]))
+                if pair not in existing and len(merged_values[index]) < 64:
+                    merged_values[index].append(candidate)
+                    merged_kinds[index].append(kind)
+    return (
+        tuple(tuple(candidates) for candidates in merged_values),
+        tuple(tuple(candidates) for candidates in merged_kinds),
     )
 
 

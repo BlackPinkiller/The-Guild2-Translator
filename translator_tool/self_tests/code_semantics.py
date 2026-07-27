@@ -113,6 +113,15 @@ def assert_code_semantics_resolve_local_function_returns() -> None:
             '    MsgQuick("", "@L_BODY_CITY_+0", citylabel)',
             "    local titlelabel = GetNobilityTitleLabel(CurrentTitle)",
             '    MsgQuick("", "@L_BODY_TITLE_+0", titlelabel)',
+            '    local SettlementId = GetSettlementID("")',
+            '    MsgQuick("", "@L_BODY_SETTLEMENT_+0", SettlementId)',
+            "    local Place",
+            "    if UseSettlement then",
+            '        Place = GetSettlementID("")',
+            "    else",
+            '        Place = GetHomeBuildingId("")',
+            "    end",
+            '    MsgQuick("", "@L_BODY_AMBIGUOUS_OBJECT_+0", Place)',
             "end",
         )
     )
@@ -189,6 +198,21 @@ def assert_code_semantics_resolve_local_function_returns() -> None:
     ):
         raise AssertionError(
             "an uncertain local engine result guessed an exact title label"
+        )
+    settlement = by_label["body_settlement_+0"]
+    if settlement.runtime_argument_values != (("",),):
+        raise AssertionError("an unknown runtime object ID leaked into preview text")
+    if settlement.runtime_argument_kinds != (("settlement",),):
+        raise AssertionError(
+            "GetSettlementID type did not propagate through a local variable"
+        )
+    ambiguous_object = by_label["body_ambiguous_object_+0"]
+    if set(ambiguous_object.runtime_argument_kinds[0]) != {
+        "building",
+        "settlement",
+    }:
+        raise AssertionError(
+            "branching runtime object types did not remain explicitly ambiguous"
         )
 
     branch_script = "\n".join(
@@ -529,6 +553,30 @@ def assert_placeholder_values_avoid_ambiguous_random_branches() -> None:
     plain_name = builder.argument_value(1, "NAME", ambiguous_context).text
     if plain_name != "Object 1":
         raise AssertionError(f"an ambiguous NAME branch was forced to one object type: {plain_name!r}")
+
+    typed_settlement = CodeReference(
+        "settlement_name_+0",
+        Path("Settlement.lua"),
+        31,
+        1,
+        "MsgQuick",
+        1,
+        runtime_arguments=("SettlementId",),
+        runtime_argument_values=(("",),),
+        runtime_argument_kinds=(("settlement",),),
+        role="body",
+    )
+    settlement_context = PlaceholderContext(
+        "SETTLEMENT_NAME_+0",
+        "Text.dbt",
+        False,
+        "en",
+        (typed_settlement,),
+    )
+    if builder.argument_value(1, "NAME", settlement_context).text != "York":
+        raise AssertionError(
+            "NAME ignored a settlement type proven by runtime data flow"
+        )
 
     character_name_context = PlaceholderContext(
         "CHARACTER_NAME_+0",

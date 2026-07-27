@@ -9,6 +9,10 @@ from typing import Protocol
 from .code_index import dynamic_label_patterns, normalize_label
 from .i18n import translate
 from .script_semantics import (
+    SEMANTIC_BUILDING,
+    SEMANTIC_CHARACTER,
+    SEMANTIC_DYNASTY,
+    SEMANTIC_SETTLEMENT,
     SEMANTIC_STRUCTURE,
     SEMANTIC_TEXT,
     variadic_argument_pack,
@@ -570,6 +574,30 @@ def _name_semantic_kind(number: int, context: PlaceholderContext) -> str:
     # dynasty-name projection proves that the object itself is a dynasty.
     if "DN" in suffixes:
         return "dynasty"
+
+    runtime_kinds: set[str] = set()
+    kind_names = {
+        SEMANTIC_BUILDING: "building",
+        SEMANTIC_CHARACTER: "character",
+        SEMANTIC_DYNASTY: "dynasty",
+        SEMANTIC_SETTLEMENT: "city",
+    }
+    for reference in context.references:
+        arguments = getattr(reference, "runtime_argument_kinds", ())
+        if not isinstance(arguments, tuple) or not (0 < number <= len(arguments)):
+            continue
+        candidates = arguments[number - 1]
+        if not isinstance(candidates, tuple):
+            continue
+        runtime_kinds.update(
+            kind_names[kind]
+            for kind in candidates
+            if kind in kind_names
+        )
+    if len(runtime_kinds) == 1:
+        return next(iter(runtime_kinds))
+    if len(runtime_kinds) > 1:
+        return ""
 
     kinds: set[str] = set()
     for reference in context.references:
