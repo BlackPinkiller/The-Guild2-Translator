@@ -55,6 +55,46 @@ def assert_preview_context_selection_keeps_arguments_and_style_coherent() -> Non
     if rank_preview_references("%1SN found %2l", (quick, message), "SAME_BODY_+0")[0] != message:
         raise AssertionError("the source-code candidate order disagreed with the preview selection")
 
+    scheduled = CodeReference(
+        "family_school_head_+*",
+        Path("School.lua"),
+        30,
+        1,
+        "feedback_MessageSchedule",
+        1,
+        (
+            '""',
+            '"@L_FAMILY_SCHOOL_HEAD"',
+            '"@L_FAMILY_SCHOOL_BODY"',
+            'GetID("")',
+            "Money",
+        ),
+        role="header",
+        runtime_arguments=('GetID("")', "Money"),
+        resolved_arguments=(
+            ("",),
+            ("@L_family_school_head_+*",),
+            ("@L_family_school_body_+*",),
+            (),
+            (),
+        ),
+        match_kind="family",
+        confidence=88,
+    )
+    scheduled_selection = select_preview_context(
+        "School",
+        (scheduled,),
+        "FAMILY_SCHOOL_HEAD_+0",
+    )
+    if (
+        scheduled_selection.window is None
+        or scheduled_selection.window.header_label != "family_school_head_+0"
+        or scheduled_selection.window.body_label != "family_school_body_+0"
+    ):
+        raise AssertionError(
+            "a suffix-free code family did not keep its scheduled header/body pair"
+        )
+
 
 def assert_preview_context_selection_understands_returned_label_roles() -> None:
     returned = CodeReference(

@@ -54,6 +54,37 @@ def assert_code_semantics_are_scope_and_role_aware() -> None:
     if head.runtime_arguments != ("DynID", "strongboxvalue") or body.runtime_arguments != head.runtime_arguments:
         raise AssertionError("MsgBox header and body did not share the same runtime argument list")
 
+    scheduled = analyze_script(
+        (
+            'feedback_MessageSchedule("", '
+            '"@L_FAMILY_SCHOOL_HEAD", '
+            '"@L_FAMILY_SCHOOL_BODY", GetID(""), Money)'
+        ),
+        Path("School.lua"),
+        label_catalog=frozenset(
+            {
+                "family_school_head_+0",
+                "family_school_body_+0",
+            }
+        ),
+    )
+    scheduled_by_role = {use.role: use for use in scheduled}
+    if scheduled_by_role["header"].label != "family_school_head_+*":
+        raise AssertionError("an omitted DBT suffix was not represented as a header family")
+    if scheduled_by_role["body"].label != "family_school_body_+*":
+        raise AssertionError("an omitted DBT suffix was not represented as a body family")
+    expected_arguments = (
+        ("",),
+        ("@L_family_school_head_+*",),
+        ("@L_family_school_body_+*",),
+        (),
+        (),
+    )
+    if scheduled_by_role["body"].resolved_arguments != expected_arguments:
+        raise AssertionError(
+            "family semantics did not reach the call's paired label arguments"
+        )
+
 
 def assert_code_semantics_resolve_local_function_returns() -> None:
     script = "\n".join(

@@ -263,7 +263,11 @@ def analyze_script_facts(
     claimed_ranges: list[tuple[int, int]] = []
     for call in calls:
         contract = call_contract(call.name)
-        resolved_arguments = _resolved_call_arguments(analysis, call)
+        resolved_arguments = _resolved_call_arguments(
+            analysis,
+            call,
+            label_catalog,
+        )
         for argument_index, ((start, end), expression) in enumerate(zip(call.argument_spans, call.arguments)):
             values = _label_values_for_argument(
                 analysis,
@@ -854,7 +858,14 @@ def _label_values_for_argument(
                     else _literal_match_kind(label, catalog)
                 )
                 confidence = 78 if kind == "dynamic" and "*" not in label else 88 if kind == "family" else 100
-                candidates.append((label, start + relative, kind, confidence))
+                candidates.append(
+                    (
+                        _semantic_label_identity(label, kind, catalog),
+                        start + relative,
+                        kind,
+                        confidence,
+                    )
+                )
     if not candidates:
         depth = 0
         for index in token_indices:
@@ -868,7 +879,15 @@ def _label_values_for_argument(
             if token.kind != "string" or depth:
                 continue
             for label, relative in _literal_labels(token.value, catalog):
-                candidates.append((label, token.start + relative, "exact", 100))
+                kind = _literal_match_kind(label, catalog)
+                candidates.append(
+                    (
+                        _semantic_label_identity(label, kind, catalog),
+                        token.start + relative,
+                        kind,
+                        88 if kind == "family" else 100,
+                    )
+                )
     candidates.extend(
         _dependent_label_values(
             analysis,
@@ -979,7 +998,17 @@ def _collect_label_origin_paths(
                     catalog,
                     allow_patterns=True,
                 ):
-                    found.setdefault(candidate, []).append(assignment_path)
+                    kind = (
+                        "dynamic"
+                        if "*" in candidate
+                        else _literal_match_kind(candidate, catalog)
+                    )
+                    identity = _semantic_label_identity(
+                        candidate,
+                        kind,
+                        catalog,
+                    )
+                    found.setdefault(identity, []).append(assignment_path)
             _collect_label_origin_paths(
                 analysis,
                 assignment.token_start,
@@ -1015,6 +1044,19 @@ def _literal_match_kind(label: str, catalog: frozenset[str]) -> str:
     if variants & _catalog_family_bases(catalog):
         return "family"
     return "exact"
+
+
+def _semantic_label_identity(
+    label: str,
+    kind: str,
+    catalog: frozenset[str],
+) -> str:
+    if kind != "family" or not catalog or "_+" in label:
+        return label
+    variants = {label, label.lstrip("_")}
+    if variants & _catalog_family_bases(catalog):
+        return label + "_+*"
+    return label
 
 
 @lru_cache(maxsize=8)
@@ -1233,14 +1275,28 @@ def _dependent_label_values(
             for value in values:
                 for label, relative in _literal_labels(value, catalog, allow_patterns=True):
                     kind = "dynamic" if "*" in label else _literal_match_kind(label, catalog)
-                    candidates.append((label, assignment.position + relative, kind, 82))
+                    candidates.append(
+                        (
+                            _semantic_label_identity(label, kind, catalog),
+                            assignment.position + relative,
+                            kind,
+                            82,
+                        )
+                    )
             for token_index in range(assignment.token_start, assignment.token_end):
                 token = analysis.tokens[token_index]
                 if token.kind != "string":
                     continue
                 for label, relative in _literal_labels(token.value, catalog):
                     kind = "dynamic" if "*" in label else _literal_match_kind(label, catalog)
-                    candidates.append((label, token.start + relative, kind, 82))
+                    candidates.append(
+                        (
+                            _semantic_label_identity(label, kind, catalog),
+                            token.start + relative,
+                            kind,
+                            82,
+                        )
+                    )
             candidates.extend(
                 _dependent_label_values(
                     analysis,
@@ -1868,6 +1924,7 @@ def _semantic_value_kinds(
 def _resolved_call_arguments(
     analysis: _Analysis,
     call: ScriptCall,
+    catalog: frozenset[str],
 ) -> tuple[tuple[str, ...], ...]:
     values: list[tuple[str, ...]] = []
     for start, end in call.argument_spans:
@@ -1883,8 +1940,28 @@ def _resolved_call_arguments(
             call.function_index,
             set(),
         )
-        values.append(tuple(dict.fromkeys(resolved))[:64])
+        values.append(
+            tuple(
+                dict.fromkeys(
+                    _semantic_resolved_argument(value, catalog)
+                    for value in resolved
+                )
+            )[:64]
+        )
     return tuple(values)
+
+
+def _semantic_resolved_argument(
+    value: str,
+    catalog: frozenset[str],
+) -> str:
+    stripped = value.strip()
+    if not re.fullmatch(r"(?:@L_)?_[A-Za-z0-9_+*]+|@L_[A-Za-z0-9_+*]+", stripped):
+        return value
+    label = _normalize_label(stripped)
+    kind = "dynamic" if "*" in label else _literal_match_kind(label, catalog)
+    identity = _semantic_label_identity(label, kind, catalog)
+    return "@L_" + identity.lstrip("_") if identity != label else value
 
 
 def _tokens_in_span(analysis: _Analysis, start: int, end: int) -> tuple[int, ...]:
