@@ -79,7 +79,7 @@ from .ai import (
 )
 from .code_index import CodeReference, CodeReferenceIndex, CodeReferenceSet, label_group_key, normalize_label
 from .code_index_lazy import LazyCodeIndexBuilder, LazyIndexProgress
-from .code_window_context import DARK_PANEL_TEXT, PreviewWindowContext
+from .code_window_context import DARK_PANEL_TEXT, PreviewWindowContext, engine_window_context
 from .code_open import open_code_reference
 from .codec_adapter import CodecError, Guild2Codec, load_codec_for_language, language_uses_codec
 from .diagnostics import configure_diagnostics, log_exception, log_failure, log_metrics, shutdown_diagnostics
@@ -3890,10 +3890,24 @@ class TranslatorWindow(QMainWindow):
         context = selection.window
         if context is None:
             header_unit, body_unit = self._paired_preview_units(unit)
-            is_onscreen_help = TranslatorWindow._is_onscreen_help_label(unit.label)
-            if is_onscreen_help or TranslatorWindow._is_name_tooltip_pair(header_unit, body_unit):
+            context = engine_window_context(unit.label)
+            if context is not None:
+                context = replace(
+                    context,
+                    header_label=(
+                        normalize_label(header_unit.label)
+                        if header_unit is not None
+                        else context.header_label
+                    ),
+                    body_label=(
+                        normalize_label(body_unit.label)
+                        if body_unit is not None
+                        else context.body_label
+                    ),
+                )
+            elif TranslatorWindow._is_name_tooltip_pair(header_unit, body_unit):
                 context = PreviewWindowContext(
-                    kind="onscreen_help" if is_onscreen_help else "tooltip",
+                    kind="tooltip",
                     background="dark_panel",
                     default_color=DARK_PANEL_TEXT,
                     header_label=normalize_label(header_unit.label) if header_unit is not None else "",
@@ -4087,10 +4101,6 @@ class TranslatorWindow(QMainWindow):
             re.match(r"^.*NAME(_[+]\d+)?$", header_unit.label, re.IGNORECASE)
             and re.match(r"^.*TOOLTIP(_[+]\d+)?$", body_unit.label, re.IGNORECASE)
         )
-
-    @staticmethod
-    def _is_onscreen_help_label(label: str) -> bool:
-        return bool(re.match(r"^.*ONSCREENHELP.*(?:NAME|DESCRIPTION|TOOLTIP)(_[+]\d+)?$", label, re.IGNORECASE))
 
     def _refresh_preview_presentations(self) -> None:
         self._game_preview_cache.clear()

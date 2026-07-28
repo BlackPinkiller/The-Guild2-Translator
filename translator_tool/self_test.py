@@ -27,7 +27,13 @@ from .ai import (
 )
 from .cache import cache_path, confirmed_uids, need_work_uids, source_review_uids
 from .code_index import CodeReference, CodeReferenceIndex, build_code_reference_index
-from .code_window_context import DARK_PANEL_TEXT, PARCHMENT_TEXT, PreviewWindowContext, best_window_context
+from .code_window_context import (
+    DARK_PANEL_TEXT,
+    PARCHMENT_TEXT,
+    PreviewWindowContext,
+    best_window_context,
+    engine_window_context,
+)
 from .codec_adapter import Guild2Codec, load_codec_for_language
 from .git_history import GitCommit, GitError, LanguageGit, TranslationLogEntry, combine_entries, format_entries
 from .history import OperationHistory, TranslationOperation, UnitChange
@@ -724,6 +730,58 @@ def assert_name_tooltip_preview_pairs_title_and_body() -> None:
         raise AssertionError(f"tooltip preview should use the dark panel text color: {context!r}")
     if header is not name or body is not tooltip or buttons:
         raise AssertionError("NAME/TOOLTIP preview parts were not assembled as title/body")
+
+
+def assert_engine_owned_preview_styles() -> None:
+    from .app import TranslatorWindow
+
+    market = SimpleNamespace(
+        uid="market",
+        file_rel="Text.dbt",
+        label="_GENERAL_TOOLTIPS_BUILDING_MARKET_+0",
+        source_text="Market in %1SN",
+    )
+    window = SimpleNamespace(
+        model=SimpleNamespace(units=(market,)),
+        _code_references_for_unit=lambda _unit: (),
+    )
+    window._paired_preview_units = lambda unit: TranslatorWindow._paired_preview_units(window, unit)
+    context, header, body, buttons, references = TranslatorWindow._game_preview_parts(window, market)
+    if context is None or context.kind != "tooltip" or context.background != "dark_panel":
+        raise AssertionError(f"engine tooltip should use its dark tooltip profile: {context!r}")
+    if header is not None or body is not market or buttons or references:
+        raise AssertionError("body-only engine tooltip preview parts were assembled incorrectly")
+
+    help_name = SimpleNamespace(
+        uid="help-name",
+        file_rel="Text.dbt",
+        label="ONSCREENHELP_9_ACTION_IMPACT_CoId_NAME_+0",
+        source_text="Impact",
+    )
+    help_description = SimpleNamespace(
+        uid="help-description",
+        file_rel="Text.dbt",
+        label="ONSCREENHELP_9_ACTION_IMPACT_CoId_DESCRIPTION_+0",
+        source_text="Description",
+    )
+    help_window = SimpleNamespace(
+        model=SimpleNamespace(units=(help_name, help_description)),
+        _code_references_for_unit=lambda _unit: (),
+    )
+    help_window._paired_preview_units = lambda unit: TranslatorWindow._paired_preview_units(help_window, unit)
+    context, header, body, _, _ = TranslatorWindow._game_preview_parts(help_window, help_description)
+    if context is None or context.kind != "onscreen_help":
+        raise AssertionError(f"engine onscreen help should use its native panel profile: {context!r}")
+    if header is not help_name or body is not help_description:
+        raise AssertionError("engine onscreen help should retain structural title/body pairing")
+
+    status = engine_window_context("_SETTLEMENTSTATE_HEADLINE_+0")
+    if status is None or status.kind != "status" or not status.header_label:
+        raise AssertionError(f"engine status headline should be a dark panel header: {status!r}")
+    if PreviewService._game_window_background_name(status) != "Hud/NoCompression/Priority3/PanelBackground_01.tga":
+        raise AssertionError("engine status preview should request the in-game panel texture")
+    if engine_window_context("_UNRELATED_TEXT_+0") is not None:
+        raise AssertionError("unknown labels must not receive a guessed engine window style")
 
 
 def assert_sync_source_project_invalidates_changed_translations(root: Path) -> None:
@@ -3897,6 +3955,7 @@ def main() -> int:
     assert_game_preview_draws_all_buttons()
     assert_onscreen_help_preview_pairs_name_and_description()
     assert_name_tooltip_preview_pairs_title_and_body()
+    assert_engine_owned_preview_styles()
     assert_startup_prefers_local_sources_over_game_root()
     assert_sync_vanilla_sources_only_imports_originals()
     assert_sync_source_project_invalidates_changed_translations(root)

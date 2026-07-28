@@ -1110,7 +1110,7 @@ class PreviewService:
             return "Hud/messagebox/mbback0.tga"
         if context.call_name in {"msgsay", "msgsaynowait", "msgsayinteraction", "showtutorialboxnowait"}:
             return "Hud/NoCompression/Priority3/PanelBackground_01.tga"
-        if context.kind in {"tooltip", "onscreen_help"}:
+        if context.kind in {"tooltip", "onscreen_help", "status"}:
             return "Hud/NoCompression/Priority3/PanelBackground_01.tga"
         return ""
 

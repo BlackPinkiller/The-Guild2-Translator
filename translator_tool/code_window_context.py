@@ -4,6 +4,7 @@ from dataclasses import dataclass
 import re
 
 from .code_index import CodeReference, LABEL_RE, dynamic_label_patterns, normalize_label
+from .engine_semantics import engine_format_preview_style
 from .script_semantics import call_contract
 
 
@@ -108,6 +109,30 @@ def best_window_context(references: tuple[CodeReference, ...], current_label: st
         if context is not None:
             return context
     return None
+
+
+def engine_window_context(label: str) -> PreviewWindowContext | None:
+    """Build a window context for a format rendered by native engine code."""
+    style = engine_format_preview_style(label)
+    if style is None:
+        return None
+    normalized = _context_label(label)
+    role = _engine_label_role(normalized)
+    return PreviewWindowContext(
+        kind=style.kind,
+        background=style.background,
+        default_color=DARK_PANEL_TEXT if style.background == "dark_panel" else PARCHMENT_TEXT,
+        header_label=normalized if role == "header" else "",
+        body_label=normalized if role != "header" else "",
+        call_name=f"engine:{style.kind}",
+    )
+
+
+def _engine_label_role(label: str) -> str:
+    identity = re.sub(r"_[+][a-z0-9*]+$", "", label, flags=re.IGNORECASE)
+    if re.search(r"(?:^|_)(?:head|header|headline|name)$", identity, re.IGNORECASE):
+        return "header"
+    return "body"
 
 
 def _is_window_call(call_name: str) -> bool:
