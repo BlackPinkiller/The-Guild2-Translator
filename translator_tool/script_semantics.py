@@ -53,10 +53,56 @@ _FIXED_CALL_CONTRACTS: dict[str, CallContract] = {
 
 
 def call_contract(call_name: str) -> CallContract | None:
-    normalized = call_name.casefold()
-    if normalized.startswith("feedback_message"):
-        return CallContract(((1, "header"), (2, "body")), 3)
-    return _FIXED_CALL_CONTRACTS.get(normalized)
+    return _FIXED_CALL_CONTRACTS.get(call_name.casefold())
+
+
+def _semantic_call_contract(
+    call: ScriptCall,
+    resolved_arguments: tuple[tuple[str, ...], ...],
+    catalog: frozenset[str],
+) -> CallContract | None:
+    roles: list[tuple[int, str]] = []
+    for argument_index, candidates in enumerate(resolved_arguments):
+        argument_roles: set[str] = set()
+        for candidate in candidates:
+            labels = _literal_labels(candidate, catalog, allow_patterns=True)
+            for label, _position in labels:
+                role = _window_label_role(label)
+                if role:
+                    argument_roles.add(role)
+        if len(argument_roles) == 1:
+            roles.append((argument_index, next(iter(argument_roles))))
+    role_names = {role for _index, role in roles}
+    if not roles or (
+        not call.name.casefold().startswith("feedback_message")
+        and not {"header", "body"} <= role_names
+    ):
+        return None
+    text_indices = [index for index, role in roles if role in {"header", "body"}]
+    if not text_indices:
+        return None
+    buttons = tuple(
+        index
+        for index, expression in enumerate(call.arguments)
+        if "@B[" in expression
+    )
+    return CallContract(
+        tuple(roles),
+        max(text_indices) + 1,
+        buttons,
+    )
+
+
+def _window_label_role(label: str) -> str:
+    normalized = label.strip().lstrip("_").casefold()
+    if re.search(r"(^|_)(head|header|kopf)(_|$)", normalized):
+        return "header"
+    if re.search(
+        r"(^|_)(body|text|question|answer|rumpf)(_|$)",
+        normalized,
+    ):
+        return "body"
+    return ""
 
 
 @dataclass(frozen=True)
@@ -222,6 +268,7 @@ _NATIVE_OBJECT_RETURN_KINDS = {
 }
 
 _NATIVE_ALIAS_OUTPUT_KINDS = {
+    "buildinggetsim": ((2, SEMANTIC_CHARACTER),),
     "buildinggetcity": ((1, SEMANTIC_SETTLEMENT),),
     "citygetrandombuilding": ((6, SEMANTIC_BUILDING),),
     "dynastygetmember": ((2, SEMANTIC_CHARACTER),),
@@ -231,6 +278,19 @@ _NATIVE_ALIAS_OUTPUT_KINDS = {
     "getsettlement": ((1, SEMANTIC_SETTLEMENT),),
 }
 
+_NATIVE_ALIAS_INPUT_KINDS = {
+    "buildinggetcity": ((0, SEMANTIC_BUILDING),),
+    "buildinggetsim": ((0, SEMANTIC_BUILDING),),
+    "citygetbuildingcount": ((0, SEMANTIC_SETTLEMENT),),
+    "citygetbuildings": ((0, SEMANTIC_SETTLEMENT),),
+    "citygetpenalty": ((0, SEMANTIC_SETTLEMENT),),
+    "citygetrandombuilding": ((0, SEMANTIC_SETTLEMENT),),
+    "cityiskontor": ((0, SEMANTIC_SETTLEMENT),),
+    "dynastygetmember": ((0, SEMANTIC_DYNASTY),),
+    "simgetgender": ((0, SEMANTIC_CHARACTER),),
+    "simgetlevel": ((0, SEMANTIC_CHARACTER),),
+}
+
 _FIXED_ALIAS_KINDS = {
     "building": SEMANTIC_BUILDING,
     "city": SEMANTIC_SETTLEMENT,
@@ -238,6 +298,14 @@ _FIXED_ALIAS_KINDS = {
     "settlement": SEMANTIC_SETTLEMENT,
     "sim": SEMANTIC_CHARACTER,
     "workbuilding": SEMANTIC_BUILDING,
+}
+
+_ENGINE_TYPE_NAME_KINDS = {
+    "building": SEMANTIC_BUILDING,
+    "city": SEMANTIC_SETTLEMENT,
+    "dynasty": SEMANTIC_DYNASTY,
+    "settlement": SEMANTIC_SETTLEMENT,
+    "sim": SEMANTIC_CHARACTER,
 }
 
 
@@ -303,10 +371,14 @@ def analyze_script_facts(
     external_flows: list[ExternalCallFlow] = []
     claimed_ranges: list[tuple[int, int]] = []
     for call in calls:
-        contract = call_contract(call.name)
         resolved_arguments = _resolved_call_arguments(
             analysis,
             call,
+            label_catalog,
+        )
+        contract = call_contract(call.name) or _semantic_call_contract(
+            call,
+            resolved_arguments,
             label_catalog,
         )
         for argument_index, ((start, end), expression) in enumerate(zip(call.argument_spans, call.arguments)):
@@ -326,7 +398,15 @@ def analyze_script_facts(
             runtime_start = contract.runtime_start if contract is not None else argument_index + 1
             runtime_arguments = call.arguments[runtime_start:]
             runtime_argument_values, runtime_argument_kinds = (
-                _runtime_argument_semantics(analysis, call, runtime_start)
+                _runtime_argument_semantics(
+                    analysis,
+                    call,
+                    runtime_start,
+                    required_branches=_branch_path_at_position(
+                        analysis,
+                        call.start,
+                    ),
+                )
             )
             path_sensitive = bool(values and runtime_arguments) and (
                 _argument_has_conditional_assignments(
@@ -1312,11 +1392,11 @@ def _getid_object_kinds(
     if len(token_indices) != 1:
         return ()
     token = analysis.tokens[token_indices[0]]
-    if token.kind != "string":
+    if token.kind not in {"identifier", "string"}:
         return ()
     alias = token.value.casefold()
     kinds: list[str] = []
-    fixed = _FIXED_ALIAS_KINDS.get(alias)
+    fixed = _FIXED_ALIAS_KINDS.get(alias) if token.kind == "string" else None
     if fixed is not None:
         kinds.append(fixed)
     for position, producer_token, kind in analysis.alias_type_events.get(
@@ -1331,6 +1411,14 @@ def _getid_object_kinds(
         ):
             continue
         kinds.append(kind)
+    if token.kind == "string" and call.function_index is not None:
+        kinds.extend(
+            kind
+            for _position, _producer_token, kind in analysis.alias_type_events.get(
+                (None, alias),
+                (),
+            )
+        )
     return tuple(dict.fromkeys(kinds))[:64]
 
 
@@ -1345,7 +1433,26 @@ def _native_alias_type_events(
     ] = {}
     for call in calls:
         name = re.split(r"[.:]", call.name)[-1].casefold()
-        for argument_index, kind in _NATIVE_ALIAS_OUTPUT_KINDS.get(name, ()):
+        typed_arguments = [
+            *_NATIVE_ALIAS_OUTPUT_KINDS.get(name, ()),
+            *_NATIVE_ALIAS_INPUT_KINDS.get(name, ()),
+        ]
+        if name == "istype" and len(call.argument_spans) > 1:
+            type_start, type_end = call.argument_spans[1]
+            type_first = bisect.bisect_left(token_starts, type_start)
+            type_last = bisect.bisect_left(token_starts, type_end)
+            type_tokens = tuple(
+                index
+                for index in range(type_first, type_last)
+                if tokens[index].end <= type_end
+            )
+            if len(type_tokens) == 1 and tokens[type_tokens[0]].kind == "string":
+                proven_kind = _ENGINE_TYPE_NAME_KINDS.get(
+                    tokens[type_tokens[0]].value.casefold()
+                )
+                if proven_kind is not None:
+                    typed_arguments.append((0, proven_kind))
+        for argument_index, kind in typed_arguments:
             if argument_index >= len(call.argument_spans):
                 continue
             start, end = call.argument_spans[argument_index]
@@ -1356,18 +1463,26 @@ def _native_alias_type_events(
                 for index in range(first, last)
                 if tokens[index].end <= end
             )
-            if len(indices) != 1 or tokens[indices[0]].kind != "string":
+            if (
+                len(indices) != 1
+                or tokens[indices[0]].kind not in {"identifier", "string"}
+            ):
                 continue
-            grouped.setdefault(
-                (call.function_index, tokens[indices[0]].value.casefold()),
-                [],
-            ).append(
-                (
-                    call.start,
-                    bisect.bisect_left(token_starts, call.start),
-                    kind,
-                )
+            token = tokens[indices[0]]
+            event = (
+                call.start,
+                bisect.bisect_left(token_starts, call.start),
+                kind,
             )
+            keys = [(call.function_index, token.value.casefold())]
+            if (
+                token.kind == "string"
+                and call.function_index is not None
+                and name != "istype"
+            ):
+                keys.append((None, token.value.casefold()))
+            for key in keys:
+                grouped.setdefault(key, []).append(event)
     return {key: tuple(events) for key, events in grouped.items()}
 
 

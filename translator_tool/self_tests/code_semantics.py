@@ -85,6 +85,32 @@ def assert_code_semantics_are_scope_and_role_aware() -> None:
             "family semantics did not reach the call's paired label arguments"
         )
 
+    office = analyze_script(
+        (
+            'feedback_MessageOffice("", PrivilegeList, '
+            '"@L_OFFICE_HEAD_+0", "@L_OFFICE_BODY_+0", '
+            'GetID(""), GetSettlementID(""))'
+        ),
+        Path("Office.lua"),
+    )
+    office_by_role = {use.role: use for use in office}
+    if office_by_role["header"].argument_index != 2:
+        raise AssertionError(
+            "semantic call analysis did not locate the shifted office header"
+        )
+    office_body = office_by_role["body"]
+    if office_body.argument_index != 3 or office_body.runtime_arguments != (
+        'GetID("")',
+        'GetSettlementID("")',
+    ):
+        raise AssertionError(
+            "semantic call analysis used a fixed feedback-message layout"
+        )
+    if office_body.runtime_argument_kinds != ((), ("settlement",)):
+        raise AssertionError(
+            "shifted feedback-message parameters lost their runtime types"
+        )
+
 
 def assert_code_semantics_resolve_local_function_returns() -> None:
     script = "\n".join(
@@ -100,6 +126,12 @@ def assert_code_semantics_resolve_local_function_returns() -> None:
             "end",
             "function RecursiveLabel(value)",
             "    return RecursiveLabel(value)",
+            "end",
+            "function EstablishImplicitObject()",
+            '    CityIsKontor("")',
+            "end",
+            "function ReportImplicitObject()",
+            '    MsgQuick("", "@L_BODY_IMPLICIT_SETTLEMENT_+0", GetID(""))',
             "end",
             "function Main()",
             '    MsgQuick("", "@L_BODY_BREAD_+0", MakeItemLabel("BREAD", "0"))',
@@ -128,6 +160,15 @@ def assert_code_semantics_resolve_local_function_returns() -> None:
             '    MsgQuick("", "@L_BODY_ALIAS_DYNASTY_+0", GetID("AnyFamily"))',
             '    MsgQuick("", "@L_BODY_FIXED_CITY_+0", GetID("City"))',
             '    MsgQuick("", "@L_BODY_UNKNOWN_ALIAS_+0", GetID("TemporaryAlias"))',
+            '    SimGetGender("AnyOfficer")',
+            '    MsgQuick("", "@L_BODY_INPUT_CHARACTER_+0", GetID("AnyOfficer"))',
+            '    CityGetRandomBuilding(TravelAlias, -1, -1, -1, -1, 0, "Market")',
+            '    MsgQuick("", "@L_BODY_INPUT_SETTLEMENT_+0", GetID(TravelAlias))',
+            '    if IsType(TargetAlias, "Building") then',
+            '        MsgQuick("", "@L_BODY_PREDICATE_BUILDING_+0", GetID(TargetAlias))',
+            "    else",
+            '        MsgQuick("", "@L_BODY_PREDICATE_UNKNOWN_+0", GetID(TargetAlias))',
+            "    end",
             "end",
         )
     )
@@ -238,6 +279,30 @@ def assert_code_semantics_resolve_local_function_returns() -> None:
         raise AssertionError("GetID did not recognize a fixed engine alias")
     if by_label["body_unknown_alias_+0"].runtime_argument_kinds != ((),):
         raise AssertionError("an unproven temporary alias was typed from its name")
+    if by_label["body_input_character_+0"].runtime_argument_kinds != (
+        ("character",),
+    ):
+        raise AssertionError(
+            "GetID did not consume character evidence from an engine API input"
+        )
+    if by_label["body_input_settlement_+0"].runtime_argument_kinds != (
+        ("settlement",),
+    ):
+        raise AssertionError(
+            "GetID did not consume settlement evidence carried by a Lua variable"
+        )
+    if by_label["body_implicit_settlement_+0"].runtime_argument_kinds != (
+        ("settlement",),
+    ):
+        raise AssertionError(
+            "a consistent script-wide implicit alias type was not reused"
+        )
+    if by_label["body_predicate_building_+0"].runtime_argument_kinds != (
+        ("building",),
+    ):
+        raise AssertionError("IsType did not narrow the true branch")
+    if by_label["body_predicate_unknown_+0"].runtime_argument_kinds != ((),):
+        raise AssertionError("IsType leaked its type evidence into the false branch")
 
     branch_script = "\n".join(
         (

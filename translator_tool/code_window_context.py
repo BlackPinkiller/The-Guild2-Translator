@@ -332,7 +332,11 @@ def _header_body_labels(
 
 def _labels_from_first_two(candidates: list[tuple[int, str]]) -> tuple[str, str]:
     unique: list[str] = []
-    for _, label in sorted(candidates, key=lambda item: item[0]):
+    seen_arguments: set[int] = set()
+    for argument_index, label in sorted(candidates, key=lambda item: item[0]):
+        if argument_index in seen_arguments:
+            continue
+        seen_arguments.add(argument_index)
         if label not in unique:
             unique.append(label)
         if len(unique) >= 2:
