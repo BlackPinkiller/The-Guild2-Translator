@@ -7,6 +7,13 @@ import re
 from typing import Protocol
 
 from .code_index import dynamic_label_patterns, normalize_label
+from .engine_semantics import (
+    ENGINE_BUILDING,
+    ENGINE_CHARACTER,
+    ENGINE_DYNASTY,
+    ENGINE_SETTLEMENT,
+    engine_format_argument_kind,
+)
 from .i18n import translate
 from .script_semantics import (
     SEMANTIC_BUILDING,
@@ -574,6 +581,15 @@ def _name_semantic_kind(number: int, context: PlaceholderContext) -> str:
     # dynasty-name projection proves that the object itself is a dynasty.
     if "DN" in suffixes:
         return "dynasty"
+
+    engine_kind = engine_format_argument_kind(context.label, number)
+    if engine_kind:
+        return {
+            ENGINE_BUILDING: "building",
+            ENGINE_CHARACTER: "character",
+            ENGINE_DYNASTY: "dynasty",
+            ENGINE_SETTLEMENT: "city",
+        }.get(engine_kind, "")
 
     runtime_kinds: set[str] = set()
     kind_names = {

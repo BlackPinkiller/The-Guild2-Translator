@@ -111,6 +111,31 @@ def assert_code_semantics_are_scope_and_role_aware() -> None:
             "shifted feedback-message parameters lost their runtime types"
         )
 
+    dynamic = analyze_script(
+        "\n".join(
+            (
+                "function Main()",
+                "    local Choice = 0",
+                "    Choice = RuntimeChoice()",
+                '    MsgQuick("", "@L_DYNAMIC_BODY_+"..Choice, GetID(""))',
+                "end",
+            )
+        ),
+        Path("DynamicChoice.lua"),
+        label_catalog=frozenset(
+            {
+                "dynamic_body_+0",
+                "dynamic_body_+2",
+                "dynamic_body_+3",
+            }
+        ),
+    )
+    dynamic_labels = {use.label for use in dynamic}
+    if "dynamic_body_+*" not in dynamic_labels:
+        raise AssertionError(
+            "a dynamic label collapsed to its stale initialized value"
+        )
+
 
 def assert_code_semantics_resolve_local_function_returns() -> None:
     script = "\n".join(
@@ -665,6 +690,43 @@ def assert_placeholder_values_avoid_ambiguous_random_branches() -> None:
     if builder.argument_value(1, "NAME", settlement_context).text != "York":
         raise AssertionError(
             "NAME ignored a settlement type proven by runtime data flow"
+        )
+
+    engine_settlement_context = PlaceholderContext(
+        "_SETTLEMENTSTATE_HEADLINE_+0",
+        "Text.dbt",
+        False,
+        "en",
+    )
+    if (
+        builder.argument_value(1, "NAME", engine_settlement_context).text
+        != "York"
+    ):
+        raise AssertionError(
+            "an engine-owned settlement format lacked its object contract"
+        )
+    engine_office_context = PlaceholderContext(
+        "SubstSimFullDescOffice_+0",
+        "Text.dbt",
+        False,
+        "en",
+    )
+    if builder.argument_value(2, "NAME", engine_office_context).text != "York":
+        raise AssertionError(
+            "an engine-owned office format lost its settlement parameter"
+        )
+    unknown_engine_context = PlaceholderContext(
+        "_UNPROVEN_ENGINE_FORMAT_+0",
+        "Text.dbt",
+        False,
+        "en",
+    )
+    if (
+        builder.argument_value(1, "NAME", unknown_engine_context).text
+        != "Object 1"
+    ):
+        raise AssertionError(
+            "an unknown engine format was typed from its label spelling"
         )
 
     character_name_context = PlaceholderContext(

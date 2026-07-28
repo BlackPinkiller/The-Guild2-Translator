@@ -990,6 +990,25 @@ def _label_values_for_argument(
                         confidence,
                     )
                 )
+    if dynamic_expression:
+        for value in _syntactic_dynamic_values(
+            analysis.tokens,
+            token_indices[0],
+            token_indices[-1] + 1,
+        ):
+            for label, relative in _literal_labels(
+                value,
+                catalog,
+                allow_patterns=True,
+            ):
+                candidates.append(
+                    (
+                        label,
+                        start + relative,
+                        "dynamic",
+                        82,
+                    )
+                )
     if not candidates:
         depth = 0
         for index in token_indices:
@@ -1024,6 +1043,33 @@ def _label_values_for_argument(
         )
     )
     return _best_label_candidates(candidates)
+
+
+def _syntactic_dynamic_values(
+    tokens: tuple[Token, ...],
+    start: int,
+    end: int,
+) -> tuple[str, ...]:
+    parts = _split_token_range(tokens, start, end, "..")
+    if len(parts) <= 1:
+        return ()
+    values: list[str] = []
+    for part_start, part_end in parts:
+        while (
+            part_end - part_start >= 2
+            and tokens[part_start].value == "("
+            and _matching_token(tokens, part_start, "(", ")") == part_end - 1
+        ):
+            part_start += 1
+            part_end -= 1
+        if part_end - part_start == 1 and tokens[part_start].kind in {
+            "number",
+            "string",
+        }:
+            values.append(tokens[part_start].value)
+        else:
+            values.append("*")
+    return ("".join(values),)
 
 
 def _label_origin_branch_map(
