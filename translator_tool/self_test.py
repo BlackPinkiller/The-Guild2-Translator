@@ -2837,6 +2837,19 @@ def assert_preview_i18n_and_symbol_mapping() -> None:
             raise AssertionError("the same preview identity was not localized independently on both sides")
         if "Preview label" not in source.display_text or "预览标签" not in target.display_text:
             raise AssertionError("@L localization preview did not use matching source and target labels")
+        for file_rel in ("Text.dbt", "Tooltips.dbt"):
+            plain_argument = service.render(
+                "Value %1",
+                unit_key=f"plain-argument:{file_rel}",
+                file_rel=file_rel,
+                kind="dbt",
+                target=False,
+            )
+            if plain_argument.display_text != "Value Argument 1":
+                raise AssertionError(
+                    f"suffix-free placeholder crashed or rendered incorrectly in {file_rel}: "
+                    f"{plain_argument.display_text!r}"
+                )
         label_seed_left = service.render(
             "%1SN",
             unit_key="left-uid",

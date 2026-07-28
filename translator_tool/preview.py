@@ -1613,7 +1613,8 @@ class _PreviewCompiler:
         argument = ARG_PREVIEW_RE.fullmatch(token)
         if argument is not None:
             number = int(argument.group(1))
-            if argument.group(2) == "t":
+            suffix = argument.group(2) or ""
+            if suffix == "t":
                 split = max(start, end - 1)
                 value, _glyph_id = self.service._argument_value(
                     self.unit_key,
@@ -1638,7 +1639,7 @@ class _PreviewCompiler:
                 self.label,
                 self.file_rel,
                 number,
-                argument.group(2),
+                suffix,
                 self.target,
                 self.references,
                 self.argument_suffixes,
@@ -1662,7 +1663,8 @@ class _PreviewCompiler:
         argument = ARG_PREVIEW_RE.fullmatch(token)
         if argument is not None:
             number = int(argument.group(1))
-            if argument.group(2) == "t":
+            suffix = argument.group(2) or ""
+            if suffix == "t":
                 split = max(start, end - 1)
                 value, _glyph_id = self.service._argument_value(
                     self.unit_key,
@@ -1682,7 +1684,7 @@ class _PreviewCompiler:
                 self.label,
                 self.file_rel,
                 number,
-                argument.group(2),
+                suffix,
                 self.target,
                 self.references,
                 self.argument_suffixes,
