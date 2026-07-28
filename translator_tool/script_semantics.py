@@ -42,7 +42,7 @@ _FIXED_CALL_CONTRACTS: dict[str, CallContract] = {
     "feedback_overheadskill": CallContract(((1, "body"),), 3),
     "feedback_overheadcomment": CallContract(((1, "body"),), 4),
     "showoverheadsymbol": CallContract(((4, "body"),), 5),
-    "simadddatebookentry": CallContract(((4, "body"),), 5),
+    "simadddatebookentry": CallContract(((3, "header"), (4, "body")), 5),
     "cityschedulecutsceneevent": CallContract(((6, "body"),), 7),
     "setquesttitle": CallContract(((1, "body"),), 2),
     "setquestdescription": CallContract(((1, "body"),), 2),

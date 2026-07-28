@@ -85,6 +85,24 @@ def assert_code_semantics_are_scope_and_role_aware() -> None:
             "family semantics did not reach the call's paired label arguments"
         )
 
+    datebook = analyze_script(
+        (
+            'SimAddDatebookEntry("Sim", EventTime, "Court", '
+            '"@L_TRIAL_DATEBOOK_HEAD_+0", "@L_TRIAL_DATEBOOK_BODY_+0", '
+            'GetID("Accuser"), GetSettlementID(""))'
+        ),
+        Path("Trial.lua"),
+    )
+    datebook_by_role = {use.role: use for use in datebook}
+    if datebook_by_role["header"].argument_index != 3:
+        raise AssertionError("datebook semantics lost the entry title argument")
+    datebook_body = datebook_by_role["body"]
+    if datebook_body.argument_index != 4 or datebook_body.runtime_arguments != (
+        'GetID("Accuser")',
+        'GetSettlementID("")',
+    ):
+        raise AssertionError("datebook title/body did not share the runtime arguments")
+
     office = analyze_script(
         (
             'feedback_MessageOffice("", PrivilegeList, '

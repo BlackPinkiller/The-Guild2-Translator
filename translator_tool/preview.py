@@ -1065,7 +1065,11 @@ class PreviewService:
             minimum_index = max(minimum_index, 2)
 
         top = 18 if dark_panel else 30
-        left_margin = 92 if context is not None and context.kind == "news" else (26 if dark_panel else 34)
+        left_margin = (
+            92
+            if context is not None and context.kind in {"news", "datebook"}
+            else (26 if dark_panel else 34)
+        )
         right_margin = 26 if dark_panel else 34
         body_scale = 0.78 if dark_panel else 0.85
         body_line_height = max(12, round(25 * body_scale))
@@ -1110,7 +1114,7 @@ class PreviewService:
             return "Hud/messagebox/mbback0.tga"
         if context.call_name in {"msgsay", "msgsaynowait", "msgsayinteraction", "showtutorialboxnowait"}:
             return "Hud/NoCompression/Priority3/PanelBackground_01.tga"
-        if context.kind in {"tooltip", "onscreen_help", "status"}:
+        if context.kind in {"tooltip", "onscreen_help", "status", "datebook"}:
             return "Hud/NoCompression/Priority3/PanelBackground_01.tga"
         return ""
 
@@ -1135,9 +1139,10 @@ class PreviewService:
         context: PreviewWindowContext | None,
         rect: QRect,
     ) -> bool:
-        if context is None or context.kind != "news":
+        if context is None or context.kind not in {"news", "datebook"}:
             return False
-        icon = self.ui_image("Hud/news/default.tga")
+        icon_name = "Hud/news/schedule.tga" if context.kind == "datebook" else "Hud/news/default.tga"
+        icon = self.ui_image(icon_name)
         if icon is None or icon.isNull():
             return False
         size = min(64, rect.height() - 36)

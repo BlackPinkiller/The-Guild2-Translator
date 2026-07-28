@@ -479,6 +479,11 @@ def assert_code_window_context_extracts_window_labels_and_buttons() -> None:
                     '    "@L_MEASURE_BUYGOLDRING_HEAD_+0",',
                     '    "@L_MEASURE_BUYGOLDRING_QUESTION_+0",',
                     '    GetID(""), Cost)',
+                    'SimAddDatebookEntry("accuser", EventTime, "courtbuilding",',
+                    '    "@L_TRIAL_DATEBOOK_HEAD_+0",',
+                    '    "@L_TRIAL_DATEBOOK_BODY_+0", GetID("accuser"), GetSettlementID(""))',
+                    'CityScheduleCutsceneEvent("settlement", "council_date", "",',
+                    '    "BeginCouncilMeeting", 17, 6, "@L_COUNCIL_SCHEDULE_+0")',
                 )
             ),
             encoding="utf-8",
@@ -555,6 +560,18 @@ def assert_code_window_context_extracts_window_labels_and_buttons() -> None:
             raise AssertionError(f"MsgSayInteraction head label was not extracted: {interaction_context!r}")
         if interaction_context.body_label != "measure_buygoldring_question_+0":
             raise AssertionError(f"MsgSayInteraction body label was not extracted: {interaction_context!r}")
+        datebook_refs = index.references_for("TRIAL_DATEBOOK_BODY_+0").project
+        datebook_context = best_window_context(datebook_refs, "TRIAL_DATEBOOK_BODY_+0")
+        if datebook_context is None or datebook_context.kind != "datebook":
+            raise AssertionError(f"datebook entry did not receive its own preview style: {datebook_context!r}")
+        if datebook_context.header_label != "trial_datebook_head_+0":
+            raise AssertionError(f"datebook title was not paired with its body: {datebook_context!r}")
+        if datebook_context.body_label != "trial_datebook_body_+0":
+            raise AssertionError(f"datebook body was not retained: {datebook_context!r}")
+        schedule_refs = index.references_for("COUNCIL_SCHEDULE_+0").project
+        schedule_context = best_window_context(schedule_refs, "COUNCIL_SCHEDULE_+0")
+        if schedule_context is None or schedule_context.kind != "datebook":
+            raise AssertionError(f"scheduled event did not receive the datebook profile: {schedule_context!r}")
     finally:
         safe_rmtree(temp)
 
@@ -680,6 +697,23 @@ def assert_game_preview_draws_all_buttons() -> None:
     asset_service._game_window_background(dialogue_context, 380, 148)
     if requested_assets != ["Hud/NoCompression/Priority3/PanelBackground_01.tga"]:
         raise AssertionError(f"MsgSay should request its actual panel texture: {requested_assets!r}")
+    requested_assets.clear()
+    datebook_canvas = QImage(380, 148, QImage.Format.Format_ARGB32)
+    datebook_canvas.fill(0)
+    datebook_painter = QPainter(datebook_canvas)
+    asset_service._draw_game_window_decoration(
+        datebook_painter,
+        PreviewWindowContext(
+            "datebook",
+            "dark_panel",
+            DARK_PANEL_TEXT,
+            call_name="simadddatebookentry",
+        ),
+        datebook_canvas.rect(),
+    )
+    datebook_painter.end()
+    if requested_assets != ["Hud/news/schedule.tga"]:
+        raise AssertionError(f"datebook preview should request the schedule icon: {requested_assets!r}")
     requested_assets.clear()
     button_canvas = QImage(220, 50, QImage.Format.Format_ARGB32)
     button_canvas.fill(0)

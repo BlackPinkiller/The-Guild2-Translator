@@ -149,6 +149,8 @@ def _is_window_call(call_name: str) -> bool:
             "msgsaynowait",
             "msgsayinteraction",
             "showtutorialboxnowait",
+            "simadddatebookentry",
+            "cityschedulecutsceneevent",
         }
         or call_name.startswith("feedback_message")
     )
@@ -161,6 +163,8 @@ def _kind_for_call(call_name: str) -> str:
         return "short"
     if call_name in {"msgnews", "msgnewsnowait"}:
         return "news"
+    if call_name in {"simadddatebookentry", "cityschedulecutsceneevent"}:
+        return "datebook"
     if call_name == "msgquest":
         return "quest"
     return "message"
