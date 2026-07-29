@@ -380,6 +380,7 @@ _VARIADIC_RETURN_FUNCTIONS = {
     "generateprivilegelistlabels",
     "unpacktable",
 }
+_MAX_VARIADIC_ARGUMENTS = 24
 _CALL_EXPRESSION_RE = re.compile(
     r"^(?P<name>[A-Za-z_][A-Za-z0-9_.:]*)\s*\((?P<arguments>.*)\)$",
     re.DOTALL,
@@ -396,6 +397,7 @@ SEMANTIC_NUMBER = "number"
 SEMANTIC_SETTLEMENT = "settlement"
 SEMANTIC_STRUCTURE = "structure"
 SEMANTIC_TEXT = "text"
+SEMANTIC_VEHICLE = "vehicle"
 
 _NATIVE_OBJECT_RETURN_KINDS = {
     "getdynastyid": SEMANTIC_DYNASTY,
@@ -409,7 +411,12 @@ _NATIVE_OBJECT_RETURN_KINDS = {
     "squadgetleaderid": SEMANTIC_CHARACTER,
 }
 _SEMANTIC_MARKER_KINDS = frozenset(
-    (*_NATIVE_OBJECT_RETURN_KINDS.values(), SEMANTIC_DYNASTY_CREST)
+    (
+        *_NATIVE_OBJECT_RETURN_KINDS.values(),
+        SEMANTIC_DYNASTY_CREST,
+        SEMANTIC_NUMBER,
+        SEMANTIC_VEHICLE,
+    )
 )
 
 _NATIVE_ALIAS_OUTPUT_KINDS = {
@@ -431,6 +438,7 @@ _NATIVE_ALIAS_INPUT_KINDS = {
     "citygetpenalty": ((0, SEMANTIC_SETTLEMENT),),
     "citygetrandombuilding": ((0, SEMANTIC_SETTLEMENT),),
     "cityiskontor": ((0, SEMANTIC_SETTLEMENT),),
+    "cartgettype": ((0, SEMANTIC_VEHICLE),),
     "dynastygetmember": ((0, SEMANTIC_DYNASTY),),
     "simgetgender": ((0, SEMANTIC_CHARACTER),),
     "simgetlevel": ((0, SEMANTIC_CHARACTER),),
@@ -486,7 +494,7 @@ def analyze_script_facts(
             (assignment.function_index, assignment.name.casefold()),
             [],
         ).append(assignment)
-        table_match = re.fullmatch(r"(.+)\[\d+\]", assignment.name)
+        table_match = re.fullmatch(r"(.+)\[[^\]]+\]", assignment.name)
         if table_match is not None:
             key = (assignment.function_index, table_match.group(1).casefold())
             fields = table_fields_by_base.setdefault(key, [])
@@ -1416,6 +1424,30 @@ def _evaluate_tokens(
             end -= 1
         else:
             break
+    conditional_parts = _split_token_range(analysis.tokens, start, end, "or")
+    if len(conditional_parts) > 1:
+        values: list[str] = []
+        for part_start, part_end in conditional_parts:
+            conjunctions = _split_token_range(
+                analysis.tokens,
+                part_start,
+                part_end,
+                "and",
+            )
+            value_start, value_end = conjunctions[-1]
+            values.extend(
+                _evaluate_tokens(
+                    analysis,
+                    value_start,
+                    value_end,
+                    position,
+                    function_index,
+                    resolving,
+                    parameter_bindings,
+                    required_branches,
+                )
+            )
+        return tuple(dict.fromkeys(values))[:64]
     parts = _split_token_range(analysis.tokens, start, end, "..")
     if len(parts) > 1:
         combined = ("",)
@@ -1616,6 +1648,16 @@ def _getid_object_kinds(
         ):
             continue
         kinds.append(kind)
+    if not kinds and token.kind == "string":
+        whole_function_kinds = {
+            kind
+            for _position, _producer_token, kind in analysis.alias_type_events.get(
+                (call.function_index, alias),
+                (),
+            )
+        }
+        if len(whole_function_kinds) == 1:
+            kinds.extend(whole_function_kinds)
     if token.kind == "string" and call.function_index is not None:
         kinds.extend(
             kind
@@ -1992,7 +2034,10 @@ def native_semantic_function_name(alias: str) -> str | None:
         "getnobilitytitlelabel",
         "itemgetlabel",
         "officegettextlabel",
+        "professiongetlabel",
     }:
+        return name
+    if name in {"ceil", "floor"}:
         return name
     return None
 
@@ -2052,6 +2097,12 @@ def resolve_native_semantic_function(
         # supplied office object/ID. The exact office and gender may be runtime
         # values, but the engine label family is fixed.
         return ((semantic_literal("_CHARACTERS_3_OFFICES_NAME_*_+*"),),)
+    if name == "professiongetlabel":
+        # The engine selects a profession and gender-specific localization
+        # member. Runtime values vary, but the returned label family is fixed.
+        return ((semantic_literal("_CHARACTERS_2_PROFESSIONS_*_NAME_+*"),),)
+    if name in {"ceil", "floor"}:
+        return ((SemanticValue(SEMANTIC_NUMBER, ""),),)
     if name != "generateprivilegelistlabels":
         return None
     positions: list[tuple[SemanticValue, ...]] = []
@@ -2177,11 +2228,18 @@ def _resolve_variable(
                 )
             )
     table_match = re.fullmatch(r"(.+)\[([^\]]+)\]", name)
-    if table_match is not None and not table_match.group(2).isdigit():
+    if table_match is not None:
+        requested_field = table_match.group(2)
         for field_name in analysis.table_fields_by_base.get(
             (function_index, table_match.group(1).casefold()),
             (),
         ):
+            assigned_match = re.fullmatch(r".+\[([^\]]+)\]", field_name)
+            if assigned_match is None:
+                continue
+            assigned_field = assigned_match.group(1)
+            if requested_field.isdigit() and assigned_field.isdigit():
+                continue
             values.extend(
                 _resolve_variable(
                     analysis,
@@ -2374,7 +2432,36 @@ def _runtime_argument_semantics(
 ) -> tuple[tuple[tuple[str, ...], ...], tuple[tuple[str, ...], ...]]:
     values: list[tuple[str, ...]] = []
     kinds: list[tuple[str, ...]] = []
-    for start, end in call.argument_spans[runtime_start:]:
+    for argument_index, (start, end) in enumerate(
+        call.argument_spans[runtime_start:],
+        start=runtime_start,
+    ):
+        expression = call.arguments[argument_index]
+        packed_table = variadic_argument_pack(expression)
+        if packed_table and packed_table != expression:
+            for ordinal in range(1, _MAX_VARIADIC_ARGUMENTS + 1):
+                resolved = _resolve_variable(
+                    analysis,
+                    f"{packed_table}[{ordinal}]",
+                    call.start,
+                    call.function_index,
+                    set(),
+                    required_branches=required_branches,
+                )
+                candidates = tuple(dict.fromkeys(resolved))[:64]
+                values.append(
+                    tuple(
+                        "" if _semantic_marker_kind(value) else value
+                        for value in candidates
+                    )
+                )
+                kinds.append(
+                    tuple(
+                        _semantic_marker_kind(value) or semantic_literal(value).kind
+                        for value in candidates
+                    )
+                )
+            continue
         token_indices = _tokens_in_span(analysis, start, end)
         if not token_indices:
             values.append(())

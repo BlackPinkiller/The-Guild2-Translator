@@ -35,6 +35,8 @@ class PlaceholderPreviewCoverage:
     concrete_positions: int = 0
     semantic_type_positions: int = 0
     suffix_format_positions: int = 0
+    structural_positions: int = 0
+    incompatible_positions: int = 0
     expression_only_positions: int = 0
     missing_positions: int = 0
 
@@ -146,6 +148,8 @@ def preview_placeholder_coverage(
     concrete_positions = 0
     semantic_type_positions = 0
     suffix_format_positions = 0
+    structural_positions = 0
+    incompatible_positions = 0
     expression_only_positions = 0
     missing_positions = 0
     seen_labels: set[str] = set()
@@ -177,6 +181,10 @@ def preview_placeholder_coverage(
             values, kinds = _runtime_evidence(aligned, number)
             if any(value not in {"", "$N"} for value in values):
                 concrete_positions += 1
+            elif kinds and all(kind == "structure" for kind in kinds):
+                structural_positions += 1
+            elif not _placeholder_kinds_compatible(suffix, kinds):
+                incompatible_positions += 1
             elif any(kind and kind != "structure" for kind in kinds):
                 semantic_type_positions += 1
             elif _suffix_has_intrinsic_format(suffix):
@@ -189,9 +197,26 @@ def preview_placeholder_coverage(
         concrete_positions=concrete_positions,
         semantic_type_positions=semantic_type_positions,
         suffix_format_positions=suffix_format_positions,
+        structural_positions=structural_positions,
+        incompatible_positions=incompatible_positions,
         expression_only_positions=expression_only_positions,
         missing_positions=missing_positions,
     )
+
+
+def _placeholder_kinds_compatible(
+    suffix: str,
+    kinds: tuple[str, ...],
+) -> bool:
+    """Reject only caller evidence that cannot satisfy the requested format."""
+    meaningful = {kind for kind in kinds if kind and kind != "structure"}
+    if not meaningful:
+        return True
+    if suffix == "l" and meaningful == {"number"}:
+        return False
+    if suffix.upper() == "NAME" and meaningful <= {"label", "number", "text"}:
+        return False
+    return True
 
 
 def _metric_references(

@@ -23,6 +23,7 @@ from .script_semantics import (
     SEMANTIC_SETTLEMENT,
     SEMANTIC_STRUCTURE,
     SEMANTIC_TEXT,
+    SEMANTIC_VEHICLE,
     variadic_argument_pack,
 )
 from .validation import ARG_PREVIEW_TOKEN
@@ -424,6 +425,10 @@ class PlaceholderValueBuilder:
                 return PlaceholderValue(self.entities.building(number, context).proper_name)
             if semantic == "city":
                 return PlaceholderValue(_city_value(self.localization, number, context))
+            if semantic == "vehicle":
+                return PlaceholderValue(
+                    translate("preview.value.vehicle", locale=context.locale)
+                )
         values = {
             "n": "preview.value.number",
             "i": "preview.value.integer",
@@ -477,6 +482,10 @@ class PlaceholderValueBuilder:
                 return PlaceholderValue(_city_value(self.localization, number, context))
             if semantic == "dynasty":
                 return PlaceholderValue(self.entities.dynasty(number, context).name)
+            if semantic == "vehicle":
+                return PlaceholderValue(
+                    translate("preview.value.vehicle", locale=context.locale)
+                )
             return PlaceholderValue(
                 translate("preview.value.object_name", locale=context.locale, number=number)
             )
@@ -625,6 +634,7 @@ def _name_semantic_kind(number: int, context: PlaceholderContext) -> str:
         SEMANTIC_CHARACTER: "character",
         SEMANTIC_DYNASTY: "dynasty",
         SEMANTIC_SETTLEMENT: "city",
+        SEMANTIC_VEHICLE: "vehicle",
     }
     named_runtime_kinds = {
         kind_names[kind]

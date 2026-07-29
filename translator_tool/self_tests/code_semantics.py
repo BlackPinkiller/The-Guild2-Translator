@@ -461,6 +461,8 @@ def assert_code_semantics_follow_fields_panels_and_initdata() -> None:
             '    MsgBox("", "Owner", "", "@L_CREDIT_HEAD_+0", Strings.Body, Account)',
             '    local Options = "@P"',
             '    Options = Options .. "@B["..i..",@L_TWP_SUPPLYWORKSHOP_MARKET_+"..i..",]"',
+            "    local LabelIds = {}",
+            "    for i=1, 10 do LabelIds[i] = GetSettlementID(Target[i]) end",
             '    MsgBox("", "Owner", Options, "@L_SUPPLY_HEAD_+0", "@L_SUPPLY_BODY_+0", helpfuncs_UnpackTable(LabelIds))',
             '    local OptionTable = {"@B[5,@L_ROUTE_OPTION_+5,]", "@B[6,@L_ROUTE_OPTION_+6,]"}',
             "    local SelectedOptions = OptionTable[1]..OptionTable[2]",
@@ -484,6 +486,13 @@ def assert_code_semantics_follow_fields_panels_and_initdata() -> None:
     )
     if panel_use.role != "button" or panel_use.runtime_arguments != ("helpfuncs_UnpackTable(LabelIds)",):
         raise AssertionError(f"accumulated panel label did not flow into MsgBox: {panel_use!r}")
+    if (
+        len(panel_use.runtime_argument_kinds) != 24
+        or any(kinds != ("settlement",) for kinds in panel_use.runtime_argument_kinds)
+    ):
+        raise AssertionError(
+            f"an unpacked dynamic table lost its per-position semantics: {panel_use!r}"
+        )
     table_buttons = [
         use
         for use in uses
@@ -563,6 +572,18 @@ def assert_dynamic_table_and_engine_label_semantics_are_preserved() -> None:
                 "    local SkillIndex = Rand(2) + 1",
                 '    MsgQuick("", "@L_RANDOM_TALENT_BODY_+0", Skills[SkillIndex])',
                 '    MsgQuick("", "@L_OFFICE_BODY_+0", OfficeGetTextLabel(OfficeID))',
+                "    local LabelIds = {}",
+                "    for i=1, 10 do LabelIds[i] = GetSettlementID(Target[i]) end",
+                '    MsgQuick("", "@L_MARKET_BODY_+0", LabelIds[4])',
+                "    local function getLabel(value)",
+                '        return value == 1 and "@L_MESSAGES_ON_+0" or "@L_MESSAGES_OFF_+0"',
+                "    end",
+                "    local Labels = {Take = getLabel(1)}",
+                '    MsgQuick("", "@L_MESSAGES_BODY_+0", Labels.Take)',
+                '    MsgQuick("", "@L_PROFESSION_BODY_+0", ProfessionGetLabel(Profession, Gender))',
+                '    MsgQuick("", "@L_ROUNDED_BODY_+0", math.floor(Amount * Factor))',
+                '    MsgQuick("", "@L_VEHICLE_BODY_+0", GetID("Destination"))',
+                '    local VehicleType = CartGetType("Destination")',
                 "end",
             )
         ),
@@ -597,6 +618,35 @@ def assert_dynamic_table_and_engine_label_semantics_are_preserved() -> None:
     if office.runtime_argument_kinds != (("label",),):
         raise AssertionError(
             f"OfficeGetTextLabel lost its label semantic type: {office!r}"
+        )
+    market = by_label["market_body_+0"]
+    if market.runtime_argument_kinds != (("settlement",),):
+        raise AssertionError(
+            f"a fixed index did not follow a dynamic table assignment: {market!r}"
+        )
+    messages = by_label["messages_body_+0"]
+    if messages.runtime_argument_values != (
+        ("@L_MESSAGES_ON_+0", "@L_MESSAGES_OFF_+0"),
+    ):
+        raise AssertionError(
+            f"a conditional local-function return lost its label candidates: {messages!r}"
+        )
+    profession = by_label["profession_body_+0"]
+    if profession.runtime_argument_values != (
+        ("_CHARACTERS_2_PROFESSIONS_*_NAME_+*",),
+    ):
+        raise AssertionError(
+            f"ProfessionGetLabel lost its documented label family: {profession!r}"
+        )
+    rounded = by_label["rounded_body_+0"]
+    if rounded.runtime_argument_kinds != (("number",),):
+        raise AssertionError(
+            f"a numeric engine function lost its scalar result type: {rounded!r}"
+        )
+    vehicle = by_label["vehicle_body_+0"]
+    if vehicle.runtime_argument_kinds != (("vehicle",),):
+        raise AssertionError(
+            f"a stable alias ignored later engine type evidence: {vehicle!r}"
         )
 
 
@@ -690,6 +740,47 @@ def assert_code_index_handles_families_and_binary_gui() -> None:
         ):
             raise AssertionError(
                 f"actual placeholder evidence was counted incorrectly: {placeholder_coverage!r}"
+            )
+        quality_index = CodeReferenceIndex(
+            {
+                "structure_+0": (
+                    CodeReference(
+                        "structure_+0",
+                        temp / "Structure.lua",
+                        1,
+                        1,
+                        runtime_arguments=("Separator",),
+                        runtime_argument_values=(("$N",),),
+                        runtime_argument_kinds=(("structure",),),
+                    ),
+                ),
+                "bad_format_+0": (
+                    CodeReference(
+                        "bad_format_+0",
+                        temp / "BadFormat.lua",
+                        1,
+                        1,
+                        runtime_arguments=("math.floor(Money)",),
+                        runtime_argument_values=(("",),),
+                        runtime_argument_kinds=(("number",),),
+                    ),
+                ),
+            }
+        )
+        quality_coverage = preview_placeholder_coverage(
+            quality_index,
+            (
+                ("STRUCTURE_+0", "%1l"),
+                ("BAD_FORMAT_+0", "%1l"),
+            ),
+        )
+        if (
+            quality_coverage.structural_positions != 1
+            or quality_coverage.incompatible_positions != 1
+            or quality_coverage.expression_only_positions != 0
+        ):
+            raise AssertionError(
+                f"preview quality evidence was misclassified: {quality_coverage!r}"
             )
         parsed = placeholder_arguments("%2it | %1Sn | %2.1f/d")
         if parsed != ((2, "i"), (1, "Sn")):
@@ -804,6 +895,8 @@ def assert_placeholder_values_avoid_ambiguous_random_branches() -> None:
                 return "Town"
             if prefix == "_CHARACTERS_3_TITLES_NAME_+":
                 return "Citizen"
+            if prefix == "_CHARACTERS_2_PROFESSIONS_":
+                return "Blacksmith"
             if prefix == "_PRIVILEGE_":
                 return "May trade goods"
             return "Supreme Commander"
@@ -820,6 +913,11 @@ def assert_placeholder_values_avoid_ambiguous_random_branches() -> None:
                 return PlaceholderLabelRecord(
                     "_CHARACTERS_1_CLASSES_patron",
                     ("Patron", "Worker"),
+                )
+            if prefix == "_CHARACTERS_2_PROFESSIONS_":
+                return PlaceholderLabelRecord(
+                    "_CHARACTERS_2_PROFESSIONS_blacksmith_NAME_+0",
+                    ("Blacksmith",),
                 )
             return PlaceholderLabelRecord("_BUILDING_Bakery", ("Bakery", "Bread & Butter"))
 
@@ -986,6 +1084,54 @@ def assert_placeholder_values_avoid_ambiguous_random_branches() -> None:
     if builder.argument_value(1, "NAME", settlement_context).text != "York":
         raise AssertionError(
             "NAME ignored a settlement type proven by runtime data flow"
+        )
+    typed_vehicle = CodeReference(
+        "vehicle_name_+0",
+        Path("Vehicle.lua"),
+        32,
+        1,
+        "MsgQuick",
+        1,
+        runtime_arguments=('GetID("Destination")',),
+        runtime_argument_values=(("",),),
+        runtime_argument_kinds=(("vehicle",),),
+        role="body",
+    )
+    vehicle_context = PlaceholderContext(
+        "VEHICLE_NAME_+0",
+        "Text.dbt",
+        False,
+        "en",
+        (typed_vehicle,),
+    )
+    if builder.argument_value(1, "NAME", vehicle_context).text != "Sea Hawk":
+        raise AssertionError(
+            "NAME ignored a vehicle type proven by runtime data flow"
+        )
+    profession_label = CodeReference(
+        "profession_label_+0",
+        Path("Profession.lua"),
+        33,
+        1,
+        "MsgQuick",
+        1,
+        runtime_arguments=("ProfessionGetLabel(Profession, Gender)",),
+        runtime_argument_values=(
+            ("_CHARACTERS_2_PROFESSIONS_*_NAME_+*",),
+        ),
+        runtime_argument_kinds=(("label",),),
+        role="body",
+    )
+    profession_context = PlaceholderContext(
+        "PROFESSION_LABEL_+0",
+        "Text.dbt",
+        False,
+        "en",
+        (profession_label,),
+    )
+    if builder.argument_value(1, "l", profession_context).text != "Blacksmith":
+        raise AssertionError(
+            "a proven profession label family did not reach the rendered preview"
         )
 
     engine_settlement_context = PlaceholderContext(
