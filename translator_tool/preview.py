@@ -1604,6 +1604,10 @@ class PreviewService:
         atlas = self._atlas(target)
         return atlas.glyph(glyph_id) if atlas is not None else None
 
+    def text_font_family(self, target: bool) -> str:
+        """Return the registered standard font used for native editor rendering."""
+        return self._standard_font_family(target)
+
     def text_glyph_image(
         self,
         char: str,

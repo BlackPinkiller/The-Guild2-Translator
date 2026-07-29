@@ -3794,6 +3794,20 @@ def assert_preview_editor_restores_raw_placeholder_on_edit() -> None:
         raise AssertionError("rebuilding a preview lost the editor zoom")
     glyph = QImage(10, 20, QImage.Format.Format_RGBA8888)
     glyph.fill(0xFFFFFFFF)
+    editor.set_game_font_builder(
+        True,
+        lambda _char, _color: glyph,
+        lambda: "Arial",
+    )
+    editor.setPlainText("Native font")
+    native_cursor = QTextCursor(editor.document())
+    native_cursor.movePosition(
+        QTextCursor.MoveOperation.NextCharacter,
+        QTextCursor.MoveMode.KeepAnchor,
+    )
+    native_format = native_cursor.charFormat()
+    if native_format.isImageFormat() or native_format.font().family() != "Arial":
+        raise AssertionError("standard preview font was rasterized instead of rendered natively")
     editor.set_preview_builder(
         lambda text: service.render(
             text,

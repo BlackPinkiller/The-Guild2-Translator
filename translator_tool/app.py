@@ -1357,6 +1357,7 @@ class PreviewPlainTextEdit(QTextEdit):
         self._preview_builder: Callable[[str], PreviewDocument] | None = None
         self._glyph_provider: Callable[[int], object | None] | None = None
         self._text_glyph_provider: Callable[[str, tuple[int, int, int, int] | None], object | None] | None = None
+        self._text_font_family_provider: Callable[[], str] | None = None
         self._game_font_enabled = False
         self._preview_document = PreviewDocument.from_atoms("", [])
         self._base_zoom_point_size: float | None = None
@@ -1393,9 +1394,11 @@ class PreviewPlainTextEdit(QTextEdit):
         self,
         enabled: bool,
         provider: Callable[[str, tuple[int, int, int, int] | None], object | None],
+        font_family_provider: Callable[[], str] | None = None,
     ) -> None:
         self._game_font_enabled = enabled
         self._text_glyph_provider = provider
+        self._text_font_family_provider = font_family_provider
         if self._preview_enabled:
             self.refresh_preview()
 
@@ -1515,11 +1518,17 @@ class PreviewPlainTextEdit(QTextEdit):
         blocker = QSignalBlocker(self)
         self._set_unformatted_plain_text(document.display_text)
         self._apply_preview_line_height(document.line_height_percent)
+        text_font_family = (
+            self._text_font_family_provider()
+            if self._game_font_enabled and self._text_font_family_provider is not None
+            else ""
+        )
         for span in document.spans:
             atom = span.atom
             if (
                 self._game_font_enabled
                 and self._text_glyph_provider is not None
+                and not text_font_family
                 and atom.glyph_id is None
             ):
                 for offset, char in enumerate(atom.text):
@@ -1560,6 +1569,10 @@ class PreviewPlainTextEdit(QTextEdit):
             cursor.setPosition(span.display_start)
             cursor.setPosition(span.display_end, QTextCursor.MoveMode.KeepAnchor)
             char_format = QTextCharFormat()
+            if text_font_family and atom.glyph_id is None:
+                font = QFont(self.document().defaultFont())
+                font.setFamily(text_font_family)
+                char_format.setFont(font)
             has_visible_replacement = atom.replacement and atom.text not in {"\n", "\t", PREVIEW_MARK}
             if atom.final_style and atom.color is not None:
                 char_format.setForeground(QColor(*atom.color))
@@ -3258,10 +3271,12 @@ class TranslatorWindow(QMainWindow):
         self.source_edit.set_game_font_builder(
             self.settings.preview_game_font_in_editors,
             lambda char, color: self.preview_service.text_glyph_image(char, False, color),
+            lambda: self.preview_service.text_font_family(False),
         )
         self.translation_edit.set_game_font_builder(
             self.settings.preview_game_font_in_editors,
             lambda char, color: self.preview_service.text_glyph_image(char, True, color),
+            lambda: self.preview_service.text_font_family(True),
         )
         self.translation_edit.use_application_undo_history()
         self.source_edit.installEventFilter(self)
@@ -6054,10 +6069,12 @@ class TranslatorWindow(QMainWindow):
             self.source_edit.set_game_font_builder(
                 self.settings.preview_game_font_in_editors,
                 lambda char, color: self.preview_service.text_glyph_image(char, False, color),
+                lambda: self.preview_service.text_font_family(False),
             )
             self.translation_edit.set_game_font_builder(
                 self.settings.preview_game_font_in_editors,
                 lambda char, color: self.preview_service.text_glyph_image(char, True, color),
+                lambda: self.preview_service.text_font_family(True),
             )
         if (
             self.settings.enable_chinese_codec != previous_codec
