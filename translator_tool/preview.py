@@ -8,10 +8,19 @@ import math
 from pathlib import Path
 import re
 import struct
+import time
 import unicodedata
 
 from PySide6.QtCore import QBuffer, QIODevice, QRect, Qt
-from PySide6.QtGui import QColor, QFont, QFontMetrics, QImage, QPainter, qRgba
+from PySide6.QtGui import (
+    QColor,
+    QFont,
+    QFontDatabase,
+    QFontMetrics,
+    QImage,
+    QPainter,
+    qRgba,
+)
 
 from .code_window_context import PreviewWindowContext
 from .format_io import dbt_row_values, load_dbt, translatable_fields
@@ -682,7 +691,12 @@ class PreviewService:
         self._ui_image_cache: dict[str, QImage | None] = {}
         self._render_cache: dict[tuple[str, str, str, str, bool, tuple[object, ...], str], PreviewDocument] = {}
         self._scaled_glyph_cache: dict[tuple[int, float, int], QImage] = {}
-        self._system_glyph_cache: dict[tuple[str, float, int], QImage] = {}
+        self._system_glyph_cache: dict[tuple[str, float, int, str], QImage] = {}
+        self._translation_font_ids: list[int] = []
+        self._translation_font_family = ""
+        self._translation_font_key = ""
+        self._translation_font_checked = False
+        self._translation_font_check_after = 0.0
 
     def configure(
         self,
@@ -709,6 +723,13 @@ class PreviewService:
         self._render_cache.clear()
         self._scaled_glyph_cache.clear()
         self._system_glyph_cache.clear()
+        for font_id in self._translation_font_ids:
+            QFontDatabase.removeApplicationFont(font_id)
+        self._translation_font_ids.clear()
+        self._translation_font_family = ""
+        self._translation_font_key = ""
+        self._translation_font_checked = False
+        self._translation_font_check_after = 0.0
 
     @property
     def localization(self) -> GameLocalization:
@@ -861,6 +882,7 @@ class PreviewService:
         target: bool,
         references: tuple[object, ...] = (),
     ) -> PreviewDocument:
+        self._refresh_standard_font()
         references = select_preview_context(text, references, label).references
         key = (unit_key, label, file_rel, kind, target, references, text)
         cached = self._render_cache.get(key)
@@ -912,6 +934,65 @@ class PreviewService:
         atlas = GameGlyphAtlas(hud_root, variant) if (hud_root / variant / "Sets.dat").is_file() else GameGlyphAtlas(hud_root)
         self._atlases[target] = atlas
         return atlas
+
+    def _standard_font_files(self, target: bool) -> tuple[Path, ...]:
+        if not target or not self.translation_font_dir.strip():
+            return ()
+        configured = Path(self.translation_font_dir).expanduser()
+        if configured.is_file():
+            return (configured,) if configured.suffix.casefold() == ".ttf" else ()
+        if not configured.is_dir():
+            return ()
+        return tuple(
+            sorted(
+                (
+                    path
+                    for path in configured.iterdir()
+                    if path.is_file() and path.suffix.casefold() == ".ttf"
+                ),
+                key=lambda path: path.name.casefold(),
+            )
+        )
+
+    def _standard_font_family(self, target: bool) -> str:
+        if not target:
+            return ""
+        if not self._translation_font_checked:
+            self._refresh_standard_font()
+        return self._translation_font_family
+
+    def _refresh_standard_font(self) -> None:
+        now = time.monotonic()
+        if now < self._translation_font_check_after:
+            return
+        self._translation_font_check_after = now + 1.0
+        font_files = self._standard_font_files(True)
+        key_parts: list[str] = []
+        for path in font_files:
+            try:
+                stat = path.stat()
+            except OSError:
+                continue
+            key_parts.append(
+                f"{path.resolve()}:{stat.st_size}:{stat.st_mtime_ns}"
+            )
+        key = "|".join(key_parts)
+        if self._translation_font_checked and key == self._translation_font_key:
+            return
+        for font_id in self._translation_font_ids:
+            QFontDatabase.removeApplicationFont(font_id)
+        self._translation_font_ids.clear()
+        self._translation_font_key = key
+        self._translation_font_family = ""
+        for path in font_files:
+            font_id = QFontDatabase.addApplicationFont(str(path))
+            if font_id < 0:
+                continue
+            self._translation_font_ids.append(font_id)
+            families = QFontDatabase.applicationFontFamilies(font_id)
+            if families and not self._translation_font_family:
+                self._translation_font_family = families[0]
+        self._translation_font_checked = True
 
     @staticmethod
     def _configured_directory(value: str) -> Path | None:
@@ -1346,7 +1427,9 @@ class PreviewService:
         centered: bool,
         default_color: tuple[int, int, int, int] = (55, 38, 24, 255),
     ) -> int:
-        atlas = self._atlas(target)
+        symbol_atlas = self._atlas(target)
+        standard_family = self._standard_font_family(target)
+        text_atlas = None if standard_family else symbol_atlas
         lines: list[list[QImage]] = [[]]
         widths = [0]
         line_height = max(12, round(25 * scale))
@@ -1365,7 +1448,11 @@ class PreviewService:
 
         for atom in document.atoms:
             if atom.glyph_id is not None:
-                glyph = atlas.glyph(atom.glyph_id) if atlas is not None else None
+                glyph = (
+                    symbol_atlas.glyph(atom.glyph_id)
+                    if symbol_atlas is not None
+                    else None
+                )
                 if glyph is not None:
                     image = self._scaled_game_glyph(glyph, scale, None)
                     if not append_image(image):
@@ -1383,9 +1470,13 @@ class PreviewService:
                 if char == "\t":
                     char = " "
                 for codepoint in self._game_codepoints(char, target):
-                    glyph = atlas.glyph(codepoint) if atlas is not None else None
+                    glyph = (
+                        text_atlas.glyph(codepoint)
+                        if text_atlas is not None
+                        else None
+                    )
                     if glyph is None:
-                        image = self._system_text_glyph(char, scale, color)
+                        image = self._system_text_glyph(char, scale, color, target)
                         if not append_image(image):
                             stopped = True
                             break
@@ -1407,12 +1498,19 @@ class PreviewService:
             y += line_height
         return y
 
-    def _system_text_glyph(self, char: str, scale: float, color: QColor) -> QImage:
-        cache_key = (char, scale, color.rgba())
+    def _system_text_glyph(
+        self,
+        char: str,
+        scale: float,
+        color: QColor,
+        target: bool,
+    ) -> QImage:
+        family = self._standard_font_family(target) or "Microsoft YaHei UI"
+        cache_key = (char, scale, color.rgba(), family)
         cached = self._system_glyph_cache.get(cache_key)
         if cached is not None:
             return cached
-        font = QFont("Microsoft YaHei UI")
+        font = QFont(family)
         font.setPixelSize(max(12, round(24 * scale)))
         metrics = QFontMetrics(font)
         width = max(1, metrics.horizontalAdvance(char))
@@ -1512,6 +1610,13 @@ class PreviewService:
         target: bool,
         color: tuple[int, int, int, int] | None = None,
     ) -> QImage | None:
+        if self._standard_font_family(target):
+            return self._system_text_glyph(
+                char,
+                1.0,
+                QColor(*(color or (55, 38, 24, 255))),
+                target,
+            )
         atlas = self._atlas(target)
         if atlas is None:
             return None

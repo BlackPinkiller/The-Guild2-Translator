@@ -3310,6 +3310,27 @@ def assert_preview_i18n_and_symbol_mapping() -> None:
             raise AssertionError(
                 f"format controls in a referenced label were not rendered: {related_newline.display_text!r}"
             )
+        windows_fonts = sorted(
+            (Path(os.environ.get("WINDIR", "C:/Windows")) / "Fonts").glob("*.ttf")
+        )
+        if windows_fonts:
+            from PySide6.QtWidgets import QApplication
+
+            font_app = QApplication.instance()
+            if font_app is None:
+                font_app = QApplication([])
+            standard_font_service = PreviewService(
+                translation_font_dir=str(windows_fonts[0])
+            )
+            if standard_font_service._standard_font_files(True) != (
+                windows_fonts[0],
+            ):
+                raise AssertionError("a configured TTF file was not selected")
+            if not standard_font_service._standard_font_family(True):
+                raise AssertionError("a configured TTF file was not registered with Qt")
+            standard_glyph = standard_font_service.text_glyph_image("A", True)
+            if standard_glyph is None or standard_glyph.isNull():
+                raise AssertionError("a configured TTF did not render preview text")
 
         semantic = service.render(
             "%1SN >%2l< >%3l<",

@@ -16,6 +16,11 @@ translation_review/
 Translation-format-FULL.txt
 local_docs/
 encoder/Mare
+
+# User-supplied preview fonts.
+/font/
+*.ttf
+
 # Local agent guidance uses progressive disclosure and is intentionally not versioned.
 AGENTS.md
 **/AGENTS.md
