@@ -508,6 +508,28 @@ def _presentation_for_surface(
             "Hud/NoCompression/Priority3/PanelBackground_01.tga",
             "Hud/borders/Border_Gold_02.tga",
         ),
+        "gui_embedded": PreviewSurfacePresentation(
+            "gui_embedded",
+            "dark_panel",
+            "panel",
+        ),
+        "important_persons": PreviewSurfacePresentation(
+            "important_persons",
+            "parchment",
+            "book",
+            "GUI/Hud/panel_importantpersons.gui",
+            "Hud/sheets/evidences/bg_buch.tga",
+            "Hud/borders/Border_Gold_02.tga",
+        ),
+        "pamphlet": PreviewSurfacePresentation(
+            "pamphlet",
+            "dark_panel",
+            "panel",
+            "GUI/Hud/panel_pamphletsheet.gui",
+            "Hud/NoCompression/Priority3/PanelBackground_01.tga",
+            "Hud/borders/Border_Gold_02.tga",
+            icon_asset="Hud/Hud_Icons/Pamphlet.tga",
+        ),
     }
     return profiles.get(
         surface,

@@ -141,11 +141,58 @@ _FIXED_CALL_CONTRACTS: dict[str, CallContract] = {
         "measure_choice",
         panel_argument=0,
     ),
+    "initalias": CallContract(
+        ((3, "body"),),
+        5,
+        surface="measure_choice",
+        panel_argument=1,
+    ),
+    "addsheettotabgroup": CallContract(
+        ((2, "header"),),
+        3,
+        surface="gui_embedded",
+        panel_argument=1,
+    ),
+    "settabgroupheader": CallContract(
+        ((1, "header"),),
+        2,
+        surface="gui_embedded",
+        panel_argument=0,
+    ),
+    "createimportantpersonsection": CallContract(
+        ((1, "header"),),
+        2,
+        surface="important_persons",
+    ),
+    "blackboardaddpamphlet": CallContract(
+        ((2, "body"),),
+        3,
+        surface="pamphlet",
+    ),
 }
+
+_FEEDBACK_MESSAGE_CONTRACT = CallContract(
+    ((1, "header"), (2, "body")),
+    3,
+    surface="news",
+)
+_FEEDBACK_MESSAGE_OFFICE_CONTRACT = CallContract(
+    ((2, "header"), (3, "body")),
+    4,
+    surface="news",
+)
 
 
 def call_contract(call_name: str) -> CallContract | None:
-    return _FIXED_CALL_CONTRACTS.get(call_name.casefold())
+    normalized = call_name.casefold()
+    fixed = _FIXED_CALL_CONTRACTS.get(normalized)
+    if fixed is not None:
+        return fixed
+    if normalized == "feedback_messageoffice":
+        return _FEEDBACK_MESSAGE_OFFICE_CONTRACT
+    if normalized.startswith("feedback_message"):
+        return _FEEDBACK_MESSAGE_CONTRACT
+    return None
 
 
 def _semantic_call_contract(
@@ -310,6 +357,7 @@ class _Analysis:
     call_starts: tuple[int, ...]
     assignments: tuple[Assignment, ...]
     assignments_by_name: dict[tuple[int | None, str], tuple[Assignment, ...]]
+    table_fields_by_base: dict[tuple[int | None, str], tuple[str, ...]]
     calls_by_alias: dict[str, tuple[int, ...]]
     functions_by_alias: dict[str, tuple[int, ...]]
     returns_by_function: dict[int, tuple[tuple[int, int, int], ...]]
@@ -428,11 +476,18 @@ def analyze_script_facts(
     calls = _calls(text, tokens, functions)
     assignments = _assignments(tokens, functions)
     assignments_by_name: dict[tuple[int | None, str], list[Assignment]] = {}
+    table_fields_by_base: dict[tuple[int | None, str], list[str]] = {}
     for assignment in assignments:
         assignments_by_name.setdefault(
             (assignment.function_index, assignment.name.casefold()),
             [],
         ).append(assignment)
+        table_match = re.fullmatch(r"(.+)\[\d+\]", assignment.name)
+        if table_match is not None:
+            key = (assignment.function_index, table_match.group(1).casefold())
+            fields = table_fields_by_base.setdefault(key, [])
+            if assignment.name not in fields:
+                fields.append(assignment.name)
     calls_by_alias: dict[str, list[int]] = {}
     for index, call in enumerate(calls):
         calls_by_alias.setdefault(call.name.casefold(), []).append(index)
@@ -460,6 +515,7 @@ def analyze_script_facts(
         tuple(call.start for call in calls),
         assignments,
         {key: tuple(values) for key, values in assignments_by_name.items()},
+        {key: tuple(values) for key, values in table_fields_by_base.items()},
         {name: tuple(indices) for name, indices in calls_by_alias.items()},
         {name: tuple(indices) for name, indices in functions_by_alias.items()},
         _return_expressions_by_function(tokens, functions),
@@ -1930,6 +1986,7 @@ def native_semantic_function_name(alias: str) -> str | None:
         "generateprivilegelistlabels",
         "getnobilitytitlelabel",
         "itemgetlabel",
+        "officegettextlabel",
     }:
         return name
     return None
@@ -1980,6 +2037,11 @@ def resolve_native_semantic_function(
         # The engine also selects a gendered title variant. The title number
         # proves the label family, but not one exact localized member.
         return ((semantic_literal("_CHARACTERS_3_TITLES_NAME_+*"),),)
+    if name == "officegettextlabel":
+        # OfficeGetTextLabel returns the localized display label for the
+        # supplied office object/ID. The exact office and gender may be runtime
+        # values, but the engine label family is fixed.
+        return ((semantic_literal("_CHARACTERS_3_OFFICES_NAME_*_+*"),),)
     if name != "generateprivilegelistlabels":
         return None
     positions: list[tuple[SemanticValue, ...]] = []
@@ -2091,6 +2153,23 @@ def _resolve_variable(
                     assignment.token_start,
                     assignment.token_end,
                     assignment.position,
+                    function_index,
+                    next_resolving,
+                    parameter_bindings,
+                    required_branches,
+                )
+            )
+    table_match = re.fullmatch(r"(.+)\[([^\]]+)\]", name)
+    if table_match is not None and not table_match.group(2).isdigit():
+        for field_name in analysis.table_fields_by_base.get(
+            (function_index, table_match.group(1).casefold()),
+            (),
+        ):
+            values.extend(
+                _resolve_variable(
+                    analysis,
+                    field_name,
+                    position,
                     function_index,
                     next_resolving,
                     parameter_bindings,

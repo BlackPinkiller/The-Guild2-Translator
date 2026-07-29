@@ -73,6 +73,8 @@ from .self_tests.code_semantics import (
     assert_cross_file_return_labels_flow_only_to_real_callers,
     assert_display_call_contracts_match_engine_signatures,
     assert_code_semantics_follow_fields_panels_and_initdata,
+    assert_feedback_message_contracts_do_not_depend_on_label_names,
+    assert_dynamic_table_and_engine_label_semantics_are_preserved,
     assert_code_semantics_are_scope_and_role_aware,
     assert_code_semantics_resolve_local_function_returns,
     assert_placeholder_values_avoid_ambiguous_random_branches,
@@ -440,12 +442,22 @@ def assert_code_window_context_extracts_window_labels_and_buttons() -> None:
         (game_root / "Scripts" / "Hud").mkdir(parents=True, exist_ok=True)
         (game_root / "GUI" / "Hud").mkdir(parents=True, exist_ok=True)
         (game_root / "Scripts" / "Hud" / "GameHud.lua").write_text(
-            'this:AddPanel("SayPanel", 10, "GUI/Hud/CustomSay.gui", false)',
+            "\n".join(
+                (
+                    'this:AddPanel("SayPanel", 10, "GUI/Hud/CustomSay.gui", false)',
+                    'this:AddPanel("CustomSheet", 11, "GUI/Hud/CustomSheet.gui", false)',
+                )
+            ),
             encoding="utf-8",
         )
         (game_root / "GUI" / "Hud" / "CustomSay.gui").write_bytes(
             b"\x03\x00"
             b"Hud/NoCompression/Priority3/PanelBackground_01.tga\x00"
+            b"Hud/borders/Border_Gold_02.tga\x00"
+        )
+        (game_root / "GUI" / "Hud" / "CustomSheet.gui").write_bytes(
+            b"\x03\x00"
+            b"Hud/sheets/evidences/bg_buch.tga\x00"
             b"Hud/borders/Border_Gold_02.tga\x00"
         )
         window_script = game_root / "Scripts" / "Window.lua"
@@ -503,6 +515,10 @@ def assert_code_window_context_extracts_window_labels_and_buttons() -> None:
                     'CityScheduleCutsceneEvent("settlement", "council_date", "",',
                     '    "BeginCouncilMeeting", 17, 6, "@L_COUNCIL_SCHEDULE_+0")',
                     'InitData("SayPanel", 0, "@L_PANEL_HEAD_+0", "@L_PANEL_BODY_+0", Cost)',
+                    'this:AddSheetToTabGroup("Diary", "CustomSheet", "@L_CUSTOM_TAB_+0")',
+                    'InitAlias("Destination", MEASUREINIT_SELECTION, "", "@L_SELECT_TARGET_+0", 0)',
+                    'CreateImportantPersonSection("Family", "@L_IMPORTANT_SECTION_+0")',
+                    'BlackBoardAddPamphlet("BlackBoard", "Destination", "@L_PAMPHLET_BODY_+0")',
                 )
             ),
             encoding="utf-8",
@@ -651,6 +667,57 @@ def assert_code_window_context_extracts_window_labels_and_buttons() -> None:
         ):
             raise AssertionError(
                 f"registered panel resource did not refine the semantic preview: {panel_context!r}"
+            )
+        tab_context = best_window_context(
+            index.references_for("CUSTOM_TAB_+0").project,
+            "CUSTOM_TAB_+0",
+        )
+        if (
+            tab_context is None
+            or tab_context.surface != "gui_embedded"
+            or tab_context.gui_resource != "GUI/Hud/CustomSheet.gui"
+            or tab_context.layout != "book"
+            or tab_context.background_asset != "Hud/sheets/evidences/bg_buch.tga"
+        ):
+            raise AssertionError(
+                f"a tab label did not inherit its registered sheet resources: {tab_context!r}"
+            )
+        selection_context = best_window_context(
+            index.references_for("SELECT_TARGET_+0").project,
+            "SELECT_TARGET_+0",
+        )
+        if (
+            selection_context is None
+            or selection_context.surface != "measure_choice"
+            or selection_context.body_label != "select_target_+0"
+        ):
+            raise AssertionError(
+                f"InitAlias target text did not receive a selection preview: {selection_context!r}"
+            )
+        important_context = best_window_context(
+            index.references_for("IMPORTANT_SECTION_+0").project,
+            "IMPORTANT_SECTION_+0",
+        )
+        if (
+            important_context is None
+            or important_context.surface != "important_persons"
+            or important_context.layout != "book"
+        ):
+            raise AssertionError(
+                f"important-person sections lost their real sheet profile: {important_context!r}"
+            )
+        pamphlet_context = best_window_context(
+            index.references_for("PAMPHLET_BODY_+0").project,
+            "PAMPHLET_BODY_+0",
+        )
+        if (
+            pamphlet_context is None
+            or pamphlet_context.surface != "pamphlet"
+            or pamphlet_context.gui_resource != "GUI/Hud/panel_pamphletsheet.gui"
+            or pamphlet_context.icon_asset != "Hud/Hud_Icons/Pamphlet.tga"
+        ):
+            raise AssertionError(
+                f"blackboard text did not receive its pamphlet presentation: {pamphlet_context!r}"
             )
     finally:
         safe_rmtree(temp)
@@ -4068,6 +4135,8 @@ def main() -> int:
     assert_code_semantics_are_scope_and_role_aware()
     assert_code_semantics_resolve_local_function_returns()
     assert_code_semantics_follow_fields_panels_and_initdata()
+    assert_feedback_message_contracts_do_not_depend_on_label_names()
+    assert_dynamic_table_and_engine_label_semantics_are_preserved()
     assert_cross_file_return_labels_flow_only_to_real_callers()
     assert_cross_file_function_summaries_bind_arguments_and_expand_returns()
     assert_cross_file_function_summaries_follow_nested_dependencies()

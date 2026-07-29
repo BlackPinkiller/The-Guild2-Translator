@@ -44,6 +44,14 @@ def assert_display_call_contracts_match_engine_signatures() -> None:
         "SetQuestDescriptionByQuestname": (((2, "body"),), 4, (), "questbook"),
         "SetMainQuestTitle": (((1, "header"),), 2, (), "questbook"),
         "SetMainQuestDescription": (((1, "body"),), 2, (), "questbook"),
+        "feedback_MessagePolitics": (((1, "header"), (2, "body")), 3, (), "news"),
+        "feedback_MessageMission": (((1, "header"), (2, "body")), 3, (), "news"),
+        "feedback_MessageOffice": (((2, "header"), (3, "body")), 4, (), "news"),
+        "InitAlias": (((3, "body"),), 5, (), "measure_choice"),
+        "AddSheetToTabGroup": (((2, "header"),), 3, (), "gui_embedded"),
+        "SetTabGroupHeader": (((1, "header"),), 2, (), "gui_embedded"),
+        "CreateImportantPersonSection": (((1, "header"),), 2, (), "important_persons"),
+        "BlackBoardAddPamphlet": (((2, "body"),), 3, (), "pamphlet"),
     }
     for call_name, values in expected.items():
         contract = call_contract(call_name)
@@ -478,6 +486,107 @@ def assert_code_semantics_follow_fields_panels_and_initdata() -> None:
         raise AssertionError(f"InitData runtime arguments started at the wrong slot: {init_body!r}")
 
 
+def assert_feedback_message_contracts_do_not_depend_on_label_names() -> None:
+    uses = analyze_script(
+        "\n".join(
+            (
+                'feedback_MessagePolitics("Patron", "@L_GUILDMASTER_HEAD",',
+                '    "@L_GUILDMASTER_PLAYER_FEMALE", GetID("City"), PatronID,',
+                '    GetYear(), "@L_GUILDMASTER_TITLE_FEMALE")',
+                'feedback_MessageMission("Actor", "@L_MISSION_NAME_+0",',
+                '    "@L_MISSION_NAME_+1", Goal)',
+                'feedback_MessageOffice("", GetPrivilegeList, "@L_OFFICE_GAIN_HEAD",',
+                '    "@L_OFFICE_GAIN_DESCRIPTION", GetID(""))',
+            )
+        ),
+        Path("FeedbackContracts.lua"),
+    )
+    by_label = {
+        use.label: use
+        for use in uses
+        if use.label
+    }
+    politics = by_label["guildmaster_player_female"]
+    if politics.role != "body":
+        raise AssertionError(
+            f"a feedback body depended on BODY/TEXT in its label name: {politics!r}"
+        )
+    if politics.runtime_arguments != (
+        'GetID("City")',
+        "PatronID",
+        "GetYear()",
+        '"@L_GUILDMASTER_TITLE_FEMALE"',
+    ):
+        raise AssertionError(
+            f"feedback runtime placeholders were shifted by the body label: {politics!r}"
+        )
+    if politics.runtime_argument_kinds[0] != ("settlement",):
+        raise AssertionError(
+            f"feedback runtime semantics no longer started at %1: {politics!r}"
+        )
+    if politics.runtime_argument_values[3] != ("@L_GUILDMASTER_TITLE_FEMALE",):
+        raise AssertionError(
+            f"the fourth feedback placeholder did not retain its label: {politics!r}"
+        )
+    mission = by_label["mission_name_+1"]
+    if mission.role != "body" or mission.runtime_arguments != ("Goal",):
+        raise AssertionError(
+            f"Mission feedback used label spelling to locate its body: {mission!r}"
+        )
+    office = by_label["office_gain_description"]
+    if office.role != "body" or office.runtime_arguments != ('GetID("")',):
+        raise AssertionError(
+            f"Office feedback ignored its extra privilege-list parameter: {office!r}"
+        )
+
+
+def assert_dynamic_table_and_engine_label_semantics_are_preserved() -> None:
+    uses = analyze_script(
+        "\n".join(
+            (
+                "function Run()",
+                '    local Skills = {"@L_TALENTS_DEXTERITY_NAME_+0",',
+                '        "@L_TALENTS_RHETORIC_NAME_+0"}',
+                "    local SkillIndex = Rand(2) + 1",
+                '    MsgQuick("", "@L_RANDOM_TALENT_BODY_+0", Skills[SkillIndex])',
+                '    MsgQuick("", "@L_OFFICE_BODY_+0", OfficeGetTextLabel(OfficeID))',
+                "end",
+            )
+        ),
+        Path("RuntimeCollections.lua"),
+    )
+    by_label = {
+        use.label: use
+        for use in uses
+        if use.role == "body"
+    }
+    talents = by_label["random_talent_body_+0"]
+    if talents.runtime_argument_values != (
+        (
+            "@L_TALENTS_DEXTERITY_NAME_+0",
+            "@L_TALENTS_RHETORIC_NAME_+0",
+        ),
+    ):
+        raise AssertionError(
+            f"a dynamic table index lost its concrete candidate values: {talents!r}"
+        )
+    if talents.runtime_argument_kinds != (("label", "label"),):
+        raise AssertionError(
+            f"dynamic table label candidates lost their semantic type: {talents!r}"
+        )
+    office = by_label["office_body_+0"]
+    if office.runtime_argument_values != (
+        ("_CHARACTERS_3_OFFICES_NAME_*_+*",),
+    ):
+        raise AssertionError(
+            f"OfficeGetTextLabel did not retain its documented label family: {office!r}"
+        )
+    if office.runtime_argument_kinds != (("label",),):
+        raise AssertionError(
+            f"OfficeGetTextLabel lost its label semantic type: {office!r}"
+        )
+
+
 def assert_code_index_handles_families_and_binary_gui() -> None:
     temp = Path(tempfile.mkdtemp(prefix="translator_tool_code_semantics_"))
     try:
@@ -548,6 +657,9 @@ def assert_code_index_handles_families_and_binary_gui() -> None:
             or coverage.gui_resource_labels != 1
             or coverage.non_display_labels != 0
             or coverage.low_confidence_labels != 1
+            or coverage.runtime_argument_positions != 1
+            or coverage.resolved_runtime_positions != 0
+            or coverage.unresolved_runtime_positions != 1
         ):
             raise AssertionError(f"preview reference coverage was counted incorrectly: {coverage!r}")
     finally:

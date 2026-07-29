@@ -30,6 +30,7 @@ def preview_reference_coverage(index: CodeReferenceIndex) -> PreviewReferenceCov
     low_confidence_labels = 0
     runtime_argument_positions = 0
     resolved_runtime_positions = 0
+    measured_calls: set[tuple[object, ...]] = set()
     for label in labels:
         references = (
             index.project_references.get(label)
@@ -47,6 +48,18 @@ def preview_reference_coverage(index: CodeReferenceIndex) -> PreviewReferenceCov
         if references and max(reference.confidence for reference in references) < 50:
             low_confidence_labels += 1
         for reference in semantic:
+            call_identity = (
+                reference.source,
+                reference.path,
+                reference.line,
+                reference.column,
+                reference.call_name,
+                reference.arguments,
+                reference.runtime_arguments,
+            )
+            if call_identity in measured_calls:
+                continue
+            measured_calls.add(call_identity)
             runtime_argument_positions += len(reference.runtime_arguments)
             resolved_runtime_positions += sum(
                 1
