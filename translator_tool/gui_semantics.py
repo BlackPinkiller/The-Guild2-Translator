@@ -4,6 +4,7 @@ from dataclasses import dataclass
 from functools import lru_cache
 from pathlib import Path
 import re
+import struct
 
 from .script_semantics import script_calls
 
@@ -20,6 +21,18 @@ class GuiResourceInfo:
     path: Path
     resource_name: str
     assets: tuple[str, ...]
+    root_size: tuple[int, int] = ()
+    content_rect: tuple[int, int, int, int] = ()
+
+
+@dataclass(frozen=True)
+class _GuiNodeGeometry:
+    name: str
+    x: int | None
+    y: int
+    width: int
+    height: int
+    horizontal_alignment: int | None
 
 
 def gui_resource_info(path: Path) -> GuiResourceInfo | None:
@@ -54,11 +67,154 @@ def _cached_gui_resource_info(
         if asset and normalized not in seen_assets:
             seen_assets.add(normalized)
             assets.append(asset)
+    nodes = _gui_node_geometry(raw)
+    root = max(
+        nodes,
+        key=lambda node: node.width * node.height,
+        default=None,
+    )
+    content = max(
+        (
+            node
+            for node in nodes
+            if re.search(r"(?:entry|body|text)", node.name, re.IGNORECASE)
+            and node.width > 0
+            and node.height > 0
+        ),
+        key=lambda node: (
+            node.name.casefold().startswith("entry"),
+            node.width * node.height,
+        ),
+        default=None,
+    )
+    root_size = (root.width, root.height) if root is not None else ()
+    content_rect: tuple[int, int, int, int] = ()
+    if root is not None and content is not None:
+        x = content.x
+        if x is None:
+            x = (
+                max(0, (root.width - content.width) // 2)
+                if content.horizontal_alignment == 4
+                else 0
+            )
+        content_rect = (x, content.y, content.width, content.height)
     return GuiResourceInfo(
         path,
         _gui_resource_name(path),
         tuple(assets),
+        root_size,
+        content_rect,
     )
+
+
+def _gui_node_geometry(raw: bytes) -> tuple[_GuiNodeGeometry, ...]:
+    property_ids = {
+        name: _gui_property_id(raw, name)
+        for name in (
+            "NODE_NAME",
+            "ABS_X",
+            "ABS_Y",
+            "ABS_WIDTH",
+            "ABS_HEIGHT",
+            "HALIGN",
+        )
+    }
+    node_id = property_ids["NODE_NAME"]
+    if not node_id:
+        return ()
+    nodes: list[_GuiNodeGeometry] = []
+    previous_end = 0
+    position = 0
+    while True:
+        position = raw.find(node_id, position)
+        if position < 0:
+            break
+        value = _gui_string_property(raw, position)
+        if value is None:
+            position += 1
+            continue
+        name, node_end = value
+        segment_start = previous_end
+        nodes.append(
+            _GuiNodeGeometry(
+                name=name,
+                x=_gui_integer_property(
+                    raw,
+                    property_ids["ABS_X"],
+                    segment_start,
+                    position,
+                ),
+                y=_gui_integer_property(
+                    raw,
+                    property_ids["ABS_Y"],
+                    segment_start,
+                    position,
+                )
+                or 0,
+                width=_gui_integer_property(
+                    raw,
+                    property_ids["ABS_WIDTH"],
+                    segment_start,
+                    position,
+                )
+                or 0,
+                height=_gui_integer_property(
+                    raw,
+                    property_ids["ABS_HEIGHT"],
+                    segment_start,
+                    position,
+                )
+                or 0,
+                horizontal_alignment=_gui_integer_property(
+                    raw,
+                    property_ids["HALIGN"],
+                    segment_start,
+                    position,
+                ),
+            )
+        )
+        previous_end = node_end
+        position = node_end
+    return tuple(nodes)
+
+
+def _gui_property_id(raw: bytes, name: str) -> bytes:
+    marker = name.encode("ascii") + b"\0"
+    position = raw.find(marker)
+    identifier_start = position + len(marker) + 4
+    if position < 0 or identifier_start + 4 > len(raw):
+        return b""
+    return raw[identifier_start : identifier_start + 4]
+
+
+def _gui_integer_property(
+    raw: bytes,
+    identifier: bytes,
+    start: int,
+    end: int,
+) -> int | None:
+    if not identifier:
+        return None
+    position = raw.rfind(identifier, start, end)
+    if position < 0 or position + 9 > len(raw) or raw[position + 4] != 1:
+        return None
+    return struct.unpack_from("<i", raw, position + 5)[0]
+
+
+def _gui_string_property(raw: bytes, position: int) -> tuple[str, int] | None:
+    if position + 9 > len(raw) or raw[position + 4] != 2:
+        return None
+    length = struct.unpack_from("<I", raw, position + 5)[0]
+    value_start = position + 9
+    value_end = value_start + length
+    if not 0 < length <= 256 or value_end > len(raw):
+        return None
+    value = raw[value_start:value_end].rstrip(b"\0")
+    try:
+        text = value.decode("ascii")
+    except UnicodeDecodeError:
+        return None
+    return (text, value_end) if text else None
 
 
 def resolve_panel_gui_resource(source_path: Path, panel_name: str) -> GuiResourceInfo | None:

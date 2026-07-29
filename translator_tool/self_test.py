@@ -43,6 +43,7 @@ from .self_tests.diagnostics import assert_diagnostics_are_bounded_and_content_f
 from .self_tests.performance import AI_CONTEXT_BUILD_LIMIT_SECONDS, assert_within_budget
 from .i18n import set_language, status_text, translate
 from .format_io import load_dbt, load_plain_text, matching_source_field, row_key
+from .gui_semantics import gui_resource_info
 from .preview import GLYPH_MARK, PreviewAtom, PreviewDocument, PreviewService
 from .recovery import apply_recovery_draft, clear_recovery_draft, load_recovery_draft, recovery_path, save_recovery_draft
 from .project import (
@@ -786,6 +787,91 @@ def assert_game_preview_draws_all_buttons() -> None:
     )
     if compact.width() != 344 or compact.height() != 240:
         raise AssertionError(f"short parchment previews should use the compact layout: {compact.size()!r}")
+    gui_temp = Path(tempfile.mkdtemp(prefix="translator_tool_gui_geometry_"))
+    try:
+        identifiers = {
+            name: bytes((0x91 + index, 0xA2 + index, 0xB3 + index, 0xC4 + index))
+            for index, name in enumerate(
+                (
+                    "NODE_NAME",
+                    "ABS_X",
+                    "ABS_Y",
+                    "ABS_WIDTH",
+                    "ABS_HEIGHT",
+                    "HALIGN",
+                ),
+                start=1,
+            )
+        }
+
+        def integer(name: str, value: int) -> bytes:
+            return identifiers[name] + b"\x01" + value.to_bytes(4, "little", signed=True)
+
+        def node(name: str, *, y: int, width: int, height: int, align: int | None = None) -> bytes:
+            raw_name = name.encode("ascii") + b"\0"
+            values = (
+                integer("ABS_Y", y)
+                + integer("ABS_WIDTH", width)
+                + integer("ABS_HEIGHT", height)
+            )
+            if align is not None:
+                values += integer("HALIGN", align)
+            return (
+                values
+                + identifiers["NODE_NAME"]
+                + b"\x02"
+                + len(raw_name).to_bytes(4, "little")
+                + raw_name
+            )
+
+        schema = b"".join(
+            name.encode("ascii") + b"\0" + b"\0" * 4 + identifier
+            for name, identifier in identifiers.items()
+        )
+        resource = gui_temp / "GUI" / "Hud" / "panel_messagebox.gui"
+        resource.parent.mkdir(parents=True)
+        resource.write_bytes(
+            schema
+            + node("Entrys", y=50, width=358, height=236, align=4)
+            + node("Messagebox", y=5, width=481, height=376)
+        )
+        geometry = gui_resource_info(resource)
+        if (
+            geometry is None
+            or geometry.root_size != (481, 376)
+            or geometry.content_rect != (61, 50, 358, 236)
+        ):
+            raise AssertionError(
+                f"binary GUI content geometry was not recovered: {geometry!r}"
+            )
+        gui_service = PreviewService(gui_temp)
+        gui_context = PreviewWindowContext(
+            "message",
+            "parchment",
+            PARCHMENT_TEXT,
+            layout="parchment",
+            gui_resource="GUI/Hud/panel_messagebox.gui",
+        )
+        gui_layout = gui_service._game_window_layout(
+            gui_context,
+            None,
+            PreviewDocument.from_atoms(
+                "Short body",
+                [PreviewAtom("Short body", 0, 10)],
+            ),
+            (),
+        )
+        if (
+            (gui_layout.width, gui_layout.height) != (385, 301)
+            or gui_layout.top != 40
+            or gui_layout.left_margin != 49
+            or gui_layout.right_margin != 50
+        ):
+            raise AssertionError(
+                f"messagebox preview ignored its GUI content rectangle: {gui_layout!r}"
+            )
+    finally:
+        shutil.rmtree(gui_temp, ignore_errors=True)
     dialogue = layout_service.game_window_image(
         None,
         None,

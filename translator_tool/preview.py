@@ -15,6 +15,7 @@ from PySide6.QtGui import QColor, QFont, QFontMetrics, QImage, QPainter, qRgba
 
 from .code_window_context import PreviewWindowContext
 from .format_io import dbt_row_values, load_dbt, translatable_fields
+from .gui_semantics import gui_resource_info
 from .i18n import translate
 from .preview_context_selection import select_preview_context
 from .preview_placeholders import PlaceholderContext, PlaceholderLabelRecord, PlaceholderValueBuilder
@@ -1065,7 +1066,17 @@ class PreviewService:
     ) -> GameWindowLayout:
         layout_kind = context.layout if context is not None and context.layout else ""
         dark_panel = context is not None and context.background in {"dark_panel", "overlay"}
-        if layout_kind == "book":
+        gui_geometry = self._game_window_gui_geometry(context)
+        if layout_kind == "parchment" and gui_geometry is not None:
+            (root_width, root_height), _content_rect = gui_geometry
+            candidates = tuple(
+                (
+                    max(1, round(root_width * scale)),
+                    max(1, round(root_height * scale)),
+                )
+                for scale in (0.8, 1.0, 1.2)
+            )
+        elif layout_kind == "book":
             candidates = ((520, 435), (622, 521), (720, 603))
         elif layout_kind == "document":
             candidates = ((400, 338), (520, 438), (620, 524))
@@ -1108,15 +1119,38 @@ class PreviewService:
             )
             right_margin = 26 if dark_panel else 34
             body_scale = 0.78 if dark_panel else 0.85
-        body_line_height = max(12, round(25 * body_scale))
-        header_line_height = 25
         button_gap = 6
 
         for index, (width, height) in enumerate(candidates):
-            usable_width = max(90, width - left_margin - right_margin)
+            candidate_top = top
+            candidate_left = left_margin
+            candidate_right = right_margin
+            candidate_body_scale = body_scale
+            content_bottom = height
+            if layout_kind == "parchment" and gui_geometry is not None:
+                (root_width, root_height), (x, y, content_width, content_height) = gui_geometry
+                scale_x = width / max(1, root_width)
+                scale_y = height / max(1, root_height)
+                candidate_top = round(y * scale_y)
+                candidate_left = round(x * scale_x)
+                candidate_right = max(
+                    0,
+                    width - round((x + content_width) * scale_x),
+                )
+                content_bottom = round((y + content_height) * scale_y)
+                candidate_body_scale = max(
+                    0.72,
+                    min(1.0, 0.85 * min(scale_x, scale_y)),
+                )
+            body_line_height = max(12, round(25 * candidate_body_scale))
+            header_line_height = max(16, round(25 * candidate_body_scale))
+            usable_width = max(
+                90,
+                width - candidate_left - candidate_right,
+            )
             text_columns = max(8, round(usable_width / 13))
             button_width = min(250, max(150, width - 92))
-            needed = top + 24
+            needed = candidate_top + 24
             if header is not None:
                 needed += _estimated_document_lines(header, text_columns) * header_line_height + 12
             if body is not None:
@@ -1124,11 +1158,53 @@ class PreviewService:
             if buttons:
                 needed += 10 + sum(_estimated_button_height(button, button_width) for button in buttons)
                 needed += max(0, len(buttons) - 1) * button_gap
-            if index >= minimum_index and needed <= height:
-                return GameWindowLayout(width, height, top, left_margin, right_margin, body_scale)
+            if index >= minimum_index and needed <= content_bottom:
+                return GameWindowLayout(
+                    width,
+                    height,
+                    candidate_top,
+                    candidate_left,
+                    candidate_right,
+                    candidate_body_scale,
+                )
 
         width, height = candidates[-1]
+        if layout_kind == "parchment" and gui_geometry is not None:
+            (root_width, root_height), (x, y, content_width, _content_height) = gui_geometry
+            scale_x = width / max(1, root_width)
+            scale_y = height / max(1, root_height)
+            return GameWindowLayout(
+                width,
+                height,
+                round(y * scale_y),
+                round(x * scale_x),
+                max(0, width - round((x + content_width) * scale_x)),
+                max(0.72, min(1.0, 0.85 * min(scale_x, scale_y))),
+            )
         return GameWindowLayout(width, height, top, left_margin, right_margin, body_scale)
+
+    def _game_window_gui_geometry(
+        self,
+        context: PreviewWindowContext | None,
+    ) -> tuple[tuple[int, int], tuple[int, int, int, int]] | None:
+        if (
+            context is None
+            or self.game_root is None
+            or not context.gui_resource
+            or context.gui_resource.startswith("engine:")
+        ):
+            return None
+        path = self.game_root.joinpath(
+            *context.gui_resource.replace("\\", "/").split("/")
+        )
+        info = gui_resource_info(path)
+        if (
+            info is None
+            or len(info.root_size) != 2
+            or len(info.content_rect) != 4
+        ):
+            return None
+        return info.root_size, info.content_rect
 
     def _game_window_background(self, context: PreviewWindowContext | None, width: int, height: int) -> QImage | None:
         name = self._game_window_background_name(context)
