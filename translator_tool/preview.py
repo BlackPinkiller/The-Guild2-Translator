@@ -68,6 +68,13 @@ class PreviewAtom:
     final_style: bool = False
 
 
+@dataclass
+class _NativeTextRun:
+    text: str
+    color: QColor
+    width: int
+
+
 @dataclass(frozen=True)
 class PreviewSpan:
     display_start: int
@@ -1430,20 +1437,60 @@ class PreviewService:
         symbol_atlas = self._atlas(target)
         standard_family = self._standard_font_family(target)
         text_atlas = None if standard_family else symbol_atlas
-        lines: list[list[QImage]] = [[]]
+        native_font = QFont(standard_family) if standard_family else None
+        if native_font is not None:
+            native_font.setPixelSize(max(12, round(24 * scale)))
+        native_metrics = (
+            QFontMetrics(native_font, painter.device())
+            if native_font is not None
+            else None
+        )
+        lines: list[list[QImage | _NativeTextRun]] = [[]]
         widths = [0]
         line_height = max(12, round(25 * scale))
         max_lines = max(1, (painter.device().height() - top - 28) // line_height)
         stopped = False
 
+        def next_line() -> bool:
+            if len(lines) >= max_lines:
+                return False
+            lines.append([])
+            widths.append(0)
+            return True
+
         def append_image(image: QImage) -> bool:
             if widths[-1] + image.width() > right - left and lines[-1]:
-                if len(lines) >= max_lines:
+                if not next_line():
                     return False
-                lines.append([])
-                widths.append(0)
             lines[-1].append(image)
             widths[-1] += image.width()
+            return True
+
+        def append_text(char: str, color: QColor) -> bool:
+            if native_metrics is None:
+                return False
+            previous = lines[-1][-1] if lines[-1] else None
+            if isinstance(previous, _NativeTextRun) and previous.color == color:
+                merged = previous.text + char
+                merged_width = max(1, native_metrics.horizontalAdvance(merged))
+                added_width = merged_width - previous.width
+            else:
+                merged = char
+                merged_width = max(1, native_metrics.horizontalAdvance(char))
+                added_width = merged_width
+            if widths[-1] + added_width > right - left and lines[-1]:
+                if not next_line():
+                    return False
+                previous = None
+                merged = char
+                merged_width = max(1, native_metrics.horizontalAdvance(char))
+                added_width = merged_width
+            if isinstance(previous, _NativeTextRun) and previous.color == color:
+                previous.text = merged
+                previous.width = merged_width
+            else:
+                lines[-1].append(_NativeTextRun(merged, QColor(color), merged_width))
+            widths[-1] += added_width
             return True
 
         for atom in document.atoms:
@@ -1461,14 +1508,17 @@ class PreviewService:
             color = QColor(*(atom.color or default_color))
             for char in atom.text.replace(PREVIEW_MARK, ""):
                 if char == "\n":
-                    if len(lines) >= max_lines:
+                    if not next_line():
                         stopped = True
                         break
-                    lines.append([])
-                    widths.append(0)
                     continue
                 if char == "\t":
                     char = " "
+                if native_font is not None:
+                    if not append_text(char, color):
+                        stopped = True
+                        break
+                    continue
                 for codepoint in self._game_codepoints(char, target):
                     glyph = (
                         text_atlas.glyph(codepoint)
@@ -1490,12 +1540,23 @@ class PreviewService:
             if stopped:
                 break
         y = top
-        for images, width in zip(lines, widths):
+        painter.save()
+        if native_font is not None:
+            painter.setRenderHint(QPainter.RenderHint.TextAntialiasing, True)
+            painter.setFont(native_font)
+        for items, width in zip(lines, widths):
             x = left + max(0, (right - left - width) // 2) if centered else left
-            for image in images:
-                painter.drawImage(x, y + max(0, (line_height - image.height()) // 2), image)
-                x += image.width()
+            for item in items:
+                if isinstance(item, _NativeTextRun) and native_metrics is not None:
+                    painter.setPen(item.color)
+                    baseline = y + max(0, (line_height - native_metrics.height()) // 2) + native_metrics.ascent()
+                    painter.drawText(x, baseline, item.text)
+                    x += item.width
+                else:
+                    painter.drawImage(x, y + max(0, (line_height - item.height()) // 2), item)
+                    x += item.width()
             y += line_height
+        painter.restore()
         return y
 
     def _system_text_glyph(

@@ -3314,6 +3314,8 @@ def assert_preview_i18n_and_symbol_mapping() -> None:
             (Path(os.environ.get("WINDIR", "C:/Windows")) / "Fonts").glob("*.ttf")
         )
         if windows_fonts:
+            from PySide6.QtCore import Qt
+            from PySide6.QtGui import QImage, QPainter
             from PySide6.QtWidgets import QApplication
 
             font_app = QApplication.instance()
@@ -3331,6 +3333,35 @@ def assert_preview_i18n_and_symbol_mapping() -> None:
             standard_glyph = standard_font_service.text_glyph_image("A", True)
             if standard_glyph is None or standard_glyph.isNull():
                 raise AssertionError("a configured TTF did not render preview text")
+            standard_font_service._system_text_glyph = (  # type: ignore[method-assign]
+                lambda *_args, **_kwargs: (_ for _ in ()).throw(
+                    AssertionError("hover preview rasterized a standard font into glyph images")
+                )
+            )
+            native_canvas = QImage(160, 50, QImage.Format.Format_ARGB32_Premultiplied)
+            native_canvas.fill(Qt.GlobalColor.transparent)
+            native_painter = QPainter(native_canvas)
+            native_document = PreviewDocument.from_atoms(
+                "Native",
+                [PreviewAtom("Native", 0, 6)],
+            )
+            standard_font_service._draw_game_document(
+                native_painter,
+                native_document,
+                target=True,
+                top=0,
+                left=0,
+                right=160,
+                scale=1.0,
+                centered=False,
+            )
+            native_painter.end()
+            if not any(
+                native_canvas.pixelColor(x, y).alpha()
+                for y in range(native_canvas.height())
+                for x in range(native_canvas.width())
+            ):
+                raise AssertionError("native hover preview text was not painted")
 
         semantic = service.render(
             "%1SN >%2l< >%3l<",
