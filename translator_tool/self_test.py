@@ -3265,8 +3265,51 @@ def assert_preview_i18n_and_symbol_mapping() -> None:
         )
         if "%2l" in quoted_placeholder.display_text or "%1NAME" in quoted_placeholder.display_text:
             raise AssertionError("placeholders inside >...< or followed by plain text were left raw")
-        if ">" not in quoted_placeholder.display_text or "<" not in quoted_placeholder.display_text:
-            raise AssertionError(">...< fallback should keep visible angle markers")
+        if "『" not in quoted_placeholder.display_text or "』" not in quoted_placeholder.display_text:
+            raise AssertionError(">...< should use the game's visible corner quotes")
+        open_quote = service.render(
+            "before >unfinished and closed<",
+            unit_key="same-entry",
+            label="OPEN_QUOTE",
+            file_rel="Text.dbt",
+            kind="dbt",
+            target=False,
+        )
+        if open_quote.display_text != "before 『unfinished and closed』":
+            raise AssertionError(
+                f"unpaired angle markers did not use game corner quotes: {open_quote.display_text!r}"
+            )
+        service.update_project_localization(
+            "_RELATED_TEXT_+0",
+            "first$Nsecond >quoted<",
+            "第一行$N第二行 >引用<",
+        )
+        related_newline = service.render(
+            "%1l",
+            unit_key="same-entry",
+            label="RELATED_NEWLINE",
+            file_rel="Text.dbt",
+            kind="dbt",
+            target=False,
+            references=(
+                CodeReference(
+                    "RELATED_NEWLINE",
+                    temp / "Scripts" / "Related.lua",
+                    1,
+                    1,
+                    "MsgQuick",
+                    1,
+                    runtime_arguments=("RelatedLabel",),
+                    runtime_argument_values=(("@L_RELATED_TEXT_+0",),),
+                    runtime_argument_kinds=(("label",),),
+                    role="body",
+                ),
+            ),
+        )
+        if related_newline.display_text != "first\nsecond 『quoted』":
+            raise AssertionError(
+                f"format controls in a referenced label were not rendered: {related_newline.display_text!r}"
+            )
 
         semantic = service.render(
             "%1SN >%2l< >%3l<",

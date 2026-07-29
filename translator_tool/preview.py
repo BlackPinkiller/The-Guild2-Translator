@@ -1651,15 +1651,48 @@ class _PreviewCompiler:
         position = 0
         for match in pattern.finditer(text):
             if match.start() > position:
-                self._emit(text[position : match.start()], position, match.start())
+                self._emit_plain(text[position : match.start()], position)
             handler(match.group(0), match.start(), match.end())
             position = match.end()
         if position < len(text):
-            self._emit(text[position:], position, len(text))
+            self._emit_plain(text[position:], position)
+
+    def _emit_plain(self, text: str, raw_start: int) -> None:
+        position = 0
+        for match in re.finditer(r"[<>]", text):
+            if match.start() > position:
+                self._emit(
+                    text[position : match.start()],
+                    raw_start + position,
+                    raw_start + match.start(),
+                )
+            self._emit(
+                "『" if match.group(0) == ">" else "』",
+                raw_start + match.start(),
+                raw_start + match.end(),
+                replacement=True,
+            )
+            position = match.end()
+        if position < len(text):
+            self._emit(
+                text[position:],
+                raw_start + position,
+                raw_start + len(text),
+            )
+
+    @staticmethod
+    def _embedded_argument_text(text: str) -> str:
+        """Apply game display controls contained in a referenced label value."""
+        return (
+            text.replace("$N", "\n")
+            .replace("$T", "\t")
+            .replace(">", "『")
+            .replace("<", "』")
+        )
 
     def _guild2_token(self, token: str, start: int, end: int) -> None:
         if self.quote_re.fullmatch(token):
-            self._emit(">", start, start + 1, replacement=True)
+            self._emit("『", start, start + 1, replacement=True)
             inner_start = start + 1
             inner_end = end - 1
             if inner_start < inner_end:
@@ -1687,7 +1720,7 @@ class _PreviewCompiler:
                             atom.final_style,
                         )
                     )
-            self._emit("<", end - 1, end, replacement=True)
+            self._emit("』", end - 1, end, replacement=True)
             return
         if token.startswith("$[") and token.endswith("$]"):
             self._emit(PREVIEW_MARK, start, start + 2, replacement=True)
@@ -1725,10 +1758,10 @@ class _PreviewCompiler:
             self._emit("\t", start, end, replacement=True)
             return
         if token in {"$>", "%>"}:
-            self._emit(">", start, end, replacement=True)
+            self._emit("『", start, end, replacement=True)
             return
         if token in {"$<", "%<"}:
-            self._emit("<", start, end, replacement=True)
+            self._emit("』", start, end, replacement=True)
             return
         if token in {"$Z", "$L", "$R"}:
             self._emit(PREVIEW_MARK, start, end, replacement=True)
@@ -1790,7 +1823,13 @@ class _PreviewCompiler:
                 self.references,
                 self.argument_suffixes,
             )
-            self._emit(value, start, end, replacement=True, glyph_id=glyph_id)
+            self._emit(
+                self._embedded_argument_text(value),
+                start,
+                end,
+                replacement=True,
+                glyph_id=glyph_id,
+            )
             return
         if PRINTF_PREVIEW_RE.fullmatch(token):
             suffix = token[-1].casefold()

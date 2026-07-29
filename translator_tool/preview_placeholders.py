@@ -1216,6 +1216,6 @@ def _clean_sample_text(value: str) -> str:
     import re
 
     cleaned = re.sub(r"#E\[[^\]]+\]", "", value)
-    cleaned = cleaned.replace("$N", " ").replace("$T", " ")
+    cleaned = cleaned.replace("$N", "\ue000N").replace("$T", "\ue000T")
     cleaned = re.sub(r"\s+", " ", cleaned)
-    return cleaned.strip()
+    return cleaned.strip().replace("\ue000N", "$N").replace("\ue000T", "$T")
