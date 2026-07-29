@@ -30,7 +30,7 @@ def select_preview_context(
         return PreviewContextSelection()
     ranked: list[
         tuple[
-            tuple[int, int, int, int, int],
+            tuple[int, int, int, int, int, int],
             int,
             CodeReference,
             PreviewWindowContext | None,
@@ -47,6 +47,7 @@ def select_preview_context(
             int(relevant_window),
             int(complete),
             placeholder_reference_score(text, reference),
+            _surface_selection_priority(window) if relevant_window else 0,
             context_detail,
             int(reference.confidence),
         )
@@ -79,3 +80,11 @@ def _window_context_detail(context: PreviewWindowContext | None) -> int:
         score += 2
     score += min(3, len(context.buttons))
     return score
+
+
+def _surface_selection_priority(context: PreviewWindowContext | None) -> int:
+    if context is None:
+        return 0
+    if context.surface in {"measure_choice", "measure_help", "questbook"}:
+        return 1
+    return 2

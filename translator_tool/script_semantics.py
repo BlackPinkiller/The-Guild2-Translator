@@ -12,6 +12,10 @@ class CallContract:
     label_roles: tuple[tuple[int, str], ...]
     runtime_start: int
     button_arguments: tuple[int, ...] = ()
+    surface: str = ""
+    panel_argument: int | None = None
+    category_argument: int | None = None
+    speaker_argument: int | None = None
 
     def role_for(self, argument_index: int, expression: str) -> str:
         if argument_index in self.button_arguments or "@B[" in expression:
@@ -25,30 +29,118 @@ class CallContract:
 
 
 _FIXED_CALL_CONTRACTS: dict[str, CallContract] = {
-    "msgbox": CallContract(((3, "header"), (4, "body")), 5, (2,)),
-    "msgboxnowait": CallContract(((2, "header"), (3, "body")), 4),
-    "msgnews": CallContract(((6, "header"), (7, "body")), 8, (2,)),
-    "msgnewsnowait": CallContract(((5, "header"), (6, "body")), 7, (2,)),
-    "msgquick": CallContract(((1, "body"),), 2),
-    "msgmeasure": CallContract(((1, "body"),), 2),
-    "msgsay": CallContract(((1, "body"),), 2),
-    "msgsaynowait": CallContract(((1, "body"),), 2),
-    "msgsayinteraction": CallContract(((4, "header"), (5, "body")), 6, (3,)),
-    "showtutorialboxnowait": CallContract(((2, "header"), (3, "body")), 4),
-    "msgquest": CallContract(((2, "header"), (3, "body")), 4),
-    "oshsetmeasurecost": CallContract(((0, "body"),), 1),
-    "oshsetmeasureruntime": CallContract(((0, "body"),), 1),
-    "oshsetmeasurerepeat": CallContract(((0, "body"),), 1),
-    "feedback_overheadskill": CallContract(((1, "body"),), 3),
-    "feedback_overheadcomment": CallContract(((1, "body"),), 4),
-    "showoverheadsymbol": CallContract(((4, "body"),), 5),
-    "simadddatebookentry": CallContract(((3, "header"), (4, "body")), 5),
-    "cityschedulecutsceneevent": CallContract(((6, "body"),), 7),
-    "setquesttitle": CallContract(((1, "body"),), 2),
-    "setquestdescription": CallContract(((1, "body"),), 2),
-    "setmainquesttitle": CallContract(((1, "body"),), 2),
-    "setmainquestdescription": CallContract(((1, "body"),), 2),
-    "initdata": CallContract(((2, "header"), (3, "body")), 4, (0,)),
+    "msgbox": CallContract(
+        ((3, "header"), (4, "body")),
+        5,
+        (2,),
+        "messagebox",
+        panel_argument=2,
+    ),
+    "msgboxnowait": CallContract(((2, "header"), (3, "body")), 4, surface="messagebox"),
+    "msgnews": CallContract(
+        ((6, "header"), (7, "body")),
+        8,
+        (2,),
+        "news",
+        panel_argument=2,
+        category_argument=4,
+    ),
+    "msgnewsnowait": CallContract(
+        ((5, "header"), (6, "body")),
+        7,
+        (2,),
+        "news",
+        panel_argument=2,
+        category_argument=3,
+    ),
+    "msgquick": CallContract(((1, "body"),), 2, surface="quick_message"),
+    "msgmeasure": CallContract(((1, "body"),), 2, surface="measure_message"),
+    "msgsystem": CallContract(((1, "body"),), 2, surface="system_message"),
+    "msgsay": CallContract(
+        ((1, "body"),),
+        2,
+        surface="dialog",
+        speaker_argument=0,
+    ),
+    "msgsaynowait": CallContract(
+        ((1, "body"),),
+        2,
+        surface="dialog",
+        speaker_argument=0,
+    ),
+    "msgsayinteraction": CallContract(
+        ((5, "body"),),
+        6,
+        (3,),
+        "dialog",
+        panel_argument=3,
+        speaker_argument=1,
+    ),
+    "msgsayinteractionnowait": CallContract(
+        ((5, "body"),),
+        6,
+        (3,),
+        "dialog",
+        panel_argument=3,
+        speaker_argument=1,
+    ),
+    "showtutorialbox": CallContract(
+        ((7, "header"), (8, "body")),
+        10,
+        (6,),
+        "tutorial",
+        panel_argument=6,
+    ),
+    "showtutorialboxnowait": CallContract(
+        ((6, "header"), (7, "body")),
+        9,
+        surface="tutorial",
+    ),
+    "msgquest": CallContract(
+        ((3, "header"), (4, "body")),
+        5,
+        (2,),
+        "questbox",
+        panel_argument=2,
+    ),
+    "msgquestnowait": CallContract(
+        ((2, "header"), (3, "body")),
+        4,
+        surface="questbox",
+    ),
+    "msgquestintro": CallContract(((0, "body"),), 1, surface="quest_intro"),
+    "oshsetmeasurecost": CallContract(((0, "body"),), 1, surface="measure_help"),
+    "oshsetmeasureruntime": CallContract(((0, "body"),), 1, surface="measure_help"),
+    "oshsetmeasurerepeat": CallContract(((0, "body"),), 1, surface="measure_help"),
+    "feedback_overheadskill": CallContract(((1, "body"),), 3, surface="overhead"),
+    "feedback_overheadcomment": CallContract(((1, "body"),), 4, surface="overhead"),
+    "showoverheadsymbol": CallContract(((4, "body"),), 5, surface="overhead"),
+    "simadddatebookentry": CallContract(
+        ((3, "header"), (4, "body")),
+        5,
+        surface="datebook",
+    ),
+    "cityschedulecutsceneevent": CallContract(
+        ((6, "body"),),
+        7,
+        surface="city_schedule",
+    ),
+    "setquesttitle": CallContract(((0, "header"),), 1, surface="questbook"),
+    "setquestdescription": CallContract(((0, "body"),), 2, surface="questbook"),
+    "setquestdescriptionbyquestname": CallContract(
+        ((2, "body"),),
+        4,
+        surface="questbook",
+    ),
+    "setmainquesttitle": CallContract(((1, "header"),), 2, surface="questbook"),
+    "setmainquestdescription": CallContract(((1, "body"),), 2, surface="questbook"),
+    "initdata": CallContract(
+        ((2, "header"), (3, "body")),
+        4,
+        (0,),
+        "measure_choice",
+        panel_argument=0,
+    ),
 }
 
 
@@ -90,6 +182,7 @@ def _semantic_call_contract(
         tuple(roles),
         max(text_indices) + 1,
         buttons,
+        "news" if call.name.casefold().startswith("feedback_message") else "",
     )
 
 

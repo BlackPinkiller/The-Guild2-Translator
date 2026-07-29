@@ -20,7 +20,54 @@ from ..preview_placeholders import (
     PlaceholderValueBuilder,
     _placeholder_expression,
 )
-from ..script_semantics import analyze_script
+from ..script_semantics import analyze_script, call_contract
+
+
+def assert_display_call_contracts_match_engine_signatures() -> None:
+    expected = {
+        "MsgBox": (((3, "header"), (4, "body")), 5, (2,), "messagebox"),
+        "MsgBoxNoWait": (((2, "header"), (3, "body")), 4, (), "messagebox"),
+        "MsgNews": (((6, "header"), (7, "body")), 8, (2,), "news"),
+        "MsgNewsNoWait": (((5, "header"), (6, "body")), 7, (2,), "news"),
+        "MsgQuest": (((3, "header"), (4, "body")), 5, (2,), "questbox"),
+        "MsgQuestNoWait": (((2, "header"), (3, "body")), 4, (), "questbox"),
+        "MsgQuestIntro": (((0, "body"),), 1, (), "quest_intro"),
+        "MsgSayInteraction": (((5, "body"),), 6, (3,), "dialog"),
+        "MsgSayInteractionNoWait": (((5, "body"),), 6, (3,), "dialog"),
+        "MsgSystem": (((1, "body"),), 2, (), "system_message"),
+        "ShowTutorialBox": (((7, "header"), (8, "body")), 10, (6,), "tutorial"),
+        "ShowTutorialBoxNoWait": (((6, "header"), (7, "body")), 9, (), "tutorial"),
+        "SetQuestTitle": (((0, "header"),), 1, (), "questbook"),
+        "SetQuestDescription": (((0, "body"),), 2, (), "questbook"),
+        "SetQuestDescriptionByQuestname": (((2, "body"),), 4, (), "questbook"),
+        "SetMainQuestTitle": (((1, "header"),), 2, (), "questbook"),
+        "SetMainQuestDescription": (((1, "body"),), 2, (), "questbook"),
+    }
+    for call_name, values in expected.items():
+        contract = call_contract(call_name)
+        if contract is None:
+            raise AssertionError(f"documented display call is missing a contract: {call_name}")
+        actual = (
+            contract.label_roles,
+            contract.runtime_start,
+            contract.button_arguments,
+            contract.surface,
+        )
+        if actual != values:
+            raise AssertionError(
+                f"display contract does not match the documented {call_name} signature: {actual!r}"
+            )
+
+    news = call_contract("MsgNewsNoWait")
+    if news is None or news.panel_argument != 2 or news.category_argument != 3:
+        raise AssertionError(f"news presentation arguments were not described separately: {news!r}")
+    interaction = call_contract("MsgSayInteraction")
+    if (
+        interaction is None
+        or interaction.panel_argument != 3
+        or interaction.speaker_argument != 1
+    ):
+        raise AssertionError(f"dialog presentation arguments were not retained: {interaction!r}")
 
 
 def assert_code_semantics_are_scope_and_role_aware() -> None:

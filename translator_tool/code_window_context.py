@@ -5,7 +5,7 @@ import re
 
 from .code_index import CodeReference, LABEL_RE, dynamic_label_patterns, normalize_label
 from .engine_semantics import engine_format_preview_style
-from .script_semantics import call_contract
+from .script_semantics import CallContract, call_contract
 
 
 PARCHMENT_TEXT = (55, 38, 24, 255)
@@ -29,6 +29,10 @@ class PreviewWindowContext:
     buttons: tuple[PreviewWindowButton, ...] = ()
     argument_labels: tuple[str, ...] = ()
     call_name: str = ""
+    surface: str = ""
+    panel: str = ""
+    category: str = ""
+    speaker: str = ""
 
     @property
     def labels(self) -> tuple[str, ...]:
@@ -54,7 +58,9 @@ def window_context_for_reference(reference: CodeReference, current_label: str = 
     call_name = (reference.call_name or "").casefold()
     if not call_name:
         return None
-    if not _is_window_call(call_name):
+    contract = call_contract(call_name)
+    surface = _surface_for_call(call_name, contract)
+    if not surface:
         return None
     arguments = tuple(str(argument) for argument in reference.arguments)
     argument_expressions = _argument_expressions(reference, arguments)
@@ -83,9 +89,9 @@ def window_context_for_reference(reference: CodeReference, current_label: str = 
         argument_labels = (*argument_labels, referenced_label)
     if not header_label and not body_label and not buttons:
         return None
-    background = _background_for_call(call_name)
+    kind, background = _presentation_for_surface(surface)
     return PreviewWindowContext(
-        kind=_kind_for_call(call_name),
+        kind=kind,
         background=background,
         default_color=DARK_PANEL_TEXT if background == "dark_panel" else PARCHMENT_TEXT,
         header_label=header_label,
@@ -93,6 +99,10 @@ def window_context_for_reference(reference: CodeReference, current_label: str = 
         buttons=buttons,
         argument_labels=argument_labels,
         call_name=call_name,
+        surface=surface,
+        panel=_contract_argument_hint(argument_expressions, contract.panel_argument if contract else None),
+        category=_contract_argument_hint(argument_expressions, contract.category_argument if contract else None),
+        speaker=_contract_argument_hint(argument_expressions, contract.speaker_argument if contract else None),
     )
 
 
@@ -135,45 +145,34 @@ def _engine_label_role(label: str) -> str:
     return "body"
 
 
-def _is_window_call(call_name: str) -> bool:
-    return (
-        call_name in {
-            "msgbox",
-            "msgboxnowait",
-            "msgnews",
-            "msgnewsnowait",
-            "msgquick",
-            "msgquest",
-            "msgmeasure",
-            "msgsay",
-            "msgsaynowait",
-            "msgsayinteraction",
-            "showtutorialboxnowait",
-            "simadddatebookentry",
-            "cityschedulecutsceneevent",
-        }
-        or call_name.startswith("feedback_message")
-    )
-
-
-def _kind_for_call(call_name: str) -> str:
+def _surface_for_call(call_name: str, contract: CallContract | None = None) -> str:
+    resolved = contract if contract is not None else call_contract(call_name)
+    surface = str(getattr(resolved, "surface", "") or "")
+    if surface:
+        return surface
     if call_name.startswith("feedback_message"):
-        return "feedback"
-    if call_name in {"msgquick", "msgsay", "msgsaynowait", "msgsayinteraction"}:
-        return "short"
-    if call_name in {"msgnews", "msgnewsnowait"}:
         return "news"
-    if call_name in {"simadddatebookentry", "cityschedulecutsceneevent"}:
-        return "datebook"
-    if call_name == "msgquest":
-        return "quest"
-    return "message"
+    return ""
 
 
-def _background_for_call(call_name: str) -> str:
-    if call_name in {"msgbox", "msgboxnowait", "msgquest"}:
-        return "parchment"
-    return "dark_panel"
+def _presentation_for_surface(surface: str) -> tuple[str, str]:
+    return {
+        "messagebox": ("message", "parchment"),
+        "questbox": ("quest", "parchment"),
+        "news": ("news", "dark_panel"),
+        "dialog": ("short", "dark_panel"),
+        "quick_message": ("short", "dark_panel"),
+        "measure_message": ("short", "dark_panel"),
+        "system_message": ("short", "dark_panel"),
+        "tutorial": ("tutorial", "dark_panel"),
+        "quest_intro": ("quest_intro", "dark_panel"),
+        "questbook": ("questbook", "dark_panel"),
+        "measure_choice": ("measure_choice", "dark_panel"),
+        "measure_help": ("onscreen_help", "dark_panel"),
+        "overhead": ("overhead", "dark_panel"),
+        "datebook": ("datebook", "dark_panel"),
+        "city_schedule": ("datebook", "dark_panel"),
+    }.get(surface, ("message", "parchment"))
 
 
 def _argument_expressions(
@@ -185,6 +184,21 @@ def _argument_expressions(
         tuple(dict.fromkeys((*(resolved[index] if index < len(resolved) else ()), argument)))
         for index, argument in enumerate(arguments)
     )
+
+
+def _contract_argument_hint(
+    arguments: tuple[tuple[str, ...], ...],
+    argument_index: int | None,
+) -> str:
+    if argument_index is None or argument_index >= len(arguments):
+        return ""
+    expressions = arguments[argument_index]
+    for expression in reversed(expressions):
+        value = expression.strip()
+        match = STRING_LITERAL_RE.fullmatch(value)
+        if match is not None:
+            return (match.group(1) or match.group(2) or "").strip()
+    return expressions[-1].strip() if expressions else ""
 
 
 def _labels_by_argument(

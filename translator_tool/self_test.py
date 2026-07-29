@@ -71,6 +71,7 @@ from .self_tests.code_semantics import (
     assert_cross_file_function_summaries_bind_arguments_and_expand_returns,
     assert_cross_file_function_summaries_follow_nested_dependencies,
     assert_cross_file_return_labels_flow_only_to_real_callers,
+    assert_display_call_contracts_match_engine_signatures,
     assert_code_semantics_follow_fields_panels_and_initdata,
     assert_code_semantics_are_scope_and_role_aware,
     assert_code_semantics_resolve_local_function_returns,
@@ -476,9 +477,13 @@ def assert_code_window_context_extracts_window_labels_and_buttons() -> None:
                     'MsgSayInteraction("","Child","",',
                     '    "@B[0,@L_MEASURE_BUYGOLDRING_OPTION_+0]"..',
                     '    "@B[1,@L_MEASURE_BUYGOLDRING_OPTION_+1]",',
-                    '    "@L_MEASURE_BUYGOLDRING_HEAD_+0",',
+                    '    ms_buygoldring_AIDecide,',
                     '    "@L_MEASURE_BUYGOLDRING_QUESTION_+0",',
                     '    GetID(""), Cost)',
+                    'MsgQuest("#Player", 0, "MB_OK",',
+                    '    "@L_TUTORIAL_CAMERA_NAME", "@L_TUTORIAL_CAMERA_SUCCESS")',
+                    'ShowTutorialBoxNoWait(100, 700, 470, 180, 1, LEFTLOWER_NOARROW,',
+                    '    "@L_TUTORIAL_MOVEMENT_NAME", "@L_TUTORIAL_MOVEMENT_TASK", "")',
                     'SimAddDatebookEntry("accuser", EventTime, "courtbuilding",',
                     '    "@L_TRIAL_DATEBOOK_HEAD_+0",',
                     '    "@L_TRIAL_DATEBOOK_BODY_+0", GetID("accuser"), GetSettlementID(""))',
@@ -556,10 +561,32 @@ def assert_code_window_context_extracts_window_labels_and_buttons() -> None:
         interaction_context = best_window_context(interaction_refs, "MEASURE_BUYGOLDRING_OPTION_+0")
         if interaction_context is None:
             raise AssertionError("MsgSayInteraction context was not built for button labels")
-        if interaction_context.header_label != "measure_buygoldring_head_+0":
-            raise AssertionError(f"MsgSayInteraction head label was not extracted: {interaction_context!r}")
+        if interaction_context.header_label:
+            raise AssertionError(f"MsgSayInteraction AI callback was treated as a title: {interaction_context!r}")
         if interaction_context.body_label != "measure_buygoldring_question_+0":
             raise AssertionError(f"MsgSayInteraction body label was not extracted: {interaction_context!r}")
+        if interaction_context.speaker != "Child" or interaction_context.panel == "":
+            raise AssertionError(f"dialog presentation arguments were not retained: {interaction_context!r}")
+        quest_refs = index.references_for("TUTORIAL_CAMERA_SUCCESS").project
+        quest_context = best_window_context(quest_refs, "TUTORIAL_CAMERA_SUCCESS")
+        if (
+            quest_context is None
+            or quest_context.header_label != "tutorial_camera_name"
+            or quest_context.body_label != "tutorial_camera_success"
+            or quest_context.surface != "questbox"
+        ):
+            raise AssertionError(f"MsgQuest used shifted title/body arguments: {quest_context!r}")
+        tutorial_refs = index.references_for("TUTORIAL_MOVEMENT_TASK").project
+        tutorial_context = best_window_context(tutorial_refs, "TUTORIAL_MOVEMENT_TASK")
+        if (
+            tutorial_context is None
+            or tutorial_context.header_label != "tutorial_movement_name"
+            or tutorial_context.body_label != "tutorial_movement_task"
+            or tutorial_context.surface != "tutorial"
+        ):
+            raise AssertionError(
+                f"ShowTutorialBoxNoWait used coordinate arguments as labels: {tutorial_context!r}"
+            )
         datebook_refs = index.references_for("TRIAL_DATEBOOK_BODY_+0").project
         datebook_context = best_window_context(datebook_refs, "TRIAL_DATEBOOK_BODY_+0")
         if datebook_context is None or datebook_context.kind != "datebook":
@@ -570,8 +597,10 @@ def assert_code_window_context_extracts_window_labels_and_buttons() -> None:
             raise AssertionError(f"datebook body was not retained: {datebook_context!r}")
         schedule_refs = index.references_for("COUNCIL_SCHEDULE_+0").project
         schedule_context = best_window_context(schedule_refs, "COUNCIL_SCHEDULE_+0")
-        if schedule_context is None or schedule_context.kind != "datebook":
-            raise AssertionError(f"scheduled event did not receive the datebook profile: {schedule_context!r}")
+        if schedule_context is None or schedule_context.surface != "city_schedule":
+            raise AssertionError(
+                f"city schedule text was collapsed into another presentation: {schedule_context!r}"
+            )
     finally:
         safe_rmtree(temp)
 
@@ -3974,6 +4003,7 @@ def main() -> int:
     assert_local_project_roots_detect_sources_projects()
     assert_discover_game_source_projects_detects_vanilla_and_mods()
     assert_code_reference_index_avoids_db_and_uses_vanilla_fallback()
+    assert_display_call_contracts_match_engine_signatures()
     assert_code_semantics_are_scope_and_role_aware()
     assert_code_semantics_resolve_local_function_returns()
     assert_code_semantics_follow_fields_panels_and_initdata()
