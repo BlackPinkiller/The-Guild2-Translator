@@ -26,7 +26,7 @@ from .validation import (
     FORMAT_TOOLTIP,
     GUIDE_TOKEN_RE,
     GUILD2_TOKEN_RE,
-    ARG_SUFFIXES,
+    ARG_PREVIEW_TOKEN,
     PRINTF_TOKEN,
     QUOTE_STYLE_TOKEN,
     TOOLTIP_TOKEN_RE,
@@ -40,8 +40,7 @@ FONT_RECORD_RE = re.compile(
     r"(?:^|/)fonts/(?P<font>.+)_(?P<start>\d+)-(?P<end>\d+)\.tga(?P<index>\d+)$",
     re.IGNORECASE,
 )
-ARG_PREVIEW_SUFFIX_RE = "|".join(re.escape(suffix) for suffix in sorted(ARG_SUFFIXES, key=len, reverse=True))
-ARG_PREVIEW_RE = re.compile(rf"%(\d+)({ARG_PREVIEW_SUFFIX_RE})?")
+ARG_PREVIEW_RE = re.compile(ARG_PREVIEW_TOKEN)
 PRINTF_PREVIEW_RE = re.compile(PRINTF_TOKEN)
 SYMBOL_PREVIEW_RE = re.compile(r"\$S\[\s*(\d+)\s*\]")
 COLOR_VALUE_RE = re.compile(r"\d+")

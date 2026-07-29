@@ -18,37 +18,43 @@ from .i18n import translate
 from .script_semantics import (
     SEMANTIC_BUILDING,
     SEMANTIC_CHARACTER,
+    SEMANTIC_DYNASTY_CREST,
     SEMANTIC_DYNASTY,
     SEMANTIC_SETTLEMENT,
     SEMANTIC_STRUCTURE,
     SEMANTIC_TEXT,
     variadic_argument_pack,
 )
+from .validation import ARG_PREVIEW_TOKEN
 
 
 GLYPH_MARK = "\ufffc"
-_NESTED_PLACEHOLDER_RE = re.compile(r"%(\d+)([A-Za-z]*)")
+_NESTED_PLACEHOLDER_RE = re.compile(ARG_PREVIEW_TOKEN)
 _CHARACTER_SUFFIXES = frozenset(
     {"SN", "SV", "SZ", "SK", "ST", "SA", "SD", "SB", "SL"}
 )
 _BUILDING_SUFFIXES = frozenset({"GG", "GN", "GT"})
 
 
-def placeholder_reference_score(text: str, reference: object) -> int:
-    placeholders = tuple(
+def placeholder_arguments(text: str) -> tuple[tuple[int, str], ...]:
+    return tuple(
         dict.fromkeys(
             (int(match.group(1)), match.group(2) or "")
             for match in _NESTED_PLACEHOLDER_RE.finditer(text)
         )
     )
+
+
+def placeholder_reference_score(text: str, reference: object) -> int:
+    placeholders = placeholder_arguments(text)
     return _reference_score(reference, placeholders)
 
 
 def placeholder_reference_complete(text: str, reference: object) -> bool:
     placeholders = tuple(
         dict.fromkeys(
-            int(match.group(1))
-            for match in _NESTED_PLACEHOLDER_RE.finditer(text)
+            number
+            for number, _suffix in placeholder_arguments(text)
         )
     )
     return all(_placeholder_expressions(reference, number) for number in placeholders)
@@ -379,6 +385,13 @@ class PlaceholderValueBuilder:
         if explicit is not None:
             return explicit
         if suffix in {"", "l", "s"}:
+            if (
+                suffix == "l"
+                and _runtime_argument_kinds(number, context)
+                == {SEMANTIC_DYNASTY_CREST}
+            ):
+                dynasty = self.entities.dynasty(number, context)
+                return PlaceholderValue(GLYPH_MARK, dynasty.crest_glyph_id)
             rendered = (
                 _plain_string_argument_value(number, context)
                 if suffix == "s"
@@ -566,6 +579,21 @@ def _plain_string_semantic_kind(
     return next(iter(kinds)) if len(kinds) == 1 else ""
 
 
+def _runtime_argument_kinds(
+    number: int,
+    context: PlaceholderContext,
+) -> set[str]:
+    kinds: set[str] = set()
+    for reference in context.references:
+        arguments = getattr(reference, "runtime_argument_kinds", ())
+        if not isinstance(arguments, tuple) or not (0 < number <= len(arguments)):
+            continue
+        candidates = arguments[number - 1]
+        if isinstance(candidates, tuple):
+            kinds.update(str(candidate) for candidate in candidates if str(candidate))
+    return kinds
+
+
 def _name_semantic_kind(number: int, context: PlaceholderContext) -> str:
     suffixes = {suffix.upper() for suffix in context.suffixes_for(number)}
     projected_kinds: set[str] = set()
@@ -591,28 +619,21 @@ def _name_semantic_kind(number: int, context: PlaceholderContext) -> str:
             ENGINE_SETTLEMENT: "city",
         }.get(engine_kind, "")
 
-    runtime_kinds: set[str] = set()
+    runtime_kinds = _runtime_argument_kinds(number, context)
     kind_names = {
         SEMANTIC_BUILDING: "building",
         SEMANTIC_CHARACTER: "character",
         SEMANTIC_DYNASTY: "dynasty",
         SEMANTIC_SETTLEMENT: "city",
     }
-    for reference in context.references:
-        arguments = getattr(reference, "runtime_argument_kinds", ())
-        if not isinstance(arguments, tuple) or not (0 < number <= len(arguments)):
-            continue
-        candidates = arguments[number - 1]
-        if not isinstance(candidates, tuple):
-            continue
-        runtime_kinds.update(
-            kind_names[kind]
-            for kind in candidates
-            if kind in kind_names
-        )
-    if len(runtime_kinds) == 1:
-        return next(iter(runtime_kinds))
-    if len(runtime_kinds) > 1:
+    named_runtime_kinds = {
+        kind_names[kind]
+        for kind in runtime_kinds
+        if kind in kind_names
+    }
+    if len(named_runtime_kinds) == 1:
+        return next(iter(named_runtime_kinds))
+    if len(named_runtime_kinds) > 1:
         return ""
 
     kinds: set[str] = set()
@@ -1171,7 +1192,8 @@ def _literal_label_candidates(expression: str) -> tuple[str, ...]:
 
 
 _LABEL_LITERAL_RE = re.compile(
-    r"(@L_[A-Za-z0-9_]+_\+[A-Za-z0-9*]+)|(?<![A-Za-z0-9])(_[A-Za-z0-9_]+_\+[A-Za-z0-9*]+)"
+    r"(@L_[A-Za-z0-9_*]+_\+[A-Za-z0-9*]+)|"
+    r"(?<![A-Za-z0-9])(_[A-Za-z0-9_*]+_\+[A-Za-z0-9*]+)"
 )
 
 

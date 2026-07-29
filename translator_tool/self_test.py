@@ -3007,6 +3007,18 @@ def assert_preview_i18n_and_symbol_mapping() -> None:
                     f"suffix-free placeholder crashed or rendered incorrectly in {file_rel}: "
                     f"{plain_argument.display_text!r}"
                 )
+        adjacent_suffix = service.render(
+            "Term: %2it Rate: %2.1f/d",
+            unit_key="format-boundaries",
+            file_rel="Text.dbt",
+            kind="dbt",
+            target=False,
+        )
+        if adjacent_suffix.display_text != "Term: 12t Rate: 12.5/d":
+            raise AssertionError(
+                "preview did not distinguish a known Guild suffix from an adjacent "
+                f"literal or a precision printf token: {adjacent_suffix.display_text!r}"
+            )
         label_seed_left = service.render(
             "%1SN",
             unit_key="left-uid",

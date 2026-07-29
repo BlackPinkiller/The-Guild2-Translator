@@ -389,6 +389,7 @@ _SEMANTIC_KIND_PREFIX = "\x1e"
 SEMANTIC_EXPRESSION = "expression"
 SEMANTIC_BUILDING = "building"
 SEMANTIC_CHARACTER = "character"
+SEMANTIC_DYNASTY_CREST = "dynasty_crest"
 SEMANTIC_DYNASTY = "dynasty"
 SEMANTIC_LABEL = "label"
 SEMANTIC_NUMBER = "number"
@@ -407,6 +408,9 @@ _NATIVE_OBJECT_RETURN_KINDS = {
     "simgetworkingplaceid": SEMANTIC_BUILDING,
     "squadgetleaderid": SEMANTIC_CHARACTER,
 }
+_SEMANTIC_MARKER_KINDS = frozenset(
+    (*_NATIVE_OBJECT_RETURN_KINDS.values(), SEMANTIC_DYNASTY_CREST)
+)
 
 _NATIVE_ALIAS_OUTPUT_KINDS = {
     "buildinggetsim": ((2, SEMANTIC_CHARACTER),),
@@ -1965,7 +1969,7 @@ def semantic_literal(value: str) -> SemanticValue:
 
 
 def _semantic_candidate(value: SemanticValue) -> str:
-    if value.kind in _NATIVE_OBJECT_RETURN_KINDS.values() and not value.text:
+    if value.kind in _SEMANTIC_MARKER_KINDS and not value.text:
         return _SEMANTIC_KIND_PREFIX + value.kind
     return value.text
 
@@ -1974,7 +1978,7 @@ def _semantic_marker_kind(value: str) -> str:
     if not value.startswith(_SEMANTIC_KIND_PREFIX):
         return ""
     kind = value[len(_SEMANTIC_KIND_PREFIX) :]
-    return kind if kind in _NATIVE_OBJECT_RETURN_KINDS.values() else ""
+    return kind if kind in _SEMANTIC_MARKER_KINDS else ""
 
 
 def native_semantic_function_name(alias: str) -> str | None:
@@ -1984,6 +1988,7 @@ def native_semantic_function_name(alias: str) -> str | None:
     if name in {
         "citylevel2label",
         "generateprivilegelistlabels",
+        "getflaglabel",
         "getnobilitytitlelabel",
         "itemgetlabel",
         "officegettextlabel",
@@ -2001,6 +2006,11 @@ def resolve_native_semantic_function(
     object_kind = _NATIVE_OBJECT_RETURN_KINDS.get(name or "")
     if object_kind is not None:
         return ((SemanticValue(object_kind, ""),),)
+    if name == "getflaglabel":
+        # dyn_GetFlagLabel returns the crest symbol belonging to the supplied
+        # dynasty/sim alias. Its exact glyph is runtime state, but its display
+        # domain is fixed.
+        return ((SemanticValue(SEMANTIC_DYNASTY_CREST, ""),),)
     if name == "itemgetlabel":
         item_values = argument_values[0] if argument_values else ()
         singular_values = argument_values[1] if len(argument_values) > 1 else ()
@@ -2063,7 +2073,14 @@ def resolve_native_semantic_function(
         )
         positions.append((semantic_literal("$N"),))
     if not positions:
-        return None
+        for _index in range(10):
+            positions.append(
+                (semantic_literal("_PRIVILEGE_*_MESSAGETEXT_+0"),)
+            )
+            positions.append((semantic_literal("$N"),))
+        positions.append(
+            (semantic_literal("_PRIVILEGE_*_MESSAGETEXT_+0"),)
+        )
     while len(positions) < 21:
         positions.append((semantic_literal(""),))
     return tuple(positions[:21])

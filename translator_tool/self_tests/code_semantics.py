@@ -14,15 +14,21 @@ from ..code_index import (
 )
 from ..code_window_context import best_window_context
 from ..preview_context_selection import select_preview_context
-from ..preview_coverage import preview_reference_coverage
+from ..preview_coverage import preview_placeholder_coverage, preview_reference_coverage
 from ..preview_placeholders import (
     GLYPH_MARK,
     PlaceholderContext,
     PlaceholderLabelRecord,
     PlaceholderValueBuilder,
     _placeholder_expression,
+    placeholder_arguments,
 )
-from ..script_semantics import analyze_script, call_contract
+from ..script_semantics import (
+    analyze_script,
+    call_contract,
+    resolve_native_semantic_function,
+    semantic_literal,
+)
 
 
 def assert_display_call_contracts_match_engine_signatures() -> None:
@@ -245,6 +251,8 @@ def assert_code_semantics_resolve_local_function_returns() -> None:
             '    MsgQuick("", "@L_BODY_CITY_+0", citylabel)',
             "    local titlelabel = GetNobilityTitleLabel(CurrentTitle)",
             '    MsgQuick("", "@L_BODY_TITLE_+0", titlelabel)',
+            '    local badge = dyn_GetFlagLabel("Destination")',
+            '    MsgQuick("", "@L_BODY_BADGE_+0", badge)',
             '    local SettlementId = GetSettlementID("")',
             '    MsgQuick("", "@L_BODY_SETTLEMENT_+0", SettlementId)',
             "    local Place",
@@ -346,6 +354,11 @@ def assert_code_semantics_resolve_local_function_returns() -> None:
         raise AssertionError(
             "an uncertain local engine result guessed an exact title label"
         )
+    badge = by_label["body_badge_+0"]
+    if badge.runtime_argument_values != (("",),):
+        raise AssertionError("a runtime dynasty crest invented a fixed glyph")
+    if badge.runtime_argument_kinds != (("dynasty_crest",),):
+        raise AssertionError("dyn_GetFlagLabel did not preserve its crest display domain")
     settlement = by_label["body_settlement_+0"]
     if settlement.runtime_argument_values != (("",),):
         raise AssertionError("an unknown runtime object ID leaked into preview text")
@@ -662,6 +675,41 @@ def assert_code_index_handles_families_and_binary_gui() -> None:
             or coverage.unresolved_runtime_positions != 1
         ):
             raise AssertionError(f"preview reference coverage was counted incorrectly: {coverage!r}")
+        placeholder_coverage = preview_placeholder_coverage(
+            index,
+            (
+                ("FAMILY_BASE_+0", "%1NAME"),
+                ("EXACT_BASE", "%1l"),
+            ),
+        )
+        if (
+            placeholder_coverage.labels_with_placeholders != 2
+            or placeholder_coverage.placeholder_positions != 2
+            or placeholder_coverage.expression_only_positions != 1
+            or placeholder_coverage.missing_positions != 1
+        ):
+            raise AssertionError(
+                f"actual placeholder evidence was counted incorrectly: {placeholder_coverage!r}"
+            )
+        parsed = placeholder_arguments("%2it | %1Sn | %2.1f/d")
+        if parsed != ((2, "i"), (1, "Sn")):
+            raise AssertionError(
+                f"preview placeholder parsing disagreed with engine token boundaries: {parsed!r}"
+            )
+        late_reference = CodeReference(
+            "late_*_+*",
+            temp / "Late.lua",
+            1,
+            1,
+            source="project",
+            match_kind="dynamic",
+        )
+        index.merge(CodeReferenceIndex({"late_*_+*": (late_reference,)}))
+        late = index.references_for("LATE_VALUE_+2").project
+        if late != (late_reference,):
+            raise AssertionError(
+                "merging new code evidence did not invalidate the wildcard lookup cache"
+            )
     finally:
         shutil.rmtree(temp, ignore_errors=True)
 
@@ -756,6 +804,8 @@ def assert_placeholder_values_avoid_ambiguous_random_branches() -> None:
                 return "Town"
             if prefix == "_CHARACTERS_3_TITLES_NAME_+":
                 return "Citizen"
+            if prefix == "_PRIVILEGE_":
+                return "May trade goods"
             return "Supreme Commander"
 
         @staticmethod
@@ -813,6 +863,31 @@ def assert_placeholder_values_avoid_ambiguous_random_branches() -> None:
     )
     context = PlaceholderContext("BRANCH_BODY_+0", "Text.dbt", False, "en", (ambiguous,))
     builder = PlaceholderValueBuilder(Localization())
+    crest_reference = CodeReference(
+        "badge_body_+0",
+        Path("Badge.lua"),
+        8,
+        1,
+        "MsgQuick",
+        1,
+        runtime_arguments=("Badge",),
+        runtime_argument_values=(("",),),
+        runtime_argument_kinds=(("dynasty_crest",),),
+        role="body",
+    )
+    crest = builder.argument_value(
+        1,
+        "l",
+        PlaceholderContext(
+            "BADGE_BODY_+0",
+            "Text.dbt",
+            False,
+            "en",
+            (crest_reference,),
+        ),
+    )
+    if crest.text != GLYPH_MARK or crest.glyph_id is None:
+        raise AssertionError("a proven dynasty crest did not render as a game glyph")
     value = builder.argument_value(1, "l", context).text
     if value in {"Beggar", "Emperor"}:
         raise AssertionError(f"an unresolved runtime branch was presented as a certain value: {value!r}")
@@ -1146,6 +1221,35 @@ def assert_placeholder_values_avoid_ambiguous_random_branches() -> None:
         raise AssertionError("%s incorrectly consumed a localization-label runtime value")
     if builder.argument_value(4, "l", typed_context).text != "Town":
         raise AssertionError("%l did not sample a proven dynamic label family")
+    wildcard_field = CodeReference(
+        "wildcard_field_+0",
+        Path("WildcardField.lua"),
+        85,
+        1,
+        "MsgQuick",
+        1,
+        runtime_arguments=("PrivilegeLabel",),
+        runtime_argument_values=(("_PRIVILEGE_*_MESSAGETEXT_+0",),),
+        runtime_argument_kinds=(("label",),),
+        role="body",
+    )
+    if (
+        builder.argument_value(
+            1,
+            "l",
+            PlaceholderContext(
+                "WILDCARD_FIELD_+0",
+                "Text.dbt",
+                False,
+                "en",
+                (wildcard_field,),
+            ),
+        ).text
+        != "May trade goods"
+    ):
+        raise AssertionError(
+            "a wildcard inside a label family was not sampled as a real localized entry"
+        )
 
     named_string = CodeReference(
         "named_string_+0",
@@ -1170,6 +1274,19 @@ def assert_placeholder_values_avoid_ambiguous_random_branches() -> None:
 
 
 def assert_variadic_runtime_arguments_map_to_placeholder_positions() -> None:
+    generic_privileges = resolve_native_semantic_function(
+        "chr_GeneratePrivilegeListLabels",
+        ((semantic_literal("*"),),),
+    )
+    if (
+        generic_privileges is None
+        or len(generic_privileges) != 21
+        or generic_privileges[0][0].text != "_PRIVILEGE_*_MESSAGETEXT_+0"
+        or generic_privileges[1][0].text != "$N"
+    ):
+        raise AssertionError(
+            "a privilege-list call with runtime-only contents lost its known return structure"
+        )
     privileges = CodeReference(
         "privileges",
         Path("Privileges.lua"),

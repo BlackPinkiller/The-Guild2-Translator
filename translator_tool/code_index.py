@@ -143,15 +143,39 @@ class CodeReferenceIndex:
         self.project_references = project_references or {}
         self.vanilla_references = vanilla_references or {}
         self._lookup_cache: dict[str, CodeReferenceSet] = {}
+        self._project_wildcards: tuple[
+            tuple[re.Pattern[str], int, tuple[CodeReference, ...]],
+            ...,
+        ] | None = None
+        self._vanilla_wildcards: tuple[
+            tuple[re.Pattern[str], int, tuple[CodeReference, ...]],
+            ...,
+        ] | None = None
 
     def references_for(self, label: str) -> CodeReferenceSet:
         cached = self._lookup_cache.get(label)
         if cached is not None:
             return cached
         labels = lookup_labels(label)
+        if self._project_wildcards is None:
+            self._project_wildcards = _compiled_wildcard_references(
+                self.project_references
+            )
+        if self._vanilla_wildcards is None:
+            self._vanilla_wildcards = _compiled_wildcard_references(
+                self.vanilla_references
+            )
         result = CodeReferenceSet(
-            _matching_references(self.project_references, labels),
-            _matching_references(self.vanilla_references, labels),
+            _matching_references(
+                self.project_references,
+                labels,
+                self._project_wildcards,
+            ),
+            _matching_references(
+                self.vanilla_references,
+                labels,
+                self._vanilla_wildcards,
+            ),
         )
         if len(self._lookup_cache) >= 4096:
             self._lookup_cache.clear()
@@ -162,6 +186,8 @@ class CodeReferenceIndex:
         _merge_reference_maps(self.project_references, other.project_references)
         _merge_reference_maps(self.vanilla_references, other.vanilla_references)
         self._lookup_cache.clear()
+        self._project_wildcards = None
+        self._vanilla_wildcards = None
 
     @property
     def is_empty(self) -> bool:
@@ -1033,6 +1059,10 @@ def dynamic_label_keys(label: str) -> tuple[str, ...]:
 def _matching_references(
     references: dict[str, tuple[CodeReference, ...]],
     labels: tuple[str, ...],
+    wildcard_references: tuple[
+        tuple[re.Pattern[str], int, tuple[CodeReference, ...]],
+        ...,
+    ] = (),
 ) -> tuple[CodeReference, ...]:
     family_bases = {
         base
@@ -1052,11 +1082,8 @@ def _matching_references(
             return _rank_references(found)
     matches: list[tuple[int, tuple[CodeReference, ...]]] = []
     concrete_labels = tuple(label for label in labels if "*" not in label)
-    for pattern, found in references.items():
-        if "*" not in pattern:
-            continue
-        if any(_wildcard_matches(pattern, label) for label in concrete_labels):
-            specificity = len(pattern.replace("*", "")) - pattern.count("*") * 8
+    for regex, specificity, found in wildcard_references:
+        if any(regex.fullmatch(label) is not None for label in concrete_labels):
             matches.append((specificity, found))
     if not matches:
         return ()
@@ -1068,6 +1095,21 @@ def _matching_references(
         for reference in found
     ]
     return _rank_references(tuple(combined))
+
+
+def _compiled_wildcard_references(
+    references: dict[str, tuple[CodeReference, ...]],
+) -> tuple[tuple[re.Pattern[str], int, tuple[CodeReference, ...]], ...]:
+    values: list[tuple[re.Pattern[str], int, tuple[CodeReference, ...]]] = []
+    for pattern, found in references.items():
+        if "*" not in pattern:
+            continue
+        regex = re.compile(
+            "^" + re.escape(pattern).replace(r"\*", "[a-z0-9_+]+") + "$"
+        )
+        specificity = len(pattern.replace("*", "")) - pattern.count("*") * 8
+        values.append((regex, specificity, found))
+    return tuple(values)
 
 
 def _rank_references(references: tuple[CodeReference, ...]) -> tuple[CodeReference, ...]:
@@ -1108,9 +1150,6 @@ def _alternate_label(label: str) -> str:
     return normalized[1:] if normalized.startswith("_") else "_" + normalized
 
 
-def _wildcard_matches(pattern: str, label: str) -> bool:
-    regex = "^" + re.escape(pattern).replace(r"\*", "[a-z0-9_+]+") + "$"
-    return re.match(regex, label) is not None
 
 
 def _looks_binary(raw: bytes) -> bool:

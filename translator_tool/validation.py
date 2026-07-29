@@ -44,15 +44,20 @@ FORMAT_TOOLTIP = "tooltip"
 
 KNOWN_GENDER_SUFFIXES = ("Male", "Female")
 ARG_SUFFIX = "(?:" + "|".join(re.escape(suffix) for suffix in ARG_SUFFIXES) + ")"
-ARG_PLAIN_TOKEN = r"%\d+(?![A-Za-z0-9_:])"
+ARG_PLAIN_TOKEN = r"%\d+(?![A-Za-z0-9_:]|\.\d)"
 # The engine stops parsing as soon as a known suffix is complete, even when
 # translators continue immediately with letters or digits such as `%2NAMEwe`
 # or `%2GG6小时`.
 ARG_TOKEN = rf"(?:{ARG_PLAIN_TOKEN}|%\d+{ARG_SUFFIX})"
+ARG_PREVIEW_TOKEN = rf"%(\d+)(?:({ARG_SUFFIX})|(?![A-Za-z0-9_:]|\.\d))"
 PRINTF_TOKEN = r"%(?:\d+\$)?[-+#0]*(?:\d+|\*)?(?:\.(?:\d+|\*))?[diufFeEgGxXos](?![A-Za-z0-9])"
+PRINTF_PRECISION_TOKEN = r"%(?:\d+\$)?[-+#0]*(?:\d+|\*)?\.(?:\d+|\*)[diufFeEgGxXos](?![A-Za-z0-9])"
 NAMED_PERCENT_TOKEN = r"%[A-Za-z][A-Za-z0-9_:-]*%"
 LITERAL_PERCENT_TOKEN = r"%(?=$|[\s$.,:;!?()\[\]{}\"'”’<>]|[^\x00-\x7F])|(?<=\d)%(?![A-Za-z0-9_:])"
-PERCENT_TOKEN = rf"%%|%[<>]|{ARG_TOKEN}|{PRINTF_TOKEN}|{LITERAL_PERCENT_TOKEN}"
+PERCENT_TOKEN = (
+    rf"%%|%[<>]|{PRINTF_PRECISION_TOKEN}|{ARG_TOKEN}|"
+    rf"{PRINTF_TOKEN}|{LITERAL_PERCENT_TOKEN}"
+)
 
 BYTE_TOKEN = r"(?:0|[1-9]\d?|1\d\d|2[0-4]\d|25[0-5])"
 COLOR_TOKEN = rf"\$C\s*\[\s*{BYTE_TOKEN}(?:\s*,\s*{BYTE_TOKEN}){{2,3}}\s*\]"

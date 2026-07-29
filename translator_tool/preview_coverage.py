@@ -1,8 +1,15 @@
 from __future__ import annotations
 
 from dataclasses import asdict, dataclass
+from typing import Iterable
 
 from .code_index import CodeReference, CodeReferenceIndex
+from .engine_semantics import engine_format_argument_kind
+from .preview_placeholders import (
+    placeholder_arguments,
+    placeholder_reference_complete,
+    placeholder_reference_score,
+)
 from .script_semantics import call_contract
 
 
@@ -19,6 +26,53 @@ class PreviewReferenceCoverage:
 
     def metrics(self) -> dict[str, int]:
         return asdict(self)
+
+
+@dataclass(frozen=True)
+class PlaceholderPreviewCoverage:
+    labels_with_placeholders: int = 0
+    placeholder_positions: int = 0
+    concrete_positions: int = 0
+    semantic_type_positions: int = 0
+    suffix_format_positions: int = 0
+    expression_only_positions: int = 0
+    missing_positions: int = 0
+
+    def metrics(self) -> dict[str, int]:
+        return asdict(self)
+
+
+_SUFFIX_TYPED_FORMATS = frozenset(
+    {
+        "SN",
+        "SV",
+        "SZ",
+        "SK",
+        "ST",
+        "SA",
+        "SD",
+        "SB",
+        "SL",
+        "GG",
+        "GN",
+        "GT",
+        "DN",
+        "DS",
+        "n",
+        "i",
+        "f",
+        "t",
+        "c",
+        "z",
+        "j",
+    }
+)
+
+
+def _suffix_has_intrinsic_format(suffix: str) -> bool:
+    if suffix.upper() in _SUFFIX_TYPED_FORMATS:
+        return True
+    return suffix in _SUFFIX_TYPED_FORMATS
 
 
 def preview_reference_coverage(index: CodeReferenceIndex) -> PreviewReferenceCoverage:
@@ -80,6 +134,97 @@ def preview_reference_coverage(index: CodeReferenceIndex) -> PreviewReferenceCov
             runtime_argument_positions - resolved_runtime_positions,
         ),
     )
+
+
+def preview_placeholder_coverage(
+    index: CodeReferenceIndex,
+    label_texts: Iterable[tuple[str, str]],
+) -> PlaceholderPreviewCoverage:
+    """Measure evidence for placeholders that localization text actually uses."""
+    labels_with_placeholders = 0
+    placeholder_positions = 0
+    concrete_positions = 0
+    semantic_type_positions = 0
+    suffix_format_positions = 0
+    expression_only_positions = 0
+    missing_positions = 0
+    seen_labels: set[str] = set()
+    for label, text in label_texts:
+        placeholders = placeholder_arguments(text)
+        normalized_label = label.strip().lstrip("_").casefold()
+        if not normalized_label or not placeholders or normalized_label in seen_labels:
+            continue
+        seen_labels.add(normalized_label)
+        labels_with_placeholders += 1
+        references = index.references_for(label).active
+        selected = _metric_references(text, references)
+        for number, suffix in placeholders:
+            placeholder_positions += 1
+            token = f"%{number}{suffix}"
+            aligned = tuple(
+                reference
+                for reference in selected
+                if placeholder_reference_complete(token, reference)
+            )
+            if not aligned:
+                if engine_format_argument_kind(label, number):
+                    semantic_type_positions += 1
+                elif _suffix_has_intrinsic_format(suffix):
+                    suffix_format_positions += 1
+                else:
+                    missing_positions += 1
+                continue
+            values, kinds = _runtime_evidence(aligned, number)
+            if any(value not in {"", "$N"} for value in values):
+                concrete_positions += 1
+            elif any(kind and kind != "structure" for kind in kinds):
+                semantic_type_positions += 1
+            elif _suffix_has_intrinsic_format(suffix):
+                suffix_format_positions += 1
+            else:
+                expression_only_positions += 1
+    return PlaceholderPreviewCoverage(
+        labels_with_placeholders=labels_with_placeholders,
+        placeholder_positions=placeholder_positions,
+        concrete_positions=concrete_positions,
+        semantic_type_positions=semantic_type_positions,
+        suffix_format_positions=suffix_format_positions,
+        expression_only_positions=expression_only_positions,
+        missing_positions=missing_positions,
+    )
+
+
+def _metric_references(
+    text: str,
+    references: tuple[CodeReference, ...],
+) -> tuple[CodeReference, ...]:
+    if not references:
+        return ()
+    best = max(
+        enumerate(references),
+        key=lambda item: (
+            placeholder_reference_complete(text, item[1]),
+            placeholder_reference_score(text, item[1]),
+            item[1].confidence,
+            -item[0],
+        ),
+    )[1]
+    return (best,)
+
+
+def _runtime_evidence(
+    references: tuple[CodeReference, ...],
+    number: int,
+) -> tuple[tuple[str, ...], tuple[str, ...]]:
+    values: list[str] = []
+    kinds: list[str] = []
+    position = number - 1
+    for reference in references:
+        if position < len(reference.runtime_argument_values):
+            values.extend(str(value) for value in reference.runtime_argument_values[position])
+        if position < len(reference.runtime_argument_kinds):
+            kinds.extend(str(kind) for kind in reference.runtime_argument_kinds[position])
+    return tuple(dict.fromkeys(values)), tuple(dict.fromkeys(kinds))
 
 
 def _is_display_reference(reference: CodeReference) -> bool:
