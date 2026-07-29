@@ -437,6 +437,17 @@ def assert_code_window_context_extracts_window_labels_and_buttons() -> None:
     try:
         game_root = temp / "game"
         (game_root / "Scripts").mkdir(parents=True, exist_ok=True)
+        (game_root / "Scripts" / "Hud").mkdir(parents=True, exist_ok=True)
+        (game_root / "GUI" / "Hud").mkdir(parents=True, exist_ok=True)
+        (game_root / "Scripts" / "Hud" / "GameHud.lua").write_text(
+            'this:AddPanel("SayPanel", 10, "GUI/Hud/CustomSay.gui", false)',
+            encoding="utf-8",
+        )
+        (game_root / "GUI" / "Hud" / "CustomSay.gui").write_bytes(
+            b"\x03\x00"
+            b"Hud/NoCompression/Priority3/PanelBackground_01.tga\x00"
+            b"Hud/borders/Border_Gold_02.tga\x00"
+        )
         window_script = game_root / "Scripts" / "Window.lua"
         window_script.write_text(
             "\n".join(
@@ -491,6 +502,7 @@ def assert_code_window_context_extracts_window_labels_and_buttons() -> None:
                     '    "@L_TRIAL_DATEBOOK_BODY_+0", GetID("accuser"), GetSettlementID(""))',
                     'CityScheduleCutsceneEvent("settlement", "council_date", "",',
                     '    "BeginCouncilMeeting", 17, 6, "@L_COUNCIL_SCHEDULE_+0")',
+                    'InitData("SayPanel", 0, "@L_PANEL_HEAD_+0", "@L_PANEL_BODY_+0", Cost)',
                 )
             ),
             encoding="utf-8",
@@ -627,6 +639,19 @@ def assert_code_window_context_extracts_window_labels_and_buttons() -> None:
             or schedule_context.layout != "panel"
         ):
             raise AssertionError(f"city schedule did not retain its own GUI profile: {schedule_context!r}")
+        panel_refs = index.references_for("PANEL_BODY_+0").project
+        panel_context = best_window_context(panel_refs, "PANEL_BODY_+0")
+        if (
+            panel_context is None
+            or panel_context.surface != "measure_choice"
+            or panel_context.gui_resource != "GUI/Hud/CustomSay.gui"
+            or panel_context.background_asset
+            != "Hud/NoCompression/Priority3/PanelBackground_01.tga"
+            or panel_context.frame_asset != "Hud/borders/Border_Gold_02.tga"
+        ):
+            raise AssertionError(
+                f"registered panel resource did not refine the semantic preview: {panel_context!r}"
+            )
     finally:
         safe_rmtree(temp)
 

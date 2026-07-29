@@ -411,6 +411,12 @@ def analyze_script(
     return analyze_script_facts(text, path, label_catalog=label_catalog).uses
 
 
+def script_calls(text: str, path: Path) -> tuple[ScriptCall, ...]:
+    """Parse Lua calls without assigning localization roles."""
+    tokens = tokenize_lua(text)
+    return _calls(text, tokens, _functions(tokens, path))
+
+
 def analyze_script_facts(
     text: str,
     path: Path,

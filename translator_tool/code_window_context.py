@@ -1,11 +1,13 @@
 from __future__ import annotations
 
+from collections.abc import Callable
 from dataclasses import dataclass
 from functools import lru_cache
 import re
 
 from .code_index import CodeReference, LABEL_RE, dynamic_label_patterns, normalize_label
 from .engine_semantics import engine_format_preview_style
+from .gui_semantics import GuiResourceInfo, gui_resource_info, resolve_panel_gui_resource
 from .script_semantics import CallContract, call_contract
 
 
@@ -76,6 +78,8 @@ RESOLVED_LABEL_RE = re.compile(r"@L_[A-Za-z0-9_+*]+", re.IGNORECASE)
 def window_context_for_reference(reference: CodeReference, current_label: str = "") -> PreviewWindowContext | None:
     call_name = (reference.call_name or "").casefold()
     if not call_name:
+        if reference.role == "gui_resource":
+            return _gui_resource_window_context(reference, current_label)
         return None
     contract = call_contract(call_name)
     surface = _surface_for_call(call_name, contract)
@@ -121,6 +125,10 @@ def window_context_for_reference(reference: CodeReference, current_label: str = 
     if not header_label and not body_label and not buttons:
         return None
     presentation = _presentation_for_surface(surface, panel=panel, category=category)
+    if panel:
+        gui_info = resolve_panel_gui_resource(reference.path, panel)
+        if gui_info is not None:
+            presentation = _merge_gui_presentation(presentation, gui_info)
     return PreviewWindowContext(
         kind=presentation.kind,
         background=presentation.background,
@@ -138,6 +146,33 @@ def window_context_for_reference(reference: CodeReference, current_label: str = 
         panel=panel,
         category=category,
         speaker=speaker,
+        layout=presentation.layout,
+        gui_resource=presentation.gui_resource,
+        background_asset=presentation.background_asset,
+        frame_asset=presentation.frame_asset,
+        title_asset=presentation.title_asset,
+        icon_asset=presentation.icon_asset,
+    )
+
+
+def _gui_resource_window_context(
+    reference: CodeReference,
+    current_label: str,
+) -> PreviewWindowContext | None:
+    info = gui_resource_info(reference.path)
+    if info is None:
+        return None
+    label = _context_label(current_label or reference.label)
+    if not label:
+        return None
+    presentation = _presentation_from_gui_resource(info)
+    return PreviewWindowContext(
+        kind=presentation.kind,
+        background=presentation.background,
+        default_color=_default_color_for_presentation(presentation),
+        body_label=label,
+        call_name="gui_resource",
+        surface="gui_embedded",
         layout=presentation.layout,
         gui_resource=presentation.gui_resource,
         background_asset=presentation.background_asset,
@@ -203,6 +238,109 @@ def surface_window_context(
         frame_asset=presentation.frame_asset,
         title_asset=presentation.title_asset,
         icon_asset=presentation.icon_asset,
+    )
+
+
+def _default_color_for_presentation(
+    presentation: PreviewSurfacePresentation,
+) -> tuple[int, int, int, int]:
+    return (
+        DARK_PANEL_TEXT
+        if presentation.background in {"dark_panel", "overlay"}
+        else PARCHMENT_TEXT
+    )
+
+
+def _merge_gui_presentation(
+    semantic: PreviewSurfacePresentation,
+    info: GuiResourceInfo,
+) -> PreviewSurfacePresentation:
+    resource = _presentation_from_gui_resource(info)
+    has_visual_profile = bool(
+        resource.background_asset
+        or resource.frame_asset
+        or resource.title_asset
+    )
+    return PreviewSurfacePresentation(
+        semantic.kind,
+        resource.background if has_visual_profile else semantic.background,
+        resource.layout if has_visual_profile else semantic.layout,
+        info.resource_name,
+        resource.background_asset or semantic.background_asset,
+        resource.frame_asset or semantic.frame_asset,
+        resource.title_asset or semantic.title_asset,
+        resource.icon_asset or semantic.icon_asset,
+    )
+
+
+def _presentation_from_gui_resource(
+    info: GuiResourceInfo,
+) -> PreviewSurfacePresentation:
+    assets = tuple(asset.replace("\\", "/") for asset in info.assets)
+    background_asset = _first_gui_asset(
+        assets,
+        (
+            lambda value: value.endswith("/mbback1.tga"),
+            lambda value: value.endswith("/mbback0.tga"),
+            lambda value: value.endswith("/bg_buch.tga"),
+            lambda value: "/onscreenhelp/" in value and value.endswith("/bg.tga"),
+            lambda value: value.endswith("/panelbackground_01.tga"),
+            _looks_like_background_asset,
+        ),
+    )
+    frame_asset = _first_gui_asset(
+        assets,
+        (
+            lambda value: value.endswith("/border_gold_02.tga"),
+            lambda value: value.endswith("/border_wood.tga"),
+        ),
+    )
+    title_asset = _first_gui_asset(
+        assets,
+        (lambda value: value.endswith("/header_red.tga"),),
+    )
+    normalized_background = background_asset.casefold()
+    if normalized_background.endswith("/mbback1.tga"):
+        background, layout = "parchment", "document"
+    elif normalized_background.endswith("/mbback0.tga"):
+        background, layout = "parchment", "parchment"
+    elif normalized_background.endswith("/bg_buch.tga"):
+        background, layout = "parchment", "book"
+    elif "/onscreenhelp/" in normalized_background:
+        background, layout = "dark_panel", "help"
+    elif background_asset or frame_asset or title_asset:
+        background, layout = "dark_panel", "panel"
+    else:
+        background, layout = "overlay", "overlay"
+    return PreviewSurfacePresentation(
+        "gui",
+        background,
+        layout,
+        info.resource_name,
+        background_asset,
+        frame_asset,
+        title_asset,
+    )
+
+
+def _first_gui_asset(
+    assets: tuple[str, ...],
+    predicates: tuple[Callable[[str], bool], ...],
+) -> str:
+    for predicate in predicates:
+        for asset in assets:
+            if predicate(asset.casefold()):
+                return asset
+    return ""
+
+
+def _looks_like_background_asset(value: str) -> bool:
+    name = value.rsplit("/", 1)[-1]
+    return (
+        "background" in name
+        or name.startswith("background")
+        or name.startswith("bg_")
+        or name == "bg.tga"
     )
 
 

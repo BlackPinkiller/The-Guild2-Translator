@@ -12,7 +12,9 @@ from ..code_index import (
     analyze_code_file,
     scan_scripts_root,
 )
+from ..code_window_context import best_window_context
 from ..preview_context_selection import select_preview_context
+from ..preview_coverage import preview_reference_coverage
 from ..preview_placeholders import (
     GLYPH_MARK,
     PlaceholderContext,
@@ -487,7 +489,12 @@ def assert_code_index_handles_families_and_binary_gui() -> None:
             )),
             encoding="utf-8",
         )
-        (temp / "Panel.gui").write_bytes(b"\x03\x00binary@L_GUI_RESOURCE_+0\x00(random bytes)")
+        (temp / "Panel.gui").write_bytes(
+            b"\x03\x00binary@L_GUI_RESOURCE_+0\x00"
+            b"Hud/NoCompression/Priority3/PanelBackground_01.tga\x00"
+            b"Hud/borders/Border_Gold_02.tga\x00"
+            b"Hud/NoCompression/header_red.tga\x00"
+        )
         references = scan_scripts_root(
             temp,
             label_catalog=frozenset({"family_base_+0", "exact_base", "exact_base_+1"}),
@@ -506,6 +513,43 @@ def assert_code_index_handles_families_and_binary_gui() -> None:
         gui = index.references_for("GUI_RESOURCE_+0").project
         if len(gui) != 1 or not gui[0].binary or gui[0].call_name is not None or gui[0].role != "gui_resource":
             raise AssertionError(f"binary GUI data produced a script call context: {gui!r}")
+        gui_context = best_window_context(gui, "GUI_RESOURCE_+0")
+        if (
+            gui_context is None
+            or gui_context.surface != "gui_embedded"
+            or gui_context.layout != "panel"
+            or gui_context.gui_resource != "Panel.gui"
+            or gui_context.background_asset
+            != "Hud/NoCompression/Priority3/PanelBackground_01.tga"
+            or gui_context.frame_asset != "Hud/borders/Border_Gold_02.tga"
+            or gui_context.title_asset != "Hud/NoCompression/header_red.tga"
+        ):
+            raise AssertionError(
+                f"binary GUI resources did not drive their preview presentation: {gui_context!r}"
+            )
+        (temp / "Panel.gui").write_bytes(
+            b"\x03\x00binary@L_GUI_RESOURCE_+0\x00"
+            b"Hud/messagebox/mbback0.tga\x00"
+        )
+        refreshed_gui_context = best_window_context(gui, "GUI_RESOURCE_+0")
+        if (
+            refreshed_gui_context is None
+            or refreshed_gui_context.background != "parchment"
+            or refreshed_gui_context.layout != "parchment"
+            or refreshed_gui_context.background_asset != "Hud/messagebox/mbback0.tga"
+        ):
+            raise AssertionError(
+                f"changed GUI resources reused stale presentation data: {refreshed_gui_context!r}"
+            )
+        coverage = preview_reference_coverage(index)
+        if (
+            coverage.indexed_labels != 4
+            or coverage.semantic_display_labels != 3
+            or coverage.gui_resource_labels != 1
+            or coverage.non_display_labels != 0
+            or coverage.low_confidence_labels != 1
+        ):
+            raise AssertionError(f"preview reference coverage was counted incorrectly: {coverage!r}")
     finally:
         shutil.rmtree(temp, ignore_errors=True)
 

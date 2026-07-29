@@ -118,6 +118,7 @@ from .project import (
     TranslationUnit,
 )
 from .preview import GLYPH_MARK, PREVIEW_MARK, PreviewAtom, PreviewDocument, PreviewService
+from .preview_coverage import preview_reference_coverage
 from .preview_context_selection import rank_preview_references, select_preview_context
 from .recovery import apply_recovery_draft, clear_recovery_draft, load_recovery_draft, save_recovery_draft
 from .search import SearchClause, parse_search_query, search_blob as _search_blob, search_field_values as _search_field_values
@@ -3503,6 +3504,11 @@ class TranslatorWindow(QMainWindow):
         if token != self.code_reference_index_token:
             return
         self.code_reference_index_complete = True
+        if isinstance(self.code_reference_index, CodeReferenceIndex):
+            log_metrics(
+                "preview_reference_coverage",
+                **preview_reference_coverage(self.code_reference_index).metrics(),
+            )
         self._update_code_reference_display()
         self._refresh_preview_presentations()
 
