@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from functools import lru_cache
 import re
 
 from .code_index import CodeReference, LABEL_RE, dynamic_label_patterns, normalize_label
@@ -20,6 +21,18 @@ class PreviewWindowButton:
 
 
 @dataclass(frozen=True)
+class PreviewSurfacePresentation:
+    kind: str
+    background: str
+    layout: str
+    gui_resource: str = ""
+    background_asset: str = ""
+    frame_asset: str = ""
+    title_asset: str = ""
+    icon_asset: str = ""
+
+
+@dataclass(frozen=True)
 class PreviewWindowContext:
     kind: str
     background: str
@@ -33,6 +46,12 @@ class PreviewWindowContext:
     panel: str = ""
     category: str = ""
     speaker: str = ""
+    layout: str = ""
+    gui_resource: str = ""
+    background_asset: str = ""
+    frame_asset: str = ""
+    title_asset: str = ""
+    icon_asset: str = ""
 
     @property
     def labels(self) -> tuple[str, ...]:
@@ -64,6 +83,18 @@ def window_context_for_reference(reference: CodeReference, current_label: str = 
         return None
     arguments = tuple(str(argument) for argument in reference.arguments)
     argument_expressions = _argument_expressions(reference, arguments)
+    panel = _contract_argument_hint(
+        argument_expressions,
+        contract.panel_argument if contract else None,
+    )
+    category = _contract_argument_hint(
+        argument_expressions,
+        contract.category_argument if contract else None,
+    ) or _feedback_category(call_name)
+    speaker = _contract_argument_hint(
+        argument_expressions,
+        contract.speaker_argument if contract else None,
+    )
     buttons = _buttons_from_arguments(argument_expressions)
     labels_by_arg = _labels_by_argument(argument_expressions)
     button_label_set = {button.label for button in buttons if button.label}
@@ -89,20 +120,30 @@ def window_context_for_reference(reference: CodeReference, current_label: str = 
         argument_labels = (*argument_labels, referenced_label)
     if not header_label and not body_label and not buttons:
         return None
-    kind, background = _presentation_for_surface(surface)
+    presentation = _presentation_for_surface(surface, panel=panel, category=category)
     return PreviewWindowContext(
-        kind=kind,
-        background=background,
-        default_color=DARK_PANEL_TEXT if background == "dark_panel" else PARCHMENT_TEXT,
+        kind=presentation.kind,
+        background=presentation.background,
+        default_color=(
+            DARK_PANEL_TEXT
+            if presentation.background in {"dark_panel", "overlay"}
+            else PARCHMENT_TEXT
+        ),
         header_label=header_label,
         body_label=body_label,
         buttons=buttons,
         argument_labels=argument_labels,
         call_name=call_name,
         surface=surface,
-        panel=_contract_argument_hint(argument_expressions, contract.panel_argument if contract else None),
-        category=_contract_argument_hint(argument_expressions, contract.category_argument if contract else None),
-        speaker=_contract_argument_hint(argument_expressions, contract.speaker_argument if contract else None),
+        panel=panel,
+        category=category,
+        speaker=speaker,
+        layout=presentation.layout,
+        gui_resource=presentation.gui_resource,
+        background_asset=presentation.background_asset,
+        frame_asset=presentation.frame_asset,
+        title_asset=presentation.title_asset,
+        icon_asset=presentation.icon_asset,
     )
 
 
@@ -128,13 +169,40 @@ def engine_window_context(label: str) -> PreviewWindowContext | None:
         return None
     normalized = _context_label(label)
     role = _engine_label_role(normalized)
-    return PreviewWindowContext(
-        kind=style.kind,
-        background=style.background,
-        default_color=DARK_PANEL_TEXT if style.background == "dark_panel" else PARCHMENT_TEXT,
+    return surface_window_context(
+        style.kind,
         header_label=normalized if role == "header" else "",
         body_label=normalized if role != "header" else "",
         call_name=f"engine:{style.kind}",
+    )
+
+
+def surface_window_context(
+    surface: str,
+    *,
+    header_label: str = "",
+    body_label: str = "",
+    call_name: str = "",
+) -> PreviewWindowContext:
+    presentation = _presentation_for_surface(surface)
+    return PreviewWindowContext(
+        kind=presentation.kind,
+        background=presentation.background,
+        default_color=(
+            DARK_PANEL_TEXT
+            if presentation.background in {"dark_panel", "overlay"}
+            else PARCHMENT_TEXT
+        ),
+        header_label=header_label,
+        body_label=body_label,
+        call_name=call_name,
+        surface=surface,
+        layout=presentation.layout,
+        gui_resource=presentation.gui_resource,
+        background_asset=presentation.background_asset,
+        frame_asset=presentation.frame_asset,
+        title_asset=presentation.title_asset,
+        icon_asset=presentation.icon_asset,
     )
 
 
@@ -155,24 +223,179 @@ def _surface_for_call(call_name: str, contract: CallContract | None = None) -> s
     return ""
 
 
-def _presentation_for_surface(surface: str) -> tuple[str, str]:
+@lru_cache(maxsize=64)
+def _presentation_for_surface(
+    surface: str,
+    *,
+    panel: str = "",
+    category: str = "",
+) -> PreviewSurfacePresentation:
+    if surface == "news" and panel.casefold() == "panel_nobility_title_deed":
+        return PreviewSurfacePresentation(
+            "document",
+            "parchment",
+            "document",
+            "engine:panel_nobility_title_deed",
+            "Hud/messagebox/mbback1.tga",
+        )
+    profiles = {
+        "messagebox": PreviewSurfacePresentation(
+            "message",
+            "parchment",
+            "parchment",
+            "GUI/Hud/panel_messagebox.gui",
+            "Hud/messagebox/mbback0.tga",
+        ),
+        "questbox": PreviewSurfacePresentation(
+            "quest",
+            "parchment",
+            "parchment",
+            "GUI/Hud/questboxpanel.gui",
+            "Hud/messagebox/mbback0.tga",
+        ),
+        "news": PreviewSurfacePresentation(
+            "news",
+            "overlay",
+            "news",
+            "GUI/Hud/panel_news.gui",
+            icon_asset=_news_icon_asset(category),
+        ),
+        "dialog": PreviewSurfacePresentation(
+            "short",
+            "dark_panel",
+            "panel",
+            "GUI/Hud/SayPanel.gui",
+            "Hud/NoCompression/Priority3/PanelBackground_01.tga",
+            "Hud/borders/Border_Gold_02.tga",
+        ),
+        "quick_message": PreviewSurfacePresentation(
+            "short",
+            "overlay",
+            "overlay",
+            "GUI/Hud/panel_quickmessage.gui",
+        ),
+        "measure_message": PreviewSurfacePresentation(
+            "short",
+            "overlay",
+            "overlay",
+            "GUI/Hud/panel_measuremessage.gui",
+        ),
+        "system_message": PreviewSurfacePresentation(
+            "short",
+            "overlay",
+            "overlay",
+            "GUI/Hud/panel_systemmessage.gui",
+        ),
+        "tutorial": PreviewSurfacePresentation(
+            "tutorial",
+            "dark_panel",
+            "panel",
+            "GUI/Hud/panel_tutorial.gui",
+            "Hud/NoCompression/Priority3/PanelBackground_01.tga",
+            "Hud/borders/Border_Gold_02.tga",
+        ),
+        "quest_intro": PreviewSurfacePresentation(
+            "quest_intro",
+            "dark_panel",
+            "panel",
+            "GUI/Hud/panel_questintro.gui",
+            "Hud/NoCompression/Priority3/PanelBackground_01.tga",
+            "Hud/borders/border_wood.tga",
+        ),
+        "questbook": PreviewSurfacePresentation(
+            "questbook",
+            "parchment",
+            "book",
+            "GUI/Hud/panel_questbooksheet.gui",
+            "Hud/sheets/evidences/bg_buch.tga",
+        ),
+        "measure_choice": PreviewSurfacePresentation(
+            "measure_choice",
+            "dark_panel",
+            "panel",
+            "GUI/Hud/panel_measurechoice.gui",
+            "Hud/NoCompression/Priority3/PanelBackground_01.tga",
+            "Hud/borders/Border_Gold_02.tga",
+        ),
+        "measure_help": PreviewSurfacePresentation(
+            "onscreen_help",
+            "dark_panel",
+            "help",
+            "GUI/Hud/Helppanels/measures.gui",
+            "Hud/sheets/OnscreenHelp/bg.tga",
+            "Hud/borders/Border_Gold_02.tga",
+            "Hud/NoCompression/header_red.tga",
+        ),
+        "tooltip": PreviewSurfacePresentation(
+            "tooltip",
+            "dark_panel",
+            "help",
+            background_asset="Hud/NoCompression/Priority3/PanelBackground_01.tga",
+            frame_asset="Hud/borders/Border_Gold_02.tga",
+            title_asset="Hud/NoCompression/header_red.tga",
+        ),
+        "onscreen_help": PreviewSurfacePresentation(
+            "onscreen_help",
+            "dark_panel",
+            "help",
+            "GUI/Hud/Helppanels/text.gui",
+            "Hud/sheets/OnscreenHelp/bg.tga",
+            "Hud/borders/Border_Gold_02.tga",
+            "Hud/NoCompression/header_red.tga",
+        ),
+        "status": PreviewSurfacePresentation(
+            "status",
+            "dark_panel",
+            "panel",
+            background_asset="Hud/NoCompression/Priority3/PanelBackground_01.tga",
+        ),
+        "overhead": PreviewSurfacePresentation(
+            "overhead",
+            "overlay",
+            "overlay",
+            gui_resource="GUI/styles/overheadsymbollabel.gst",
+        ),
+        "datebook": PreviewSurfacePresentation(
+            "datebook",
+            "parchment",
+            "book",
+            "GUI/Hud/panel_datebooksheet.gui",
+            "Hud/sheets/evidences/bg_buch.tga",
+        ),
+        "city_schedule": PreviewSurfacePresentation(
+            "city_schedule",
+            "dark_panel",
+            "panel",
+            "GUI/Hud/panel_cityschedule.gui",
+            "Hud/NoCompression/Priority3/PanelBackground_01.tga",
+            "Hud/borders/Border_Gold_02.tga",
+        ),
+    }
+    return profiles.get(
+        surface,
+        PreviewSurfacePresentation("message", "parchment", "parchment"),
+    )
+
+
+def _feedback_category(call_name: str) -> str:
     return {
-        "messagebox": ("message", "parchment"),
-        "questbox": ("quest", "parchment"),
-        "news": ("news", "dark_panel"),
-        "dialog": ("short", "dark_panel"),
-        "quick_message": ("short", "dark_panel"),
-        "measure_message": ("short", "dark_panel"),
-        "system_message": ("short", "dark_panel"),
-        "tutorial": ("tutorial", "dark_panel"),
-        "quest_intro": ("quest_intro", "dark_panel"),
-        "questbook": ("questbook", "dark_panel"),
-        "measure_choice": ("measure_choice", "dark_panel"),
-        "measure_help": ("onscreen_help", "dark_panel"),
-        "overhead": ("overhead", "dark_panel"),
-        "datebook": ("datebook", "dark_panel"),
-        "city_schedule": ("datebook", "dark_panel"),
-    }.get(surface, ("message", "parchment"))
+        "feedback_messageworkshop": "building",
+        "feedback_messagecharacter": "intrigue",
+        "feedback_messageothercharacters": "intrigue",
+        "feedback_messageproduction": "production",
+        "feedback_messageeconomie": "economie",
+        "feedback_messagemilitary": "military",
+        "feedback_messagepolitics": "politics",
+        "feedback_messageschedule": "schedule",
+        "feedback_messagemission": "mission",
+        "feedback_messageoffice": "politics",
+        "feedback_messagedefault": "default",
+    }.get(call_name, "")
+
+
+def _news_icon_asset(category: str) -> str:
+    normalized = re.sub(r"[^a-z0-9_]+", "", category.casefold())
+    return f"Hud/news/{normalized or 'default'}.tga"
 
 
 def _argument_expressions(

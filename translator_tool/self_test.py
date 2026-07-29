@@ -484,6 +484,8 @@ def assert_code_window_context_extracts_window_labels_and_buttons() -> None:
                     '    "@L_TUTORIAL_CAMERA_NAME", "@L_TUTORIAL_CAMERA_SUCCESS")',
                     'ShowTutorialBoxNoWait(100, 700, 470, 180, 1, LEFTLOWER_NOARROW,',
                     '    "@L_TUTORIAL_MOVEMENT_NAME", "@L_TUTORIAL_MOVEMENT_TASK", "")',
+                    'MsgNewsNoWait("", "", "panel_nobility_title_deed", "intrigue", -1,',
+                    '    "@L_CERTIFICATE_HEAD", "@L_CERTIFICATE_BODY")',
                     'SimAddDatebookEntry("accuser", EventTime, "courtbuilding",',
                     '    "@L_TRIAL_DATEBOOK_HEAD_+0",',
                     '    "@L_TRIAL_DATEBOOK_BODY_+0", GetID("accuser"), GetSettlementID(""))',
@@ -515,8 +517,8 @@ def assert_code_window_context_extracts_window_labels_and_buttons() -> None:
             raise AssertionError(f"button labels were not extracted from @B tokens: {context.buttons!r}")
         short_refs = index.references_for("SHORT_NOTICE_+0").project
         short_context = best_window_context(short_refs, "SHORT_NOTICE_+0")
-        if short_context is None or short_context.background != "dark_panel":
-            raise AssertionError(f"MsgQuick should use the dark panel preview profile: {short_context!r}")
+        if short_context is None or short_context.background != "overlay":
+            raise AssertionError(f"MsgQuick should use its transparent HUD overlay profile: {short_context!r}")
         if short_context.default_color != DARK_PANEL_TEXT:
             raise AssertionError(f"dark panel default text color should be white: {short_context!r}")
         variable_button_refs = index.references_for("MEASURE_WUERDENTRAGEREMPFANGEN_BODY_+0").project
@@ -535,12 +537,14 @@ def assert_code_window_context_extracts_window_labels_and_buttons() -> None:
         news_context = best_window_context(news_refs, "KONTOR_MISSIONS_OFFER_ITEMS_TEXT_+2")
         if news_context is None:
             raise AssertionError("code window context was not built for dynamic MsgNewsNoWait labels")
-        if news_context.call_name != "msgnewsnowait" or news_context.background != "dark_panel":
+        if news_context.call_name != "msgnewsnowait" or news_context.background != "overlay":
             raise AssertionError(f"MsgNews should retain its HUD entry style: {news_context!r}")
         if news_context.header_label != "kontor_missions_offer_items_head_+2":
             raise AssertionError(f"dynamic MsgNews head should follow the current concrete suffix: {news_context!r}")
         if news_context.body_label != "kontor_missions_offer_items_text_+2":
             raise AssertionError(f"dynamic MsgNews body should ignore cooldown/control labels: {news_context!r}")
+        if news_context.category != "economie" or news_context.icon_asset != "Hud/news/economie.tga":
+            raise AssertionError(f"MsgNews category did not select its real icon: {news_context!r}")
         argument_refs = index.references_for("SCENARIO_WAR_*_+1").project
         argument_context = best_window_context(argument_refs, "SCENARIO_WAR_*_+1")
         if argument_context is None:
@@ -587,6 +591,17 @@ def assert_code_window_context_extracts_window_labels_and_buttons() -> None:
             raise AssertionError(
                 f"ShowTutorialBoxNoWait used coordinate arguments as labels: {tutorial_context!r}"
             )
+        certificate_refs = index.references_for("CERTIFICATE_BODY").project
+        certificate_context = best_window_context(certificate_refs, "CERTIFICATE_BODY")
+        if (
+            certificate_context is None
+            or certificate_context.kind != "document"
+            or certificate_context.layout != "document"
+            or certificate_context.background_asset != "Hud/messagebox/mbback1.tga"
+        ):
+            raise AssertionError(
+                f"news panel parameter did not select the title-deed document: {certificate_context!r}"
+            )
         datebook_refs = index.references_for("TRIAL_DATEBOOK_BODY_+0").project
         datebook_context = best_window_context(datebook_refs, "TRIAL_DATEBOOK_BODY_+0")
         if datebook_context is None or datebook_context.kind != "datebook":
@@ -595,12 +610,23 @@ def assert_code_window_context_extracts_window_labels_and_buttons() -> None:
             raise AssertionError(f"datebook title was not paired with its body: {datebook_context!r}")
         if datebook_context.body_label != "trial_datebook_body_+0":
             raise AssertionError(f"datebook body was not retained: {datebook_context!r}")
+        if (
+            datebook_context.layout != "book"
+            or datebook_context.background_asset != "Hud/sheets/evidences/bg_buch.tga"
+            or datebook_context.icon_asset
+        ):
+            raise AssertionError(f"datebook entry did not use the real book sheet: {datebook_context!r}")
         schedule_refs = index.references_for("COUNCIL_SCHEDULE_+0").project
         schedule_context = best_window_context(schedule_refs, "COUNCIL_SCHEDULE_+0")
         if schedule_context is None or schedule_context.surface != "city_schedule":
             raise AssertionError(
                 f"city schedule text was collapsed into another presentation: {schedule_context!r}"
             )
+        if (
+            schedule_context.gui_resource != "GUI/Hud/panel_cityschedule.gui"
+            or schedule_context.layout != "panel"
+        ):
+            raise AssertionError(f"city schedule did not retain its own GUI profile: {schedule_context!r}")
     finally:
         safe_rmtree(temp)
 
@@ -791,6 +817,11 @@ def assert_name_tooltip_preview_pairs_title_and_body() -> None:
         raise AssertionError(f"NAME/TOOLTIP pairs should use the tooltip preview profile: {context!r}")
     if context.default_color != DARK_PANEL_TEXT:
         raise AssertionError(f"tooltip preview should use the dark panel text color: {context!r}")
+    if (
+        context.background_asset != "Hud/NoCompression/Priority3/PanelBackground_01.tga"
+        or context.title_asset != "Hud/NoCompression/header_red.tga"
+    ):
+        raise AssertionError(f"tooltip pair did not use the real tooltip assets: {context!r}")
     if header is not name or body is not tooltip or buttons:
         raise AssertionError("NAME/TOOLTIP preview parts were not assembled as title/body")
 
@@ -835,6 +866,11 @@ def assert_engine_owned_preview_styles() -> None:
     context, header, body, _, _ = TranslatorWindow._game_preview_parts(help_window, help_description)
     if context is None or context.kind != "onscreen_help":
         raise AssertionError(f"engine onscreen help should use its native panel profile: {context!r}")
+    if (
+        context.background_asset != "Hud/sheets/OnscreenHelp/bg.tga"
+        or context.title_asset != "Hud/NoCompression/header_red.tga"
+    ):
+        raise AssertionError(f"onscreen help did not use its own GUI assets: {context!r}")
     if header is not help_name or body is not help_description:
         raise AssertionError("engine onscreen help should retain structural title/body pairing")
 

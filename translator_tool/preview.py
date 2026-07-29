@@ -968,7 +968,16 @@ class PreviewService:
                 layout.height,
                 QImage.Format.Format_ARGB32_Premultiplied,
             )
-            canvas.fill(QColor("#3b3631" if context is not None and context.background == "dark_panel" else "#d8bd83"))
+            if context is not None and context.background == "overlay":
+                canvas.fill(QColor(28, 25, 22, 176))
+            else:
+                canvas.fill(
+                    QColor(
+                        "#3b3631"
+                        if context is not None and context.background == "dark_panel"
+                        else "#d8bd83"
+                    )
+                )
         else:
             canvas = background.convertToFormat(QImage.Format.Format_ARGB32_Premultiplied)
         painter = QPainter(canvas)
@@ -1031,9 +1040,14 @@ class PreviewService:
         left: int,
         right: int,
     ) -> bool:
-        if context is None or context.kind not in {"tooltip", "onscreen_help"}:
+        if context is None:
             return False
-        bar = self.ui_image("header_red.tga")
+        asset = context.title_asset
+        if not asset and context.kind in {"tooltip", "onscreen_help"}:
+            asset = "header_red.tga"
+        if not asset:
+            return False
+        bar = self.ui_image(asset)
         if bar is None or bar.isNull():
             return False
         height = max(22, round(bar.height() * min(1.15, max(1.0, (right - left) / max(1, bar.width())))))
@@ -1050,12 +1064,24 @@ class PreviewService:
         body: PreviewDocument | None,
         buttons: tuple[PreviewDocument, ...],
     ) -> GameWindowLayout:
-        dark_panel = context is not None and context.background == "dark_panel"
-        candidates = (
-            ((380, 148), (440, 280), (520, 430))
-            if dark_panel
-            else ((344, 240), (380, 344), (460, 520))
-        )
+        layout_kind = context.layout if context is not None and context.layout else ""
+        dark_panel = context is not None and context.background in {"dark_panel", "overlay"}
+        if layout_kind == "book":
+            candidates = ((520, 435), (622, 521), (720, 603))
+        elif layout_kind == "document":
+            candidates = ((400, 338), (520, 438), (620, 524))
+        elif layout_kind == "overlay":
+            candidates = ((380, 96), (440, 136), (520, 180))
+        elif layout_kind == "news":
+            candidates = ((380, 116), (440, 160), (520, 220))
+        elif layout_kind == "help":
+            candidates = ((440, 333), (524, 396), (620, 470))
+        else:
+            candidates = (
+                ((380, 148), (440, 280), (520, 430))
+                if dark_panel
+                else ((344, 240), (380, 344), (460, 520))
+            )
         minimum_index = 0
         if len(buttons) >= 4:
             minimum_index = 2
@@ -1064,14 +1090,25 @@ class PreviewService:
         if _document_visual_units(header) + _document_visual_units(body) >= 220:
             minimum_index = max(minimum_index, 2)
 
-        top = 18 if dark_panel else 30
-        left_margin = (
-            92
-            if context is not None and context.kind in {"news", "datebook"}
-            else (26 if dark_panel else 34)
-        )
-        right_margin = 26 if dark_panel else 34
-        body_scale = 0.78 if dark_panel else 0.85
+        if layout_kind == "book":
+            top, left_margin, right_margin, body_scale = 48, 66, 66, 0.82
+        elif layout_kind == "document":
+            top, left_margin, right_margin, body_scale = 42, 48, 48, 0.85
+        elif layout_kind == "overlay":
+            top, left_margin, right_margin, body_scale = 14, 18, 18, 0.78
+        elif layout_kind == "news":
+            top, left_margin, right_margin, body_scale = 18, 76, 22, 0.78
+        elif layout_kind == "help":
+            top, left_margin, right_margin, body_scale = 32, 36, 36, 0.78
+        else:
+            top = 18 if dark_panel else 30
+            left_margin = (
+                92
+                if context is not None and context.kind in {"news", "datebook"}
+                else (26 if dark_panel else 34)
+            )
+            right_margin = 26 if dark_panel else 34
+            body_scale = 0.78 if dark_panel else 0.85
         body_line_height = max(12, round(25 * body_scale))
         header_line_height = 25
         button_gap = 6
@@ -1110,6 +1147,8 @@ class PreviewService:
 
     @staticmethod
     def _game_window_background_name(context: PreviewWindowContext | None) -> str:
+        if context is not None and context.background_asset:
+            return context.background_asset
         if context is None or context.kind in {"message", "quest"}:
             return "Hud/messagebox/mbback0.tga"
         if context.call_name in {"msgsay", "msgsaynowait", "msgsayinteraction", "showtutorialboxnowait"}:
@@ -1124,14 +1163,19 @@ class PreviewService:
         context: PreviewWindowContext | None,
         rect: QRect,
     ) -> bool:
-        if context is None or context.call_name not in {
+        if context is None:
+            return False
+        asset = context.frame_asset
+        if not asset and context.call_name in {
             "msgsay",
             "msgsaynowait",
             "msgsayinteraction",
             "showtutorialboxnowait",
         }:
+            asset = "Hud/borders/Border_Gold_02.tga"
+        if not asset:
             return False
-        return self._draw_game_nine_slice(painter, rect, "Hud/borders/Border_Gold_02.tga")
+        return self._draw_game_nine_slice(painter, rect, asset)
 
     def _draw_game_window_decoration(
         self,
@@ -1139,14 +1183,41 @@ class PreviewService:
         context: PreviewWindowContext | None,
         rect: QRect,
     ) -> bool:
-        if context is None or context.kind not in {"news", "datebook"}:
+        if context is None:
             return False
-        icon_name = "Hud/news/schedule.tga" if context.kind == "datebook" else "Hud/news/default.tga"
+        icon_name = context.icon_asset
+        if not icon_name and not context.surface and context.kind in {"news", "datebook"}:
+            icon_name = (
+                "Hud/news/schedule.tga"
+                if context.kind == "datebook"
+                else "Hud/news/default.tga"
+            )
+        if not icon_name:
+            return False
         icon = self.ui_image(icon_name)
+        if (
+            (icon is None or icon.isNull())
+            and context.surface == "news"
+            and icon_name.casefold() != "hud/news/default.tga"
+        ):
+            icon = self.ui_image("Hud/news/default.tga")
         if icon is None or icon.isNull():
             return False
-        size = min(64, rect.height() - 36)
-        painter.drawImage(QRect(16, 18, size, size), icon)
+        maximum = min(64, rect.height() - 36)
+        scaled = icon.size().scaled(
+            maximum,
+            maximum,
+            Qt.AspectRatioMode.KeepAspectRatio,
+        )
+        painter.drawImage(
+            QRect(
+                16 + max(0, (maximum - scaled.width()) // 2),
+                18 + max(0, (maximum - scaled.height()) // 2),
+                scaled.width(),
+                scaled.height(),
+            ),
+            icon,
+        )
         return True
 
     def _draw_game_nine_slice(self, painter: QPainter, rect: QRect, prefix: str) -> bool:

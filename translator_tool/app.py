@@ -79,7 +79,11 @@ from .ai import (
 )
 from .code_index import CodeReference, CodeReferenceIndex, CodeReferenceSet, label_group_key, normalize_label
 from .code_index_lazy import LazyCodeIndexBuilder, LazyIndexProgress
-from .code_window_context import DARK_PANEL_TEXT, PreviewWindowContext, engine_window_context
+from .code_window_context import (
+    PreviewWindowContext,
+    engine_window_context,
+    surface_window_context,
+)
 from .code_open import open_code_reference
 from .codec_adapter import CodecError, Guild2Codec, load_codec_for_language, language_uses_codec
 from .diagnostics import configure_diagnostics, log_exception, log_failure, log_metrics, shutdown_diagnostics
@@ -3805,12 +3809,7 @@ class TranslatorWindow(QMainWindow):
         cache_key = (
             target,
             unit.uid,
-            context.kind if context is not None else "",
-            context.background if context is not None else "",
-            context.call_name if context is not None else "",
-            context.header_label if context is not None else "",
-            context.body_label if context is not None else "",
-            tuple((button.label, button.text) for button in context.buttons) if context is not None else (),
+            context,
             context_references,
             header_unit.uid if header_unit is not None else "",
             header_unit.current_text if target and header_unit is not None else (
@@ -3906,10 +3905,8 @@ class TranslatorWindow(QMainWindow):
                     ),
                 )
             elif TranslatorWindow._is_name_tooltip_pair(header_unit, body_unit):
-                context = PreviewWindowContext(
-                    kind="tooltip",
-                    background="dark_panel",
-                    default_color=DARK_PANEL_TEXT,
+                context = surface_window_context(
+                    "tooltip",
                     header_label=normalize_label(header_unit.label) if header_unit is not None else "",
                     body_label=normalize_label(body_unit.label) if body_unit is not None else "",
                 )
