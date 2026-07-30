@@ -942,6 +942,8 @@ def assert_placeholder_values_avoid_ambiguous_random_branches() -> None:
                 "_ITEM_BoozyBreathBeer_NAME_+0": "Drunkard Brew beer",
                 "_PRIVILEGE_CanTrade_MESSAGETEXT_+0": "May trade goods",
                 "PlainOfficeKey": "Bailiff",
+                "_CHARACTERS_3_OFFICES_NAME_Bischof_+0": "Bishop",
+                "_CHARACTERS_3_OFFICES_NAME_Buergermeister_+0": "City Mayor",
                 "_CHARACTERS_3_TITLES_NAME_+9": "Citizen",
                 "_BIRTH_PROMPT_DAUGHTER_+0": "What do you want to name your daughter?",
                 "SubstSimFullDescOffice_+0": "%1ST %1SV %1SD, %1SA in %2NAME",
@@ -1044,6 +1046,59 @@ def assert_placeholder_values_avoid_ambiguous_random_branches() -> None:
     office = builder.argument_value(1, "SA", character_context).text
     if title == "Supreme Commander" or office == "Supreme Commander":
         raise AssertionError("character metadata placeholders still sampled unrelated extreme DB entries")
+
+    office_evidence = CodeReference(
+        "office_gain_body_+0",
+        Path("ps_bischof.lua"),
+        17,
+        1,
+        "feedback_MessageOffice",
+        2,
+        runtime_arguments=('GetID("")', 'GetSettlementID("")', "AthmoLabel"),
+        runtime_argument_values=(
+            (),
+            ("",),
+            ("@L_CHARACTERS_3_OFFICES_NAME_Bischof_ATHMO_+0",),
+        ),
+        runtime_argument_kinds=((), ("settlement",), ("label",)),
+        role="body",
+    )
+    office_evidence_context = PlaceholderContext(
+        "OFFICE_GAIN_BODY_+0",
+        "Text.dbt",
+        False,
+        "en",
+        (office_evidence,),
+        ((1, ("SN", "SA", "SV")), (2, ("NAME",)), (3, ("l",))),
+    )
+    if builder.argument_value(1, "SA", office_evidence_context).text != "Bishop":
+        raise AssertionError("a character office ignored the unique office identity proven by its call")
+
+    ambiguous_office_evidence = CodeReference(
+        "office_gain_body_+0",
+        Path("Office.lua"),
+        18,
+        1,
+        "feedback_MessageOffice",
+        2,
+        runtime_arguments=("FirstOffice", "SecondOffice"),
+        runtime_argument_values=(
+            ("@L_CHARACTERS_3_OFFICES_NAME_Bischof_ATHMO_+0",),
+            ("@L_CHARACTERS_3_OFFICES_NAME_Buergermeister_ATHMO_+0",),
+        ),
+        runtime_argument_kinds=(("label",), ("label",)),
+        role="body",
+    )
+    ambiguous_office_context = PlaceholderContext(
+        "OFFICE_GAIN_BODY_+0",
+        "Text.dbt",
+        False,
+        "en",
+        (ambiguous_office_evidence,),
+        ((1, ("SA",)),),
+    )
+    if builder.argument_value(1, "SA", ambiguous_office_context).text != "Mayor":
+        raise AssertionError("ambiguous office evidence was forced onto a character")
 
     ambiguous_name = CodeReference(
         "plain_name_+0",

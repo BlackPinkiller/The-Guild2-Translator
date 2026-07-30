@@ -317,7 +317,8 @@ class PlaceholderEntityResolver:
             title = translate("preview.value.title", locale=context.locale, number=number)
         needs_office = "SA" in context.suffixes_for(number)
         office = (
-            self.localization.sample_character_office(
+            _related_office_value(self.localization, context)
+            or self.localization.sample_character_office(
                 context.seed_key,
                 number,
                 context.target,
@@ -1205,6 +1206,37 @@ _LABEL_LITERAL_RE = re.compile(
     r"(@L_[A-Za-z0-9_*]+_\+[A-Za-z0-9*]+)|"
     r"(?<![A-Za-z0-9])(_[A-Za-z0-9_*]+_\+[A-Za-z0-9*]+)"
 )
+
+
+def _related_office_value(
+    localization: PlaceholderLocalization,
+    context: PlaceholderContext,
+) -> str:
+    """Reuse one office identity already proven elsewhere in the same call."""
+    identities: set[str] = set()
+    for reference in context.references:
+        expressions = list(getattr(reference, "runtime_arguments", ()) or ())
+        for candidates in getattr(reference, "runtime_argument_values", ()) or ():
+            if isinstance(candidates, tuple):
+                expressions.extend(str(candidate) for candidate in candidates)
+        for expression in expressions:
+            for label in _literal_label_candidates(str(expression)):
+                match = re.match(
+                    r"^_?CHARACTERS_3_OFFICES_NAME_(.+)_\+[A-Za-z0-9*]+$",
+                    label,
+                    re.IGNORECASE,
+                )
+                if match is None:
+                    continue
+                identity = re.sub(r"_ATHMO$", "", match.group(1), flags=re.IGNORECASE)
+                if identity:
+                    identities.add(identity)
+    if len(identities) != 1:
+        return ""
+    identity = next(iter(identities))
+    label = f"_CHARACTERS_3_OFFICES_NAME_{identity}_+0"
+    value = localization.localized(label, context.target)
+    return _clean_sample_text(value) if value and value != label else ""
 
 
 def _city_value(localization: PlaceholderLocalization, number: int, context: PlaceholderContext) -> str:
