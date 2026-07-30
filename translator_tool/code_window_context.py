@@ -322,7 +322,7 @@ def surface_window_context(
         background=presentation.background,
         default_color=(
             DARK_PANEL_TEXT
-            if presentation.background in {"dark_panel", "overlay"}
+            if presentation.background in {"dark_panel", "overlay", "transparent"}
             else PARCHMENT_TEXT
         ),
         header_label=header_label,
@@ -531,7 +531,7 @@ def _presentation_for_surface(
         ),
         "quest_intro": PreviewSurfacePresentation(
             "quest_intro",
-            "dark_panel",
+            "transparent",
             "panel",
             "GUI/Hud/panel_questintro.gui",
             "Hud/NoCompression/Priority3/PanelBackground_01.tga",

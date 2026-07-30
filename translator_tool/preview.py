@@ -1267,9 +1267,49 @@ class PreviewService:
         node_names = _gui_document_node_names(context)
         if info is None or node_names is None or not info.root_size:
             return False
+        if context is not None and context.kind == "quest_intro":
+            panel_node = max(
+                (
+                    node
+                    for node in info.nodes
+                    if node.name.casefold() == "cl_wincontainer"
+                ),
+                key=lambda node: node.width * node.height,
+                default=None,
+            )
+            if panel_node is not None:
+                panel_rect = _scaled_gui_node_rect(panel_node, info.root_size, rect)
+                background = self.ui_image(
+                    context.background_asset
+                    or "Hud/NoCompression/Priority3/PanelBackground_01.tga"
+                )
+                if background is not None and not background.isNull():
+                    painter.drawImage(panel_rect, background)
+                self._draw_game_nine_slice(
+                    painter,
+                    panel_rect,
+                    context.frame_asset or "Hud/borders/border_wood.tga",
+                )
+            header_node = gui_node_geometry(info, "Header")
+            if header_node is not None:
+                header_rect = _scaled_gui_node_rect(header_node, info.root_size, rect)
+                label = self.ui_image("Hud/NoCompression/label.tga")
+                if label is not None and not label.isNull():
+                    painter.drawImage(header_rect, label)
         header_names, body_names = node_names
         header_node = gui_node_geometry(info, *header_names)
         body_node = gui_node_geometry(info, *body_names)
+        if context is not None and context.kind == "quest_intro" and body_node is not None:
+            body_parent = gui_node_geometry(info, "ScrollContainern")
+            if body_parent is not None:
+                body_node = GuiNodeGeometry(
+                    body_node.name,
+                    body_node.x,
+                    body_parent.y + body_node.y,
+                    body_node.width,
+                    body_node.height,
+                    body_node.horizontal_alignment,
+                )
         if (header is not None and header_node is None) or (body is not None and body_node is None):
             return False
         scale_x = rect.width() / max(1, info.root_size[0])
@@ -1792,6 +1832,8 @@ class PreviewService:
 
     @staticmethod
     def _game_window_background_name(context: PreviewWindowContext | None) -> str:
+        if context is not None and context.kind == "quest_intro":
+            return ""
         if context is not None and context.background_asset:
             return context.background_asset
         if context is None or context.kind in {"message", "quest"}:
@@ -1809,6 +1851,8 @@ class PreviewService:
         rect: QRect,
     ) -> bool:
         if context is None:
+            return False
+        if context.kind == "quest_intro":
             return False
         asset = context.frame_asset
         if not asset and context.call_name in {

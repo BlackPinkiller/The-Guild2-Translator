@@ -33,6 +33,7 @@ from .code_window_context import (
     PreviewWindowContext,
     best_window_context,
     engine_window_context,
+    surface_window_context,
 )
 from .codec_adapter import Guild2Codec, load_codec_for_language
 from .git_history import GitCommit, GitError, LanguageGit, TranslationLogEntry, combine_entries, format_entries
@@ -900,6 +901,12 @@ def assert_game_preview_draws_all_buttons() -> None:
     )
     if overhead.height() != 30 or overhead.pixelColor(0, 0).alpha() != 0:
         raise AssertionError("overhead text should use its tight transparent in-world surface")
+    quest_intro = surface_window_context("quest_intro")
+    if (
+        quest_intro.background != "transparent"
+        or PreviewService._game_window_background_name(quest_intro)
+    ):
+        raise AssertionError("quest intro should compose its centered game panel over a transparent HUD root")
     gui_temp = Path(tempfile.mkdtemp(prefix="translator_tool_gui_geometry_"))
     try:
         identifiers = {
