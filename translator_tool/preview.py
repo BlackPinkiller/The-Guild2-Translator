@@ -63,6 +63,8 @@ def _gui_document_node_names(
     if context is None:
         return None
     resource = context.gui_resource.replace("\\", "/").casefold()
+    if resource == "gui/hud/helppanels/items.gui":
+        return (("Header",), ("Artefact",))
     if resource.startswith("gui/hud/helppanels/") and resource.endswith(".gui"):
         return (("Header",), ("Label",))
     if resource == "gui/styles/tooltip.gst":
@@ -1525,15 +1527,6 @@ class PreviewService:
             .casefold()
             .startswith("gui/hud/helppanels/")
         )
-        if help_resource and body_node is not None and body_node.x is None:
-            body_node = GuiNodeGeometry(
-                body_node.name,
-                16,
-                body_node.y,
-                body_node.width,
-                body_node.height,
-                body_node.horizontal_alignment,
-            )
         header_centered, body_centered = _gui_document_centering(context)
         if context is not None and context.kind == "tooltip" and body_node is not None:
             body_node = GuiNodeGeometry(
@@ -1603,6 +1596,8 @@ class PreviewService:
             if context is not None and context.kind == "tooltip"
             else max(0.50, min(0.86, 0.78 * min(scale_x, scale_y)))
         )
+        header_font_scale = font_scale
+        body_font_scale = 0.58 if help_resource else font_scale
         if header is not None and header_node is not None:
             header_rect = _scaled_gui_node_rect(header_node, render_root_size, rect)
             if help_resource:
@@ -1623,7 +1618,7 @@ class PreviewService:
                 top=header_rect.top(),
                 left=header_rect.left(),
                 right=header_rect.right() + 1,
-                scale=font_scale,
+                scale=header_font_scale,
                 centered=header_centered,
                 bottom=header_rect.bottom() + 1,
                 default_color=default_color,
@@ -1637,7 +1632,7 @@ class PreviewService:
                 top=body_rect.top(),
                 left=body_rect.left(),
                 right=body_rect.right() + 1,
-                scale=font_scale,
+                scale=body_font_scale,
                 centered=body_centered,
                 bottom=body_rect.bottom() + 1,
                 default_color=default_color,
@@ -1720,6 +1715,12 @@ class PreviewService:
             outer_rect,
             "Hud/borders/border_header_red.tga",
         )
+        if context.frame_asset:
+            self._draw_game_nine_slice(
+                painter,
+                rect,
+                context.frame_asset,
+            )
 
     def _draw_game_questbook(
         self,

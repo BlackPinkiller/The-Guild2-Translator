@@ -1209,9 +1209,25 @@ def assert_game_preview_draws_all_buttons() -> None:
         def integer(name: str, value: int) -> bytes:
             return identifiers[name] + b"\x01" + value.to_bytes(4, "little", signed=True)
 
-        def node(name: str, *, y: int, width: int, height: int, align: int | None = None) -> bytes:
+        def node(
+            name: str,
+            *,
+            y: int,
+            width: int,
+            height: int,
+            x: int | None = None,
+            align: int | None = None,
+        ) -> bytes:
             raw_name = name.encode("ascii") + b"\0"
-            values = (
+            values = b""
+            if x is not None:
+                values += (
+                    b"\x10\x20\x30\x40"
+                    + b"\x00" * 8
+                    + b"\x01"
+                    + x.to_bytes(4, "little", signed=True)
+                )
+            values += (
                 integer("ABS_Y", y)
                 + integer("ABS_WIDTH", width)
                 + integer("ABS_HEIGHT", height)
@@ -1364,7 +1380,14 @@ def assert_game_preview_draws_all_buttons() -> None:
             + node("Header", y=6, width=603, height=27)
             + node("Container", y=6, width=597, height=26)
             + node("Container", y=0, width=603, height=38)
-            + node("Label", y=140, width=291, height=209)
+            + node("Label", x=15, y=140, width=291, height=209)
+            + node(
+                "Artefact",
+                x=354,
+                y=64,
+                width=216,
+                height=65,
+            )
             + node("Root", y=0, width=603, height=462)
         )
         requested_help_assets: list[str] = []
@@ -1395,11 +1418,11 @@ def assert_game_preview_draws_all_buttons() -> None:
             or gui_positions
             != [
                 ("Item title", 6, 0, 603, True),
-                ("Item description", 140, 16, 307, False),
+                ("Item description", 64, 354, 570, False),
             ]
         ):
             raise AssertionError(
-                f"item help text did not follow its real header and left-column coordinates: {gui_positions!r}"
+                f"item help text did not use the engine-populated Artefact node: {gui_positions!r}"
             )
         if (
             "Hud/NoCompression/header_red.tga" not in requested_help_assets

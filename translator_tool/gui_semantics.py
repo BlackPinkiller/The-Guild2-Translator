@@ -148,9 +148,10 @@ def _gui_node_geometry(raw: bytes) -> tuple[GuiNodeGeometry, ...]:
         nodes.append(
             GuiNodeGeometry(
                 name=name,
-                x=_gui_integer_property(
+                x=_gui_horizontal_property(
                     raw,
                     property_ids["ABS_X"],
+                    property_ids["ABS_Y"],
                     segment_start,
                     position,
                 ),
@@ -188,6 +189,31 @@ def _gui_node_geometry(raw: bytes) -> tuple[GuiNodeGeometry, ...]:
     return tuple(nodes)
 
 
+def _gui_horizontal_property(
+    raw: bytes,
+    identifier: bytes,
+    vertical_identifier: bytes,
+    start: int,
+    end: int,
+) -> int | None:
+    """Read ABS_X, whose vector-property value precedes the ordinary ABS_Y record."""
+    if vertical_identifier:
+        search_end = end
+        while True:
+            position = raw.rfind(vertical_identifier, start, search_end)
+            if position < 0:
+                break
+            if (
+                position + 9 <= end
+                and raw[position + 4] == 1
+                and position >= start + 5
+                and raw[position - 5] == 1
+            ):
+                return struct.unpack_from("<i", raw, position - 4)[0]
+            search_end = position
+    return _gui_integer_property(raw, identifier, start, end)
+
+
 def _gui_property_id(raw: bytes, name: str) -> bytes:
     marker = name.encode("ascii") + b"\0"
     position = raw.find(marker)
@@ -205,10 +231,14 @@ def _gui_integer_property(
 ) -> int | None:
     if not identifier:
         return None
-    position = raw.rfind(identifier, start, end)
-    if position < 0 or position + 9 > len(raw) or raw[position + 4] != 1:
-        return None
-    return struct.unpack_from("<i", raw, position + 5)[0]
+    search_end = end
+    while True:
+        position = raw.rfind(identifier, start, search_end)
+        if position < 0:
+            return None
+        if position + 9 <= end and raw[position + 4] == 1:
+            return struct.unpack_from("<i", raw, position + 5)[0]
+        search_end = position
 
 
 def _gui_string_property(raw: bytes, position: int) -> tuple[str, int] | None:
