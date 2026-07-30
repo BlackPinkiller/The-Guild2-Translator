@@ -24,7 +24,7 @@ from PySide6.QtGui import (
 
 from .code_window_context import PreviewWindowContext
 from .format_io import dbt_row_values, load_dbt, translatable_fields
-from .gui_semantics import gui_resource_info
+from .gui_semantics import GuiNodeGeometry, GuiResourceInfo, gui_node_geometry, gui_resource_info
 from .i18n import translate
 from .preview_context_selection import select_preview_context
 from .preview_placeholders import PlaceholderContext, PlaceholderLabelRecord, PlaceholderValueBuilder
@@ -55,6 +55,46 @@ PRINTF_PREVIEW_RE = re.compile(PRINTF_TOKEN)
 SYMBOL_PREVIEW_RE = re.compile(r"\$S\[\s*(\d+)\s*\]")
 COLOR_VALUE_RE = re.compile(r"\d+")
 GUIDE_VALUE_RE = re.compile(r"\[([rgb])=(\d{1,3})\]")
+
+
+def _gui_document_node_names(
+    context: PreviewWindowContext | None,
+) -> tuple[tuple[str, ...], tuple[str, ...]] | None:
+    if context is None:
+        return None
+    resource = context.gui_resource.replace("\\", "/").casefold()
+    return {
+        "gui/hud/panel_messagebox.gui": (("LHeader",), ("Entrys",)),
+        "gui/hud/questboxpanel.gui": (("LHeader",), ("Entrys",)),
+        "gui/hud/saypanel.gui": (("LHeader",), ("Text",)),
+        "gui/hud/panel_quickmessage.gui": ((), ("InfoLabel",)),
+        "gui/hud/panel_measuremessage.gui": ((), ("InfoLabel",)),
+        "gui/hud/panel_systemmessage.gui": ((), ("InfoLabel",)),
+        "gui/hud/panel_tutorial.gui": (("LHeader",), ("Entrys",)),
+        "gui/hud/panel_questintro.gui": (("Header",), ("Scrolltext",)),
+        "gui/hud/helppanels/measures.gui": (("Header",), ("Label",)),
+        "gui/hud/helppanels/text.gui": (("Header",), ("Label",)),
+        "gui/hud/panel_cityschedule.gui": ((), ("Entrys",)),
+    }.get(resource)
+
+
+def _scaled_gui_node_rect(
+    node: GuiNodeGeometry,
+    root_size: tuple[int, int],
+    target: QRect,
+) -> QRect:
+    root_width, root_height = root_size
+    x = node.x
+    if x is None:
+        x = max(0, (root_width - node.width) // 2)
+    scale_x = target.width() / max(1, root_width)
+    scale_y = target.height() / max(1, root_height)
+    return QRect(
+        target.left() + round(x * scale_x),
+        target.top() + round(node.y * scale_y),
+        max(1, round(node.width * scale_x)),
+        max(1, round(node.height * scale_y)),
+    )
 
 
 @dataclass(frozen=True)
@@ -1106,6 +1146,25 @@ class PreviewService:
             )
             painter.end()
             return canvas
+        if self._draw_game_gui_documents(
+            painter,
+            context,
+            header,
+            body,
+            target=target,
+            rect=canvas.rect(),
+            default_color=default_color,
+        ):
+            if buttons:
+                self._draw_game_buttons(
+                    painter,
+                    buttons,
+                    target=target,
+                    top=max(0, canvas.height() - _estimated_buttons_height(buttons, canvas.width()) - 12),
+                    default_color=(235, 225, 175, 255),
+                )
+            painter.end()
+            return canvas
         top = layout.top
         left_margin = layout.left_margin
         right_margin = layout.right_margin
@@ -1159,6 +1218,59 @@ class PreviewService:
             )
         painter.end()
         return canvas
+
+    def _draw_game_gui_documents(
+        self,
+        painter: QPainter,
+        context: PreviewWindowContext | None,
+        header: PreviewDocument | None,
+        body: PreviewDocument | None,
+        *,
+        target: bool,
+        rect: QRect,
+        default_color: tuple[int, int, int, int],
+    ) -> bool:
+        info = self._game_window_gui_info(context)
+        node_names = _gui_document_node_names(context)
+        if info is None or node_names is None or not info.root_size:
+            return False
+        header_names, body_names = node_names
+        header_node = gui_node_geometry(info, *header_names)
+        body_node = gui_node_geometry(info, *body_names)
+        if (header is not None and header_node is None) or (body is not None and body_node is None):
+            return False
+        scale_x = rect.width() / max(1, info.root_size[0])
+        scale_y = rect.height() / max(1, info.root_size[1])
+        font_scale = max(0.50, min(0.86, 0.78 * min(scale_x, scale_y)))
+        if header is not None and header_node is not None:
+            header_rect = _scaled_gui_node_rect(header_node, info.root_size, rect)
+            self._draw_game_document(
+                painter,
+                header,
+                target=target,
+                top=header_rect.top(),
+                left=header_rect.left(),
+                right=header_rect.right() + 1,
+                scale=font_scale,
+                centered=header_node.horizontal_alignment == 4,
+                bottom=header_rect.bottom() + 1,
+                default_color=default_color,
+            )
+        if body is not None and body_node is not None:
+            body_rect = _scaled_gui_node_rect(body_node, info.root_size, rect)
+            self._draw_game_document(
+                painter,
+                body,
+                target=target,
+                top=body_rect.top(),
+                left=body_rect.left(),
+                right=body_rect.right() + 1,
+                scale=font_scale,
+                centered=body_node.horizontal_alignment == 4,
+                bottom=body_rect.bottom() + 1,
+                default_color=default_color,
+            )
+        return header is not None or body is not None
 
     def _draw_game_questbook(
         self,
@@ -1266,14 +1378,25 @@ class PreviewService:
         layout_kind = context.layout if context is not None and context.layout else ""
         dark_panel = context is not None and context.background in {"dark_panel", "overlay"}
         gui_geometry = self._game_window_gui_geometry(context)
-        if layout_kind == "parchment" and gui_geometry is not None:
+        gui_driven = _gui_document_node_names(context) is not None
+        if gui_driven and gui_geometry is not None:
             (root_width, root_height), _content_rect = gui_geometry
+            maximum_scale = min(
+                1.2,
+                620 / max(1, root_width),
+                620 / max(1, root_height),
+            )
+            scales = (
+                (maximum_scale * 0.8, maximum_scale)
+                if maximum_scale < 0.8
+                else tuple(dict.fromkeys((0.8, min(1.0, maximum_scale), maximum_scale)))
+            )
             candidates = tuple(
                 (
                     max(1, round(root_width * scale)),
                     max(1, round(root_height * scale)),
                 )
-                for scale in (0.8, 1.0, 1.2)
+                for scale in scales
             )
         elif layout_kind == "book":
             candidates = ((520, 435), (622, 521), (720, 603))
@@ -1350,7 +1473,7 @@ class PreviewService:
             candidate_right = right_margin
             candidate_body_scale = body_scale
             content_bottom = height
-            if layout_kind == "parchment" and gui_geometry is not None:
+            if gui_driven and gui_geometry is not None:
                 (root_width, root_height), (x, y, content_width, content_height) = gui_geometry
                 scale_x = width / max(1, root_width)
                 scale_y = height / max(1, root_height)
@@ -1430,7 +1553,7 @@ class PreviewService:
             )
             if result is not None:
                 return result
-        if layout_kind == "parchment" and gui_geometry is not None:
+        if gui_driven and gui_geometry is not None:
             (root_width, root_height), (x, y, content_width, _content_height) = gui_geometry
             scale_x = width / max(1, root_width)
             scale_y = height / max(1, root_height)
@@ -1455,10 +1578,7 @@ class PreviewService:
             or context.gui_resource.startswith("engine:")
         ):
             return None
-        path = self.game_root.joinpath(
-            *context.gui_resource.replace("\\", "/").split("/")
-        )
-        info = gui_resource_info(path)
+        info = self._game_window_gui_info(context)
         if (
             info is None
             or len(info.root_size) != 2
@@ -1466,6 +1586,22 @@ class PreviewService:
         ):
             return None
         return info.root_size, info.content_rect
+
+    def _game_window_gui_info(
+        self,
+        context: PreviewWindowContext | None,
+    ) -> GuiResourceInfo | None:
+        if (
+            context is None
+            or self.game_root is None
+            or not context.gui_resource
+            or context.gui_resource.startswith("engine:")
+        ):
+            return None
+        path = self.game_root.joinpath(
+            *context.gui_resource.replace("\\", "/").split("/")
+        )
+        return gui_resource_info(path)
 
     def _game_window_background(self, context: PreviewWindowContext | None, width: int, height: int) -> QImage | None:
         name = self._game_window_background_name(context)

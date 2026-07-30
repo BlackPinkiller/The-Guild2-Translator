@@ -23,10 +23,11 @@ class GuiResourceInfo:
     assets: tuple[str, ...]
     root_size: tuple[int, int] = ()
     content_rect: tuple[int, int, int, int] = ()
+    nodes: tuple[GuiNodeGeometry, ...] = ()
 
 
 @dataclass(frozen=True)
-class _GuiNodeGeometry:
+class GuiNodeGeometry:
     name: str
     x: int | None
     y: int
@@ -77,14 +78,11 @@ def _cached_gui_resource_info(
         (
             node
             for node in nodes
-            if re.search(r"(?:entry|body|text)", node.name, re.IGNORECASE)
+            if re.search(r"(?:entry|body|text|label)", node.name, re.IGNORECASE)
             and node.width > 0
             and node.height > 0
         ),
-        key=lambda node: (
-            node.name.casefold().startswith("entry"),
-            node.width * node.height,
-        ),
+        key=lambda node: node.width * node.height,
         default=None,
     )
     root_size = (root.width, root.height) if root is not None else ()
@@ -104,10 +102,22 @@ def _cached_gui_resource_info(
         tuple(assets),
         root_size,
         content_rect,
+        nodes,
     )
 
 
-def _gui_node_geometry(raw: bytes) -> tuple[_GuiNodeGeometry, ...]:
+def gui_node_geometry(
+    info: GuiResourceInfo,
+    *names: str,
+) -> GuiNodeGeometry | None:
+    requested = {name.casefold() for name in names}
+    return next(
+        (node for node in info.nodes if node.name.casefold() in requested),
+        None,
+    )
+
+
+def _gui_node_geometry(raw: bytes) -> tuple[GuiNodeGeometry, ...]:
     property_ids = {
         name: _gui_property_id(raw, name)
         for name in (
@@ -122,7 +132,7 @@ def _gui_node_geometry(raw: bytes) -> tuple[_GuiNodeGeometry, ...]:
     node_id = property_ids["NODE_NAME"]
     if not node_id:
         return ()
-    nodes: list[_GuiNodeGeometry] = []
+    nodes: list[GuiNodeGeometry] = []
     previous_end = 0
     position = 0
     while True:
@@ -136,7 +146,7 @@ def _gui_node_geometry(raw: bytes) -> tuple[_GuiNodeGeometry, ...]:
         name, node_end = value
         segment_start = previous_end
         nodes.append(
-            _GuiNodeGeometry(
+            GuiNodeGeometry(
                 name=name,
                 x=_gui_integer_property(
                     raw,

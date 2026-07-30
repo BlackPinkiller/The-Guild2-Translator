@@ -43,7 +43,7 @@ from .self_tests.diagnostics import assert_diagnostics_are_bounded_and_content_f
 from .self_tests.performance import AI_CONTEXT_BUILD_LIMIT_SECONDS, assert_within_budget
 from .i18n import set_language, status_text, translate
 from .format_io import load_dbt, load_plain_text, matching_source_field, row_key
-from .gui_semantics import gui_resource_info
+from .gui_semantics import gui_node_geometry, gui_resource_info
 from .preview import GLYPH_MARK, PreviewAtom, PreviewDocument, PreviewService
 from .recovery import apply_recovery_draft, clear_recovery_draft, load_recovery_draft, recovery_path, save_recovery_draft
 from .project import (
@@ -880,6 +880,7 @@ def assert_game_preview_draws_all_buttons() -> None:
             geometry is None
             or geometry.root_size != (481, 376)
             or geometry.content_rect != (61, 50, 358, 236)
+            or gui_node_geometry(geometry, "Entrys") is None
         ):
             raise AssertionError(
                 f"binary GUI content geometry was not recovered: {geometry!r}"
@@ -909,6 +910,37 @@ def assert_game_preview_draws_all_buttons() -> None:
         ):
             raise AssertionError(
                 f"messagebox preview ignored its GUI content rectangle: {gui_layout!r}"
+            )
+        gui_positions: list[tuple[str, int, int, int]] = []
+
+        def capture_gui_document(
+            _painter: object,
+            document: PreviewDocument,
+            **kwargs: object,
+        ) -> int:
+            gui_positions.append(
+                (
+                    document.display_text,
+                    int(kwargs.get("top", 0)),
+                    int(kwargs.get("left", 0)),
+                    int(kwargs.get("right", 0)),
+                )
+            )
+            return int(kwargs.get("top", 0)) + 1
+
+        gui_service._draw_game_document = capture_gui_document  # type: ignore[method-assign]
+        gui_image = gui_service.game_window_image(
+            None,
+            PreviewDocument.from_atoms("Body", [PreviewAtom("Body", 0, 4)]),
+            target=False,
+            context=gui_context,
+        )
+        if (
+            gui_positions != [("Body", 40, 49, 336)]
+            or (gui_image.width(), gui_image.height()) != (385, 301)
+        ):
+            raise AssertionError(
+                f"messagebox text was not drawn in its named GUI node: {gui_positions!r}"
             )
         gui_service._translation_font_checked = True
         gui_service._translation_font_family = "Arial"
