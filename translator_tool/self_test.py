@@ -45,7 +45,7 @@ from .self_tests.performance import AI_CONTEXT_BUILD_LIMIT_SECONDS, assert_withi
 from .i18n import set_language, status_text, translate
 from .format_io import load_dbt, load_plain_text, matching_source_field, row_key
 from .gui_semantics import gui_node_geometry, gui_resource_info
-from .preview import GLYPH_MARK, PreviewAtom, PreviewDocument, PreviewService
+from .preview import GLYPH_MARK, PreviewAtom, PreviewDocument, PreviewService, _load_tga_image
 from .recovery import apply_recovery_draft, clear_recovery_draft, load_recovery_draft, recovery_path, save_recovery_draft
 from .project import (
     MISSING_WORK_STATUSES,
@@ -516,6 +516,8 @@ def assert_code_window_context_extracts_window_labels_and_buttons() -> None:
                     '    "@L_TRIAL_DATEBOOK_BODY_+0", GetID("accuser"), GetSettlementID(""))',
                     'CityScheduleCutsceneEvent("settlement", "council_date", "",',
                     '    "BeginCouncilMeeting", 17, 6, "@L_COUNCIL_SCHEDULE_+0")',
+                    'InitData("@P@B[1,@L_BONUS_SMALL_+0,@L_BONUS_SMALL_TIP_+0,Hud/Buttons/btn_Money_Small.tga]",',
+                    '    0, "@L_BONUS_HEAD_+0", "@L_BONUS_OBSOLETE_BODY_+0", Cost)',
                     'InitData("SayPanel", 0, "@L_PANEL_HEAD_+0", "@L_PANEL_BODY_+0", Cost)',
                     'this:AddSheetToTabGroup("Diary", "CustomSheet", "@L_CUSTOM_TAB_+0")',
                     'InitAlias("Destination", MEASUREINIT_SELECTION, "", "@L_SELECT_TARGET_+0", 0)',
@@ -567,8 +569,14 @@ def assert_code_window_context_extracts_window_labels_and_buttons() -> None:
         news_context = best_window_context(news_refs, "KONTOR_MISSIONS_OFFER_ITEMS_TEXT_+2")
         if news_context is None:
             raise AssertionError("code window context was not built for dynamic MsgNewsNoWait labels")
-        if news_context.call_name != "msgnewsnowait" or news_context.background != "overlay":
-            raise AssertionError(f"MsgNews should retain its HUD entry style: {news_context!r}")
+        if (
+            news_context.call_name != "msgnewsnowait"
+            or news_context.background != "parchment"
+            or news_context.gui_resource != "GUI/Hud/questboxpanel.gui"
+        ):
+            raise AssertionError(
+                f"MsgNews should open its real QuestBox content panel: {news_context!r}"
+            )
         if news_context.header_label != "kontor_missions_offer_items_head_+2":
             raise AssertionError(f"dynamic MsgNews head should follow the current concrete suffix: {news_context!r}")
         if news_context.body_label != "kontor_missions_offer_items_text_+2":
@@ -657,6 +665,20 @@ def assert_code_window_context_extracts_window_labels_and_buttons() -> None:
             or schedule_context.layout != "panel"
         ):
             raise AssertionError(f"city schedule did not retain its own GUI profile: {schedule_context!r}")
+        bonus_context = best_window_context(
+            index.references_for("BONUS_HEAD_+0").project,
+            "BONUS_HEAD_+0",
+        )
+        if (
+            bonus_context is None
+            or bonus_context.gui_resource != "GUI/Hud/panel_measurechoice.gui"
+            or len(bonus_context.buttons) != 1
+            or bonus_context.buttons[0].icon_asset
+            != "Hud/Buttons/btn_Money_Small.tga"
+        ):
+            raise AssertionError(
+                f"InitData measure-button icon was not retained for the real slot preview: {bonus_context!r}"
+            )
         panel_refs = index.references_for("PANEL_BODY_+0").project
         panel_context = best_window_context(panel_refs, "PANEL_BODY_+0")
         if (
@@ -716,10 +738,10 @@ def assert_code_window_context_extracts_window_labels_and_buttons() -> None:
             pamphlet_context is None
             or pamphlet_context.surface != "pamphlet"
             or pamphlet_context.gui_resource != "GUI/Hud/panel_pamphletsheet.gui"
-            or pamphlet_context.icon_asset != "Hud/Hud_Icons/Pamphlet.tga"
+            or pamphlet_context.icon_asset
         ):
             raise AssertionError(
-                f"blackboard text did not receive its pamphlet presentation: {pamphlet_context!r}"
+                f"blackboard text should use the pamphlet text cells without drawing its navigation icon: {pamphlet_context!r}"
             )
     finally:
         safe_rmtree(temp)
@@ -755,6 +777,29 @@ def assert_code_preview_unit_lookup_accepts_leading_underscore_labels() -> None:
     )
     if selected is not current:
         raise AssertionError("a dynamic code label did not preserve the matching selected preview entry")
+
+
+def assert_true_color_tga_loader() -> None:
+    path = Path(tempfile.gettempdir()) / f"translator_tool_tga_{uuid.uuid4().hex}.tga"
+    try:
+        path.write_bytes(
+            bytes.fromhex(
+                "000002000000000000000000020001001800"
+                "0000ff"
+                "00ff00"
+            )
+        )
+        image = _load_tga_image(path)
+        if (
+            image is None
+            or image.width() != 2
+            or image.height() != 1
+            or image.pixelColor(0, 0).getRgb()[:3] != (255, 0, 0)
+            or image.pixelColor(1, 0).getRgb()[:3] != (0, 255, 0)
+        ):
+            raise AssertionError("unpacked true-color game TGA was not decoded into RGBA pixels")
+    finally:
+        path.unlink(missing_ok=True)
 
 
 def assert_game_preview_draws_all_buttons() -> None:
@@ -829,7 +874,7 @@ def assert_game_preview_draws_all_buttons() -> None:
             f"questbook preview did not keep its task list and detail on separate pages: {quest_positions!r}"
         )
     multi_service = PreviewService()
-    multi_positions: list[tuple[str, int, int]] = []
+    multi_positions: list[tuple[str, int, int, int, int]] = []
 
     def capture_multi_document(
         _painter: object,
@@ -841,6 +886,8 @@ def assert_game_preview_draws_all_buttons() -> None:
                 document.display_text,
                 int(kwargs.get("left", 0)),
                 int(kwargs.get("right", 0)),
+                int(kwargs.get("top", 0)),
+                int(kwargs.get("bottom", 0)),
             )
         )
         return int(kwargs.get("top", 0)) + 1
@@ -862,9 +909,50 @@ def assert_game_preview_draws_all_buttons() -> None:
         or multi_positions[0][1] >= datebook.width() // 2
         or multi_positions[1][1] <= datebook.width() // 2
         or multi_positions[2][1] <= datebook.width() // 2
+        or multi_positions[0][3] != round(datebook.height() * (187 / 612)) + 6
+        or multi_positions[1][3] != round(datebook.height() * (320 / 612))
+        or multi_positions[2][3] != round(datebook.height() * (372 / 612))
     ):
         raise AssertionError(
-            f"datebook preview did not reproduce list and detail pages: {multi_positions!r}"
+            f"datebook preview did not follow the game GUI list and detail regions: {multi_positions!r}"
+        )
+    multi_positions.clear()
+    choice_buttons = tuple(
+        PreviewDocument.from_atoms(
+            f"Choice {index}",
+            [PreviewAtom(f"Choice {index}", 0, len(f"Choice {index}"))],
+        )
+        for index in range(3)
+    )
+    measure_choice = multi_service.game_window_image(
+        PreviewDocument.from_atoms("Choose", [PreviewAtom("Choose", 0, 6)]),
+        PreviewDocument.from_atoms(
+            "Obsolete body",
+            [PreviewAtom("Obsolete body", 0, 13)],
+        ),
+        target=False,
+        buttons=choice_buttons,
+        context=PreviewWindowContext(
+            "measure_choice",
+            "dark_panel",
+            DARK_PANEL_TEXT,
+            layout="panel",
+            gui_resource="GUI/Hud/panel_measurechoice.gui",
+        ),
+    )
+    if (
+        measure_choice.width() * 115 != measure_choice.height() * 255
+        or [position[0] for position in multi_positions]
+        != ["Choose", "Choice 0", "Choice 1", "Choice 2"]
+        or not (
+            multi_positions[1][1]
+            < multi_positions[2][1]
+            < multi_positions[3][1]
+        )
+    ):
+        raise AssertionError(
+            "InitData preview should follow the three-slot game panel and omit its obsolete BodyLabel: "
+            f"{measure_choice.size()!r}, {multi_positions!r}"
         )
     multi_positions.clear()
     pamphlet = multi_service.game_window_image(
@@ -991,7 +1079,7 @@ def assert_game_preview_draws_all_buttons() -> None:
             raise AssertionError(
                 f"messagebox preview ignored its GUI content rectangle: {gui_layout!r}"
             )
-        gui_positions: list[tuple[str, int, int, int]] = []
+        gui_positions: list[tuple[str, int, int, int, bool]] = []
 
         def capture_gui_document(
             _painter: object,
@@ -1004,6 +1092,7 @@ def assert_game_preview_draws_all_buttons() -> None:
                     int(kwargs.get("top", 0)),
                     int(kwargs.get("left", 0)),
                     int(kwargs.get("right", 0)),
+                    bool(kwargs.get("centered", False)),
                 )
             )
             return int(kwargs.get("top", 0)) + 1
@@ -1016,7 +1105,7 @@ def assert_game_preview_draws_all_buttons() -> None:
             context=gui_context,
         )
         if (
-            gui_positions != [("Body", 40, 49, 336)]
+            gui_positions != [("Body", 40, 49, 336, False)]
             or (gui_image.width(), gui_image.height()) != (385, 301)
         ):
             raise AssertionError(
@@ -4577,6 +4666,7 @@ def main() -> int:
     assert_stale_code_index_workers_are_released()
     assert_code_window_context_extracts_window_labels_and_buttons()
     assert_code_preview_unit_lookup_accepts_leading_underscore_labels()
+    assert_true_color_tga_loader()
     assert_game_preview_draws_all_buttons()
     assert_onscreen_help_preview_pairs_name_and_description()
     assert_name_tooltip_preview_pairs_title_and_body()

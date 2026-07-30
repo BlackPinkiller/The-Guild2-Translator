@@ -72,10 +72,35 @@ def _gui_document_node_names(
         "gui/hud/panel_systemmessage.gui": ((), ("InfoLabel",)),
         "gui/hud/panel_tutorial.gui": (("LHeader",), ("Entrys",)),
         "gui/hud/panel_questintro.gui": (("Header",), ("Scrolltext",)),
+        "gui/hud/panel_measurechoice.gui": (("LHeader",), ()),
         "gui/hud/helppanels/measures.gui": (("Header",), ("Label",)),
         "gui/hud/helppanels/text.gui": (("Header",), ("Label",)),
         "gui/hud/panel_cityschedule.gui": ((), ("Entrys",)),
     }.get(resource)
+
+
+def _gui_document_centering(
+    context: PreviewWindowContext | None,
+) -> tuple[bool, bool]:
+    if context is None:
+        return False, False
+    resource = context.gui_resource.replace("\\", "/").casefold()
+    body_centered = resource in {
+        "gui/hud/panel_quickmessage.gui",
+        "gui/hud/panel_measuremessage.gui",
+        "gui/hud/panel_systemmessage.gui",
+    }
+    header_centered = resource in {
+        "gui/hud/panel_messagebox.gui",
+        "gui/hud/questboxpanel.gui",
+        "gui/hud/saypanel.gui",
+        "gui/hud/panel_tutorial.gui",
+        "gui/hud/panel_questintro.gui",
+        "gui/hud/panel_measurechoice.gui",
+        "gui/hud/helppanels/measures.gui",
+        "gui/hud/helppanels/text.gui",
+    }
+    return header_centered, body_centered
 
 
 def _scaled_gui_node_rect(
@@ -95,6 +120,90 @@ def _scaled_gui_node_rect(
         max(1, round(node.width * scale_x)),
         max(1, round(node.height * scale_y)),
     )
+
+
+def _load_tga_image(path: Path) -> QImage | None:
+    """Load the true-color TGA variants used by unpacked Guild 2 HUD assets."""
+    try:
+        raw = path.read_bytes()
+    except OSError:
+        return None
+    if len(raw) < 18:
+        return None
+    (
+        identifier_length,
+        color_map_type,
+        image_type,
+        _color_map_origin,
+        _color_map_length,
+        _color_map_depth,
+        _x_origin,
+        _y_origin,
+        width,
+        height,
+        pixel_depth,
+        descriptor,
+    ) = struct.unpack_from("<BBBHHBHHHHBB", raw, 0)
+    if (
+        color_map_type != 0
+        or image_type not in {2, 10}
+        or width <= 0
+        or height <= 0
+        or pixel_depth not in {24, 32}
+    ):
+        return None
+    bytes_per_pixel = pixel_depth // 8
+    cursor = 18 + identifier_length
+    pixel_count = width * height
+    source_data: bytes | bytearray
+    if image_type == 2:
+        end = cursor + pixel_count * bytes_per_pixel
+        if end > len(raw):
+            return None
+        source_data = raw[cursor:end]
+    else:
+        decoded = bytearray()
+        target_size = pixel_count * bytes_per_pixel
+        while len(decoded) < target_size and cursor < len(raw):
+            packet = raw[cursor]
+            cursor += 1
+            count = (packet & 0x7F) + 1
+            if packet & 0x80:
+                end = cursor + bytes_per_pixel
+                if end > len(raw):
+                    return None
+                decoded.extend(raw[cursor:end] * count)
+                cursor = end
+            else:
+                end = cursor + count * bytes_per_pixel
+                if end > len(raw):
+                    return None
+                decoded.extend(raw[cursor:end])
+                cursor = end
+        if len(decoded) < target_size:
+            return None
+        source_data = decoded[:target_size]
+
+    top_origin = bool(descriptor & 0x20)
+    right_origin = bool(descriptor & 0x10)
+    rgba = bytearray(pixel_count * 4)
+    for source_index in range(pixel_count):
+        source = source_index * bytes_per_pixel
+        pixel = source_data[source : source + bytes_per_pixel]
+        source_y, source_x = divmod(source_index, width)
+        target_y = source_y if top_origin else height - 1 - source_y
+        target_x = width - 1 - source_x if right_origin else source_x
+        target = (target_y * width + target_x) * 4
+        blue, green, red = pixel[:3]
+        alpha = pixel[3] if bytes_per_pixel == 4 else 255
+        rgba[target : target + 4] = bytes((red, green, blue, alpha))
+    return QImage(
+        bytes(rgba),
+        width,
+        height,
+        width * 4,
+        QImage.Format.Format_RGBA8888,
+    ).copy()
 
 
 @dataclass(frozen=True)
@@ -1090,12 +1199,34 @@ class PreviewService:
             root = self.game_root / "Textures" / "Hud"
         if root is None:
             return None
-        direct = root / name
+        relative = Path(*name.replace("\\", "/").split("/"))
+        candidates = [root / relative]
+        if relative.parts and relative.parts[0].casefold() == "hud":
+            candidates.append(root.joinpath(*relative.parts[1:]))
+        direct = next((path for path in candidates if path.is_file()), candidates[0])
         if not direct.is_file():
-            direct = next((path for path in root.rglob(name) if path.is_file()), direct)
+            expected_parts = tuple(part.casefold() for part in relative.parts)
+            if expected_parts and expected_parts[0] == "hud":
+                expected_parts = expected_parts[1:]
+            direct = next(
+                (
+                    path
+                    for path in root.rglob(relative.name)
+                    if path.is_file()
+                    and tuple(part.casefold() for part in path.relative_to(root).parts)[
+                        -len(expected_parts) :
+                    ]
+                    == expected_parts
+                ),
+                direct,
+            )
         if direct.is_file() and direct.suffix.casefold() not in {".dds"}:
-            direct_image = QImage(str(direct))
-            if not direct_image.isNull():
+            direct_image = (
+                _load_tga_image(direct)
+                if direct.suffix.casefold() == ".tga"
+                else QImage(str(direct))
+            )
+            if direct_image is not None and not direct_image.isNull():
                 self._ui_image_cache[key] = direct_image
                 return direct_image
         self._ui_image_cache[key] = None
@@ -1109,6 +1240,7 @@ class PreviewService:
         target: bool,
         context: PreviewWindowContext | None = None,
         buttons: tuple[PreviewDocument, ...] = (),
+        button_assets: tuple[str, ...] = (),
     ) -> QImage:
         layout = self._game_window_layout(context, header, body, buttons, target=target)
         background = self._game_window_background(context, layout.width, layout.height)
@@ -1151,6 +1283,7 @@ class PreviewService:
         if context is not None and context.kind == "datebook":
             self._draw_game_datebook(
                 painter,
+                context,
                 header,
                 body,
                 target=target,
@@ -1173,6 +1306,24 @@ class PreviewService:
             self._draw_game_pamphlet(
                 painter,
                 body,
+                target=target,
+                rect=canvas.rect(),
+                default_color=default_color,
+            )
+            painter.end()
+            return canvas
+        if (
+            context is not None
+            and context.kind == "measure_choice"
+            and context.gui_resource.replace("\\", "/").casefold()
+            == "gui/hud/panel_measurechoice.gui"
+        ):
+            self._draw_game_measure_choice(
+                painter,
+                context,
+                header,
+                buttons,
+                button_assets,
                 target=target,
                 rect=canvas.rect(),
                 default_color=default_color,
@@ -1299,6 +1450,7 @@ class PreviewService:
         header_names, body_names = node_names
         header_node = gui_node_geometry(info, *header_names)
         body_node = gui_node_geometry(info, *body_names)
+        header_centered, body_centered = _gui_document_centering(context)
         if context is not None and context.kind == "quest_intro" and body_node is not None:
             body_parent = gui_node_geometry(info, "ScrollContainern")
             if body_parent is not None:
@@ -1325,7 +1477,7 @@ class PreviewService:
                 left=header_rect.left(),
                 right=header_rect.right() + 1,
                 scale=font_scale,
-                centered=header_node.horizontal_alignment == 4,
+                centered=header_centered,
                 bottom=header_rect.bottom() + 1,
                 default_color=default_color,
             )
@@ -1339,7 +1491,7 @@ class PreviewService:
                 left=body_rect.left(),
                 right=body_rect.right() + 1,
                 scale=font_scale,
-                centered=body_node.horizontal_alignment == 4,
+                centered=body_centered,
                 bottom=body_rect.bottom() + 1,
                 default_color=default_color,
             )
@@ -1416,6 +1568,7 @@ class PreviewService:
     def _draw_game_datebook(
         self,
         painter: QPainter,
+        context: PreviewWindowContext,
         header: PreviewDocument | None,
         body: PreviewDocument | None,
         *,
@@ -1429,10 +1582,46 @@ class PreviewService:
         left_right = round(width * 0.465)
         right = round(width * 0.535)
         right_right = round(width * 0.955)
-        top = round(height * 0.18)
-        bottom = round(height * 0.91)
+        root_height = 612
+        entry_top = 187
+        entry_height = 74
+        detail_header_top = 320
+        detail_header_height = 49
+        detail_top = 372
+        detail_height = 184
+        info = self._game_window_gui_info(context)
+        if info is not None and info.root_size:
+            root_height = info.root_size[1]
+            date_root = gui_node_geometry(info, "DateRoot")
+            date_entry = gui_node_geometry(info, "DateEntry")
+            detail_header = gui_node_geometry(info, "DateDescHeader")
+            detail = gui_node_geometry(info, "DateDesc")
+            if date_root is not None and date_entry is not None:
+                entry_top = date_root.y + date_entry.y
+                entry_height = date_entry.height
+            if detail_header is not None:
+                detail_header_top = detail_header.y
+                detail_header_height = detail_header.height
+            if detail is not None:
+                detail_top = detail.y
+                detail_height = detail.height
+        left_top = round(height * (entry_top / max(1, root_height)))
+        left_bottom = round(
+            height * ((entry_top + entry_height) / max(1, root_height))
+        )
+        right_header_top = round(
+            height * (detail_header_top / max(1, root_height))
+        )
+        right_header_bottom = round(
+            height
+            * ((detail_header_top + detail_header_height) / max(1, root_height))
+        )
+        right_body_top = round(height * (detail_top / max(1, root_height)))
+        right_body_bottom = round(
+            height * ((detail_top + detail_height) / max(1, root_height))
+        )
         if header is not None:
-            row_height = max(44, round(height * 0.12))
+            row_height = max(1, left_bottom - left_top)
             marker = self.ui_image("Hud/hud_icons/open.tga")
             marker_space = max(16, round(row_height * 0.38))
             if marker is not None and not marker.isNull():
@@ -1440,7 +1629,7 @@ class PreviewService:
                 painter.drawImage(
                     QRect(
                         left + 4,
-                        top + (row_height - marker_size) // 2,
+                        left_top + (row_height - marker_size) // 2,
                         marker_size,
                         marker_size,
                     ),
@@ -1450,24 +1639,24 @@ class PreviewService:
                 painter,
                 header,
                 target=target,
-                top=top + 6,
+                top=left_top + 6,
                 left=left + marker_space + 8,
                 right=left_right,
                 scale=0.68,
                 centered=False,
-                bottom=top + row_height - 4,
+                bottom=left_bottom - 4,
                 default_color=default_color,
             )
             self._draw_game_document(
                 painter,
                 header,
                 target=target,
-                top=top,
+                top=right_header_top,
                 left=right,
                 right=right_right,
                 scale=0.74,
                 centered=True,
-                bottom=top + max(30, round(height * 0.10)),
+                bottom=right_header_bottom,
                 default_color=default_color,
             )
         if body is not None:
@@ -1475,12 +1664,12 @@ class PreviewService:
                 painter,
                 body,
                 target=target,
-                top=round(height * 0.30),
+                top=right_body_top,
                 left=right,
                 right=right_right,
                 scale=0.72,
                 centered=False,
-                bottom=bottom,
+                bottom=right_body_bottom,
                 default_color=default_color,
             )
 
@@ -1543,6 +1732,104 @@ class PreviewService:
             default_color=default_color,
         )
 
+    def _draw_game_measure_choice(
+        self,
+        painter: QPainter,
+        context: PreviewWindowContext,
+        header: PreviewDocument | None,
+        buttons: tuple[PreviewDocument, ...],
+        button_assets: tuple[str, ...],
+        *,
+        target: bool,
+        rect: QRect,
+        default_color: tuple[int, int, int, int],
+    ) -> None:
+        """Draw InitData's real header and three measure slots.
+
+        ScriptDocumentation.html marks InitData's BodyLabel as obsolete, and
+        panel_measurechoice.gui contains no body label, so body text is
+        intentionally absent here.
+        """
+        info = self._game_window_gui_info(context)
+        root_size = info.root_size if info is not None and info.root_size else (255, 115)
+        header_node = (
+            gui_node_geometry(info, "LHeader")
+            if info is not None
+            else GuiNodeGeometry("LHeader", None, 5, 255, 24, None)
+        )
+        if header is not None and header_node is not None:
+            header_rect = _scaled_gui_node_rect(header_node, root_size, rect)
+            self._draw_game_document(
+                painter,
+                header,
+                target=target,
+                top=header_rect.top(),
+                left=header_rect.left(),
+                right=header_rect.right() + 1,
+                scale=0.70,
+                centered=True,
+                bottom=header_rect.bottom() + 1,
+                default_color=default_color,
+            )
+
+        root_width, root_height = root_size
+        slot_width = 53
+        slot_height = 61
+        slot_top = 31
+        label_top = 54
+        label_height = 24
+        if info is not None:
+            slot = gui_node_geometry(info, "Slot0")
+            label = gui_node_geometry(info, "LSlot")
+            if slot is not None:
+                slot_width = slot.width
+                slot_height = min(slot.height, 61)
+                slot_top = slot.y
+            if label is not None:
+                label_top = label.y
+                label_height = label.height
+        slot_lefts = (
+            0,
+            max(0, (root_width - slot_width) // 2),
+            max(0, root_width - slot_width),
+        )
+        scale_x = rect.width() / max(1, root_width)
+        scale_y = rect.height() / max(1, root_height)
+        slot_asset = self.ui_image("Hud/nocompression/measurebutton.tga")
+        for index, button in enumerate(buttons[:3]):
+            x = slot_lefts[index]
+            slot_rect = QRect(
+                rect.left() + round(x * scale_x),
+                rect.top() + round(slot_top * scale_y),
+                max(1, round(slot_width * scale_x)),
+                max(1, round(slot_height * scale_y)),
+            )
+            if slot_asset is not None and not slot_asset.isNull():
+                painter.drawImage(slot_rect, slot_asset)
+            if index < len(button_assets) and button_assets[index]:
+                icon = self.ui_image(button_assets[index])
+                if icon is not None and not icon.isNull():
+                    icon_rect = QRect(
+                        slot_rect.left() + round(6 * scale_x),
+                        slot_rect.top() + round(6 * scale_y),
+                        max(1, round(41 * scale_x)),
+                        max(1, round(40 * scale_y)),
+                    )
+                    painter.drawImage(icon_rect, icon)
+            self._draw_game_document(
+                painter,
+                button,
+                target=target,
+                top=rect.top() + round((slot_top + label_top) * scale_y),
+                left=slot_rect.left(),
+                right=slot_rect.right() + 1,
+                scale=0.58,
+                centered=True,
+                bottom=rect.top()
+                + round((slot_top + label_top + label_height) * scale_y),
+                default_color=default_color,
+            )
+
     def _draw_game_title_bar(
         self,
         painter: QPainter,
@@ -1584,6 +1871,8 @@ class PreviewService:
         gui_driven = _gui_document_node_names(context) is not None
         if context is not None and context.kind == "pamphlet":
             candidates = ((504, 496), (620, 610))
+        elif context is not None and context.kind == "measure_choice":
+            candidates = ((255, 115), (382, 172), (510, 230))
         elif gui_driven and gui_geometry is not None:
             (root_width, root_height), _content_rect = gui_geometry
             maximum_scale = min(
@@ -1892,6 +2181,37 @@ class PreviewService:
             icon = self.ui_image("Hud/news/default.tga")
         if icon is None or icon.isNull():
             return False
+        if context.surface == "news":
+            info = self._game_window_gui_info(context)
+            icon_node = (
+                gui_node_geometry(info, "IconDesc")
+                if info is not None
+                else None
+            )
+            body_node = (
+                gui_node_geometry(info, "Entrys")
+                if info is not None
+                else None
+            )
+            if (
+                info is not None
+                and info.root_size
+                and icon_node is not None
+                and body_node is not None
+            ):
+                root_width, root_height = info.root_size
+                body_left = max(0, (root_width - body_node.width) // 2)
+                icon_left = max(0, body_left - icon_node.width - 8)
+                painter.drawImage(
+                    QRect(
+                        rect.left() + round(icon_left * rect.width() / max(1, root_width)),
+                        rect.top() + round(icon_node.y * rect.height() / max(1, root_height)),
+                        max(1, round(icon_node.width * rect.width() / max(1, root_width))),
+                        max(1, round(icon_node.height * rect.height() / max(1, root_height))),
+                    ),
+                    icon,
+                )
+                return True
         maximum = min(64, rect.height() - 36)
         scaled = icon.size().scaled(
             maximum,

@@ -3897,6 +3897,11 @@ class TranslatorWindow(QMainWindow):
             target=target,
             context=context,
             buttons=tuple(document for button in button_units if (document := render(button)) is not None),
+            button_assets=(
+                tuple(button.icon_asset for button in context.buttons)
+                if context is not None
+                else ()
+            ),
         )
         if len(self._game_preview_cache) >= 24:
             self._game_preview_cache.clear()

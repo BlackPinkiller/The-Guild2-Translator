@@ -28,6 +28,7 @@ class PreviewWindowButton:
     identifier: str
     label: str = ""
     text: str = ""
+    icon_asset: str = ""
 
 
 @dataclass(frozen=True)
@@ -81,6 +82,7 @@ class PreviewWindowContext:
 BUTTON_RE = re.compile(r"@B\[(?P<body>[^\]]*)\]", re.IGNORECASE | re.DOTALL)
 STRING_LITERAL_RE = re.compile(r"""(?:"([^"\\]*(?:\\.[^"\\]*)*)"|'([^'\\]*(?:\\.[^'\\]*)*)')""")
 RESOLVED_LABEL_RE = re.compile(r"@L_[A-Za-z0-9_+*]+", re.IGNORECASE)
+BUTTON_ASSET_RE = re.compile(r"[A-Za-z0-9_./\\-]+\.tga", re.IGNORECASE)
 
 
 def window_context_for_reference(reference: CodeReference, current_label: str = "") -> PreviewWindowContext | None:
@@ -490,9 +492,10 @@ def _presentation_for_surface(
         ),
         "news": PreviewSurfacePresentation(
             "news",
-            "overlay",
-            "news",
-            "GUI/Hud/panel_news.gui",
+            "parchment",
+            "parchment",
+            "GUI/Hud/questboxpanel.gui",
+            "Hud/messagebox/mbback0.tga",
             icon_asset=_news_icon_asset(category),
         ),
         "dialog": PreviewSurfacePresentation(
@@ -625,7 +628,6 @@ def _presentation_for_surface(
             "GUI/Hud/panel_pamphletsheet.gui",
             "Hud/NoCompression/Priority3/PanelBackground_01.tga",
             "Hud/borders/Border_Gold_02.tga",
-            icon_asset="Hud/Hud_Icons/Pamphlet.tga",
         ),
     }
     return profiles.get(
@@ -720,9 +722,9 @@ def _buttons_from_arguments(
         for argument in expressions:
             buttons.extend(_buttons_from_expression(argument))
     unique: list[PreviewWindowButton] = []
-    seen: set[tuple[str, str, str]] = set()
+    seen: set[tuple[str, str, str, str]] = set()
     for button in buttons:
-        key = (button.identifier, button.label, button.text)
+        key = (button.identifier, button.label, button.text, button.icon_asset)
         if key not in seen:
             seen.add(key)
             unique.append(button)
@@ -746,15 +748,26 @@ def _direct_buttons_from_text(text: str) -> tuple[PreviewWindowButton, ...]:
         identifier = parts[0].strip() if parts else ""
         label = ""
         text_value = ""
+        icon_asset = ""
         for part in parts[1:]:
+            asset_match = BUTTON_ASSET_RE.search(part)
+            if asset_match is not None:
+                icon_asset = asset_match.group(0).replace("\\", "/")
             label_match = RESOLVED_LABEL_RE.search(part) or LABEL_RE.search(part)
             if label_match is not None:
                 label = normalize_label(label_match.group(0))
-                break
+                continue
             literal = _literal_text(part)
-            if literal:
+            if literal and not icon_asset:
                 text_value = literal
-        buttons.append(PreviewWindowButton(identifier=identifier, label=label, text=text_value))
+        buttons.append(
+            PreviewWindowButton(
+                identifier=identifier,
+                label=label,
+                text=text_value,
+                icon_asset=icon_asset,
+            )
+        )
     return tuple(buttons)
 
 
