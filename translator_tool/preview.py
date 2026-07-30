@@ -1104,6 +1104,7 @@ class PreviewService:
             if buttons
             else canvas.height() - 28
         )
+        text_bottom = button_top - 10 if buttons else button_top
         if header is not None:
             title_bar = self._draw_game_title_bar(
                 painter,
@@ -1121,7 +1122,7 @@ class PreviewService:
                 right=canvas.width() - right_margin,
                 scale=0.82 if title_bar else 1.0,
                 centered=True,
-                bottom=button_top - 10,
+                bottom=text_bottom,
                 default_color=(222, 178, 41, 255) if title_bar else default_color,
             ) + (8 if title_bar else 12)
         if body is not None:
@@ -1134,7 +1135,7 @@ class PreviewService:
                 right=canvas.width() - right_margin,
                 scale=layout.body_scale,
                 centered=False,
-                bottom=button_top - 10,
+                bottom=text_bottom,
                 default_color=default_color,
             )
         if buttons:
@@ -1303,7 +1304,11 @@ class PreviewService:
             if buttons:
                 needed += 10 + sum(_estimated_button_height(button, button_width) for button in buttons)
                 needed += max(0, len(buttons) - 1) * button_gap
-            available_bottom = height - 22 if buttons else content_bottom
+            available_bottom = (
+                height - 22
+                if buttons
+                else min(content_bottom, height - 28)
+            )
             if index >= minimum_index and needed <= available_bottom:
                 return GameWindowLayout(
                     width,

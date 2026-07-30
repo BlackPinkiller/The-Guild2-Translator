@@ -898,6 +898,27 @@ def assert_game_preview_draws_all_buttons() -> None:
             raise AssertionError(
                 "long standard-font previews did not reduce body text to avoid clipping"
             )
+        news_context = PreviewWindowContext(
+            "news",
+            "overlay",
+            DARK_PANEL_TEXT,
+            layout="news",
+        )
+        news_body_text = "A translated notification long enough to wrap across three complete lines."
+        news_layout = gui_service._game_window_layout(
+            news_context,
+            PreviewDocument.from_atoms("Notice", [PreviewAtom("Notice", 0, 6)]),
+            PreviewDocument.from_atoms(
+                news_body_text,
+                [PreviewAtom(news_body_text, 0, len(news_body_text))],
+            ),
+            (),
+            target=True,
+        )
+        if news_layout.height == 116:
+            raise AssertionError(
+                "a wrapped news preview ignored the bottom margin and selected the clipped compact layout"
+            )
     finally:
         shutil.rmtree(gui_temp, ignore_errors=True)
     dialogue = layout_service.game_window_image(
