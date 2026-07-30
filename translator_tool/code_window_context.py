@@ -163,7 +163,7 @@ def window_context_for_reference(reference: CodeReference, current_label: str = 
         background=presentation.background,
         default_color=(
             DARK_PANEL_TEXT
-            if presentation.background in {"dark_panel", "overlay"}
+            if presentation.background in {"dark_panel", "overlay", "transparent"}
             else PARCHMENT_TEXT
         ),
         header_label=header_label,
@@ -343,7 +343,7 @@ def _default_color_for_presentation(
 ) -> tuple[int, int, int, int]:
     return (
         DARK_PANEL_TEXT
-        if presentation.background in {"dark_panel", "overlay"}
+        if presentation.background in {"dark_panel", "overlay", "transparent"}
         else PARCHMENT_TEXT
     )
 
@@ -505,19 +505,19 @@ def _presentation_for_surface(
         ),
         "quick_message": PreviewSurfacePresentation(
             "short",
-            "overlay",
+            "transparent",
             "overlay",
             "GUI/Hud/panel_quickmessage.gui",
         ),
         "measure_message": PreviewSurfacePresentation(
             "short",
-            "overlay",
+            "transparent",
             "overlay",
             "GUI/Hud/panel_measuremessage.gui",
         ),
         "system_message": PreviewSurfacePresentation(
             "short",
-            "overlay",
+            "transparent",
             "overlay",
             "GUI/Hud/panel_systemmessage.gui",
         ),
@@ -586,8 +586,8 @@ def _presentation_for_surface(
         ),
         "overhead": PreviewSurfacePresentation(
             "overhead",
-            "overlay",
-            "overlay",
+            "transparent",
+            "overhead",
             gui_resource="GUI/styles/overheadsymbollabel.gst",
         ),
         "datebook": PreviewSurfacePresentation(

@@ -546,7 +546,7 @@ def assert_code_window_context_extracts_window_labels_and_buttons() -> None:
             raise AssertionError(f"button labels were not extracted from @B tokens: {context.buttons!r}")
         short_refs = index.references_for("SHORT_NOTICE_+0").project
         short_context = best_window_context(short_refs, "SHORT_NOTICE_+0")
-        if short_context is None or short_context.background != "overlay":
+        if short_context is None or short_context.background != "transparent":
             raise AssertionError(f"MsgQuick should use its transparent HUD overlay profile: {short_context!r}")
         if short_context.default_color != DARK_PANEL_TEXT:
             raise AssertionError(f"dark panel default text color should be white: {short_context!r}")
@@ -827,6 +827,79 @@ def assert_game_preview_draws_all_buttons() -> None:
         raise AssertionError(
             f"questbook preview did not keep its task list and detail on separate pages: {quest_positions!r}"
         )
+    multi_service = PreviewService()
+    multi_positions: list[tuple[str, int, int]] = []
+
+    def capture_multi_document(
+        _painter: object,
+        document: PreviewDocument,
+        **kwargs: object,
+    ) -> int:
+        multi_positions.append(
+            (
+                document.display_text,
+                int(kwargs.get("left", 0)),
+                int(kwargs.get("right", 0)),
+            )
+        )
+        return int(kwargs.get("top", 0)) + 1
+
+    multi_service._draw_game_document = capture_multi_document  # type: ignore[method-assign]
+    datebook = multi_service.game_window_image(
+        PreviewDocument.from_atoms("Appointment", [PreviewAtom("Appointment", 0, 11)]),
+        PreviewDocument.from_atoms("Details", [PreviewAtom("Details", 0, 7)]),
+        target=False,
+        context=PreviewWindowContext(
+            "datebook",
+            "parchment",
+            PARCHMENT_TEXT,
+            layout="book",
+        ),
+    )
+    if (
+        len(multi_positions) != 3
+        or multi_positions[0][1] >= datebook.width() // 2
+        or multi_positions[1][1] <= datebook.width() // 2
+        or multi_positions[2][1] <= datebook.width() // 2
+    ):
+        raise AssertionError(
+            f"datebook preview did not reproduce list and detail pages: {multi_positions!r}"
+        )
+    multi_positions.clear()
+    pamphlet = multi_service.game_window_image(
+        None,
+        PreviewDocument.from_atoms("Pamphlet", [PreviewAtom("Pamphlet", 0, 8)]),
+        target=False,
+        context=PreviewWindowContext(
+            "pamphlet",
+            "dark_panel",
+            DARK_PANEL_TEXT,
+            layout="panel",
+        ),
+    )
+    if (
+        (pamphlet.width(), pamphlet.height()) != (504, 496)
+        or len(multi_positions) != 1
+        or multi_positions[0][1] >= pamphlet.width() // 2
+        or multi_positions[0][2] >= pamphlet.width() // 2 + 10
+    ):
+        raise AssertionError(
+            f"pamphlet preview did not use one real four-cell text area: {multi_positions!r}"
+        )
+    transparent_service = PreviewService()
+    overhead = transparent_service.game_window_image(
+        None,
+        PreviewDocument.from_atoms("+12", [PreviewAtom("+12", 0, 3)]),
+        target=False,
+        context=PreviewWindowContext(
+            "overhead",
+            "transparent",
+            DARK_PANEL_TEXT,
+            layout="overhead",
+        ),
+    )
+    if overhead.height() != 30 or overhead.pixelColor(0, 0).alpha() != 0:
+        raise AssertionError("overhead text should use its tight transparent in-world surface")
     gui_temp = Path(tempfile.mkdtemp(prefix="translator_tool_gui_geometry_"))
     try:
         identifiers = {

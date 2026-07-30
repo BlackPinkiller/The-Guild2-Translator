@@ -1118,7 +1118,9 @@ class PreviewService:
                 layout.height,
                 QImage.Format.Format_ARGB32_Premultiplied,
             )
-            if context is not None and context.background == "overlay":
+            if context is not None and context.background == "transparent":
+                canvas.fill(QColor(0, 0, 0, 0))
+            elif context is not None and context.background == "overlay":
                 canvas.fill(QColor(28, 25, 22))
             else:
                 canvas.fill(
@@ -1139,6 +1141,37 @@ class PreviewService:
             self._draw_game_questbook(
                 painter,
                 header,
+                body,
+                target=target,
+                rect=canvas.rect(),
+                default_color=default_color,
+            )
+            painter.end()
+            return canvas
+        if context is not None and context.kind == "datebook":
+            self._draw_game_datebook(
+                painter,
+                header,
+                body,
+                target=target,
+                rect=canvas.rect(),
+                default_color=default_color,
+            )
+            painter.end()
+            return canvas
+        if context is not None and context.kind == "important_persons":
+            self._draw_game_important_persons(
+                painter,
+                header,
+                target=target,
+                rect=canvas.rect(),
+                default_color=default_color,
+            )
+            painter.end()
+            return canvas
+        if context is not None and context.kind == "pamphlet":
+            self._draw_game_pamphlet(
+                painter,
                 body,
                 target=target,
                 rect=canvas.rect(),
@@ -1340,6 +1373,136 @@ class PreviewService:
                 default_color=default_color,
             )
 
+    def _draw_game_datebook(
+        self,
+        painter: QPainter,
+        header: PreviewDocument | None,
+        body: PreviewDocument | None,
+        *,
+        target: bool,
+        rect: QRect,
+        default_color: tuple[int, int, int, int],
+    ) -> None:
+        width = rect.width()
+        height = rect.height()
+        left = round(width * 0.055)
+        left_right = round(width * 0.465)
+        right = round(width * 0.535)
+        right_right = round(width * 0.955)
+        top = round(height * 0.18)
+        bottom = round(height * 0.91)
+        if header is not None:
+            row_height = max(44, round(height * 0.12))
+            marker = self.ui_image("Hud/hud_icons/open.tga")
+            marker_space = max(16, round(row_height * 0.38))
+            if marker is not None and not marker.isNull():
+                marker_size = min(marker_space, row_height - 10)
+                painter.drawImage(
+                    QRect(
+                        left + 4,
+                        top + (row_height - marker_size) // 2,
+                        marker_size,
+                        marker_size,
+                    ),
+                    marker,
+                )
+            self._draw_game_document(
+                painter,
+                header,
+                target=target,
+                top=top + 6,
+                left=left + marker_space + 8,
+                right=left_right,
+                scale=0.68,
+                centered=False,
+                bottom=top + row_height - 4,
+                default_color=default_color,
+            )
+            self._draw_game_document(
+                painter,
+                header,
+                target=target,
+                top=top,
+                left=right,
+                right=right_right,
+                scale=0.74,
+                centered=True,
+                bottom=top + max(30, round(height * 0.10)),
+                default_color=default_color,
+            )
+        if body is not None:
+            self._draw_game_document(
+                painter,
+                body,
+                target=target,
+                top=round(height * 0.30),
+                left=right,
+                right=right_right,
+                scale=0.72,
+                centered=False,
+                bottom=bottom,
+                default_color=default_color,
+            )
+
+    def _draw_game_important_persons(
+        self,
+        painter: QPainter,
+        header: PreviewDocument | None,
+        *,
+        target: bool,
+        rect: QRect,
+        default_color: tuple[int, int, int, int],
+    ) -> None:
+        if header is None:
+            return
+        width = rect.width()
+        height = rect.height()
+        left = round(width * 0.055)
+        right = round(width * 0.465)
+        top = round(height * 0.22)
+        marker = self.ui_image("Hud/hud_icons/open.tga")
+        marker_size = max(14, round(height * 0.04))
+        if marker is not None and not marker.isNull():
+            painter.drawImage(QRect(left, top, marker_size, marker_size), marker)
+        self._draw_game_document(
+            painter,
+            header,
+            target=target,
+            top=top,
+            left=left + marker_size + 8,
+            right=right,
+            scale=0.72,
+            centered=False,
+            bottom=round(height * 0.31),
+            default_color=default_color,
+        )
+
+    def _draw_game_pamphlet(
+        self,
+        painter: QPainter,
+        body: PreviewDocument | None,
+        *,
+        target: bool,
+        rect: QRect,
+        default_color: tuple[int, int, int, int],
+    ) -> None:
+        if body is None:
+            return
+        width = rect.width()
+        height = rect.height()
+        self._draw_game_document(
+            painter,
+            body,
+            target=target,
+            top=round(height * (56 / 620)),
+            left=round(width * (30 / 630)),
+            right=round(width * (290 / 630)),
+            scale=0.72,
+            centered=False,
+            bottom=round(height * (320 / 620)),
+            default_color=default_color,
+        )
+
     def _draw_game_title_bar(
         self,
         painter: QPainter,
@@ -1379,7 +1542,9 @@ class PreviewService:
         dark_panel = context is not None and context.background in {"dark_panel", "overlay"}
         gui_geometry = self._game_window_gui_geometry(context)
         gui_driven = _gui_document_node_names(context) is not None
-        if gui_driven and gui_geometry is not None:
+        if context is not None and context.kind == "pamphlet":
+            candidates = ((504, 496), (620, 610))
+        elif gui_driven and gui_geometry is not None:
             (root_width, root_height), _content_rect = gui_geometry
             maximum_scale = min(
                 1.2,
@@ -1404,6 +1569,8 @@ class PreviewService:
             candidates = ((400, 338), (520, 438), (620, 524))
         elif layout_kind == "overlay":
             candidates = ((380, 96), (440, 136), (520, 180))
+        elif layout_kind == "overhead":
+            candidates = ((220, 30), (320, 42), (440, 56))
         elif layout_kind == "news":
             candidates = ((380, 116), (440, 160), (520, 220))
         elif layout_kind == "help":
@@ -1428,6 +1595,8 @@ class PreviewService:
             top, left_margin, right_margin, body_scale = 42, 48, 48, 0.85
         elif layout_kind == "overlay":
             top, left_margin, right_margin, body_scale = 14, 18, 18, 0.78
+        elif layout_kind == "overhead":
+            top, left_margin, right_margin, body_scale = 2, 4, 4, 0.62
         elif layout_kind == "news":
             top, left_margin, right_margin, body_scale = 18, 76, 22, 0.78
         elif layout_kind == "help":
@@ -1525,7 +1694,11 @@ class PreviewService:
             available_bottom = (
                 height - 22
                 if buttons
-                else min(content_bottom, height - 28)
+                else (
+                    height - 2
+                    if layout_kind == "overhead"
+                    else min(content_bottom, height - 28)
+                )
             )
             if index >= minimum_index and needed <= available_bottom:
                 return GameWindowLayout(
