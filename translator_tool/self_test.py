@@ -808,7 +808,10 @@ def assert_true_color_tga_loader() -> None:
             bytes.fromhex("0000020000000000000000000100010018000000ff")
         )
         hires.write_bytes(
-            bytes.fromhex("00000200000000000000000001000100180000ff00")
+            bytes.fromhex(
+                "000002000000000000000000020002001800"
+                "00ff0000ff0000ff0000ff00"
+            )
         )
         selected = PreviewService(ui_assets_dir=str(asset_root)).ui_image(
             "Hud/NoCompression/button.tga"
@@ -816,8 +819,12 @@ def assert_true_color_tga_loader() -> None:
         if (
             selected is None
             or selected.pixelColor(0, 0).getRgb()[:3] != (0, 255, 0)
+            or selected.devicePixelRatio() != 2.0
+            or selected.deviceIndependentSize().toSize().width() != 1
         ):
-            raise AssertionError("game preview did not prefer the matching Hires UI texture")
+            raise AssertionError(
+                "game preview did not retain the matching Hires texture at its logical size"
+            )
         from .preview import GameUiAtlas, UiAssetRecord
 
         basename_service = PreviewService(ui_assets_dir=str(asset_root))
@@ -923,6 +930,33 @@ def assert_game_preview_draws_all_buttons() -> None:
         raise AssertionError(
             f"game preview scale should increase physical pixels without changing layout selection: {scaled.size()!r}"
         )
+    scaled_body_service = PreviewService()
+    scaled_body_bounds: list[tuple[int, int]] = []
+
+    def capture_scaled_body(
+        _painter: object,
+        _document: PreviewDocument,
+        **kwargs: object,
+    ) -> int:
+        scaled_body_bounds.append(
+            (int(kwargs.get("left", 0)), int(kwargs.get("right", 0)))
+        )
+        return int(kwargs.get("top", 0)) + 1
+
+    scaled_body_service._draw_game_document = capture_scaled_body  # type: ignore[method-assign]
+    for output_scale in (1.0, 1.25, 1.5):
+        scaled_body_bounds.clear()
+        scaled_body_service.game_window_image(
+            None,
+            PreviewDocument.from_atoms("Hi", [PreviewAtom("Hi", 0, 2)]),
+            target=False,
+            output_scale=output_scale,
+        )
+        if scaled_body_bounds != [(34, 310)]:
+            raise AssertionError(
+                "scaled preview text should retain logical layout bounds at "
+                f"{output_scale}: {scaled_body_bounds!r}"
+            )
     scaled_button_service = PreviewService()
     scaled_button_rects: list[QRect] = []
     scaled_button_service._draw_game_document = fake_draw_document  # type: ignore[method-assign]
@@ -946,6 +980,39 @@ def assert_game_preview_draws_all_buttons() -> None:
     ):
         raise AssertionError(
             f"scaled game preview buttons should remain centered in logical coordinates: {scaled_button_rects!r}"
+        )
+    title_service = PreviewService()
+    hires_title = QImage(530, 44, QImage.Format.Format_ARGB32)
+    hires_title.fill(0xFFFF0000)
+    hires_title.setDevicePixelRatio(2.0)
+    title_service.ui_image = lambda _name: hires_title  # type: ignore[method-assign]
+    title_canvas = QImage(300, 60, QImage.Format.Format_ARGB32)
+    title_canvas.fill(0)
+    title_painter = QPainter(title_canvas)
+    title_service._draw_game_title_bar(
+        title_painter,
+        PreviewWindowContext(
+            "tooltip",
+            "dark_panel",
+            DARK_PANEL_TEXT,
+            title_asset="header_red.tga",
+        ),
+        top=0,
+        left=0,
+        right=265,
+    )
+    title_painter.end()
+    painted_rows = [
+        y
+        for y in range(title_canvas.height())
+        if any(
+            title_canvas.pixelColor(x, y).alpha()
+            for x in range(title_canvas.width())
+        )
+    ]
+    if not painted_rows or max(painted_rows) != 21:
+        raise AssertionError(
+            f"Hires title art should retain its 22-pixel logical height: {painted_rows[-3:]!r}"
         )
     quest_service = PreviewService()
     quest_positions: list[tuple[str, int, int]] = []

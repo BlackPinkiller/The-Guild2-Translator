@@ -1212,6 +1212,27 @@ class PreviewService:
                 else QImage(str(hires))
             )
             if hires.is_file() and hires_image is not None and not hires_image.isNull():
+                ordinary_root = root.parent if root.name.casefold() == "hires" else root
+                ordinary = ordinary_root.joinpath(*parts)
+                ordinary_image = (
+                    _load_tga_image(ordinary)
+                    if ordinary.suffix.casefold() == ".tga"
+                    else QImage(str(ordinary))
+                )
+                if (
+                    ordinary.is_file()
+                    and ordinary_image is not None
+                    and not ordinary_image.isNull()
+                    and ordinary_image.width() > 0
+                    and ordinary_image.height() > 0
+                ):
+                    width_ratio = hires_image.width() / ordinary_image.width()
+                    height_ratio = hires_image.height() / ordinary_image.height()
+                    if (
+                        1.0 < width_ratio <= 4.0
+                        and abs(width_ratio - height_ratio) < 0.01
+                    ):
+                        hires_image.setDevicePixelRatio(width_ratio)
                 return hires_image
             return None
 
@@ -1431,7 +1452,7 @@ class PreviewService:
                 target=target,
                 top=top,
                 left=left_margin,
-                right=canvas.width() - right_margin,
+                right=logical_width - right_margin,
                 scale=layout.body_scale,
                 centered=False,
                 bottom=text_bottom,
@@ -1907,7 +1928,17 @@ class PreviewService:
         bar = self.ui_image(asset)
         if bar is None or bar.isNull():
             return False
-        height = max(22, round(bar.height() * min(1.15, max(1.0, (right - left) / max(1, bar.width())))))
+        logical_size = bar.deviceIndependentSize()
+        height = max(
+            22,
+            round(
+                logical_size.height()
+                * min(
+                    1.15,
+                    max(1.0, (right - left) / max(1.0, logical_size.width())),
+                )
+            ),
+        )
         painter.drawImage(
             QRect(left, top, max(1, right - left), height),
             bar,
@@ -2170,12 +2201,14 @@ class PreviewService:
         image = self.ui_image(name)
         if image is None or image.isNull():
             return None
-        return image.scaled(
+        background = image.scaled(
             width,
             height,
             Qt.AspectRatioMode.IgnoreAspectRatio,
             Qt.TransformationMode.SmoothTransformation,
         )
+        background.setDevicePixelRatio(1.0)
+        return background
 
     @staticmethod
     def _game_window_background_name(context: PreviewWindowContext | None) -> str:
@@ -2271,7 +2304,7 @@ class PreviewService:
                 )
                 return True
         maximum = min(64, rect.height() - 36)
-        scaled = icon.size().scaled(
+        scaled = icon.deviceIndependentSize().toSize().scaled(
             maximum,
             maximum,
             Qt.AspectRatioMode.KeepAspectRatio,
@@ -2302,10 +2335,26 @@ class PreviewService:
         center = pieces[4]
         if center is not None and not center.isNull():
             painter.drawImage(rect, center)
-        left = pieces[0].width() if pieces[0] is not None else 0
-        top = pieces[0].height() if pieces[0] is not None else 0
-        right = pieces[2].width() if pieces[2] is not None else left
-        bottom = pieces[6].height() if pieces[6] is not None else top
+        left = (
+            round(pieces[0].deviceIndependentSize().width())
+            if pieces[0] is not None
+            else 0
+        )
+        top = (
+            round(pieces[0].deviceIndependentSize().height())
+            if pieces[0] is not None
+            else 0
+        )
+        right = (
+            round(pieces[2].deviceIndependentSize().width())
+            if pieces[2] is not None
+            else left
+        )
+        bottom = (
+            round(pieces[6].deviceIndependentSize().height())
+            if pieces[6] is not None
+            else top
+        )
         inner_width = max(1, rect.width() - left - right)
         inner_height = max(1, rect.height() - top - bottom)
         targets = (
