@@ -142,7 +142,7 @@ _FIXED_CALL_CONTRACTS: dict[str, CallContract] = {
         panel_argument=0,
     ),
     "initalias": CallContract(
-        ((3, "body"),),
+        ((3, "header"),),
         5,
         surface="measure_choice",
         panel_argument=1,

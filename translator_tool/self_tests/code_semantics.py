@@ -53,7 +53,7 @@ def assert_display_call_contracts_match_engine_signatures() -> None:
         "feedback_MessagePolitics": (((1, "header"), (2, "body")), 3, (), "news"),
         "feedback_MessageMission": (((1, "header"), (2, "body")), 3, (), "news"),
         "feedback_MessageOffice": (((2, "header"), (3, "body")), 4, (), "news"),
-        "InitAlias": (((3, "body"),), 5, (), "measure_choice"),
+        "InitAlias": (((3, "header"),), 5, (), "measure_choice"),
         "AddSheetToTabGroup": (((2, "header"),), 3, (), "gui_embedded"),
         "SetTabGroupHeader": (((1, "header"),), 2, (), "gui_embedded"),
         "CreateImportantPersonSection": (((1, "header"),), 2, (), "important_persons"),

@@ -713,10 +713,11 @@ def assert_code_window_context_extracts_window_labels_and_buttons() -> None:
         if (
             selection_context is None
             or selection_context.surface != "measure_choice"
-            or selection_context.body_label != "select_target_+0"
+            or selection_context.header_label != "select_target_+0"
+            or selection_context.body_label
         ):
             raise AssertionError(
-                f"InitAlias target text did not receive a selection preview: {selection_context!r}"
+                f"InitAlias target prompt did not enter the selection panel header: {selection_context!r}"
             )
         important_context = best_window_context(
             index.references_for("IMPORTANT_SECTION_+0").project,
