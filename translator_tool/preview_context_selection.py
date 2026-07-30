@@ -6,6 +6,7 @@ from .code_index import CodeReference
 from .code_window_context import (
     PreviewWindowContext,
     context_has_label,
+    related_window_references,
     window_context_for_reference,
 )
 from .preview_placeholders import (
@@ -53,7 +54,8 @@ def select_preview_context(
         )
         ranked.append((key, -index, reference, window if relevant_window else None))
     _key, _stable_order, reference, window = max(ranked, key=lambda item: (item[0], item[1]))
-    return PreviewContextSelection((reference,), window)
+    related = related_window_references(reference) if window is not None else ()
+    return PreviewContextSelection((reference, *related), window)
 
 
 def rank_preview_references(

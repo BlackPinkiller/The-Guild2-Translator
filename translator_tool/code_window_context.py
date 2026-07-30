@@ -3,9 +3,17 @@ from __future__ import annotations
 from collections.abc import Callable
 from dataclasses import dataclass
 from functools import lru_cache
+from pathlib import Path
 import re
 
-from .code_index import CodeReference, LABEL_RE, dynamic_label_patterns, normalize_label
+from .code_index import (
+    CodeFileSpec,
+    CodeReference,
+    LABEL_RE,
+    analyze_code_file,
+    dynamic_label_patterns,
+    normalize_label,
+)
 from .engine_semantics import engine_format_preview_style
 from .gui_semantics import GuiResourceInfo, gui_resource_info, resolve_panel_gui_resource
 from .script_semantics import CallContract, call_contract
@@ -103,6 +111,27 @@ def window_context_for_reference(reference: CodeReference, current_label: str = 
     labels_by_arg = _labels_by_argument(argument_expressions)
     button_label_set = {button.label for button in buttons if button.label}
     header_label, body_label = _header_body_labels(call_name, labels_by_arg, button_label_set, current_label)
+    related_references = related_window_references(reference)
+    if surface == "questbook":
+        for related in related_references:
+            related_arguments = tuple(str(argument) for argument in related.arguments)
+            related_expressions = _argument_expressions(related, related_arguments)
+            related_labels = _labels_by_argument(related_expressions)
+            related_header, related_body = _header_body_labels(
+                (related.call_name or "").casefold(),
+                related_labels,
+                set(),
+                "",
+            )
+            if related_header and not header_label:
+                header_label = related_header
+            if related_body and not body_label:
+                body_label = related_body
+            offset = max((index for index, _values in labels_by_arg), default=-1) + 1
+            labels_by_arg.extend(
+                (offset + index, values)
+                for index, values in related_labels
+            )
     referenced_label = _context_label(current_label or reference.label)
     if referenced_label:
         if reference.role == "header":
@@ -153,6 +182,74 @@ def window_context_for_reference(reference: CodeReference, current_label: str = 
         title_asset=presentation.title_asset,
         icon_asset=presentation.icon_asset,
     )
+
+
+def related_window_references(reference: CodeReference) -> tuple[CodeReference, ...]:
+    """Return the other state-setting call that completes a questbook preview."""
+    call_name = (reference.call_name or "").casefold()
+    counterpart = {
+        "setmainquesttitle": "setmainquestdescription",
+        "setmainquestdescription": "setmainquesttitle",
+    }.get(call_name)
+    if counterpart is None or not reference.arguments:
+        return ()
+    key = reference.arguments[0].strip().casefold()
+    if not key:
+        return ()
+    try:
+        resolved = reference.path.expanduser().resolve()
+        stat = resolved.stat()
+    except OSError:
+        return ()
+    candidates = _cached_file_references(
+        str(resolved),
+        stat.st_mtime_ns,
+        stat.st_size,
+        reference.source,
+    )
+    matching = tuple(
+        candidate
+        for candidate in candidates
+        if (candidate.call_name or "").casefold() == counterpart
+        and candidate.arguments
+        and candidate.arguments[0].strip().casefold() == key
+        and candidate.role in {"header", "body"}
+    )
+    if not matching:
+        return ()
+    return (
+        min(
+            matching,
+            key=lambda candidate: (
+                abs(candidate.line - reference.line),
+                -candidate.confidence,
+                candidate.line,
+            ),
+        ),
+    )
+
+
+@lru_cache(maxsize=64)
+def _cached_file_references(
+    path_text: str,
+    _modified_ns: int,
+    _size: int,
+    source: str,
+) -> tuple[CodeReference, ...]:
+    analysis = analyze_code_file(CodeFileSpec(Path(path_text), source))
+    mappings = (
+        analysis.index.project_references,
+        analysis.index.vanilla_references,
+    )
+    values: list[CodeReference] = []
+    seen: set[CodeReference] = set()
+    for mapping in mappings:
+        for references in mapping.values():
+            for reference in references:
+                if reference not in seen:
+                    seen.add(reference)
+                    values.append(reference)
+    return tuple(values)
 
 
 def _gui_resource_window_context(

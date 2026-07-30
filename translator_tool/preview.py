@@ -1095,6 +1095,17 @@ class PreviewService:
         self._draw_game_window_frame(painter, context, canvas.rect())
         self._draw_game_window_decoration(painter, context, canvas.rect())
         default_color = context.default_color if context is not None else (55, 38, 24, 255)
+        if context is not None and context.kind == "questbook":
+            self._draw_game_questbook(
+                painter,
+                header,
+                body,
+                target=target,
+                rect=canvas.rect(),
+                default_color=default_color,
+            )
+            painter.end()
+            return canvas
         top = layout.top
         left_margin = layout.left_margin
         right_margin = layout.right_margin
@@ -1148,6 +1159,74 @@ class PreviewService:
             )
         painter.end()
         return canvas
+
+    def _draw_game_questbook(
+        self,
+        painter: QPainter,
+        header: PreviewDocument | None,
+        body: PreviewDocument | None,
+        *,
+        target: bool,
+        rect: QRect,
+        default_color: tuple[int, int, int, int],
+    ) -> None:
+        """Draw the QuestbookSheet task list and selected task detail panes."""
+        width = rect.width()
+        height = rect.height()
+        left = round(width * 0.045)
+        left_right = round(width * 0.468)
+        right = round(width * 0.535)
+        right_right = round(width * 0.955)
+        top = round(height * 0.185)
+        bottom = round(height * 0.91)
+
+        if header is not None:
+            row_height = max(30, round(height * 0.065))
+            selected = QRect(
+                left,
+                top,
+                max(1, left_right - left),
+                row_height,
+            )
+            marker = self.ui_image("Hud/hud_icons/open.tga")
+            marker_space = max(14, round(row_height * 0.72))
+            if marker is not None and not marker.isNull():
+                marker_size = min(marker_space, row_height - 8)
+                painter.drawImage(
+                    QRect(
+                        selected.left() + 6,
+                        selected.top() + (row_height - marker_size) // 2,
+                        marker_size,
+                        marker_size,
+                    ),
+                    marker,
+                )
+            self._draw_game_document(
+                painter,
+                header,
+                target=target,
+                top=selected.top() + 4,
+                left=selected.left() + marker_space + 10,
+                right=selected.right() - 6,
+                scale=0.70,
+                centered=False,
+                bottom=selected.bottom() - 3,
+                default_color=default_color,
+            )
+
+        if body is not None:
+            self._draw_game_document(
+                painter,
+                body,
+                target=target,
+                top=top + 4,
+                left=right,
+                right=right_right,
+                scale=0.76,
+                centered=False,
+                bottom=bottom,
+                default_color=default_color,
+            )
 
     def _draw_game_title_bar(
         self,
@@ -1297,10 +1376,26 @@ class PreviewService:
             )
             button_width = min(250, max(150, width - 92))
             needed = candidate_top
-            if header is not None:
-                needed += document_lines(header, usable_width, header_scale) * header_line_height + 12
-            if body is not None:
-                needed += document_lines(body, usable_width, candidate_body_scale) * body_line_height
+            if context is not None and context.kind == "questbook":
+                pane_width = max(90, round(width * 0.42))
+                header_needed = (
+                    candidate_top
+                    + document_lines(header, pane_width, 0.70) * max(14, round(25 * 0.70))
+                    if header is not None
+                    else candidate_top
+                )
+                body_needed = (
+                    candidate_top
+                    + document_lines(body, pane_width, 0.76) * max(14, round(25 * 0.76))
+                    if body is not None
+                    else candidate_top
+                )
+                needed = max(header_needed, body_needed)
+            else:
+                if header is not None:
+                    needed += document_lines(header, usable_width, header_scale) * header_line_height + 12
+                if body is not None:
+                    needed += document_lines(body, usable_width, candidate_body_scale) * body_line_height
             if buttons:
                 needed += 10 + sum(_estimated_button_height(button, button_width) for button in buttons)
                 needed += max(0, len(buttons) - 1) * button_gap

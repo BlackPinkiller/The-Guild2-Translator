@@ -2,7 +2,9 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from ..code_index import CodeReference
+import tempfile
+
+from ..code_index import CodeFileSpec, CodeReference, index_code_file
 from ..preview_context_selection import rank_preview_references, select_preview_context
 
 
@@ -94,6 +96,30 @@ def assert_preview_context_selection_keeps_arguments_and_style_coherent() -> Non
         raise AssertionError(
             "a suffix-free code family did not keep its scheduled header/body pair"
         )
+
+    with tempfile.TemporaryDirectory(prefix="translator_questbook_context_") as directory:
+        script = Path(directory) / "Mission.lua"
+        script.write_text(
+            'SetMainQuestTitle("MAIN_MISSION", "@L_QUEST_HEADER_+0", "@L_QUEST_NAME_+0")\n'
+            'SetMainQuestDescription("MAIN_MISSION", "@L_QUEST_BODY_+0", Goal)\n',
+            encoding="utf-8",
+        )
+        index = index_code_file(CodeFileSpec(script, "project"))
+        body_reference = index.references_for("QUEST_BODY_+0").active[0]
+        questbook = select_preview_context(
+            "Complete %1i tasks.",
+            (body_reference,),
+            "QUEST_BODY_+0",
+        )
+        if questbook.window is None or questbook.window.kind != "questbook":
+            raise AssertionError(f"main quest description lost its QuestbookSheet: {questbook!r}")
+        if (
+            questbook.window.header_label != "quest_header_+0"
+            or questbook.window.body_label != "quest_body_+0"
+        ):
+            raise AssertionError(f"quest title and description were not joined by quest id: {questbook!r}")
+        if len(questbook.references) != 2:
+            raise AssertionError(f"questbook preview lost its title placeholder evidence: {questbook!r}")
 
 
 def assert_preview_context_selection_understands_returned_label_roles() -> None:

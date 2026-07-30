@@ -790,6 +790,43 @@ def assert_game_preview_draws_all_buttons() -> None:
     )
     if compact.width() != 344 or compact.height() != 240:
         raise AssertionError(f"short parchment previews should use the compact layout: {compact.size()!r}")
+    quest_service = PreviewService()
+    quest_positions: list[tuple[str, int, int]] = []
+
+    def capture_quest_document(
+        _painter: object,
+        document: PreviewDocument,
+        **kwargs: object,
+    ) -> int:
+        quest_positions.append(
+            (
+                document.display_text,
+                int(kwargs.get("left", 0)),
+                int(kwargs.get("right", 0)),
+            )
+        )
+        return int(kwargs.get("top", 0)) + 1
+
+    quest_service._draw_game_document = capture_quest_document  # type: ignore[method-assign]
+    quest = quest_service.game_window_image(
+        PreviewDocument.from_atoms("Selected quest", [PreviewAtom("Selected quest", 0, 14)]),
+        PreviewDocument.from_atoms("Quest detail", [PreviewAtom("Quest detail", 0, 12)]),
+        target=False,
+        context=PreviewWindowContext(
+            "questbook",
+            "parchment",
+            PARCHMENT_TEXT,
+            layout="book",
+        ),
+    )
+    if (
+        len(quest_positions) != 2
+        or quest_positions[0][1] >= quest.width() // 2
+        or quest_positions[1][1] <= quest.width() // 2
+    ):
+        raise AssertionError(
+            f"questbook preview did not keep its task list and detail on separate pages: {quest_positions!r}"
+        )
     gui_temp = Path(tempfile.mkdtemp(prefix="translator_tool_gui_geometry_"))
     try:
         identifiers = {
