@@ -976,8 +976,8 @@ def assert_game_preview_draws_all_buttons() -> None:
         raise AssertionError(
             f"pamphlet preview did not use one real four-cell text area: {multi_positions!r}"
         )
-    transparent_service = PreviewService()
-    overhead = transparent_service.game_window_image(
+    overlay_service = PreviewService()
+    overhead = overlay_service.game_window_image(
         None,
         PreviewDocument.from_atoms("+12", [PreviewAtom("+12", 0, 3)]),
         target=False,
@@ -988,14 +988,26 @@ def assert_game_preview_draws_all_buttons() -> None:
             layout="overhead",
         ),
     )
-    if overhead.height() != 30 or overhead.pixelColor(0, 0).alpha() != 0:
-        raise AssertionError("overhead text should use its tight transparent in-world surface")
+    if overhead.height() != 30 or overhead.pixelColor(0, 0).alpha() != 255:
+        raise AssertionError(
+            "in-world text previews should keep their tight layout over an opaque reading backdrop"
+        )
     quest_intro = surface_window_context("quest_intro")
     if (
         quest_intro.background != "transparent"
         or PreviewService._game_window_background_name(quest_intro)
     ):
         raise AssertionError("quest intro should compose its centered game panel over a transparent HUD root")
+    quest_intro_image = overlay_service.game_window_image(
+        None,
+        PreviewDocument.from_atoms("Mission", [PreviewAtom("Mission", 0, 7)]),
+        target=False,
+        context=quest_intro,
+    )
+    if quest_intro_image.pixelColor(0, 0).alpha() != 255:
+        raise AssertionError(
+            "quest intro preview should not expose a transparent canvas outside its game panel"
+        )
     gui_temp = Path(tempfile.mkdtemp(prefix="translator_tool_gui_geometry_"))
     try:
         identifiers = {

@@ -1250,9 +1250,10 @@ class PreviewService:
                 layout.height,
                 QImage.Format.Format_ARGB32_Premultiplied,
             )
-            if context is not None and context.background == "transparent":
-                canvas.fill(QColor(0, 0, 0, 0))
-            elif context is not None and context.background == "overlay":
+            if (
+                context is not None
+                and context.background in {"transparent", "overlay"}
+            ):
                 canvas.fill(QColor(28, 25, 22))
             else:
                 canvas.fill(
@@ -1454,10 +1455,23 @@ class PreviewService:
         if context is not None and context.kind == "quest_intro" and body_node is not None:
             body_parent = gui_node_geometry(info, "ScrollContainern")
             if body_parent is not None:
+                panel_parent = max(
+                    (
+                        node
+                        for node in info.nodes
+                        if node.name.casefold() == "cl_wincontainer"
+                    ),
+                    key=lambda node: node.width * node.height,
+                    default=None,
+                )
                 body_node = GuiNodeGeometry(
                     body_node.name,
                     body_node.x,
-                    body_parent.y + body_node.y,
+                    (
+                        (panel_parent.y if panel_parent is not None else 0)
+                        + body_parent.y
+                        + body_node.y
+                    ),
                     body_node.width,
                     body_node.height,
                     body_node.horizontal_alignment,
