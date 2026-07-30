@@ -759,6 +759,9 @@ def assert_code_preview_unit_lookup_accepts_leading_underscore_labels() -> None:
 def assert_game_preview_draws_all_buttons() -> None:
     from PySide6.QtCore import QRect
     from PySide6.QtGui import QImage, QPainter
+    from PySide6.QtWidgets import QApplication
+
+    app = QApplication.instance() or QApplication([])
 
     service = PreviewService()
     buttons = tuple(
@@ -869,6 +872,31 @@ def assert_game_preview_draws_all_buttons() -> None:
         ):
             raise AssertionError(
                 f"messagebox preview ignored its GUI content rectangle: {gui_layout!r}"
+            )
+        gui_service._translation_font_checked = True
+        gui_service._translation_font_family = "Arial"
+        long_text = "\n\n".join(
+            f"{index}. " + "Long preview text " * 3
+            for index in range(1, 8)
+        )
+        long_document = PreviewDocument.from_atoms(
+            long_text,
+            [PreviewAtom(long_text, 0, len(long_text))],
+        )
+        long_buttons = tuple(
+            PreviewDocument.from_atoms(text, [PreviewAtom(text, 0, len(text))])
+            for text in ("Continue", "Cancel")
+        )
+        adaptive_layout = gui_service._game_window_layout(
+            gui_context,
+            PreviewDocument.from_atoms("Rules", [PreviewAtom("Rules", 0, 5)]),
+            long_document,
+            long_buttons,
+            target=True,
+        )
+        if adaptive_layout.body_scale >= gui_layout.body_scale:
+            raise AssertionError(
+                "long standard-font previews did not reduce body text to avoid clipping"
             )
     finally:
         shutil.rmtree(gui_temp, ignore_errors=True)

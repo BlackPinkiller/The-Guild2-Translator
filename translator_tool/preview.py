@@ -177,6 +177,28 @@ def _estimated_document_lines(document: PreviewDocument, columns: int) -> int:
     return sum(max(1, math.ceil(_line_visual_units(line) / columns)) for line in lines)
 
 
+def _measured_document_lines(
+    document: PreviewDocument,
+    width: int,
+    metrics: QFontMetrics,
+) -> int:
+    lines = _document_text(document).splitlines() or [""]
+    total = 0
+    for line in lines:
+        if not line:
+            total += 1
+            continue
+        line_width = 0
+        total += 1
+        for char in line:
+            char_width = max(1, metrics.horizontalAdvance(char))
+            if line_width and line_width + char_width > width:
+                total += 1
+                line_width = 0
+            line_width += char_width
+    return total
+
+
 def _estimated_button_height(document: PreviewDocument, button_width: int) -> int:
     columns = max(8, round((button_width - 20) / 13))
     line_height = max(12, round(25 * 0.72))
@@ -1048,7 +1070,7 @@ class PreviewService:
         context: PreviewWindowContext | None = None,
         buttons: tuple[PreviewDocument, ...] = (),
     ) -> QImage:
-        layout = self._game_window_layout(context, header, body, buttons)
+        layout = self._game_window_layout(context, header, body, buttons, target=target)
         background = self._game_window_background(context, layout.width, layout.height)
         if background is None or background.isNull():
             canvas = QImage(
@@ -1076,6 +1098,12 @@ class PreviewService:
         top = layout.top
         left_margin = layout.left_margin
         right_margin = layout.right_margin
+        button_block_height = _estimated_buttons_height(buttons, canvas.width())
+        button_top = (
+            canvas.height() - button_block_height - 22
+            if buttons
+            else canvas.height() - 28
+        )
         if header is not None:
             title_bar = self._draw_game_title_bar(
                 painter,
@@ -1093,6 +1121,7 @@ class PreviewService:
                 right=canvas.width() - right_margin,
                 scale=0.82 if title_bar else 1.0,
                 centered=True,
+                bottom=button_top - 10,
                 default_color=(222, 178, 41, 255) if title_bar else default_color,
             ) + (8 if title_bar else 12)
         if body is not None:
@@ -1105,15 +1134,15 @@ class PreviewService:
                 right=canvas.width() - right_margin,
                 scale=layout.body_scale,
                 centered=False,
+                bottom=button_top - 10,
                 default_color=default_color,
             )
         if buttons:
-            button_block_height = _estimated_buttons_height(buttons, canvas.width())
             self._draw_game_buttons(
                 painter,
                 buttons,
                 target=target,
-                top=max(top + 10, canvas.height() - button_block_height - 22),
+                top=button_top,
                 default_color=(235, 225, 175, 255),
             )
         painter.end()
@@ -1151,6 +1180,8 @@ class PreviewService:
         header: PreviewDocument | None,
         body: PreviewDocument | None,
         buttons: tuple[PreviewDocument, ...],
+        *,
+        target: bool = False,
     ) -> GameWindowLayout:
         layout_kind = context.layout if context is not None and context.layout else ""
         dark_panel = context is not None and context.background in {"dark_panel", "overlay"}
@@ -1209,7 +1240,31 @@ class PreviewService:
             body_scale = 0.78 if dark_panel else 0.85
         button_gap = 6
 
-        for index, (width, height) in enumerate(candidates):
+        standard_family = self._standard_font_family(target)
+
+        def document_lines(
+            document: PreviewDocument,
+            width: int,
+            scale: float,
+        ) -> int:
+            if standard_family:
+                font = QFont(standard_family)
+                font.setPixelSize(max(12, round(24 * scale)))
+                return _measured_document_lines(
+                    document,
+                    width,
+                    QFontMetrics(font),
+                )
+            columns = max(8, round(width / max(8.0, 13 * scale / 0.85)))
+            return _estimated_document_lines(document, columns)
+
+        def candidate_layout(
+            index: int,
+            width: int,
+            height: int,
+            *,
+            body_scale_override: float | None = None,
+        ) -> GameWindowLayout | None:
             candidate_top = top
             candidate_left = left_margin
             candidate_right = right_margin
@@ -1230,23 +1285,26 @@ class PreviewService:
                     0.72,
                     min(1.0, 0.85 * min(scale_x, scale_y)),
                 )
+            if body_scale_override is not None:
+                candidate_body_scale = body_scale_override
             body_line_height = max(12, round(25 * candidate_body_scale))
-            header_line_height = max(16, round(25 * candidate_body_scale))
+            header_scale = 1.0
+            header_line_height = max(16, round(25 * header_scale))
             usable_width = max(
                 90,
                 width - candidate_left - candidate_right,
             )
-            text_columns = max(8, round(usable_width / 13))
             button_width = min(250, max(150, width - 92))
-            needed = candidate_top + 24
+            needed = candidate_top
             if header is not None:
-                needed += _estimated_document_lines(header, text_columns) * header_line_height + 12
+                needed += document_lines(header, usable_width, header_scale) * header_line_height + 12
             if body is not None:
-                needed += _estimated_document_lines(body, text_columns) * body_line_height
+                needed += document_lines(body, usable_width, candidate_body_scale) * body_line_height
             if buttons:
                 needed += 10 + sum(_estimated_button_height(button, button_width) for button in buttons)
                 needed += max(0, len(buttons) - 1) * button_gap
-            if index >= minimum_index and needed <= content_bottom:
+            available_bottom = height - 22 if buttons else content_bottom
+            if index >= minimum_index and needed <= available_bottom:
                 return GameWindowLayout(
                     width,
                     height,
@@ -1255,8 +1313,23 @@ class PreviewService:
                     candidate_right,
                     candidate_body_scale,
                 )
+            return None
+
+        for index, (width, height) in enumerate(candidates):
+            result = candidate_layout(index, width, height)
+            if result is not None:
+                return result
 
         width, height = candidates[-1]
+        for adaptive_scale in (0.78, 0.72, 0.66, 0.60, 0.54, 0.50):
+            result = candidate_layout(
+                len(candidates) - 1,
+                width,
+                height,
+                body_scale_override=adaptive_scale,
+            )
+            if result is not None:
+                return result
         if layout_kind == "parchment" and gui_geometry is not None:
             (root_width, root_height), (x, y, content_width, _content_height) = gui_geometry
             scale_x = width / max(1, root_width)
@@ -1432,6 +1505,7 @@ class PreviewService:
         right: int,
         scale: float,
         centered: bool,
+        bottom: int | None = None,
         default_color: tuple[int, int, int, int] = (55, 38, 24, 255),
     ) -> int:
         symbol_atlas = self._atlas(target)
@@ -1448,7 +1522,8 @@ class PreviewService:
         lines: list[list[QImage | _NativeTextRun]] = [[]]
         widths = [0]
         line_height = max(12, round(25 * scale))
-        max_lines = max(1, (painter.device().height() - top - 28) // line_height)
+        content_bottom = bottom if bottom is not None else painter.device().height() - 28
+        max_lines = max(1, (content_bottom - top) // line_height)
         stopped = False
 
         def next_line() -> bool:
