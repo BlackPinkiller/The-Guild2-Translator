@@ -884,6 +884,19 @@ def assert_game_preview_draws_all_buttons() -> None:
     )
     if dialogue.width() != 520 or dialogue.height() != 430:
         raise AssertionError(f"dialogue previews with many choices should use the large layout: {dialogue.size()!r}")
+    overlay = PreviewService().game_window_image(
+        None,
+        None,
+        target=False,
+        context=PreviewWindowContext(
+            "short",
+            "overlay",
+            DARK_PANEL_TEXT,
+            layout="overlay",
+        ),
+    )
+    if overlay.pixelColor(0, 0).alpha() != 255:
+        raise AssertionError("overlay preview backgrounds should be fully opaque")
     title_service = PreviewService()
     title_service._draw_game_document = fake_draw_document  # type: ignore[method-assign]
     requested_images: list[str] = []

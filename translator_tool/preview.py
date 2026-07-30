@@ -1057,7 +1057,7 @@ class PreviewService:
                 QImage.Format.Format_ARGB32_Premultiplied,
             )
             if context is not None and context.background == "overlay":
-                canvas.fill(QColor(28, 25, 22, 176))
+                canvas.fill(QColor(28, 25, 22))
             else:
                 canvas.fill(
                     QColor(
