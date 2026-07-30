@@ -27,6 +27,7 @@ from .format_io import dbt_row_values, load_dbt, translatable_fields
 from .gui_semantics import GuiNodeGeometry, GuiResourceInfo, gui_node_geometry, gui_resource_info
 from .i18n import translate
 from .preview_context_selection import select_preview_context
+from .preview_game_data import item_preview_data
 from .preview_placeholders import PlaceholderContext, PlaceholderLabelRecord, PlaceholderValueBuilder
 from .preview_profiles import PreviewProfile, preview_profile
 from .validation import (
@@ -1517,6 +1518,14 @@ class PreviewService:
                 label = self.ui_image("Hud/NoCompression/label.tga")
                 if label is not None and not label.isNull():
                     painter.drawImage(header_rect, label)
+        self._draw_game_item_help_details(
+            painter,
+            context,
+            info,
+            target=target,
+            rect=rect,
+            default_color=default_color,
+        )
         header_names, body_names = node_names
         header_node = gui_node_geometry(info, *header_names)
         body_node = gui_node_geometry(info, *body_names)
@@ -1638,6 +1647,116 @@ class PreviewService:
                 default_color=default_color,
             )
         return header is not None or body is not None
+
+    def _draw_game_item_help_details(
+        self,
+        painter: QPainter,
+        context: PreviewWindowContext | None,
+        info: GuiResourceInfo,
+        *,
+        target: bool,
+        rect: QRect,
+        default_color: tuple[int, int, int, int],
+    ) -> None:
+        if (
+            context is None
+            or context.gui_resource.replace("\\", "/").casefold()
+            != "gui/hud/helppanels/items.gui"
+        ):
+            return
+        data = item_preview_data(
+            self.game_root,
+            context.header_label,
+            context.body_label,
+        )
+        if data is None:
+            return
+        icon_node = gui_node_geometry(info, "Icon")
+        if icon_node is not None:
+            icon = self.ui_image(data.icon_asset)
+            if icon is not None and not icon.isNull():
+                painter.drawImage(
+                    _scaled_gui_node_rect(icon_node, info.root_size, rect),
+                    icon,
+                )
+        if not data.ingredients:
+            return
+        heading_node = gui_node_geometry(info, "resource")
+        if heading_node is not None:
+            heading_text = self.localization.localized(
+                "_ONSCREENHELP_2_ITEMS_INGREDIENTS_+0",
+                target,
+            )
+            heading = self.render(
+                heading_text,
+                unit_key=f"engine:item:{data.name}:ingredients",
+                label="_ONSCREENHELP_2_ITEMS_INGREDIENTS_+0",
+                file_rel="Text.dbt",
+                kind="dbt",
+                target=target,
+            )
+            heading_rect = _scaled_gui_node_rect(
+                heading_node,
+                info.root_size,
+                rect,
+            )
+            self._draw_game_document(
+                painter,
+                heading,
+                target=target,
+                top=heading_rect.top(),
+                left=heading_rect.left(),
+                right=heading_rect.right() + 1,
+                scale=0.54,
+                centered=False,
+                bottom=heading_rect.bottom() + 1,
+                default_color=default_color,
+            )
+        resource_node = gui_node_geometry(info, "ResourceRoot")
+        if resource_node is None:
+            return
+        resource_rect = _scaled_gui_node_rect(
+            resource_node,
+            info.root_size,
+            rect,
+        )
+        gap = 8
+        for index, ingredient in enumerate(data.ingredients):
+            item_rect = QRect(
+                resource_rect.left() + index * (resource_rect.width() + gap),
+                resource_rect.top(),
+                resource_rect.width(),
+                resource_rect.height(),
+            )
+            icon = self.ui_image(ingredient.icon_asset)
+            icon_size = min(item_rect.height(), 23)
+            if icon is not None and not icon.isNull():
+                painter.drawImage(
+                    QRect(
+                        item_rect.left(),
+                        item_rect.top(),
+                        icon_size,
+                        icon_size,
+                    ),
+                    icon,
+                )
+            count_text = str(ingredient.count)
+            count = PreviewDocument.from_atoms(
+                count_text,
+                [PreviewAtom(count_text, 0, len(count_text))],
+            )
+            self._draw_game_document(
+                painter,
+                count,
+                target=target,
+                top=item_rect.top(),
+                left=item_rect.left() + icon_size + 2,
+                right=item_rect.right() + 1,
+                scale=0.50,
+                centered=False,
+                bottom=item_rect.bottom() + 1,
+                default_color=default_color,
+            )
 
     def _draw_game_help_header(
         self,

@@ -1380,6 +1380,9 @@ def assert_game_preview_draws_all_buttons() -> None:
             + node("Header", y=6, width=603, height=27)
             + node("Container", y=6, width=597, height=26)
             + node("Container", y=0, width=603, height=38)
+            + node("Icon", x=20, y=69, width=42, height=42)
+            + node("resource", x=354, y=140, width=216, height=19)
+            + node("ResourceRoot", x=354, y=160, width=50, height=23)
             + node("Label", x=15, y=140, width=291, height=209)
             + node(
                 "Artefact",
@@ -1389,6 +1392,18 @@ def assert_game_preview_draws_all_buttons() -> None:
                 height=65,
             )
             + node("Root", y=0, width=603, height=462)
+        )
+        item_db = gui_temp / "DB" / "Items.dbt"
+        item_db.parent.mkdir(parents=True)
+        item_db.write_text(
+            'Table Description:\n'
+            '"id" INT -1 |"name" STRING 0 |\n'
+            "Data:\n"
+            '108 "CamouflageCloak" 5 10 3 0 16 1 1 4 0 3 162 4 100 2 11 3 242 |\n'
+            '100 "Cloth" 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 |\n'
+            '11 "Leather" 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 |\n'
+            '242 "Silver" 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 |\n',
+            encoding="utf-8",
         )
         requested_help_assets: list[str] = []
 
@@ -1400,7 +1415,11 @@ def assert_game_preview_draws_all_buttons() -> None:
 
         gui_service.ui_image = help_ui_image  # type: ignore[method-assign]
         gui_positions.clear()
-        help_context = surface_window_context("item_help")
+        help_context = surface_window_context(
+            "item_help",
+            header_label="_ITEM_CamouflageCloak_NAME_+0",
+            body_label="_ITEM_CamouflageCloak_TOOLTIP_+0",
+        )
         help_image = gui_service.game_window_image(
             PreviewDocument.from_atoms(
                 "Item title",
@@ -1413,9 +1432,14 @@ def assert_game_preview_draws_all_buttons() -> None:
             target=False,
             context=help_context,
         )
+        item_documents = [
+            item
+            for item in gui_positions
+            if item[0] in {"Item title", "Item description"}
+        ]
         if (
             (help_image.width(), help_image.height()) != (603, 462)
-            or gui_positions
+            or item_documents
             != [
                 ("Item title", 6, 0, 603, True),
                 ("Item description", 64, 354, 570, False),
@@ -1432,9 +1456,16 @@ def assert_game_preview_draws_all_buttons() -> None:
                 )
                 for name in requested_help_assets
             )
+            or "Hud/Items/Item_CamouflageCloak.tga"
+            not in requested_help_assets
+            or not {
+                "Hud/Items/Item_Cloth.tga",
+                "Hud/Items/Item_Leather.tga",
+                "Hud/Items/Item_Silver.tga",
+            }.issubset(requested_help_assets)
         ):
             raise AssertionError(
-                f"item help header did not draw its nested red background and border: {requested_help_assets!r}"
+                f"item help omitted its game assets or static ingredient data: {requested_help_assets!r}"
             )
         news_context = PreviewWindowContext(
             "news",
