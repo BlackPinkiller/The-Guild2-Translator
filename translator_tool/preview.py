@@ -348,16 +348,18 @@ def _measured_document_lines(
     return total
 
 
-def _estimated_button_height(document: PreviewDocument, button_width: int) -> int:
-    columns = max(8, round((button_width - 20) / 13))
-    line_height = max(12, round(25 * 0.72))
-    return max(36, _estimated_document_lines(document, columns) * line_height + 18)
+GAME_BUTTON_WIDTH = 250
+GAME_BUTTON_HEIGHT = 36
+
+
+def _estimated_button_height(_document: PreviewDocument, _button_width: int) -> int:
+    return GAME_BUTTON_HEIGHT
 
 
 def _estimated_buttons_height(buttons: tuple[PreviewDocument, ...], canvas_width: int) -> int:
     if not buttons:
         return 0
-    button_width = min(250, max(150, canvas_width - 92))
+    button_width = min(GAME_BUTTON_WIDTH, max(150, canvas_width - 92))
     heights = [_estimated_button_height(button, button_width) for button in buttons]
     return sum(heights) + max(0, len(heights) - 1) * 6
 
@@ -552,7 +554,7 @@ class GameUiAtlas:
         except (OSError, UnicodeError, ValueError, struct.error):
             self.records.clear()
 
-    def image(self, name: str) -> QImage | None:
+    def record(self, name: str) -> UiAssetRecord | None:
         requested = name.replace("\\", "/").casefold()
         key = requested if requested in self.records else next(
             (
@@ -562,11 +564,15 @@ class GameUiAtlas:
             ),
             "",
         )
-        if not key:
+        return self.records.get(key) if key else None
+
+    def image(self, name: str) -> QImage | None:
+        record = self.record(name)
+        if record is None:
             return None
+        key = record.name.replace("\\", "/").casefold()
         if key in self.images:
             return self.images[key]
-        record = self.records[key]
         if not record.texture_path.is_file():
             return None
         try:
@@ -1183,23 +1189,53 @@ class PreviewService:
         key = name.replace("\\", "/").casefold()
         if key in self._ui_image_cache:
             return self._ui_image_cache[key]
+        root = self._configured_directory(self.ui_assets_dir)
+        if root is None and self.game_root is not None:
+            root = self.game_root / "Textures" / "Hud"
+
+        def hires_image(relative_path: Path) -> QImage | None:
+            if root is None:
+                return None
+            parts = relative_path.parts
+            if parts and parts[0].casefold() == "hud":
+                parts = parts[1:]
+            if not parts:
+                return None
+            hires = (
+                root.joinpath(*parts)
+                if root.name.casefold() == "hires"
+                else root.joinpath("hires", *parts)
+            )
+            hires_image = (
+                _load_tga_image(hires)
+                if hires.suffix.casefold() == ".tga"
+                else QImage(str(hires))
+            )
+            if hires.is_file() and hires_image is not None and not hires_image.isNull():
+                return hires_image
+            return None
+
+        relative = Path(*name.replace("\\", "/").split("/"))
+        preferred = hires_image(relative)
+        if preferred is not None:
+            self._ui_image_cache[key] = preferred
+            return preferred
         if self._ui_atlas is None:
-            root = self._configured_directory(self.ui_assets_dir)
-            if root is None and self.game_root is not None:
-                root = self.game_root / "Textures" / "Hud"
             if root is None or not (root / "Sets.dat").is_file():
                 return None
             self._ui_atlas = GameUiAtlas(root)
+        record = self._ui_atlas.record(name)
+        if record is not None:
+            preferred = hires_image(Path(*record.name.replace("\\", "/").split("/")))
+            if preferred is not None:
+                self._ui_image_cache[key] = preferred
+                return preferred
         image = self._ui_atlas.image(name)
         if image is not None and not image.isNull():
             self._ui_image_cache[key] = image
             return image
-        root = self._configured_directory(self.ui_assets_dir)
-        if root is None and self.game_root is not None:
-            root = self.game_root / "Textures" / "Hud"
         if root is None:
             return None
-        relative = Path(*name.replace("\\", "/").split("/"))
         candidates = [root / relative]
         if relative.parts and relative.parts[0].casefold() == "hud":
             candidates.append(root.joinpath(*relative.parts[1:]))
@@ -1241,13 +1277,19 @@ class PreviewService:
         context: PreviewWindowContext | None = None,
         buttons: tuple[PreviewDocument, ...] = (),
         button_assets: tuple[str, ...] = (),
+        output_scale: float = 1.0,
     ) -> QImage:
         layout = self._game_window_layout(context, header, body, buttons, target=target)
-        background = self._game_window_background(context, layout.width, layout.height)
+        output_scale = max(1.0, min(2.0, float(output_scale)))
+        logical_width = layout.width
+        logical_height = layout.height
+        physical_width = max(1, round(logical_width * output_scale))
+        physical_height = max(1, round(logical_height * output_scale))
+        background = self._game_window_background(context, physical_width, physical_height)
         if background is None or background.isNull():
             canvas = QImage(
-                layout.width,
-                layout.height,
+                physical_width,
+                physical_height,
                 QImage.Format.Format_ARGB32_Premultiplied,
             )
             if (
@@ -1267,8 +1309,10 @@ class PreviewService:
             canvas = background.convertToFormat(QImage.Format.Format_ARGB32_Premultiplied)
         painter = QPainter(canvas)
         painter.setRenderHint(QPainter.RenderHint.SmoothPixmapTransform, True)
-        self._draw_game_window_frame(painter, context, canvas.rect())
-        self._draw_game_window_decoration(painter, context, canvas.rect())
+        painter.scale(output_scale, output_scale)
+        logical_rect = QRect(0, 0, logical_width, logical_height)
+        self._draw_game_window_frame(painter, context, logical_rect)
+        self._draw_game_window_decoration(painter, context, logical_rect)
         default_color = context.default_color if context is not None else (55, 38, 24, 255)
         if context is not None and context.kind == "questbook":
             self._draw_game_questbook(
@@ -1276,7 +1320,7 @@ class PreviewService:
                 header,
                 body,
                 target=target,
-                rect=canvas.rect(),
+                rect=logical_rect,
                 default_color=default_color,
             )
             painter.end()
@@ -1288,7 +1332,7 @@ class PreviewService:
                 header,
                 body,
                 target=target,
-                rect=canvas.rect(),
+                rect=logical_rect,
                 default_color=default_color,
             )
             painter.end()
@@ -1298,7 +1342,7 @@ class PreviewService:
                 painter,
                 header,
                 target=target,
-                rect=canvas.rect(),
+                rect=logical_rect,
                 default_color=default_color,
             )
             painter.end()
@@ -1308,7 +1352,7 @@ class PreviewService:
                 painter,
                 body,
                 target=target,
-                rect=canvas.rect(),
+                rect=logical_rect,
                 default_color=default_color,
             )
             painter.end()
@@ -1326,7 +1370,7 @@ class PreviewService:
                 buttons,
                 button_assets,
                 target=target,
-                rect=canvas.rect(),
+                rect=logical_rect,
                 default_color=default_color,
             )
             painter.end()
@@ -1337,7 +1381,7 @@ class PreviewService:
             header,
             body,
             target=target,
-            rect=canvas.rect(),
+            rect=logical_rect,
             default_color=default_color,
         ):
             if buttons:
@@ -1345,7 +1389,7 @@ class PreviewService:
                     painter,
                     buttons,
                     target=target,
-                    top=max(0, canvas.height() - _estimated_buttons_height(buttons, canvas.width()) - 12),
+                    top=max(0, logical_height - _estimated_buttons_height(buttons, logical_width) - 12),
                     default_color=(235, 225, 175, 255),
                 )
             painter.end()
@@ -1353,11 +1397,11 @@ class PreviewService:
         top = layout.top
         left_margin = layout.left_margin
         right_margin = layout.right_margin
-        button_block_height = _estimated_buttons_height(buttons, canvas.width())
+        button_block_height = _estimated_buttons_height(buttons, logical_width)
         button_top = (
-            canvas.height() - button_block_height - 22
+            logical_height - button_block_height - 22
             if buttons
-            else canvas.height() - 28
+            else logical_height - 28
         )
         text_bottom = button_top - 10 if buttons else button_top
         if header is not None:
@@ -1366,7 +1410,7 @@ class PreviewService:
                 context,
                 top=top,
                 left=left_margin,
-                right=canvas.width() - right_margin,
+                right=logical_width - right_margin,
             )
             top = self._draw_game_document(
                 painter,
@@ -1374,7 +1418,7 @@ class PreviewService:
                 target=target,
                 top=top + (2 if title_bar else 0),
                 left=left_margin,
-                right=canvas.width() - right_margin,
+                right=logical_width - right_margin,
                 scale=0.82 if title_bar else 1.0,
                 centered=True,
                 bottom=text_bottom,
@@ -2294,6 +2338,7 @@ class PreviewService:
         centered: bool,
         bottom: int | None = None,
         default_color: tuple[int, int, int, int] = (55, 38, 24, 255),
+        single_line: bool = False,
     ) -> int:
         symbol_atlas = self._atlas(target)
         standard_family = self._standard_font_family(target)
@@ -2309,8 +2354,10 @@ class PreviewService:
         lines: list[list[QImage | _NativeTextRun]] = [[]]
         widths = [0]
         line_height = max(12, round(25 * scale))
-        content_bottom = bottom if bottom is not None else painter.device().height() - 28
-        max_lines = max(1, (content_bottom - top) // line_height)
+        painter_scale = max(1.0, abs(painter.worldTransform().m22()))
+        logical_device_height = round(painter.device().height() / painter_scale)
+        content_bottom = bottom if bottom is not None else logical_device_height - 28
+        max_lines = 1 if single_line else max(1, (content_bottom - top) // line_height)
         stopped = False
 
         def next_line() -> bool:
@@ -2461,8 +2508,9 @@ class PreviewService:
     ) -> None:
         if not buttons:
             return
-        canvas_width = painter.device().width()
-        button_width = min(250, max(150, canvas_width - 92))
+        painter_scale = max(1.0, abs(painter.worldTransform().m11()))
+        canvas_width = round(painter.device().width() / painter_scale)
+        button_width = min(GAME_BUTTON_WIDTH, max(150, canvas_width - 92))
         x = (canvas_width - button_width) // 2
         y = top
         for button in buttons:
@@ -2481,6 +2529,7 @@ class PreviewService:
                 scale=0.72,
                 centered=True,
                 default_color=default_color,
+                single_line=True,
             )
             y += button_height + 6
 

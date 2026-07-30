@@ -2093,6 +2093,18 @@ class SettingsDialog(QDialog):
         self.preview_use_code_context = QCheckBox()
         self.preview_use_code_context.setChecked(self.settings.preview_use_code_context)
         preview_assets_form.addRow(self.preview_use_code_context)
+        self.preview_window_scale = QComboBox()
+        for percent in (100, 125, 150, 175, 200):
+            self.preview_window_scale.addItem(f"{percent}%", percent)
+        scale_index = self.preview_window_scale.findData(
+            self.settings.preview_window_scale_percent
+        )
+        self.preview_window_scale.setCurrentIndex(scale_index if scale_index >= 0 else 0)
+        self.preview_window_scale_label = QLabel()
+        preview_assets_form.addRow(
+            self.preview_window_scale_label,
+            self.preview_window_scale,
+        )
         self.preview_assets_hint = QLabel()
         self.preview_assets_hint.setObjectName("hint")
         self.preview_assets_hint.setWordWrap(True)
@@ -2271,6 +2283,9 @@ class SettingsDialog(QDialog):
         self.preview_use_code_context.setText(
             translate("settings.preview_use_code_context", locale=locale)
         )
+        self.preview_window_scale_label.setText(
+            translate("settings.preview_window_scale", locale=locale)
+        )
         self.preview_assets_hint.setText(translate("settings.preview_assets_hint", locale=locale))
         for field in (
             self.preview_translation_font_dir,
@@ -2342,6 +2357,9 @@ class SettingsDialog(QDialog):
             preview_ui_assets_dir=self.preview_ui_assets_dir.text().strip(),
             preview_game_font_in_editors=self.preview_game_font_in_editors.isChecked(),
             preview_use_code_context=self.preview_use_code_context.isChecked(),
+            preview_window_scale_percent=int(
+                self.preview_window_scale.currentData() or 100
+            ),
         )
 
 
@@ -3860,6 +3878,7 @@ class TranslatorWindow(QMainWindow):
                 )
                 for button in button_units
             ),
+            self.settings.preview_window_scale_percent,
         )
         cached = self._game_preview_cache.get(cache_key)
         if cached is not None:
@@ -3902,6 +3921,7 @@ class TranslatorWindow(QMainWindow):
                 if context is not None
                 else ()
             ),
+            output_scale=self.settings.preview_window_scale_percent / 100.0,
         )
         if len(self._game_preview_cache) >= 24:
             self._game_preview_cache.clear()
@@ -6037,6 +6057,7 @@ class TranslatorWindow(QMainWindow):
         previous_preview_scope = self.settings.preview_scope
         previous_game_font = self.settings.preview_game_font_in_editors
         previous_use_code_context = self.settings.preview_use_code_context
+        previous_preview_window_scale = self.settings.preview_window_scale_percent
         previous_preview_resources = (
             self.settings.preview_translation_font_dir,
             self.settings.preview_ui_assets_dir,
@@ -6058,6 +6079,8 @@ class TranslatorWindow(QMainWindow):
         if self.settings.preview_scope != previous_preview_scope:
             self.table.viewport().update()
         if self.settings.preview_use_code_context != previous_use_code_context:
+            self._refresh_preview_presentations()
+        if self.settings.preview_window_scale_percent != previous_preview_window_scale:
             self._refresh_preview_presentations()
         current_preview_resources = (
             self.settings.preview_translation_font_dir,

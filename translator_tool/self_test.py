@@ -782,6 +782,7 @@ def assert_code_preview_unit_lookup_accepts_leading_underscore_labels() -> None:
 
 def assert_true_color_tga_loader() -> None:
     path = Path(tempfile.gettempdir()) / f"translator_tool_tga_{uuid.uuid4().hex}.tga"
+    asset_root = Path(tempfile.gettempdir()) / f"translator_tool_hires_{uuid.uuid4().hex}"
     try:
         path.write_bytes(
             bytes.fromhex(
@@ -799,8 +800,73 @@ def assert_true_color_tga_loader() -> None:
             or image.pixelColor(1, 0).getRgb()[:3] != (0, 255, 0)
         ):
             raise AssertionError("unpacked true-color game TGA was not decoded into RGBA pixels")
+        ordinary = asset_root / "NoCompression" / "button.tga"
+        hires = asset_root / "hires" / "NoCompression" / "button.tga"
+        ordinary.parent.mkdir(parents=True)
+        hires.parent.mkdir(parents=True)
+        ordinary.write_bytes(
+            bytes.fromhex("0000020000000000000000000100010018000000ff")
+        )
+        hires.write_bytes(
+            bytes.fromhex("00000200000000000000000001000100180000ff00")
+        )
+        selected = PreviewService(ui_assets_dir=str(asset_root)).ui_image(
+            "Hud/NoCompression/button.tga"
+        )
+        if (
+            selected is None
+            or selected.pixelColor(0, 0).getRgb()[:3] != (0, 255, 0)
+        ):
+            raise AssertionError("game preview did not prefer the matching Hires UI texture")
+        from .preview import GameUiAtlas, UiAssetRecord
+
+        basename_service = PreviewService(ui_assets_dir=str(asset_root))
+        basename_service._ui_atlas = GameUiAtlas(asset_root)
+        basename_service._ui_atlas.records["hud/nocompression/button.tga"] = UiAssetRecord(
+            "Hud/NoCompression/button.tga",
+            ordinary,
+            0,
+            0,
+            1,
+            1,
+        )
+        basename_selected = basename_service.ui_image("button.tga")
+        if (
+            basename_selected is None
+            or basename_selected.pixelColor(0, 0).getRgb()[:3] != (0, 255, 0)
+        ):
+            raise AssertionError(
+                "basename UI requests did not use their atlas record to locate Hires art"
+            )
     finally:
         path.unlink(missing_ok=True)
+        safe_rmtree(asset_root)
+
+
+def assert_preview_window_scale_setting() -> None:
+    from PySide6.QtWidgets import QApplication
+
+    from .app import SettingsDialog
+
+    app = QApplication.instance() or QApplication([])
+    dialog = SettingsDialog(AppSettings(preview_window_scale_percent=150))
+    try:
+        if (
+            dialog.preview_window_scale.currentData() != 150
+            or tuple(
+                dialog.preview_window_scale.itemData(index)
+                for index in range(dialog.preview_window_scale.count())
+            )
+            != (100, 125, 150, 175, 200)
+        ):
+            raise AssertionError("preview scale setting did not expose the fixed supported choices")
+        dialog.preview_window_scale.setCurrentIndex(
+            dialog.preview_window_scale.findData(175)
+        )
+        if dialog.result_settings().preview_window_scale_percent != 175:
+            raise AssertionError("preview scale selection was not retained in settings")
+    finally:
+        dialog.deleteLater()
 
 
 def assert_game_preview_draws_all_buttons() -> None:
@@ -823,10 +889,20 @@ def assert_game_preview_draws_all_buttons() -> None:
         return int(top) + 1 if isinstance(top, int) else 1
 
     service._draw_game_document = fake_draw_document  # type: ignore[method-assign]
-    service._draw_game_button_background = lambda _painter, _rect: True  # type: ignore[method-assign]
+    button_rects: list[tuple[int, int]] = []
+
+    def capture_button_rect(_painter: object, rect: QRect) -> bool:
+        button_rects.append((rect.width(), rect.height()))
+        return True
+
+    service._draw_game_button_background = capture_button_rect  # type: ignore[method-assign]
     service.game_window_image(None, None, target=False, buttons=buttons)
     if drawn != [button.display_text for button in buttons]:
         raise AssertionError(f"game preview should draw every button without truncation: {drawn!r}")
+    if len(set(button_rects)) != 1 or button_rects[0][1] != 36:
+        raise AssertionError(
+            f"game preview buttons should retain one fixed material size: {button_rects!r}"
+        )
     layout_service = PreviewService()
     layout_service._draw_game_document = fake_draw_document  # type: ignore[method-assign]
     layout_service._draw_game_button_background = lambda _painter, _rect: True  # type: ignore[method-assign]
@@ -837,6 +913,40 @@ def assert_game_preview_draws_all_buttons() -> None:
     )
     if compact.width() != 344 or compact.height() != 240:
         raise AssertionError(f"short parchment previews should use the compact layout: {compact.size()!r}")
+    scaled = layout_service.game_window_image(
+        None,
+        PreviewDocument.from_atoms("Hi", [PreviewAtom("Hi", 0, 2)]),
+        target=False,
+        output_scale=1.5,
+    )
+    if scaled.width() != 516 or scaled.height() != 360:
+        raise AssertionError(
+            f"game preview scale should increase physical pixels without changing layout selection: {scaled.size()!r}"
+        )
+    scaled_button_service = PreviewService()
+    scaled_button_rects: list[QRect] = []
+    scaled_button_service._draw_game_document = fake_draw_document  # type: ignore[method-assign]
+
+    def capture_scaled_button(_painter: object, rect: QRect) -> bool:
+        scaled_button_rects.append(QRect(rect))
+        return True
+
+    scaled_button_service._draw_game_button_background = capture_scaled_button  # type: ignore[method-assign]
+    scaled_button_service.game_window_image(
+        None,
+        None,
+        target=False,
+        buttons=buttons[:2],
+        output_scale=1.5,
+    )
+    if (
+        not scaled_button_rects
+        or scaled_button_rects[0].x() != 65
+        or scaled_button_rects[0].right() >= 380
+    ):
+        raise AssertionError(
+            f"scaled game preview buttons should remain centered in logical coordinates: {scaled_button_rects!r}"
+        )
     quest_service = PreviewService()
     quest_positions: list[tuple[str, int, int]] = []
 
@@ -2092,6 +2202,7 @@ def assert_project_history_settings(root: Path) -> None:
                 preview_scope="all",
                 preview_translation_font_dir="C:/game/Hud/chinese",
                 preview_ui_assets_dir="C:/game/Hud/Sets.dat",
+                preview_window_scale_percent=175,
                 editor_zoom_steps=3,
             )
         )
@@ -2108,6 +2219,7 @@ def assert_project_history_settings(root: Path) -> None:
             or loaded.preview_scope != "all"
             or loaded.preview_translation_font_dir != "C:/game/Hud/chinese"
             or loaded.preview_ui_assets_dir != "C:/game/Hud/Sets.dat"
+            or loaded.preview_window_scale_percent != 175
             or loaded.editor_zoom_steps != 3
         ):
             raise AssertionError("project folder history was not persisted safely")
@@ -4680,6 +4792,7 @@ def main() -> int:
     assert_code_window_context_extracts_window_labels_and_buttons()
     assert_code_preview_unit_lookup_accepts_leading_underscore_labels()
     assert_true_color_tga_loader()
+    assert_preview_window_scale_setting()
     assert_game_preview_draws_all_buttons()
     assert_onscreen_help_preview_pairs_name_and_description()
     assert_name_tooltip_preview_pairs_title_and_body()

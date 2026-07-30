@@ -39,6 +39,7 @@ class AppSettings:
     preview_ui_assets_dir: str = ""
     preview_game_font_in_editors: bool = False
     preview_use_code_context: bool = True
+    preview_window_scale_percent: int = 100
     editor_zoom_steps: int = 0
     last_project_root: str = ""
     last_game_root: str = ""
