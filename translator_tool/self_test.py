@@ -1355,6 +1355,64 @@ def assert_game_preview_draws_all_buttons() -> None:
             raise AssertionError(
                 f"dialog preview did not crop the registered full-screen GUI to its DialogBox: {gui_positions!r}"
             )
+        help_resource = (
+            gui_temp / "GUI" / "Hud" / "Helppanels" / "items.gui"
+        )
+        help_resource.parent.mkdir(parents=True)
+        help_resource.write_bytes(
+            schema
+            + node("Header", y=6, width=603, height=27)
+            + node("Container", y=6, width=597, height=26)
+            + node("Container", y=0, width=603, height=38)
+            + node("Label", y=140, width=291, height=209)
+            + node("Root", y=0, width=603, height=462)
+        )
+        requested_help_assets: list[str] = []
+
+        def help_ui_image(name: str) -> QImage:
+            requested_help_assets.append(name)
+            image = QImage(12, 12, QImage.Format.Format_ARGB32)
+            image.fill(0xFFFFFFFF)
+            return image
+
+        gui_service.ui_image = help_ui_image  # type: ignore[method-assign]
+        gui_positions.clear()
+        help_context = surface_window_context("item_help")
+        help_image = gui_service.game_window_image(
+            PreviewDocument.from_atoms(
+                "Item title",
+                [PreviewAtom("Item title", 0, 10)],
+            ),
+            PreviewDocument.from_atoms(
+                "Item description",
+                [PreviewAtom("Item description", 0, 16)],
+            ),
+            target=False,
+            context=help_context,
+        )
+        if (
+            (help_image.width(), help_image.height()) != (603, 462)
+            or gui_positions
+            != [
+                ("Item title", 6, 0, 603, True),
+                ("Item description", 140, 16, 307, False),
+            ]
+        ):
+            raise AssertionError(
+                f"item help text did not follow its real header and left-column coordinates: {gui_positions!r}"
+            )
+        if (
+            "Hud/NoCompression/header_red.tga" not in requested_help_assets
+            or not any(
+                name.casefold().startswith(
+                    "hud/borders/border_header_red.tga"
+                )
+                for name in requested_help_assets
+            )
+        ):
+            raise AssertionError(
+                f"item help header did not draw its nested red background and border: {requested_help_assets!r}"
+            )
         news_context = PreviewWindowContext(
             "news",
             "overlay",

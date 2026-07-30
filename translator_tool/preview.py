@@ -1519,6 +1519,21 @@ class PreviewService:
         header_node = gui_node_geometry(info, *header_names)
         body_node = gui_node_geometry(info, *body_names)
         render_root_size = info.root_size
+        help_resource = bool(
+            context is not None
+            and context.gui_resource.replace("\\", "/")
+            .casefold()
+            .startswith("gui/hud/helppanels/")
+        )
+        if help_resource and body_node is not None and body_node.x is None:
+            body_node = GuiNodeGeometry(
+                body_node.name,
+                16,
+                body_node.y,
+                body_node.width,
+                body_node.height,
+                body_node.horizontal_alignment,
+            )
         header_centered, body_centered = _gui_document_centering(context)
         if context is not None and context.kind == "tooltip" and body_node is not None:
             body_node = GuiNodeGeometry(
@@ -1590,7 +1605,14 @@ class PreviewService:
         )
         if header is not None and header_node is not None:
             header_rect = _scaled_gui_node_rect(header_node, render_root_size, rect)
-            if context is not None and context.title_asset:
+            if help_resource:
+                self._draw_game_help_header(
+                    painter,
+                    context,
+                    info,
+                    rect,
+                )
+            elif context is not None and context.title_asset:
                 title = self.ui_image(context.title_asset)
                 if title is not None and not title.isNull():
                     painter.drawImage(header_rect, title)
@@ -1621,6 +1643,83 @@ class PreviewService:
                 default_color=default_color,
             )
         return header is not None or body is not None
+
+    def _draw_game_help_header(
+        self,
+        painter: QPainter,
+        context: PreviewWindowContext,
+        info: GuiResourceInfo,
+        rect: QRect,
+    ) -> None:
+        """Draw the two nested header containers declared by Helppanels/*.gui."""
+        root_width, root_height = info.root_size
+        containers = tuple(
+            node
+            for node in info.nodes
+            if node.name.casefold() == "container"
+            and 0 <= node.y <= 7
+            and 20 <= node.height <= 40
+        )
+        outer = max(
+            (
+                node
+                for node in containers
+                if node.y == 0 and node.width <= root_width
+            ),
+            key=lambda node: node.width * node.height,
+            default=GuiNodeGeometry(
+                "HeaderBorder",
+                0,
+                0,
+                root_width,
+                min(38, root_height),
+                None,
+            ),
+        )
+        inner = max(
+            (
+                node
+                for node in containers
+                if node.y > 0 and node.width <= root_width
+            ),
+            key=lambda node: node.width,
+            default=GuiNodeGeometry(
+                "HeaderBackground",
+                3,
+                6,
+                max(1, root_width - 6),
+                26,
+                None,
+            ),
+        )
+        outer_rect = _scaled_gui_node_rect(outer, info.root_size, rect)
+        inner_x = (
+            inner.x
+            if inner.x is not None
+            else max(0, (root_width - inner.width) // 2)
+        )
+        inner_rect = _scaled_gui_node_rect(
+            GuiNodeGeometry(
+                inner.name,
+                inner_x,
+                inner.y,
+                inner.width,
+                inner.height,
+                inner.horizontal_alignment,
+            ),
+            info.root_size,
+            rect,
+        )
+        title = self.ui_image(
+            context.title_asset or "Hud/NoCompression/header_red.tga"
+        )
+        if title is not None and not title.isNull():
+            painter.drawImage(inner_rect, title)
+        self._draw_game_nine_slice(
+            painter,
+            outer_rect,
+            "Hud/borders/border_header_red.tga",
+        )
 
     def _draw_game_questbook(
         self,
