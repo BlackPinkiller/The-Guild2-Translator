@@ -527,11 +527,9 @@ def _presentation_for_surface(
         ),
         "dialog": PreviewSurfacePresentation(
             "short",
-            "dark_panel",
-            "panel",
-            "GUI/Hud/SayPanel.gui",
-            "Hud/NoCompression/Priority3/PanelBackground_01.tga",
-            "Hud/borders/Border_Gold_02.tga",
+            "overlay",
+            "dialog",
+            "GUI/Hud/panel_dialog.gui",
         ),
         "quick_message": PreviewSurfacePresentation(
             "short",
@@ -599,9 +597,9 @@ def _presentation_for_surface(
         ),
         "status": PreviewSurfacePresentation(
             "status",
-            "dark_panel",
-            "panel",
-            background_asset="Hud/NoCompression/Priority3/PanelBackground_01.tga",
+            "overlay",
+            "overlay",
+            gui_resource="engine:StatusPanel",
         ),
         "overhead": PreviewSurfacePresentation(
             "overhead",

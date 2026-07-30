@@ -70,7 +70,7 @@ def _gui_document_node_names(
     return {
         "gui/hud/panel_messagebox.gui": (("LHeader",), ("Entrys",)),
         "gui/hud/questboxpanel.gui": (("LHeader",), ("Entrys",)),
-        "gui/hud/saypanel.gui": (("LHeader",), ("Text",)),
+        "gui/hud/panel_dialog.gui": ((), ("Label",)),
         "gui/hud/panel_quickmessage.gui": ((), ("InfoLabel",)),
         "gui/hud/panel_measuremessage.gui": ((), ("InfoLabel",)),
         "gui/hud/panel_systemmessage.gui": ((), ("InfoLabel",)),
@@ -96,7 +96,6 @@ def _gui_document_centering(
     header_centered = resource in {
         "gui/hud/panel_messagebox.gui",
         "gui/hud/questboxpanel.gui",
-        "gui/hud/saypanel.gui",
         "gui/hud/panel_tutorial.gui",
         "gui/hud/panel_questintro.gui",
         "gui/hud/panel_measurechoice.gui",
@@ -1519,6 +1518,7 @@ class PreviewService:
         header_names, body_names = node_names
         header_node = gui_node_geometry(info, *header_names)
         body_node = gui_node_geometry(info, *body_names)
+        render_root_size = info.root_size
         header_centered, body_centered = _gui_document_centering(context)
         if context is not None and context.kind == "tooltip" and body_node is not None:
             body_node = GuiNodeGeometry(
@@ -1550,20 +1550,46 @@ class PreviewService:
                         + body_node.y
                     ),
                     body_node.width,
+                body_node.height,
+                body_node.horizontal_alignment,
+            )
+        if (
+            context is not None
+            and context.kind == "short"
+            and context.layout == "dialog"
+            and body_node is not None
+        ):
+            dialog_node = gui_node_geometry(info, "DialogBox")
+            if dialog_node is not None:
+                decoration_top = 22
+                decoration_bottom = 22
+                render_root_size = (
+                    dialog_node.width,
+                    dialog_node.height + decoration_top + decoration_bottom,
+                )
+                body_node = GuiNodeGeometry(
+                    body_node.name,
+                    (
+                        body_node.x
+                        if body_node.x is not None
+                        else max(0, (dialog_node.width - body_node.width) // 2)
+                    ),
+                    body_node.y + decoration_top,
+                    body_node.width,
                     body_node.height,
                     body_node.horizontal_alignment,
                 )
         if (header is not None and header_node is None) or (body is not None and body_node is None):
             return False
-        scale_x = rect.width() / max(1, info.root_size[0])
-        scale_y = rect.height() / max(1, info.root_size[1])
+        scale_x = rect.width() / max(1, render_root_size[0])
+        scale_y = rect.height() / max(1, render_root_size[1])
         font_scale = (
             0.58
             if context is not None and context.kind == "tooltip"
             else max(0.50, min(0.86, 0.78 * min(scale_x, scale_y)))
         )
         if header is not None and header_node is not None:
-            header_rect = _scaled_gui_node_rect(header_node, info.root_size, rect)
+            header_rect = _scaled_gui_node_rect(header_node, render_root_size, rect)
             if context is not None and context.title_asset:
                 title = self.ui_image(context.title_asset)
                 if title is not None and not title.isNull():
@@ -1581,7 +1607,7 @@ class PreviewService:
                 default_color=default_color,
             )
         if body is not None and body_node is not None:
-            body_rect = _scaled_gui_node_rect(body_node, info.root_size, rect)
+            body_rect = _scaled_gui_node_rect(body_node, render_root_size, rect)
             self._draw_game_document(
                 painter,
                 body,
@@ -1977,8 +2003,28 @@ class PreviewService:
         layout_kind = context.layout if context is not None and context.layout else ""
         dark_panel = context is not None and context.background in {"dark_panel", "overlay"}
         gui_geometry = self._game_window_gui_geometry(context)
+        gui_info = self._game_window_gui_info(context)
         gui_driven = _gui_document_node_names(context) is not None
-        if context is not None and context.kind == "pamphlet":
+        if (
+            context is not None
+            and context.kind
+            in {"questbook", "datebook", "important_persons", "pamphlet"}
+            and gui_info is not None
+            and gui_info.root_size
+        ):
+            root_width, root_height = gui_info.root_size
+            scale = min(
+                1.0,
+                720 / max(1, root_width),
+                720 / max(1, root_height),
+            )
+            candidates = (
+                (
+                    max(1, round(root_width * scale)),
+                    max(1, round(root_height * scale)),
+                ),
+            )
+        elif context is not None and context.kind == "pamphlet":
             candidates = ((504, 496), (620, 610))
         elif context is not None and context.kind == "measure_choice":
             candidates = ((255, 115), (382, 172), (510, 230))
@@ -1987,21 +2033,15 @@ class PreviewService:
         elif gui_driven and gui_geometry is not None:
             (root_width, root_height), _content_rect = gui_geometry
             maximum_scale = min(
-                1.2,
-                620 / max(1, root_width),
-                620 / max(1, root_height),
+                1.0,
+                720 / max(1, root_width),
+                720 / max(1, root_height),
             )
-            scales = (
-                (maximum_scale * 0.8, maximum_scale)
-                if maximum_scale < 0.8
-                else tuple(dict.fromkeys((0.8, min(1.0, maximum_scale), maximum_scale)))
-            )
-            candidates = tuple(
+            candidates = (
                 (
-                    max(1, round(root_width * scale)),
-                    max(1, round(root_height * scale)),
-                )
-                for scale in scales
+                    max(1, round(root_width * maximum_scale)),
+                    max(1, round(root_height * maximum_scale)),
+                ),
             )
         elif layout_kind == "book":
             candidates = ((520, 435), (622, 521), (720, 603))
@@ -2176,7 +2216,7 @@ class PreviewService:
                 round(y * scale_y),
                 round(x * scale_x),
                 max(0, width - round((x + content_width) * scale_x)),
-                max(0.72, min(1.0, 0.85 * min(scale_x, scale_y))),
+                0.50,
             )
         return GameWindowLayout(width, height, top, left_margin, right_margin, body_scale)
 
@@ -2197,6 +2237,23 @@ class PreviewService:
                 return None
             width, height = info.root_size
             return info.root_size, (0, 0, width, height)
+        if context.kind == "short" and context.layout == "dialog":
+            info = self._game_window_gui_info(context)
+            if info is None:
+                return None
+            label = gui_node_geometry(info, "Label")
+            dialog = gui_node_geometry(info, "DialogBox")
+            if label is None or dialog is None:
+                return None
+            label_x = (
+                label.x
+                if label.x is not None
+                else max(0, (dialog.width - label.width) // 2)
+            )
+            return (
+                (dialog.width, dialog.height + 44),
+                (label_x, label.y + 22, label.width, label.height),
+            )
         info = self._game_window_gui_info(context)
         if (
             info is None
@@ -2246,9 +2303,9 @@ class PreviewService:
             return context.background_asset
         if context is None or context.kind in {"message", "quest"}:
             return "Hud/messagebox/mbback0.tga"
-        if context.call_name in {"msgsay", "msgsaynowait", "msgsayinteraction", "showtutorialboxnowait"}:
+        if context.call_name == "showtutorialboxnowait":
             return "Hud/NoCompression/Priority3/PanelBackground_01.tga"
-        if context.kind in {"tooltip", "onscreen_help", "status", "datebook"}:
+        if context.kind in {"tooltip", "onscreen_help", "datebook"}:
             return "Hud/NoCompression/Priority3/PanelBackground_01.tga"
         return ""
 
@@ -2262,17 +2319,66 @@ class PreviewService:
             return False
         if context.kind == "quest_intro":
             return False
+        if context.kind == "short" and context.layout == "dialog":
+            return self._draw_game_dialog_frame(painter, rect)
         asset = context.frame_asset
-        if not asset and context.call_name in {
-            "msgsay",
-            "msgsaynowait",
-            "msgsayinteraction",
-            "showtutorialboxnowait",
-        }:
+        if not asset and context.call_name == "showtutorialboxnowait":
             asset = "Hud/borders/Border_Gold_02.tga"
         if not asset:
             return False
         return self._draw_game_nine_slice(painter, rect, asset)
+
+    def _draw_game_dialog_frame(self, painter: QPainter, rect: QRect) -> bool:
+        """Rebuild panel_dialog.gui's hook-and-line frame from its real assets."""
+        line = self.ui_image("Hud/borders/line_horizontal.tga")
+        upper_left = self.ui_image("Hud/hud_icons/haken_li_trans_open.tga")
+        upper_right = self.ui_image("Hud/hud_icons/haken_re_trans_oben.tga")
+        lower_left = self.ui_image("Hud/hud_icons/haken_li_trans.tga")
+        lower_right = self.ui_image("Hud/hud_icons/haken_re_trans.tga")
+        if any(
+            image is None or image.isNull()
+            for image in (line, upper_left, upper_right, lower_left, lower_right)
+        ):
+            return False
+        corner_width = 28
+        corner_height = 25
+        line_height = 3
+        painter.drawImage(
+            QRect(rect.left(), rect.top(), corner_width, corner_height),
+            upper_left,
+        )
+        painter.drawImage(
+            QRect(rect.right() - corner_width + 1, rect.top(), corner_width, corner_height),
+            upper_right,
+        )
+        painter.drawImage(
+            QRect(rect.left(), rect.bottom() - corner_height + 1, corner_width, corner_height),
+            lower_left,
+        )
+        painter.drawImage(
+            QRect(
+                rect.right() - corner_width + 1,
+                rect.bottom() - corner_height + 1,
+                corner_width,
+                corner_height,
+            ),
+            lower_right,
+        )
+        span = max(1, rect.width() - 2 * (corner_width - 7))
+        painter.drawImage(
+            QRect(rect.left() + corner_width - 7, rect.top() + 22, span, line_height),
+            line,
+        )
+        painter.drawImage(
+            QRect(
+                rect.left() + corner_width - 7,
+                rect.bottom() - corner_height + 1,
+                span,
+                line_height,
+            ),
+            line,
+        )
+        return True
 
     def _draw_game_window_decoration(
         self,

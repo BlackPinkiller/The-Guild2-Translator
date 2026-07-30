@@ -609,6 +609,10 @@ def assert_code_window_context_extracts_window_labels_and_buttons() -> None:
             raise AssertionError(f"MsgSayInteraction body label was not extracted: {interaction_context!r}")
         if interaction_context.speaker != "Child" or interaction_context.panel == "":
             raise AssertionError(f"dialog presentation arguments were not retained: {interaction_context!r}")
+        if interaction_context.gui_resource != "GUI/Hud/panel_dialog.gui":
+            raise AssertionError(
+                f"MsgSayInteraction should use the registered DialogPanel rather than the chat input panel: {interaction_context!r}"
+            )
         quest_refs = index.references_for("TUTORIAL_CAMERA_SUCCESS").project
         quest_context = best_window_context(quest_refs, "TUTORIAL_CAMERA_SUCCESS")
         if (
@@ -1261,10 +1265,10 @@ def assert_game_preview_draws_all_buttons() -> None:
             (),
         )
         if (
-            (gui_layout.width, gui_layout.height) != (385, 301)
-            or gui_layout.top != 40
-            or gui_layout.left_margin != 49
-            or gui_layout.right_margin != 50
+            (gui_layout.width, gui_layout.height) != (481, 376)
+            or gui_layout.top != 50
+            or gui_layout.left_margin != 61
+            or gui_layout.right_margin != 62
         ):
             raise AssertionError(
                 f"messagebox preview ignored its GUI content rectangle: {gui_layout!r}"
@@ -1295,8 +1299,8 @@ def assert_game_preview_draws_all_buttons() -> None:
             context=gui_context,
         )
         if (
-            gui_positions != [("Body", 40, 49, 336, False)]
-            or (gui_image.width(), gui_image.height()) != (385, 301)
+            gui_positions != [("Body", 50, 61, 419, False)]
+            or (gui_image.width(), gui_image.height()) != (481, 376)
         ):
             raise AssertionError(
                 f"messagebox text was not drawn in its named GUI node: {gui_positions!r}"
@@ -1325,6 +1329,31 @@ def assert_game_preview_draws_all_buttons() -> None:
         if adaptive_layout.body_scale >= gui_layout.body_scale:
             raise AssertionError(
                 "long standard-font previews did not reduce body text to avoid clipping"
+            )
+        dialog_resource = gui_temp / "GUI" / "Hud" / "panel_dialog.gui"
+        dialog_resource.write_bytes(
+            schema
+            + node("Label", y=2, width=242, height=92)
+            + node("DialogBox", y=320, width=348, height=108)
+            + node("CutsceneDialogArea", y=25, width=963, height=712)
+        )
+        gui_positions.clear()
+        dialog_context = surface_window_context(
+            "dialog",
+            call_name="msgsay",
+        )
+        dialog_image = gui_service.game_window_image(
+            None,
+            PreviewDocument.from_atoms("Speech", [PreviewAtom("Speech", 0, 6)]),
+            target=False,
+            context=dialog_context,
+        )
+        if (
+            (dialog_image.width(), dialog_image.height()) != (348, 152)
+            or gui_positions != [("Speech", 24, 53, 295, False)]
+        ):
+            raise AssertionError(
+                f"dialog preview did not crop the registered full-screen GUI to its DialogBox: {gui_positions!r}"
             )
         news_context = PreviewWindowContext(
             "news",
@@ -1416,15 +1445,19 @@ def assert_game_preview_draws_all_buttons() -> None:
     if requested_assets != ["Hud/messagebox/mbback0.tga"]:
         raise AssertionError(f"MsgBox should request its actual GUI background: {requested_assets!r}")
     requested_assets.clear()
-    dialogue_context = PreviewWindowContext(
-        "short",
-        "dark_panel",
-        DARK_PANEL_TEXT,
+    dialogue_context = surface_window_context(
+        "dialog",
         call_name="msgsayinteraction",
     )
     asset_service._game_window_background(dialogue_context, 380, 148)
-    if requested_assets != ["Hud/NoCompression/Priority3/PanelBackground_01.tga"]:
-        raise AssertionError(f"MsgSay should request its actual panel texture: {requested_assets!r}")
+    if requested_assets:
+        raise AssertionError(
+            f"MsgSay should not borrow the unrelated SayPanel background: {requested_assets!r}"
+        )
+    if dialogue_context.gui_resource != "GUI/Hud/panel_dialog.gui":
+        raise AssertionError(
+            f"MsgSay should use the registered game dialog resource: {dialogue_context!r}"
+        )
     requested_assets.clear()
     datebook_canvas = QImage(380, 148, QImage.Format.Format_ARGB32)
     datebook_canvas.fill(0)
@@ -1604,8 +1637,13 @@ def assert_engine_owned_preview_styles() -> None:
     status = engine_window_context("_SETTLEMENTSTATE_HEADLINE_+0")
     if status is None or status.kind != "status" or not status.header_label:
         raise AssertionError(f"engine status headline should be a dark panel header: {status!r}")
-    if PreviewService._game_window_background_name(status) != "Hud/NoCompression/Priority3/PanelBackground_01.tga":
-        raise AssertionError("engine status preview should request the in-game panel texture")
+    if (
+        status.gui_resource != "engine:StatusPanel"
+        or PreviewService._game_window_background_name(status)
+    ):
+        raise AssertionError(
+            "engine-owned StatusPanel should remain readable without borrowing an unrelated game texture"
+        )
     if engine_window_context("_UNRELATED_TEXT_+0") is not None:
         raise AssertionError("unknown labels must not receive a guessed engine window style")
 

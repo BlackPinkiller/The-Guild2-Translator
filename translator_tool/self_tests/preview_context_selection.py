@@ -142,7 +142,11 @@ def assert_preview_context_selection_understands_returned_label_roles() -> None:
     )
     if selection.window is None:
         raise AssertionError("a returned body label did not inherit its final UI call style")
-    if selection.window.kind != "short" or selection.window.background != "dark_panel":
+    if (
+        selection.window.kind != "short"
+        or selection.window.background != "overlay"
+        or selection.window.gui_resource != "GUI/Hud/panel_dialog.gui"
+    ):
         raise AssertionError(f"a returned MsgSay label got the wrong presentation: {selection.window!r}")
     if selection.window.body_label != "remote_body_+2":
         raise AssertionError(f"the returned label was not attached to the body slot: {selection.window!r}")
