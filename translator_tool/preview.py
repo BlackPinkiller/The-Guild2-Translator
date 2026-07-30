@@ -63,6 +63,10 @@ def _gui_document_node_names(
     if context is None:
         return None
     resource = context.gui_resource.replace("\\", "/").casefold()
+    if resource.startswith("gui/hud/helppanels/") and resource.endswith(".gui"):
+        return (("Header",), ("Label",))
+    if resource == "gui/styles/tooltip.gst":
+        return ((), ("cl_WinLabel",))
     return {
         "gui/hud/panel_messagebox.gui": (("LHeader",), ("Entrys",)),
         "gui/hud/questboxpanel.gui": (("LHeader",), ("Entrys",)),
@@ -73,8 +77,6 @@ def _gui_document_node_names(
         "gui/hud/panel_tutorial.gui": (("LHeader",), ("Entrys",)),
         "gui/hud/panel_questintro.gui": (("Header",), ("Scrolltext",)),
         "gui/hud/panel_measurechoice.gui": (("LHeader",), ()),
-        "gui/hud/helppanels/measures.gui": (("Header",), ("Label",)),
-        "gui/hud/helppanels/text.gui": (("Header",), ("Label",)),
         "gui/hud/panel_cityschedule.gui": ((), ("Entrys",)),
     }.get(resource)
 
@@ -89,6 +91,7 @@ def _gui_document_centering(
         "gui/hud/panel_quickmessage.gui",
         "gui/hud/panel_measuremessage.gui",
         "gui/hud/panel_systemmessage.gui",
+        "gui/styles/tooltip.gst",
     }
     header_centered = resource in {
         "gui/hud/panel_messagebox.gui",
@@ -97,9 +100,9 @@ def _gui_document_centering(
         "gui/hud/panel_tutorial.gui",
         "gui/hud/panel_questintro.gui",
         "gui/hud/panel_measurechoice.gui",
-        "gui/hud/helppanels/measures.gui",
-        "gui/hud/helppanels/text.gui",
     }
+    if resource.startswith("gui/hud/helppanels/") and resource.endswith(".gui"):
+        header_centered = True
     return header_centered, body_centered
 
 
@@ -1517,6 +1520,15 @@ class PreviewService:
         header_node = gui_node_geometry(info, *header_names)
         body_node = gui_node_geometry(info, *body_names)
         header_centered, body_centered = _gui_document_centering(context)
+        if context is not None and context.kind == "tooltip" and body_node is not None:
+            body_node = GuiNodeGeometry(
+                body_node.name,
+                0,
+                0,
+                info.root_size[0],
+                info.root_size[1],
+                body_node.horizontal_alignment,
+            )
         if context is not None and context.kind == "quest_intro" and body_node is not None:
             body_parent = gui_node_geometry(info, "ScrollContainern")
             if body_parent is not None:
@@ -1545,9 +1557,17 @@ class PreviewService:
             return False
         scale_x = rect.width() / max(1, info.root_size[0])
         scale_y = rect.height() / max(1, info.root_size[1])
-        font_scale = max(0.50, min(0.86, 0.78 * min(scale_x, scale_y)))
+        font_scale = (
+            0.58
+            if context is not None and context.kind == "tooltip"
+            else max(0.50, min(0.86, 0.78 * min(scale_x, scale_y)))
+        )
         if header is not None and header_node is not None:
             header_rect = _scaled_gui_node_rect(header_node, info.root_size, rect)
+            if context is not None and context.title_asset:
+                title = self.ui_image(context.title_asset)
+                if title is not None and not title.isNull():
+                    painter.drawImage(header_rect, title)
             self._draw_game_document(
                 painter,
                 header,
@@ -1962,6 +1982,8 @@ class PreviewService:
             candidates = ((504, 496), (620, 610))
         elif context is not None and context.kind == "measure_choice":
             candidates = ((255, 115), (382, 172), (510, 230))
+        elif context is not None and context.kind == "tooltip":
+            candidates = ((310, 30),)
         elif gui_driven and gui_geometry is not None:
             (root_width, root_height), _content_rect = gui_geometry
             maximum_scale = min(
@@ -2169,6 +2191,12 @@ class PreviewService:
             or context.gui_resource.startswith("engine:")
         ):
             return None
+        if context.kind == "tooltip":
+            info = self._game_window_gui_info(context)
+            if info is None or not info.root_size:
+                return None
+            width, height = info.root_size
+            return info.root_size, (0, 0, width, height)
         info = self._game_window_gui_info(context)
         if (
             info is None

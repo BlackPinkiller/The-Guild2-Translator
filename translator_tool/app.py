@@ -82,6 +82,7 @@ from .code_index_lazy import LazyCodeIndexBuilder, LazyIndexProgress
 from .code_window_context import (
     PreviewWindowContext,
     engine_window_context,
+    engine_pair_preview_surface,
     surface_window_context,
 )
 from .code_open import open_code_reference
@@ -3963,7 +3964,7 @@ class TranslatorWindow(QMainWindow):
                 )
             elif TranslatorWindow._is_name_tooltip_pair(header_unit, body_unit):
                 context = surface_window_context(
-                    "tooltip",
+                    engine_pair_preview_surface(unit.label),
                     header_label=normalize_label(header_unit.label) if header_unit is not None else "",
                     body_label=normalize_label(body_unit.label) if body_unit is not None else "",
                 )

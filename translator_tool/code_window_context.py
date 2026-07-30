@@ -14,7 +14,7 @@ from .code_index import (
     dynamic_label_patterns,
     normalize_label,
 )
-from .engine_semantics import engine_format_preview_style
+from .engine_semantics import engine_format_preview_style, engine_pair_preview_surface
 from .gui_semantics import GuiResourceInfo, gui_resource_info, resolve_panel_gui_resource
 from .script_semantics import CallContract, call_contract
 
@@ -475,6 +475,33 @@ def _presentation_for_surface(
             "engine:panel_nobility_title_deed",
             "Hud/messagebox/mbback1.tga",
         )
+    help_resources = {
+        "character_help": "GUI/Hud/Helppanels/characters.gui",
+        "item_help": "GUI/Hud/Helppanels/items.gui",
+        "building_help": "GUI/Hud/Helppanels/buildings.gui",
+        "upgrade_help": "GUI/Hud/Helppanels/upgrades.gui",
+        "cart_help": "GUI/Hud/Helppanels/carts.gui",
+        "office_help": "GUI/Hud/Helppanels/offices.gui",
+        "measure_help": "GUI/Hud/Helppanels/measures.gui",
+        "settlement_help": "GUI/Hud/Helppanels/settlement.gui",
+        "ship_help": "GUI/Hud/Helppanels/ship.gui",
+        "skill_help": "GUI/Hud/Helppanels/skill.gui",
+        "class_help": "GUI/Hud/Helppanels/class.gui",
+        "zodiac_help": "GUI/Hud/Helppanels/zodiac.gui",
+        "text_help": "GUI/Hud/Helppanels/text.gui",
+        "onscreen_help": "GUI/Hud/Helppanels/text.gui",
+    }
+    help_resource = help_resources.get(surface)
+    if help_resource:
+        return PreviewSurfacePresentation(
+            "onscreen_help",
+            "dark_panel",
+            "help",
+            help_resource,
+            "Hud/sheets/OnscreenHelp/bg.tga",
+            "Hud/borders/Border_Gold_02.tga",
+            "Hud/NoCompression/header_red.tga",
+        )
     profiles = {
         "messagebox": PreviewSurfacePresentation(
             "message",
@@ -566,20 +593,9 @@ def _presentation_for_surface(
         ),
         "tooltip": PreviewSurfacePresentation(
             "tooltip",
-            "dark_panel",
-            "help",
-            background_asset="Hud/NoCompression/Priority3/PanelBackground_01.tga",
-            frame_asset="Hud/borders/Border_Gold_02.tga",
-            title_asset="Hud/NoCompression/header_red.tga",
-        ),
-        "onscreen_help": PreviewSurfacePresentation(
-            "onscreen_help",
-            "dark_panel",
-            "help",
-            "GUI/Hud/Helppanels/text.gui",
-            "Hud/sheets/OnscreenHelp/bg.tga",
-            "Hud/borders/Border_Gold_02.tga",
-            "Hud/NoCompression/header_red.tga",
+            "transparent",
+            "tooltip",
+            "GUI/styles/tooltip.gst",
         ),
         "status": PreviewSurfacePresentation(
             "status",

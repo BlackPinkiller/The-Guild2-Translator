@@ -1391,10 +1391,15 @@ def assert_game_preview_draws_all_buttons() -> None:
         PreviewDocument.from_atoms("Title", [PreviewAtom("Title", 0, 5)]),
         PreviewDocument.from_atoms("Body", [PreviewAtom("Body", 0, 4)]),
         target=False,
-        context=PreviewWindowContext("tooltip", "dark_panel", DARK_PANEL_TEXT),
+        context=PreviewWindowContext(
+            "onscreen_help",
+            "dark_panel",
+            DARK_PANEL_TEXT,
+            title_asset="header_red.tga",
+        ),
     )
     if "header_red.tga" not in requested_images:
-        raise AssertionError("tooltip title preview did not request the game red title bar asset")
+        raise AssertionError("onscreen help title did not request the game red title bar asset")
 
     asset_service = PreviewService()
     requested_assets: list[str] = []
@@ -1481,15 +1486,22 @@ def assert_name_tooltip_preview_pairs_title_and_body() -> None:
     if paired_name is not name or paired_tooltip is not tooltip:
         raise AssertionError("TOOLTIP should pair back to the matching NAME title")
     context, header, body, buttons, _references = TranslatorWindow._game_preview_parts(window, tooltip)
-    if context is None or context.kind != "tooltip" or context.background != "dark_panel":
-        raise AssertionError(f"NAME/TOOLTIP pairs should use the tooltip preview profile: {context!r}")
+    if (
+        context is None
+        or context.kind != "onscreen_help"
+        or context.surface != "building_help"
+        or context.gui_resource != "GUI/Hud/Helppanels/buildings.gui"
+    ):
+        raise AssertionError(
+            f"BUILDING NAME/TOOLTIP should use the registered building help panel: {context!r}"
+        )
     if context.default_color != DARK_PANEL_TEXT:
         raise AssertionError(f"tooltip preview should use the dark panel text color: {context!r}")
     if (
-        context.background_asset != "Hud/NoCompression/Priority3/PanelBackground_01.tga"
+        context.background_asset != "Hud/sheets/OnscreenHelp/bg.tga"
         or context.title_asset != "Hud/NoCompression/header_red.tga"
     ):
-        raise AssertionError(f"tooltip pair did not use the real tooltip assets: {context!r}")
+        raise AssertionError(f"building help did not use its registered GUI assets: {context!r}")
     if header is not name or body is not tooltip or buttons:
         raise AssertionError("NAME/TOOLTIP preview parts were not assembled as title/body")
 
@@ -1509,8 +1521,15 @@ def assert_engine_owned_preview_styles() -> None:
     )
     window._paired_preview_units = lambda unit: TranslatorWindow._paired_preview_units(window, unit)
     context, header, body, buttons, references = TranslatorWindow._game_preview_parts(window, market)
-    if context is None or context.kind != "tooltip" or context.background != "dark_panel":
-        raise AssertionError(f"engine tooltip should use its dark tooltip profile: {context!r}")
+    if (
+        context is None
+        or context.kind != "tooltip"
+        or context.background != "transparent"
+        or context.gui_resource != "GUI/styles/tooltip.gst"
+        or context.background_asset
+        or context.title_asset
+    ):
+        raise AssertionError(f"engine tooltip should use the actual compact GST style: {context!r}")
     if header is not None or body is not market or buttons or references:
         raise AssertionError("body-only engine tooltip preview parts were assembled incorrectly")
 
@@ -1535,12 +1554,52 @@ def assert_engine_owned_preview_styles() -> None:
     if context is None or context.kind != "onscreen_help":
         raise AssertionError(f"engine onscreen help should use its native panel profile: {context!r}")
     if (
+        context.surface != "text_help"
+        or context.gui_resource != "GUI/Hud/Helppanels/text.gui"
+    ):
+        raise AssertionError(
+            f"action help should use the registered generic text panel: {context!r}"
+        )
+    if (
         context.background_asset != "Hud/sheets/OnscreenHelp/bg.tga"
         or context.title_asset != "Hud/NoCompression/header_red.tga"
     ):
         raise AssertionError(f"onscreen help did not use its own GUI assets: {context!r}")
     if header is not help_name or body is not help_description:
         raise AssertionError("engine onscreen help should retain structural title/body pairing")
+
+    item_name = SimpleNamespace(
+        uid="item-name",
+        file_rel="Text.dbt",
+        label="_ITEM_BreadRoll_NAME_+0",
+        source_text="Wheat roll",
+    )
+    item_tooltip = SimpleNamespace(
+        uid="item-tooltip",
+        file_rel="Text.dbt",
+        label="_ITEM_BreadRoll_TOOLTIP_+0",
+        source_text="Description",
+    )
+    item_window = SimpleNamespace(
+        model=SimpleNamespace(units=(item_name, item_tooltip)),
+        _code_references_for_unit=lambda _unit: (),
+    )
+    item_window._paired_preview_units = lambda unit: TranslatorWindow._paired_preview_units(
+        item_window, unit
+    )
+    context, header, body, _, _ = TranslatorWindow._game_preview_parts(
+        item_window, item_tooltip
+    )
+    if (
+        context is None
+        or context.surface != "item_help"
+        or context.gui_resource != "GUI/Hud/Helppanels/items.gui"
+        or header is not item_name
+        or body is not item_tooltip
+    ):
+        raise AssertionError(
+            f"ITEM NAME/TOOLTIP should use the registered item help panel: {context!r}"
+        )
 
     status = engine_window_context("_SETTLEMENTSTATE_HEADLINE_+0")
     if status is None or status.kind != "status" or not status.header_label:

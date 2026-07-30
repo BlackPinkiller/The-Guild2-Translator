@@ -30,6 +30,29 @@ _TOOLTIP = EnginePreviewStyle("tooltip", "dark_panel")
 _ONSCREEN_HELP = EnginePreviewStyle("onscreen_help", "dark_panel")
 _STATUS_PANEL = EnginePreviewStyle("status", "dark_panel")
 
+_HELP_SURFACES_BY_DOMAIN: tuple[tuple[str, str], ...] = (
+    ("character", "character_help"),
+    ("items", "item_help"),
+    ("buildings", "building_help"),
+    ("upgrades", "upgrade_help"),
+    ("carts", "cart_help"),
+    ("offices", "office_help"),
+    ("measures", "measure_help"),
+    ("settlement", "settlement_help"),
+    ("ships", "ship_help"),
+    ("skill", "skill_help"),
+    ("class", "class_help"),
+    ("zodiac", "zodiac_help"),
+)
+
+_PAIR_SURFACES_BY_PREFIX: tuple[tuple[str, str], ...] = (
+    ("item_", "item_help"),
+    ("building_", "building_help"),
+    ("upgrade_", "upgrade_help"),
+    ("measure_", "measure_help"),
+    ("laws_", "text_help"),
+)
+
 
 _EXACT_CONTRACTS: dict[str, EngineFormatContract] = {
     "city_levelchange": EngineFormatContract(((1, ENGINE_SETTLEMENT),)),
@@ -79,8 +102,29 @@ def engine_format_argument_kind(label: str, number: int) -> str:
 
 def engine_format_preview_style(label: str) -> EnginePreviewStyle | None:
     """Return the engine-owned window style when the family defines one."""
+    normalized = _format_identity(label)
+    if normalized.startswith("onscreenhelp_"):
+        return EnginePreviewStyle(_onscreen_help_surface(normalized), "dark_panel")
     contract = _engine_format_contract(label)
     return contract.preview_style if contract is not None else None
+
+
+def engine_pair_preview_surface(label: str) -> str:
+    """Return the registered HUD help panel for an engine-owned NAME/TOOLTIP pair."""
+    normalized = _format_identity(label)
+    if normalized.startswith("onscreenhelp_"):
+        return _onscreen_help_surface(normalized)
+    for prefix, surface in _PAIR_SURFACES_BY_PREFIX:
+        if normalized.startswith(prefix):
+            return surface
+    return "text_help"
+
+
+def _onscreen_help_surface(normalized: str) -> str:
+    for domain, surface in _HELP_SURFACES_BY_DOMAIN:
+        if re.search(rf"(?:^|_){re.escape(domain)}(?:_|$)", normalized):
+            return surface
+    return "text_help"
 
 
 def _engine_format_contract(label: str) -> EngineFormatContract | None:
