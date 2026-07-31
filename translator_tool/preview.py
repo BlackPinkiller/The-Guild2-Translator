@@ -1518,14 +1518,6 @@ class PreviewService:
                 label = self.ui_image("Hud/NoCompression/label.tga")
                 if label is not None and not label.isNull():
                     painter.drawImage(header_rect, label)
-        self._draw_game_item_help_details(
-            painter,
-            context,
-            info,
-            target=target,
-            rect=rect,
-            default_color=default_color,
-        )
         header_names, body_names = node_names
         header_node = gui_node_geometry(info, *header_names)
         body_node = gui_node_geometry(info, *body_names)
@@ -1634,6 +1626,48 @@ class PreviewService:
             )
         if body is not None and body_node is not None:
             body_rect = _scaled_gui_node_rect(body_node, render_root_size, rect)
+            if (
+                context is not None
+                and context.gui_resource.replace("\\", "/").casefold()
+                == "gui/hud/helppanels/items.gui"
+            ):
+                # items.gui is effectively a two-column layout despite its
+                # confusing node names: the description occupies the tall left
+                # column; the item icon and source materials form a vertical stack
+                # in the right column.  Icon supplies the icon size/text origin,
+                # while Artefact supplies the right-column position.
+                text_anchor_node = gui_node_geometry(info, "Icon")
+                icon_anchor_node = gui_node_geometry(info, "Artefact")
+                if text_anchor_node is not None and icon_anchor_node is not None:
+                    text_anchor_rect = _scaled_gui_node_rect(
+                        text_anchor_node,
+                        render_root_size,
+                        rect,
+                    )
+                    icon_anchor_rect = _scaled_gui_node_rect(
+                        icon_anchor_node,
+                        render_root_size,
+                        rect,
+                    )
+                    scale_x = rect.width() / max(1, render_root_size[0])
+                    scale_y = rect.height() / max(1, render_root_size[1])
+                    horizontal_gap = max(6, round(8 * scale_x))
+                    bottom_padding = max(8, round(12 * scale_y))
+
+                    body_left = text_anchor_rect.left()
+                    body_top = min(text_anchor_rect.top(), icon_anchor_rect.top())
+                    body_right = icon_anchor_rect.left() - horizontal_gap
+                    # Do not use the source-material nodes as a bottom boundary:
+                    # they belong underneath the icon in the separate right column.
+                    body_bottom = rect.bottom() - bottom_padding + 1
+
+                    if body_right > body_left and body_bottom > body_top:
+                        body_rect = QRect(
+                            body_left,
+                            body_top,
+                            body_right - body_left,
+                            body_bottom - body_top,
+                        )
             self._draw_game_document(
                 painter,
                 body,
@@ -1646,6 +1680,17 @@ class PreviewService:
                 bottom=body_rect.bottom() + 1,
                 default_color=default_color,
             )
+
+        # Draw the right-column item artwork last.  Long descriptions can no
+        # longer paint over the icon or the source-material heading/icons.
+        self._draw_game_item_help_details(
+            painter,
+            context,
+            info,
+            target=target,
+            rect=rect,
+            default_color=default_color,
+        )
         return header is not None or body is not None
 
     def _draw_game_item_help_details(
@@ -1672,13 +1717,19 @@ class PreviewService:
         if data is None:
             return
         icon_node = gui_node_geometry(info, "Icon")
+        icon_position_node = gui_node_geometry(info, "Artefact")
         if icon_node is not None:
             icon = self.ui_image(data.icon_asset)
             if icon is not None and not icon.isNull():
-                painter.drawImage(
-                    _scaled_gui_node_rect(icon_node, info.root_size, rect),
-                    icon,
-                )
+                icon_rect = _scaled_gui_node_rect(icon_node, info.root_size, rect)
+                if icon_position_node is not None:
+                    icon_position_rect = _scaled_gui_node_rect(
+                        icon_position_node,
+                        info.root_size,
+                        rect,
+                    )
+                    icon_rect.moveCenter(icon_position_rect.center())
+                painter.drawImage(icon_rect, icon)
         if not data.ingredients:
             return
         heading_node = gui_node_geometry(info, "resource")
