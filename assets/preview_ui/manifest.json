@@ -1,0 +1,35 @@
+{
+  "version": 1,
+  "assets": [
+    {"id": "panel_dark", "source": "Hud/NoCompression/Priority3/PanelBackground_01.tga", "file": "panels/panel_dark.png"},
+    {"id": "title_label", "source": "Hud/NoCompression/label.tga", "file": "panels/title_label.png"},
+    {"id": "title_red", "source": "Hud/NoCompression/header_red.tga", "file": "panels/title_red.png"},
+    {"id": "help_background", "source": "Hud/sheets/OnscreenHelp/bg.tga", "file": "panels/help_background.png"},
+    {"id": "book_background", "source": "Hud/sheets/evidences/bg_buch.tga", "file": "panels/book_background.png"},
+    {"id": "message_background", "source": "Hud/messagebox/mbback0.tga", "file": "panels/message_background.png"},
+    {"id": "document_background", "source": "Hud/messagebox/mbback1.tga", "file": "panels/document_background.png"},
+    {"id": "selected_marker", "source": "Hud/hud_icons/open.tga", "file": "controls/selected_marker.png"},
+    {"id": "choice_slot", "source": "Hud/nocompression/measurebutton.tga", "file": "controls/choice_slot.png"},
+    {"id": "button_green", "source": "Hud/NoCompression/btn_green_large.tga", "file": "controls/button_green.png"},
+    {"id": "line_horizontal", "source": "Hud/borders/line_horizontal.tga", "file": "controls/line_horizontal.png"},
+    {"id": "hook_upper_left", "source": "Hud/hud_icons/haken_li_trans_open.tga", "file": "controls/hook_upper_left.png"},
+    {"id": "hook_upper_right", "source": "Hud/hud_icons/haken_re_trans_oben.tga", "file": "controls/hook_upper_right.png"},
+    {"id": "hook_lower_left", "source": "Hud/hud_icons/haken_li_trans.tga", "file": "controls/hook_lower_left.png"},
+    {"id": "hook_lower_right", "source": "Hud/hud_icons/haken_re_trans.tga", "file": "controls/hook_lower_right.png"},
+    {"id": "news_default", "source": "Hud/news/default.tga", "file": "news/default.png"},
+    {"id": "news_building", "source": "Hud/news/building.tga", "file": "news/building.png"},
+    {"id": "news_intrigue", "source": "Hud/news/intrigue.tga", "file": "news/intrigue.png"},
+    {"id": "news_production", "source": "Hud/news/production.tga", "file": "news/production.png"},
+    {"id": "news_economie", "source": "Hud/news/economie.tga", "file": "news/economie.png"},
+    {"id": "news_military", "source": "Hud/news/military.tga", "file": "news/military.png"},
+    {"id": "news_politics", "source": "Hud/news/politics.tga", "file": "news/politics.png"},
+    {"id": "news_schedule", "source": "Hud/news/schedule.tga", "file": "news/schedule.png"},
+    {"id": "news_mission", "source": "Hud/news/mission.tga", "file": "news/mission.png"}
+  ],
+  "nine_slices": [
+    {"id": "frame_gold", "source_prefix": "Hud/borders/Border_Gold_02.tga", "directory": "frames/gold", "pieces": [0, 1, 2, 3, 5, 6, 7, 8]},
+    {"id": "frame_wood", "source_prefix": "Hud/borders/border_wood.tga", "directory": "frames/wood", "pieces": [0, 1, 2, 3, 5, 6, 7, 8]},
+    {"id": "frame_title_red", "source_prefix": "Hud/borders/border_header_red.tga", "directory": "frames/title_red", "pieces": [0, 1, 2, 3, 4, 5, 6, 7, 8]},
+    {"id": "frame_button_green", "source_prefix": "Hud/borders/Border_BtnGreen_small.tga", "directory": "frames/button_green", "pieces": [0, 1, 3, 4, 7]}
+  ]
+}

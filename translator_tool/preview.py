@@ -27,6 +27,7 @@ from .format_io import dbt_row_values, load_dbt, translatable_fields
 from .gui_semantics import GuiNodeGeometry, GuiResourceInfo, gui_node_geometry, gui_resource_info
 from .i18n import translate
 from .preview_context_selection import select_preview_context
+from .preview_assets import bundled_preview_asset_path
 from .preview_game_data import item_preview_data
 from .preview_placeholders import PlaceholderContext, PlaceholderLabelRecord, PlaceholderValueBuilder
 from .preview_profiles import PreviewProfile, preview_profile
@@ -1195,6 +1196,13 @@ class PreviewService:
         if key in self._ui_image_cache:
             return self._ui_image_cache[key]
         root = self._configured_directory(self.ui_assets_dir)
+        if root is None:
+            bundled = bundled_preview_asset_path(name)
+            if bundled is not None:
+                image = QImage(str(bundled))
+                if not image.isNull():
+                    self._ui_image_cache[key] = image
+                    return image
         if root is None and self.game_root is not None:
             root = self.game_root / "Textures" / "Hud"
 

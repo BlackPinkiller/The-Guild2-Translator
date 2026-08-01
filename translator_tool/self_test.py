@@ -106,6 +106,7 @@ from .self_tests.preview_localization import (
     assert_editor_changes_reach_preview_localization,
     assert_project_localization_updates_invalidate_placeholder_previews,
 )
+from .self_tests.preview_assets import assert_bundled_preview_assets_are_complete
 from .source_sync import (
     discover_game_source_projects,
     local_project_roots,
@@ -1442,11 +1443,11 @@ def assert_game_preview_draws_all_buttons() -> None:
             or item_documents
             != [
                 ("Item title", 6, 0, 603, True),
-                ("Item description", 64, 354, 570, False),
+                ("Item description", 64, 20, 346, False),
             ]
         ):
             raise AssertionError(
-                f"item help text did not use the engine-populated Artefact node: {gui_positions!r}"
+                f"item help text did not use the readable left content column: {gui_positions!r}"
             )
         if (
             "Hud/NoCompression/header_red.tga" not in requested_help_assets
@@ -5058,6 +5059,7 @@ def main() -> int:
     assert_preview_context_selection_understands_returned_label_roles()
     assert_project_localization_updates_invalidate_placeholder_previews()
     assert_editor_changes_reach_preview_localization()
+    assert_bundled_preview_assets_are_complete()
     assert_game_preview_parts_use_the_selected_call_site()
     assert_lazy_code_index_prioritizes_requested_labels_and_invalidates_cache()
     assert_lazy_code_index_links_cached_cross_file_facts()

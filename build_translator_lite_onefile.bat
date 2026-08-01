@@ -37,6 +37,7 @@ python -m PyInstaller ^
   --add-data "%CD%\encoder\data;encoder\data" ^
   --add-data "%CD%\assets\app-icon.ico;assets" ^
   --add-data "%CD%\assets\game_theme;assets\game_theme" ^
+  --add-data "%CD%\assets\preview_ui;assets\preview_ui" ^
   --exclude-module PySide6.QtBluetooth ^
   --exclude-module PySide6.QtCharts ^
   --exclude-module PySide6.QtLocation ^
