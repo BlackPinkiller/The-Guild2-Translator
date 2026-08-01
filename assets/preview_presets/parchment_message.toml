@@ -1,0 +1,57 @@
+[preset]
+id = "parchment_message"
+surfaces = ["messagebox", "questbox", "news"]
+kinds = ["message", "quest", "news"]
+flow = "column"
+min_width = 300
+preferred_width = 440
+max_width = 620
+min_height = 132
+max_height = 520
+padding = [24, 34, 24, 34]
+gap = 10
+background = "message_background"
+header_scale = 0.90
+body_scale = 0.82
+
+[[region]]
+id = "header"
+parent = "root"
+slot = "header"
+flow = "stack"
+min_size = 28
+align = "center"
+
+[[region]]
+id = "content"
+parent = "root"
+flow = "row"
+grow = 1.0
+gap = 12
+
+[[region]]
+id = "icon"
+parent = "content"
+slot = "icon"
+flow = "stack"
+basis = 52
+min_size = 0
+max_size = 64
+align = "start"
+
+[[region]]
+id = "body"
+parent = "content"
+slot = "body"
+flow = "stack"
+grow = 1.0
+min_size = 80
+
+[[region]]
+id = "buttons"
+parent = "root"
+slot = "buttons"
+flow = "column"
+gap = 6
+min_size = 0
+align = "center"

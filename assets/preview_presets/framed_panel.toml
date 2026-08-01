@@ -1,0 +1,41 @@
+[preset]
+id = "framed_panel"
+surfaces = ["dialog", "tutorial", "city_schedule", "gui_embedded"]
+kinds = ["short", "tutorial", "city_schedule", "gui_embedded"]
+flow = "column"
+min_width = 300
+preferred_width = 460
+max_width = 620
+min_height = 96
+max_height = 520
+padding = [16, 24, 18, 24]
+gap = 10
+background = "panel_dark"
+frame = "frame_gold"
+header_scale = 0.88
+body_scale = 0.78
+
+[[region]]
+id = "header"
+parent = "root"
+slot = "header"
+flow = "stack"
+min_size = 28
+align = "center"
+
+[[region]]
+id = "body"
+parent = "root"
+slot = "body"
+flow = "stack"
+grow = 1.0
+min_size = 44
+
+[[region]]
+id = "buttons"
+parent = "root"
+slot = "buttons"
+flow = "column"
+gap = 6
+min_size = 0
+align = "center"

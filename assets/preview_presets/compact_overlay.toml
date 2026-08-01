@@ -1,0 +1,23 @@
+[preset]
+id = "compact_overlay"
+surfaces = ["quick_message", "measure_message", "system_message", "status", "overhead"]
+kinds = ["overhead"]
+flow = "column"
+min_width = 220
+preferred_width = 360
+max_width = 520
+min_height = 42
+max_height = 180
+padding = [10, 16, 10, 16]
+gap = 6
+background = "panel_dark"
+body_scale = 0.78
+
+[[region]]
+id = "body"
+parent = "root"
+slot = "body"
+flow = "stack"
+grow = 1.0
+min_size = 22
+align = "center"

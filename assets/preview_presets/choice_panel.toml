@@ -1,0 +1,34 @@
+[preset]
+id = "choice_panel"
+surfaces = ["measure_choice"]
+kinds = ["measure_choice"]
+flow = "column"
+min_width = 300
+preferred_width = 390
+max_width = 540
+min_height = 110
+max_height = 480
+padding = [14, 24, 18, 24]
+gap = 10
+background = "panel_dark"
+frame = "frame_gold"
+header_scale = 0.84
+body_scale = 0.76
+
+[[region]]
+id = "header"
+parent = "root"
+slot = "header"
+flow = "stack"
+min_size = 28
+align = "center"
+
+[[region]]
+id = "buttons"
+parent = "root"
+slot = "buttons"
+flow = "column"
+grow = 1.0
+gap = 6
+min_size = 42
+align = "center"

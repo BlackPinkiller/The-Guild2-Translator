@@ -1,0 +1,51 @@
+[preset]
+id = "help_panel"
+surfaces = ["measure_help", "item_help", "character_help", "building_help", "upgrade_help", "cart_help", "office_help", "settlement_help", "ship_help", "skill_help", "class_help", "zodiac_help", "text_help", "onscreen_help", "tooltip"]
+kinds = ["onscreen_help", "tooltip"]
+flow = "column"
+min_width = 380
+preferred_width = 520
+max_width = 680
+min_height = 190
+max_height = 560
+padding = [8, 20, 20, 20]
+gap = 12
+background = "help_background"
+frame = "frame_gold"
+title = "title_red"
+header_scale = 0.86
+body_scale = 0.76
+
+[[region]]
+id = "header"
+parent = "root"
+slot = "header"
+flow = "stack"
+basis = 38
+min_size = 34
+align = "center"
+
+[[region]]
+id = "content"
+parent = "root"
+flow = "row"
+grow = 1.0
+gap = 18
+
+[[region]]
+id = "body"
+parent = "content"
+slot = "body"
+flow = "stack"
+grow = 1.0
+min_size = 210
+
+[[region]]
+id = "sidebar"
+parent = "content"
+slot = "sidebar"
+flow = "column"
+ratio = 0.34
+min_size = 0
+max_size = 220
+gap = 8

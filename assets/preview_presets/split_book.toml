@@ -1,0 +1,54 @@
+[preset]
+id = "split_book"
+surfaces = ["questbook", "datebook", "important_persons"]
+kinds = ["questbook", "datebook", "important_persons"]
+flow = "column"
+min_width = 520
+preferred_width = 660
+max_width = 820
+min_height = 390
+max_height = 640
+padding = [34, 34, 34, 34]
+gap = 12
+background = "book_background"
+header_scale = 0.82
+body_scale = 0.76
+
+[[region]]
+id = "content"
+parent = "root"
+flow = "row"
+grow = 1.0
+gap = 28
+
+[[region]]
+id = "index"
+parent = "content"
+slot = "index"
+flow = "column"
+ratio = 0.44
+min_size = 190
+gap = 6
+
+[[region]]
+id = "detail"
+parent = "content"
+flow = "column"
+grow = 1.0
+min_size = 220
+gap = 10
+
+[[region]]
+id = "header"
+parent = "detail"
+slot = "header"
+flow = "stack"
+min_size = 30
+
+[[region]]
+id = "body"
+parent = "detail"
+slot = "body"
+flow = "stack"
+grow = 1.0
+min_size = 100

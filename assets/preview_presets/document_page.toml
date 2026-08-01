@@ -1,0 +1,31 @@
+[preset]
+id = "document_page"
+surfaces = ["quest_intro", "pamphlet"]
+kinds = ["quest_intro", "pamphlet", "document"]
+flow = "column"
+min_width = 360
+preferred_width = 500
+max_width = 640
+min_height = 240
+max_height = 620
+padding = [34, 44, 38, 44]
+gap = 12
+background = "document_background"
+header_scale = 0.90
+body_scale = 0.80
+
+[[region]]
+id = "header"
+parent = "root"
+slot = "header"
+flow = "stack"
+min_size = 30
+align = "center"
+
+[[region]]
+id = "body"
+parent = "root"
+slot = "body"
+flow = "stack"
+grow = 1.0
+min_size = 120

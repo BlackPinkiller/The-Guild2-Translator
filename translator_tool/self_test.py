@@ -107,6 +107,7 @@ from .self_tests.preview_localization import (
     assert_project_localization_updates_invalidate_placeholder_previews,
 )
 from .self_tests.preview_assets import assert_bundled_preview_assets_are_complete
+from .self_tests.preview_presets import assert_preview_presets_are_complete_and_unambiguous
 from .source_sync import (
     discover_game_source_projects,
     local_project_roots,
@@ -5060,6 +5061,7 @@ def main() -> int:
     assert_project_localization_updates_invalidate_placeholder_previews()
     assert_editor_changes_reach_preview_localization()
     assert_bundled_preview_assets_are_complete()
+    assert_preview_presets_are_complete_and_unambiguous()
     assert_game_preview_parts_use_the_selected_call_site()
     assert_lazy_code_index_prioritizes_requested_labels_and_invalidates_cache()
     assert_lazy_code_index_links_cached_cross_file_facts()
