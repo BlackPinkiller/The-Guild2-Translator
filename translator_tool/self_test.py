@@ -1172,9 +1172,9 @@ def assert_game_preview_draws_all_buttons() -> None:
             layout="overhead",
         ),
     )
-    if overhead.height() != 30 or overhead.pixelColor(0, 0).alpha() != 255:
+    if overhead.height() != 42 or overhead.pixelColor(0, 0).alpha() != 255:
         raise AssertionError(
-            "in-world text previews should keep their tight layout over an opaque reading backdrop"
+            "in-world text previews should use the compact readable preset over an opaque backdrop"
         )
     quest_intro = surface_window_context("quest_intro")
     if (
@@ -1284,13 +1284,14 @@ def assert_game_preview_draws_all_buttons() -> None:
             (),
         )
         if (
-            (gui_layout.width, gui_layout.height) != (481, 376)
-            or gui_layout.top != 50
-            or gui_layout.left_margin != 61
-            or gui_layout.right_margin != 62
+            (gui_layout.width, gui_layout.height) != (300, 132)
+            or gui_layout.top != 24
+            or gui_layout.left_margin != 34
+            or gui_layout.right_margin != 34
+            or gui_layout.preset_id != "parchment_message"
         ):
             raise AssertionError(
-                f"messagebox preview ignored its GUI content rectangle: {gui_layout!r}"
+                f"messagebox preview did not use its content-driven parchment preset: {gui_layout!r}"
             )
         gui_positions: list[tuple[str, int, int, int, bool]] = []
 
@@ -1318,11 +1319,11 @@ def assert_game_preview_draws_all_buttons() -> None:
             context=gui_context,
         )
         if (
-            gui_positions != [("Body", 50, 61, 419, False)]
-            or (gui_image.width(), gui_image.height()) != (481, 376)
+            gui_positions != [("Body", 24, 34, 266, False)]
+            or (gui_image.width(), gui_image.height()) != (300, 132)
         ):
             raise AssertionError(
-                f"messagebox text was not drawn in its named GUI node: {gui_positions!r}"
+                f"messagebox text was not drawn in its preset body slot: {gui_positions!r}"
             )
         gui_service._translation_font_checked = True
         gui_service._translation_font_family = "Arial"
@@ -1345,9 +1346,12 @@ def assert_game_preview_draws_all_buttons() -> None:
             long_buttons,
             target=True,
         )
-        if adaptive_layout.body_scale >= gui_layout.body_scale:
+        if (
+            adaptive_layout.height <= gui_layout.height
+            or adaptive_layout.body_scale != gui_layout.body_scale
+        ):
             raise AssertionError(
-                "long standard-font previews did not reduce body text to avoid clipping"
+                "long standard-font previews should grow before changing the preset type scale"
             )
         dialog_resource = gui_temp / "GUI" / "Hud" / "panel_dialog.gui"
         dialog_resource.write_bytes(
@@ -1368,11 +1372,11 @@ def assert_game_preview_draws_all_buttons() -> None:
             context=dialog_context,
         )
         if (
-            (dialog_image.width(), dialog_image.height()) != (348, 152)
-            or gui_positions != [("Speech", 24, 53, 295, False)]
+            (dialog_image.width(), dialog_image.height()) != (300, 104)
+            or gui_positions != [("Speech", 30, 24, 276, False)]
         ):
             raise AssertionError(
-                f"dialog preview did not crop the registered full-screen GUI to its DialogBox: {gui_positions!r}"
+                f"dialog preview did not use its compact framed body slot: {gui_positions!r}"
             )
         help_resource = (
             gui_temp / "GUI" / "Hud" / "Helppanels" / "items.gui"
@@ -1503,8 +1507,10 @@ def assert_game_preview_draws_all_buttons() -> None:
             for index in range(4)
         ),
     )
-    if dialogue.width() != 520 or dialogue.height() != 430:
-        raise AssertionError(f"dialogue previews with many choices should use the large layout: {dialogue.size()!r}")
+    if dialogue.width() != 300 or dialogue.height() != 222:
+        raise AssertionError(
+            f"dialogue previews should grow to fit their choices without wasting a large canvas: {dialogue.size()!r}"
+        )
     overlay = PreviewService().game_window_image(
         None,
         None,

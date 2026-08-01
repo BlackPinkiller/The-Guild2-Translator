@@ -1,6 +1,11 @@
 from __future__ import annotations
 
-from ..preview_presets import preview_preset, preview_presets
+from ..preview_presets import (
+    preview_preset,
+    preview_preset_natural_size,
+    preview_presets,
+    resolve_preview_regions,
+)
 
 
 def assert_preview_presets_are_complete_and_unambiguous() -> None:
@@ -32,3 +37,40 @@ def assert_preview_presets_are_complete_and_unambiguous() -> None:
             raise AssertionError(
                 f"surface {surface!r} did not select {preset_id!r}: {preset!r}"
             )
+    compact = preview_preset("system_message")
+    if compact is None or compact.renderer != "flow":
+        raise AssertionError("compact messages should opt into the generic flow renderer")
+    short_slots = {"body": (72, 20)}
+    long_slots = {"body": (280, 92)}
+    short_natural = preview_preset_natural_size(compact, short_slots)
+    long_natural = preview_preset_natural_size(compact, long_slots)
+    if short_natural[1] >= long_natural[1]:
+        raise AssertionError(
+            f"preset natural height did not follow its content: {short_natural!r}, {long_natural!r}"
+        )
+    regions = resolve_preview_regions(compact, 260, 80, short_slots)
+    body = next((region for region in regions if region.slot == "body"), None)
+    if body is None or body.x != 16 or body.width != 228 or body.height != 60:
+        raise AssertionError(f"compact preset padding/growth was not resolved: {body!r}")
+    message = preview_preset("news")
+    if message is None:
+        raise AssertionError("news preset was not found")
+    message_regions = resolve_preview_regions(
+        message,
+        440,
+        180,
+        {"header": (80, 24), "icon": (52, 52), "body": (220, 56)},
+    )
+    message_slots = {region.slot: region for region in message_regions if region.slot}
+    if set(message_slots) != {"header", "icon", "body"}:
+        raise AssertionError(
+            f"a visible sibling slot disappeared from the preset tree: {message_slots!r}"
+        )
+    if message_slots["icon"].x >= message_slots["body"].x:
+        raise AssertionError(
+            f"message icon should reserve space before its body: {message_slots!r}"
+        )
+    if message_slots["icon"].width != 52:
+        raise AssertionError(
+            f"an active message icon should retain its material width: {message_slots!r}"
+        )

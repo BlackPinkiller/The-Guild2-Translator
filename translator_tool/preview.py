@@ -30,6 +30,13 @@ from .preview_context_selection import select_preview_context
 from .preview_assets import bundled_preview_asset_path
 from .preview_game_data import item_preview_data
 from .preview_placeholders import PlaceholderContext, PlaceholderLabelRecord, PlaceholderValueBuilder
+from .preview_presets import (
+    PreviewLayoutPreset,
+    ResolvedPreviewRegion,
+    preview_preset,
+    preview_preset_natural_size,
+    resolve_preview_regions,
+)
 from .preview_profiles import PreviewProfile, preview_profile
 from .validation import (
     COLOR_TOKEN_RE,
@@ -330,6 +337,15 @@ class GameWindowLayout:
     left_margin: int
     right_margin: int
     body_scale: float
+    header_scale: float = 1.0
+    preset_id: str = ""
+    regions: tuple[ResolvedPreviewRegion, ...] = ()
+
+    def region(self, slot: str) -> ResolvedPreviewRegion | None:
+        return next(
+            (region for region in self.regions if region.slot == slot),
+            None,
+        )
 
 
 def _document_text(document: PreviewDocument | None) -> str:
@@ -1372,7 +1388,8 @@ class PreviewService:
         painter.scale(output_scale, output_scale)
         logical_rect = QRect(0, 0, logical_width, logical_height)
         self._draw_game_window_frame(painter, context, logical_rect)
-        self._draw_game_window_decoration(painter, context, logical_rect)
+        if not layout.preset_id:
+            self._draw_game_window_decoration(painter, context, logical_rect)
         default_color = context.default_color if context is not None else (55, 38, 24, 255)
         if context is not None and context.kind == "questbook":
             self._draw_game_questbook(
@@ -1431,6 +1448,19 @@ class PreviewService:
                 button_assets,
                 target=target,
                 rect=logical_rect,
+                default_color=default_color,
+            )
+            painter.end()
+            return canvas
+        if layout.preset_id:
+            self._draw_game_preset_documents(
+                painter,
+                context,
+                layout,
+                header,
+                body,
+                buttons,
+                target=target,
                 default_color=default_color,
             )
             painter.end()
@@ -1507,6 +1537,86 @@ class PreviewService:
             )
         painter.end()
         return canvas
+
+    def _draw_game_preset_documents(
+        self,
+        painter: QPainter,
+        context: PreviewWindowContext | None,
+        layout: GameWindowLayout,
+        header: PreviewDocument | None,
+        body: PreviewDocument | None,
+        buttons: tuple[PreviewDocument, ...],
+        *,
+        target: bool,
+        default_color: tuple[int, int, int, int],
+    ) -> None:
+        icon_region = layout.region("icon")
+        if icon_region is not None and context is not None and context.icon_asset:
+            icon = self.ui_image(context.icon_asset)
+            if (
+                (icon is None or icon.isNull())
+                and context.surface == "news"
+            ):
+                icon = self.ui_image("Hud/news/default.tga")
+            if icon is not None and not icon.isNull():
+                icon_size = icon.deviceIndependentSize().toSize().scaled(
+                    icon_region.width,
+                    icon_region.height,
+                    Qt.AspectRatioMode.KeepAspectRatio,
+                )
+                painter.drawImage(
+                    QRect(
+                        icon_region.x + max(0, (icon_region.width - icon_size.width()) // 2),
+                        icon_region.y + max(0, (icon_region.height - icon_size.height()) // 2),
+                        icon_size.width(),
+                        icon_size.height(),
+                    ),
+                    icon,
+                )
+        header_region = layout.region("header")
+        if header is not None and header_region is not None:
+            title_bar = self._draw_game_title_bar(
+                painter,
+                context,
+                top=header_region.y,
+                left=header_region.x,
+                right=header_region.x + header_region.width,
+            )
+            self._draw_game_document(
+                painter,
+                header,
+                target=target,
+                top=header_region.y + (2 if title_bar else 0),
+                left=header_region.x,
+                right=header_region.x + header_region.width,
+                scale=layout.header_scale,
+                centered=header_region.align == "center",
+                bottom=header_region.y + header_region.height,
+                default_color=(222, 178, 41, 255) if title_bar else default_color,
+            )
+        body_region = layout.region("body")
+        if body is not None and body_region is not None:
+            self._draw_game_document(
+                painter,
+                body,
+                target=target,
+                top=body_region.y,
+                left=body_region.x,
+                right=body_region.x + body_region.width,
+                scale=layout.body_scale,
+                centered=body_region.align == "center",
+                bottom=body_region.y + body_region.height,
+                default_color=default_color,
+            )
+        buttons_region = layout.region("buttons")
+        if buttons and buttons_region is not None:
+            self._draw_game_buttons(
+                painter,
+                buttons,
+                target=target,
+                top=buttons_region.y,
+                default_color=(235, 225, 175, 255),
+            )
 
     def _draw_game_gui_documents(
         self,
@@ -2295,6 +2405,168 @@ class PreviewService:
         )
         return True
 
+    @staticmethod
+    def _flow_preview_preset(
+        context: PreviewWindowContext | None,
+    ) -> PreviewLayoutPreset | None:
+        if context is None:
+            return None
+        preset = preview_preset(context.surface, context.kind)
+        return preset if preset is not None and preset.renderer == "flow" else None
+
+    def _estimated_preset_document_width(
+        self,
+        document: PreviewDocument | None,
+        scale: float,
+        *,
+        target: bool,
+    ) -> int:
+        if document is None:
+            return 0
+        lines = _document_text(document).splitlines() or [""]
+        standard_family = self._standard_font_family(target)
+        if standard_family:
+            font = QFont(standard_family)
+            font.setPixelSize(max(12, round(24 * scale)))
+            metrics = QFontMetrics(font)
+            return max((metrics.horizontalAdvance(line) for line in lines), default=0)
+        return round(
+            max((_line_visual_units(line) for line in lines), default=0.0)
+            * 12
+            * scale
+        )
+
+    def _preset_document_height(
+        self,
+        document: PreviewDocument | None,
+        width: int,
+        scale: float,
+        *,
+        target: bool,
+    ) -> int:
+        if document is None:
+            return 0
+        standard_family = self._standard_font_family(target)
+        if standard_family:
+            font = QFont(standard_family)
+            font.setPixelSize(max(12, round(24 * scale)))
+            lines = _measured_document_lines(
+                document,
+                max(1, width),
+                QFontMetrics(font),
+            )
+        else:
+            columns = max(8, round(max(1, width) / max(8.0, 12 * scale)))
+            lines = _estimated_document_lines(document, columns)
+        return lines * max(12, round(25 * scale))
+
+    def _game_preset_layout(
+        self,
+        preset: PreviewLayoutPreset,
+        context: PreviewWindowContext,
+        header: PreviewDocument | None,
+        body: PreviewDocument | None,
+        buttons: tuple[PreviewDocument, ...],
+        *,
+        target: bool,
+    ) -> GameWindowLayout:
+        top_padding, right_padding, bottom_padding, left_padding = preset.padding
+        header_width = self._estimated_preset_document_width(
+            header,
+            preset.header_scale,
+            target=target,
+        )
+        body_width = self._estimated_preset_document_width(
+            body,
+            preset.body_scale,
+            target=target,
+        )
+        button_width = GAME_BUTTON_WIDTH if buttons else 0
+        icon_width = 52 if context.icon_asset else 0
+        content_gap = max(
+            (region.gap for region in preset.regions),
+            default=preset.gap,
+        )
+        desired_content_width = max(header_width, body_width, button_width)
+        if icon_width and body is not None:
+            desired_content_width += icon_width + content_gap
+        width = max(
+            preset.min_width,
+            min(
+                preset.max_width,
+                desired_content_width + left_padding + right_padding,
+            ),
+        )
+        initial_sizes: dict[str, tuple[int, int]] = {}
+        if header is not None:
+            initial_sizes["header"] = (header_width, max(1, round(25 * preset.header_scale)))
+        if body is not None:
+            initial_sizes["body"] = (body_width, max(1, round(25 * preset.body_scale)))
+        if buttons:
+            initial_sizes["buttons"] = (
+                button_width,
+                _estimated_buttons_height(buttons, width),
+            )
+        if icon_width:
+            initial_sizes["icon"] = (icon_width, icon_width)
+        provisional = resolve_preview_regions(
+            preset,
+            width,
+            preset.max_height,
+            initial_sizes,
+        )
+        provisional_by_slot = {
+            region.slot: region for region in provisional if region.slot
+        }
+        slot_sizes = dict(initial_sizes)
+        header_region = provisional_by_slot.get("header")
+        if header is not None and header_region is not None:
+            slot_sizes["header"] = (
+                header_width,
+                self._preset_document_height(
+                    header,
+                    header_region.width,
+                    preset.header_scale,
+                    target=target,
+                ),
+            )
+        body_region = provisional_by_slot.get("body")
+        if body is not None and body_region is not None:
+            slot_sizes["body"] = (
+                body_width,
+                self._preset_document_height(
+                    body,
+                    body_region.width,
+                    preset.body_scale,
+                    target=target,
+                ),
+            )
+        _natural_width, natural_height = preview_preset_natural_size(
+            preset,
+            slot_sizes,
+        )
+        height = max(preset.min_height, min(preset.max_height, natural_height))
+        regions = resolve_preview_regions(preset, width, height, slot_sizes)
+        body_bounds = next(
+            (region for region in regions if region.slot == "body"),
+            None,
+        )
+        return GameWindowLayout(
+            width,
+            height,
+            body_bounds.y if body_bounds is not None else top_padding,
+            body_bounds.x if body_bounds is not None else left_padding,
+            (
+                width - body_bounds.x - body_bounds.width
+                if body_bounds is not None
+                else right_padding
+            ),
+            preset.body_scale,
+            preset.header_scale,
+            preset.id,
+            regions,
+        )
+
     def _game_window_layout(
         self,
         context: PreviewWindowContext | None,
@@ -2306,6 +2578,16 @@ class PreviewService:
     ) -> GameWindowLayout:
         layout_kind = context.layout if context is not None and context.layout else ""
         dark_panel = context is not None and context.background in {"dark_panel", "overlay"}
+        flow_preset = self._flow_preview_preset(context)
+        if flow_preset is not None and context is not None:
+            return self._game_preset_layout(
+                flow_preset,
+                context,
+                header,
+                body,
+                buttons,
+                target=target,
+            )
         gui_geometry = self._game_window_gui_geometry(context)
         gui_info = self._game_window_gui_info(context)
         gui_driven = _gui_document_node_names(context) is not None

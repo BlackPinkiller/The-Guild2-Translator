@@ -6,14 +6,15 @@ flow = "column"
 min_width = 300
 preferred_width = 460
 max_width = 620
-min_height = 96
+min_height = 104
 max_height = 520
-padding = [16, 24, 18, 24]
+padding = [30, 24, 30, 24]
 gap = 10
 background = "panel_dark"
 frame = "frame_gold"
 header_scale = 0.88
 body_scale = 0.78
+renderer = "flow"
 
 [[region]]
 id = "header"

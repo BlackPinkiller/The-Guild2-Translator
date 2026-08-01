@@ -13,6 +13,7 @@ gap = 10
 background = "message_background"
 header_scale = 0.90
 body_scale = 0.82
+renderer = "flow"
 
 [[region]]
 id = "header"
@@ -35,7 +36,7 @@ parent = "content"
 slot = "icon"
 flow = "stack"
 basis = 52
-min_size = 0
+min_size = 52
 max_size = 64
 align = "start"
 

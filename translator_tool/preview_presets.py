@@ -4,10 +4,12 @@ from dataclasses import dataclass
 from functools import lru_cache
 from pathlib import Path
 import tomllib
+from typing import Mapping
 
 
 VALID_FLOWS = {"row", "column", "stack"}
 VALID_ALIGNS = {"start", "center", "end", "stretch"}
+VALID_RENDERERS = {"flow", "specialized"}
 
 
 @dataclass(frozen=True)
@@ -43,7 +45,19 @@ class PreviewLayoutPreset:
     title: str = ""
     header_scale: float = 0.88
     body_scale: float = 0.78
+    renderer: str = "specialized"
     regions: tuple[PreviewRegionPreset, ...] = ()
+
+
+@dataclass(frozen=True)
+class ResolvedPreviewRegion:
+    id: str
+    slot: str
+    align: str
+    x: int
+    y: int
+    width: int
+    height: int
 
 
 def preview_preset_root() -> Path:
@@ -71,6 +85,57 @@ def preview_preset(
         if normalized_kind and normalized_kind in preset.kinds:
             return preset
     return None
+
+
+def preview_preset_natural_size(
+    preset: PreviewLayoutPreset,
+    slot_sizes: Mapping[str, tuple[int, int]],
+) -> tuple[int, int]:
+    """Return the content-driven size of a preset before its outer bounds apply."""
+    children = _children_by_parent(preset)
+    active = _active_region_ids(preset, children, slot_sizes)
+    content_width, content_height = _natural_children_size(
+        "root",
+        preset.flow,
+        preset.gap,
+        preset,
+        children,
+        active,
+        slot_sizes,
+    )
+    top, right, bottom, left = preset.padding
+    return content_width + left + right, content_height + top + bottom
+
+
+def resolve_preview_regions(
+    preset: PreviewLayoutPreset,
+    width: int,
+    height: int,
+    slot_sizes: Mapping[str, tuple[int, int]],
+) -> tuple[ResolvedPreviewRegion, ...]:
+    """Lay out active preset regions using one small row/column/stack model."""
+    children = _children_by_parent(preset)
+    active = _active_region_ids(preset, children, slot_sizes)
+    top, right, bottom, left = preset.padding
+    root_rect = (
+        left,
+        top,
+        max(0, width - left - right),
+        max(0, height - top - bottom),
+    )
+    resolved: list[ResolvedPreviewRegion] = []
+    _resolve_children(
+        "root",
+        preset.flow,
+        preset.gap,
+        root_rect,
+        preset,
+        children,
+        active,
+        slot_sizes,
+        resolved,
+    )
+    return tuple(resolved)
 
 
 def _load_preview_preset(path: Path) -> PreviewLayoutPreset:
@@ -126,8 +191,218 @@ def _load_preview_preset(path: Path) -> PreviewLayoutPreset:
         title=str(raw.get("title", "")),
         header_scale=float(raw.get("header_scale", 0.88)),
         body_scale=float(raw.get("body_scale", 0.78)),
+        renderer=_choice(raw, "renderer", VALID_RENDERERS, "specialized"),
         regions=regions,
     )
+
+
+def _children_by_parent(
+    preset: PreviewLayoutPreset,
+) -> dict[str, tuple[PreviewRegionPreset, ...]]:
+    grouped: dict[str, list[PreviewRegionPreset]] = {}
+    for region in preset.regions:
+        grouped.setdefault(region.parent, []).append(region)
+    return {parent: tuple(values) for parent, values in grouped.items()}
+
+
+def _active_region_ids(
+    preset: PreviewLayoutPreset,
+    children: Mapping[str, tuple[PreviewRegionPreset, ...]],
+    slot_sizes: Mapping[str, tuple[int, int]],
+) -> frozenset[str]:
+    active: set[str] = set()
+
+    def visit(region: PreviewRegionPreset) -> bool:
+        visible = bool(region.slot and region.slot in slot_sizes)
+        children_visible = False
+        for child in children.get(region.id, ()):
+            children_visible = visit(child) or children_visible
+        visible = visible or children_visible
+        if visible:
+            active.add(region.id)
+        return visible
+
+    for region in children.get("root", ()):
+        visit(region)
+    return frozenset(active)
+
+
+def _bounded_main_size(region: PreviewRegionPreset, value: int) -> int:
+    size = region.basis or value
+    size = max(region.min_size, size)
+    if region.max_size:
+        size = min(region.max_size, size)
+    return size
+
+
+def _natural_region_size(
+    region: PreviewRegionPreset,
+    preset: PreviewLayoutPreset,
+    children: Mapping[str, tuple[PreviewRegionPreset, ...]],
+    active: frozenset[str],
+    slot_sizes: Mapping[str, tuple[int, int]],
+) -> tuple[int, int]:
+    own_width, own_height = slot_sizes.get(region.slot, (0, 0))
+    child_width, child_height = _natural_children_size(
+        region.id,
+        region.flow,
+        region.gap,
+        preset,
+        children,
+        active,
+        slot_sizes,
+    )
+    return max(own_width, child_width), max(own_height, child_height)
+
+
+def _natural_children_size(
+    parent: str,
+    flow: str,
+    gap: int,
+    preset: PreviewLayoutPreset,
+    children: Mapping[str, tuple[PreviewRegionPreset, ...]],
+    active: frozenset[str],
+    slot_sizes: Mapping[str, tuple[int, int]],
+) -> tuple[int, int]:
+    visible = tuple(
+        region for region in children.get(parent, ()) if region.id in active
+    )
+    if not visible:
+        return 0, 0
+    sizes = [
+        _natural_region_size(region, preset, children, active, slot_sizes)
+        for region in visible
+    ]
+    if flow == "row":
+        widths = [
+            _bounded_main_size(region, size[0])
+            for region, size in zip(visible, sizes)
+        ]
+        return sum(widths) + gap * (len(widths) - 1), max(size[1] for size in sizes)
+    if flow == "column":
+        heights = [
+            _bounded_main_size(region, size[1])
+            for region, size in zip(visible, sizes)
+        ]
+        return max(size[0] for size in sizes), sum(heights) + gap * (len(heights) - 1)
+    return max(size[0] for size in sizes), max(size[1] for size in sizes)
+
+
+def _distribute_main_sizes(
+    regions: tuple[PreviewRegionPreset, ...],
+    natural_sizes: tuple[tuple[int, int], ...],
+    available: int,
+    flow: str,
+    gap: int,
+) -> list[int]:
+    usable = max(0, available - gap * max(0, len(regions) - 1))
+    sizes: list[int] = []
+    for region, natural in zip(regions, natural_sizes):
+        natural_main = natural[0] if flow == "row" else natural[1]
+        value = round(usable * region.ratio) if region.ratio else natural_main
+        sizes.append(_bounded_main_size(region, value))
+    extra = usable - sum(sizes)
+    growers = [index for index, region in enumerate(regions) if region.grow > 0]
+    if extra > 0 and growers:
+        total_grow = sum(regions[index].grow for index in growers)
+        remaining = extra
+        for index in growers[:-1]:
+            share = round(extra * regions[index].grow / total_grow)
+            if regions[index].max_size:
+                share = min(share, max(0, regions[index].max_size - sizes[index]))
+            sizes[index] += share
+            remaining -= share
+        last = growers[-1]
+        if regions[last].max_size:
+            remaining = min(remaining, max(0, regions[last].max_size - sizes[last]))
+        sizes[last] += remaining
+    elif extra < 0:
+        deficit = -extra
+        shrinkable = [
+            index
+            for index, region in enumerate(regions)
+            if sizes[index] > region.min_size
+        ]
+        while deficit > 0 and shrinkable:
+            share = max(1, (deficit + len(shrinkable) - 1) // len(shrinkable))
+            next_round: list[int] = []
+            for index in shrinkable:
+                room = sizes[index] - regions[index].min_size
+                shrink = min(room, share, deficit)
+                sizes[index] -= shrink
+                deficit -= shrink
+                if sizes[index] > regions[index].min_size:
+                    next_round.append(index)
+                if deficit <= 0:
+                    break
+            shrinkable = next_round
+    return sizes
+
+
+def _resolve_children(
+    parent: str,
+    flow: str,
+    gap: int,
+    rect: tuple[int, int, int, int],
+    preset: PreviewLayoutPreset,
+    children: Mapping[str, tuple[PreviewRegionPreset, ...]],
+    active: frozenset[str],
+    slot_sizes: Mapping[str, tuple[int, int]],
+    resolved: list[ResolvedPreviewRegion],
+) -> None:
+    visible = tuple(
+        region for region in children.get(parent, ()) if region.id in active
+    )
+    if not visible:
+        return
+    x, y, width, height = rect
+    natural_sizes = tuple(
+        _natural_region_size(region, preset, children, active, slot_sizes)
+        for region in visible
+    )
+    if flow == "stack":
+        child_rects = [(x, y, width, height) for _region in visible]
+    else:
+        available = width if flow == "row" else height
+        main_sizes = _distribute_main_sizes(
+            visible,
+            natural_sizes,
+            available,
+            flow,
+            gap,
+        )
+        cursor = x if flow == "row" else y
+        child_rects = []
+        for main_size in main_sizes:
+            if flow == "row":
+                child_rects.append((cursor, y, main_size, height))
+            else:
+                child_rects.append((x, cursor, width, main_size))
+            cursor += main_size + gap
+    for region, child_rect in zip(visible, child_rects):
+        child_x, child_y, child_width, child_height = child_rect
+        resolved.append(
+            ResolvedPreviewRegion(
+                region.id,
+                region.slot,
+                region.align,
+                child_x,
+                child_y,
+                max(0, child_width),
+                max(0, child_height),
+            )
+        )
+        _resolve_children(
+            region.id,
+            region.flow,
+            region.gap,
+            child_rect,
+            preset,
+            children,
+            active,
+            slot_sizes,
+            resolved,
+        )
 
 
 def _load_region(path: Path, raw: dict[str, object]) -> PreviewRegionPreset:
