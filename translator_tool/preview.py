@@ -22,7 +22,7 @@ from PySide6.QtGui import (
     qRgba,
 )
 
-from .code_window_context import PreviewWindowContext
+from .code_window_context import DARK_PANEL_TEXT, PreviewWindowContext
 from .format_io import dbt_row_values, load_dbt, translatable_fields
 from .gui_semantics import GuiNodeGeometry, GuiResourceInfo, gui_node_geometry, gui_resource_info
 from .i18n import translate
@@ -1368,10 +1368,7 @@ class PreviewService:
                 physical_height,
                 QImage.Format.Format_ARGB32_Premultiplied,
             )
-            if (
-                context is not None
-                and context.background in {"transparent", "overlay"}
-            ):
+            if context is None or context.background in {"transparent", "overlay"}:
                 canvas.fill(QColor(28, 25, 22))
             else:
                 canvas.fill(
@@ -1390,7 +1387,7 @@ class PreviewService:
         self._draw_game_window_frame(painter, context, logical_rect)
         if not layout.preset_id:
             self._draw_game_window_decoration(painter, context, logical_rect)
-        default_color = context.default_color if context is not None else (55, 38, 24, 255)
+        default_color = context.default_color if context is not None else DARK_PANEL_TEXT
         if layout.preset_id:
             self._draw_game_preset_documents(
                 painter,
@@ -2511,9 +2508,11 @@ class PreviewService:
     def _flow_preview_preset(
         context: PreviewWindowContext | None,
     ) -> PreviewLayoutPreset | None:
-        if context is None:
-            return None
-        preset = preview_preset(context.surface, context.kind)
+        preset = (
+            preview_preset("", "short")
+            if context is None
+            else preview_preset(context.surface, context.kind)
+        )
         return preset if preset is not None and preset.renderer == "flow" else None
 
     def _estimated_preset_document_width(
@@ -2565,7 +2564,7 @@ class PreviewService:
     def _game_preset_layout(
         self,
         preset: PreviewLayoutPreset,
-        context: PreviewWindowContext,
+        context: PreviewWindowContext | None,
         header: PreviewDocument | None,
         body: PreviewDocument | None,
         buttons: tuple[PreviewDocument, ...],
@@ -2584,12 +2583,12 @@ class PreviewService:
             target=target,
         )
         button_width = GAME_BUTTON_WIDTH if buttons else 0
-        icon_width = 52 if context.icon_asset else 0
+        icon_width = 52 if context is not None and context.icon_asset else 0
         sidebar_data = (
             item_preview_data(
                 self.game_root,
-                context.header_label,
-                context.body_label,
+                context.header_label if context is not None else "",
+                context.body_label if context is not None else "",
             )
             if any(region.slot == "sidebar" for region in preset.regions)
             else None
@@ -2709,7 +2708,7 @@ class PreviewService:
         layout_kind = context.layout if context is not None and context.layout else ""
         dark_panel = context is not None and context.background in {"dark_panel", "overlay"}
         flow_preset = self._flow_preview_preset(context)
-        if flow_preset is not None and context is not None:
+        if flow_preset is not None:
             return self._game_preset_layout(
                 flow_preset,
                 context,
@@ -3013,9 +3012,11 @@ class PreviewService:
 
     @staticmethod
     def _game_window_background_name(context: PreviewWindowContext | None) -> str:
+        if context is None:
+            return ""
         if context is not None and context.background_asset:
             return context.background_asset
-        if context is None or context.kind in {"message", "quest"}:
+        if context.kind in {"message", "quest"}:
             return "Hud/messagebox/mbback0.tga"
         if context.call_name == "showtutorialboxnowait":
             return "Hud/NoCompression/Priority3/PanelBackground_01.tga"
@@ -3032,65 +3033,59 @@ class PreviewService:
         if context is None:
             return False
         if context.kind == "short" and context.layout == "dialog":
-            return self._draw_game_dialog_frame(painter, rect)
+            line = self.ui_image("Hud/borders/line_horizontal.tga")
+            tail = self.ui_image("Hud/hud_icons/haken_re_trans.tga")
+            if (
+                line is None
+                or line.isNull()
+                or tail is None
+                or tail.isNull()
+            ):
+                return False
+            # panel_dialog.gui defines four alternative hook containers.  The
+            # lower-right RightHook variant is one bottom edge interrupted by
+            # haken_re_trans; the other three hook containers are not siblings
+            # that should be painted at the same time.
+            tail_width = min(28, rect.width())
+            tail_height = min(25, rect.height())
+            line_height = min(3, rect.height())
+            line_y = rect.bottom() - tail_height + 1
+            tail_left = max(rect.left(), rect.right() - 41)
+            right_line_width = min(21, rect.width())
+            painter.drawImage(
+                QRect(
+                    rect.left(),
+                    line_y,
+                    max(1, tail_left - rect.left()),
+                    line_height,
+                ),
+                line,
+            )
+            painter.drawImage(
+                QRect(
+                    tail_left,
+                    line_y,
+                    tail_width,
+                    tail_height,
+                ),
+                tail,
+            )
+            painter.drawImage(
+                QRect(
+                    rect.right() - right_line_width + 1,
+                    line_y,
+                    right_line_width,
+                    line_height,
+                ),
+                line,
+            )
+            return True
         asset = context.frame_asset
         if not asset and context.call_name == "showtutorialboxnowait":
             asset = "Hud/borders/Border_Gold_02.tga"
         if not asset:
             return False
         return self._draw_game_nine_slice(painter, rect, asset)
-
-    def _draw_game_dialog_frame(self, painter: QPainter, rect: QRect) -> bool:
-        """Rebuild panel_dialog.gui's hook-and-line frame from its real assets."""
-        line = self.ui_image("Hud/borders/line_horizontal.tga")
-        upper_left = self.ui_image("Hud/hud_icons/haken_li_trans_open.tga")
-        upper_right = self.ui_image("Hud/hud_icons/haken_re_trans_oben.tga")
-        lower_left = self.ui_image("Hud/hud_icons/haken_li_trans.tga")
-        lower_right = self.ui_image("Hud/hud_icons/haken_re_trans.tga")
-        if any(
-            image is None or image.isNull()
-            for image in (line, upper_left, upper_right, lower_left, lower_right)
-        ):
-            return False
-        corner_width = 28
-        corner_height = 25
-        line_height = 3
-        painter.drawImage(
-            QRect(rect.left(), rect.top(), corner_width, corner_height),
-            upper_left,
-        )
-        painter.drawImage(
-            QRect(rect.right() - corner_width + 1, rect.top(), corner_width, corner_height),
-            upper_right,
-        )
-        painter.drawImage(
-            QRect(rect.left(), rect.bottom() - corner_height + 1, corner_width, corner_height),
-            lower_left,
-        )
-        painter.drawImage(
-            QRect(
-                rect.right() - corner_width + 1,
-                rect.bottom() - corner_height + 1,
-                corner_width,
-                corner_height,
-            ),
-            lower_right,
-        )
-        span = max(1, rect.width() - 2 * (corner_width - 7))
-        painter.drawImage(
-            QRect(rect.left() + corner_width - 7, rect.top() + 22, span, line_height),
-            line,
-        )
-        painter.drawImage(
-            QRect(
-                rect.left() + corner_width - 7,
-                rect.bottom() - corner_height + 1,
-                span,
-                line_height,
-            ),
-            line,
-        )
-        return True
 
     def _draw_game_window_decoration(
         self,

@@ -925,15 +925,17 @@ def assert_game_preview_draws_all_buttons() -> None:
         PreviewDocument.from_atoms("Hi", [PreviewAtom("Hi", 0, 2)]),
         target=False,
     )
-    if compact.width() != 344 or compact.height() != 240:
-        raise AssertionError(f"short parchment previews should use the compact layout: {compact.size()!r}")
+    if compact.width() != 300 or compact.height() != 104:
+        raise AssertionError(
+            f"unclassified short previews should use the compact dark layout: {compact.size()!r}"
+        )
     scaled = layout_service.game_window_image(
         None,
         PreviewDocument.from_atoms("Hi", [PreviewAtom("Hi", 0, 2)]),
         target=False,
         output_scale=1.5,
     )
-    if scaled.width() != 516 or scaled.height() != 360:
+    if scaled.width() != 450 or scaled.height() != 156:
         raise AssertionError(
             f"game preview scale should increase physical pixels without changing layout selection: {scaled.size()!r}"
         )
@@ -959,7 +961,7 @@ def assert_game_preview_draws_all_buttons() -> None:
             target=False,
             output_scale=output_scale,
         )
-        if scaled_body_bounds != [(34, 310)]:
+        if scaled_body_bounds != [(24, 276)]:
             raise AssertionError(
                 "scaled preview text should retain logical layout bounds at "
                 f"{output_scale}: {scaled_body_bounds!r}"
@@ -982,8 +984,8 @@ def assert_game_preview_draws_all_buttons() -> None:
     )
     if (
         not scaled_button_rects
-        or scaled_button_rects[0].x() != 65
-        or scaled_button_rects[0].right() >= 380
+        or scaled_button_rects[0].x() != 46
+        or scaled_button_rects[0].right() >= 300
     ):
         raise AssertionError(
             f"scaled game preview buttons should remain centered in logical coordinates: {scaled_button_rects!r}"
@@ -1577,9 +1579,31 @@ def assert_game_preview_draws_all_buttons() -> None:
         raise AssertionError(
             f"MsgSay should not borrow the unrelated SayPanel background: {requested_assets!r}"
         )
+    dialogue_canvas = QImage(300, 104, QImage.Format.Format_ARGB32)
+    dialogue_canvas.fill(0)
+    dialogue_painter = QPainter(dialogue_canvas)
+    asset_service._draw_game_window_frame(
+        dialogue_painter,
+        dialogue_context,
+        dialogue_canvas.rect(),
+    )
+    dialogue_painter.end()
+    if requested_assets != [
+        "Hud/borders/line_horizontal.tga",
+        "Hud/hud_icons/haken_re_trans.tga",
+    ]:
+        raise AssertionError(
+            f"MsgSay should draw only the lower-right speech edge variant: {requested_assets!r}"
+        )
     if dialogue_context.gui_resource != "GUI/Hud/panel_dialog.gui":
         raise AssertionError(
             f"MsgSay should use the registered game dialog resource: {dialogue_context!r}"
+        )
+    requested_assets.clear()
+    asset_service._game_window_background(None, 300, 104)
+    if requested_assets:
+        raise AssertionError(
+            f"unclassified previews should use the built-in plain dark background: {requested_assets!r}"
         )
     requested_assets.clear()
     datebook_canvas = QImage(380, 148, QImage.Format.Format_ARGB32)
