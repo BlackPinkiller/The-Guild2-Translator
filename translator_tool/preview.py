@@ -1570,6 +1570,50 @@ class PreviewService:
                     ),
                     icon,
                 )
+        index_region = layout.region("index")
+        if header is not None and index_region is not None:
+            marker = self.ui_image("Hud/hud_icons/open.tga")
+            marker_space = 24
+            row_height = min(
+                index_region.height,
+                max(
+                    34,
+                    self._preset_document_height(
+                        header,
+                        max(1, index_region.width - marker_space),
+                        layout.header_scale,
+                        target=target,
+                    )
+                    + 8,
+                ),
+            )
+            if marker is not None and not marker.isNull():
+                marker_size = min(
+                    18,
+                    marker_space,
+                    max(1, row_height - 6),
+                )
+                painter.drawImage(
+                    QRect(
+                        index_region.x,
+                        index_region.y + max(0, (row_height - marker_size) // 2),
+                        marker_size,
+                        marker_size,
+                    ),
+                    marker,
+                )
+            self._draw_game_document(
+                painter,
+                header,
+                target=target,
+                top=index_region.y,
+                left=index_region.x + marker_space,
+                right=index_region.x + index_region.width,
+                scale=layout.header_scale,
+                centered=False,
+                bottom=index_region.y + row_height,
+                default_color=default_color,
+            )
         header_region = layout.region("header")
         if header is not None and header_region is not None:
             title_bar = self._draw_game_title_bar(
@@ -2594,11 +2638,19 @@ class PreviewService:
             else None
         )
         sidebar_width = 180 if sidebar_data is not None else 0
+        has_index = any(region.slot == "index" for region in preset.regions)
+        index_width = (
+            max(190, min(260, header_width + 34))
+            if has_index and header is not None
+            else 0
+        )
         content_gap = max(
             (region.gap for region in preset.regions),
             default=preset.gap,
         )
-        primary_content_width = max(body_width, button_width)
+        primary_content_width = max(body_width, button_width, header_width)
+        if index_width:
+            primary_content_width += index_width + content_gap
         if sidebar_width:
             primary_content_width += sidebar_width + content_gap
         desired_content_width = max(header_width, primary_content_width)
@@ -2618,6 +2670,11 @@ class PreviewService:
             if header is not None:
                 values["header"] = (
                     header_width,
+                    max(1, round(25 * preset.header_scale)),
+                )
+            if index_width:
+                values["index"] = (
+                    index_width,
                     max(1, round(25 * preset.header_scale)),
                 )
             if body is not None:
@@ -2650,6 +2707,17 @@ class PreviewService:
                     self._preset_document_height(
                         header,
                         header_region.width,
+                        preset.header_scale,
+                        target=target,
+                    ),
+                )
+            index_region = by_slot.get("index")
+            if header is not None and index_region is not None:
+                values["index"] = (
+                    index_width,
+                    self._preset_document_height(
+                        header,
+                        max(1, index_region.width - 28),
                         preset.header_scale,
                         target=target,
                     ),
@@ -3031,6 +3099,8 @@ class PreviewService:
         rect: QRect,
     ) -> bool:
         if context is None:
+            return False
+        if context.kind in {"questbook", "datebook", "important_persons"}:
             return False
         if context.kind == "short" and context.layout == "dialog":
             line = self.ui_image("Hud/borders/line_horizontal.tga")

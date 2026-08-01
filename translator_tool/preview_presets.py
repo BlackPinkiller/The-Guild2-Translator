@@ -300,7 +300,14 @@ def _distribute_main_sizes(
     sizes: list[int] = []
     for region, natural in zip(regions, natural_sizes):
         natural_main = natural[0] if flow == "row" else natural[1]
-        value = round(usable * region.ratio) if region.ratio else natural_main
+        if region.ratio:
+            value = round(usable * region.ratio)
+        elif region.basis:
+            value = region.basis
+        elif region.grow:
+            value = region.min_size
+        else:
+            value = natural_main
         sizes.append(_bounded_main_size(region, value))
     extra = usable - sum(sizes)
     growers = [index for index, region in enumerate(regions) if region.grow > 0]

@@ -13,20 +13,21 @@ gap = 12
 background = "book_background"
 header_scale = 0.82
 body_scale = 0.76
+renderer = "flow"
 
 [[region]]
 id = "content"
 parent = "root"
 flow = "row"
 grow = 1.0
-gap = 28
+gap = 42
 
 [[region]]
 id = "index"
 parent = "content"
 slot = "index"
 flow = "column"
-ratio = 0.44
+ratio = 0.50
 min_size = 190
 gap = 6
 

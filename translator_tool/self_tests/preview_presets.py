@@ -107,3 +107,23 @@ def assert_preview_presets_are_complete_and_unambiguous() -> None:
         raise AssertionError(
             f"optional help sidebar should follow the main body: {help_slots!r}"
         )
+    split_book = preview_preset("datebook")
+    if split_book is None or split_book.renderer != "flow":
+        raise AssertionError("book surfaces should use the shared split-book renderer")
+    book_regions = resolve_preview_regions(
+        split_book,
+        660,
+        420,
+        {"index": (220, 28), "header": (180, 28), "body": (260, 120)},
+    )
+    book_slots = {region.slot: region for region in book_regions if region.slot}
+    if (
+        set(book_slots) != {"index", "header", "body"}
+        or book_slots["index"].x >= book_slots["header"].x
+        or book_slots["header"].y >= book_slots["body"].y
+        or abs(book_slots["index"].width - book_slots["header"].width) > 1
+        or book_slots["header"].x <= 330
+    ):
+        raise AssertionError(
+            f"split-book index/detail hierarchy was not preserved: {book_slots!r}"
+        )

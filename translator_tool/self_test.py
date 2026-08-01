@@ -1053,12 +1053,14 @@ def assert_game_preview_draws_all_buttons() -> None:
         ),
     )
     if (
-        len(quest_positions) != 2
-        or quest_positions[0][1] >= quest.width() // 2
-        or quest_positions[1][1] <= quest.width() // 2
+        len(quest_positions) != 3
+        or quest_positions[0][2] >= quest_positions[1][1]
+        or quest_positions[1][1:] != quest_positions[2][1:]
+        or [position[0] for position in quest_positions]
+        != ["Selected quest", "Selected quest", "Quest detail"]
     ):
         raise AssertionError(
-            f"questbook preview did not keep its task list and detail on separate pages: {quest_positions!r}"
+            f"questbook preview did not keep its index, detail title and body on separate pages: {quest_positions!r}"
         )
     multi_service = PreviewService()
     multi_positions: list[tuple[str, int, int, int, int]] = []
@@ -1093,15 +1095,13 @@ def assert_game_preview_draws_all_buttons() -> None:
     )
     if (
         len(multi_positions) != 3
-        or multi_positions[0][1] >= datebook.width() // 2
-        or multi_positions[1][1] <= datebook.width() // 2
-        or multi_positions[2][1] <= datebook.width() // 2
-        or multi_positions[0][3] != round(datebook.height() * (187 / 612)) + 6
-        or multi_positions[1][3] != round(datebook.height() * (320 / 612))
-        or multi_positions[2][3] != round(datebook.height() * (372 / 612))
+        or multi_positions[0][2] >= multi_positions[1][1]
+        or multi_positions[1][1:3] != multi_positions[2][1:3]
+        or multi_positions[0][3] != multi_positions[1][3]
+        or multi_positions[1][4] >= multi_positions[2][3]
     ):
         raise AssertionError(
-            f"datebook preview did not follow the game GUI list and detail regions: {multi_positions!r}"
+            f"datebook preview did not keep its index, detail title and detail body distinct: {multi_positions!r}"
         )
     multi_positions.clear()
     choice_buttons = tuple(
