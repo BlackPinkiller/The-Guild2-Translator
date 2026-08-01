@@ -74,3 +74,36 @@ def assert_preview_presets_are_complete_and_unambiguous() -> None:
         raise AssertionError(
             f"an active message icon should retain its material width: {message_slots!r}"
         )
+    help_panel = preview_preset("text_help")
+    document_page = preview_preset("quest_intro")
+    if (
+        help_panel is None
+        or help_panel.renderer != "flow"
+        or document_page is None
+        or document_page.renderer != "flow"
+    ):
+        raise AssertionError("help and document presets should use the shared flow renderer")
+    help_without_sidebar = resolve_preview_regions(
+        help_panel,
+        520,
+        240,
+        {"header": (120, 24), "body": (420, 120)},
+    )
+    help_slots = {
+        region.slot: region for region in help_without_sidebar if region.slot
+    }
+    if "sidebar" in help_slots or help_slots["body"].width != 480:
+        raise AssertionError(
+            f"ordinary help should use the full content width: {help_slots!r}"
+        )
+    help_with_sidebar = resolve_preview_regions(
+        help_panel,
+        520,
+        240,
+        {"header": (120, 24), "body": (260, 120), "sidebar": (160, 132)},
+    )
+    help_slots = {region.slot: region for region in help_with_sidebar if region.slot}
+    if help_slots["body"].x >= help_slots["sidebar"].x:
+        raise AssertionError(
+            f"optional help sidebar should follow the main body: {help_slots!r}"
+        )

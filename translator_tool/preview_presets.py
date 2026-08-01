@@ -53,6 +53,7 @@ class PreviewLayoutPreset:
 class ResolvedPreviewRegion:
     id: str
     slot: str
+    flow: str
     align: str
     x: int
     y: int
@@ -385,6 +386,7 @@ def _resolve_children(
             ResolvedPreviewRegion(
                 region.id,
                 region.slot,
+                region.flow,
                 region.align,
                 child_x,
                 child_y,

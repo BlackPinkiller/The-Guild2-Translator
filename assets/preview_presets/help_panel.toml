@@ -15,6 +15,7 @@ frame = "frame_gold"
 title = "title_red"
 header_scale = 0.86
 body_scale = 0.76
+renderer = "flow"
 
 [[region]]
 id = "header"

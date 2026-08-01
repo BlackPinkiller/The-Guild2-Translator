@@ -6,13 +6,14 @@ flow = "column"
 min_width = 360
 preferred_width = 500
 max_width = 640
-min_height = 240
+min_height = 160
 max_height = 620
 padding = [34, 44, 38, 44]
 gap = 12
 background = "document_background"
 header_scale = 0.90
 body_scale = 0.80
+renderer = "flow"
 
 [[region]]
 id = "header"
@@ -28,4 +29,4 @@ parent = "root"
 slot = "body"
 flow = "stack"
 grow = 1.0
-min_size = 120
+min_size = 80

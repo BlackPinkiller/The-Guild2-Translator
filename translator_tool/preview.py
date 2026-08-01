@@ -1391,6 +1391,19 @@ class PreviewService:
         if not layout.preset_id:
             self._draw_game_window_decoration(painter, context, logical_rect)
         default_color = context.default_color if context is not None else (55, 38, 24, 255)
+        if layout.preset_id:
+            self._draw_game_preset_documents(
+                painter,
+                context,
+                layout,
+                header,
+                body,
+                buttons,
+                target=target,
+                default_color=default_color,
+            )
+            painter.end()
+            return canvas
         if context is not None and context.kind == "questbook":
             self._draw_game_questbook(
                 painter,
@@ -1448,19 +1461,6 @@ class PreviewService:
                 button_assets,
                 target=target,
                 rect=logical_rect,
-                default_color=default_color,
-            )
-            painter.end()
-            return canvas
-        if layout.preset_id:
-            self._draw_game_preset_documents(
-                painter,
-                context,
-                layout,
-                header,
-                body,
-                buttons,
-                target=target,
                 default_color=default_color,
             )
             painter.end()
@@ -1608,6 +1608,15 @@ class PreviewService:
                 bottom=body_region.y + body_region.height,
                 default_color=default_color,
             )
+        sidebar_region = layout.region("sidebar")
+        if sidebar_region is not None:
+            self._draw_game_preset_sidebar(
+                painter,
+                context,
+                sidebar_region,
+                target=target,
+                default_color=default_color,
+            )
         buttons_region = layout.region("buttons")
         if buttons and buttons_region is not None:
             self._draw_game_buttons(
@@ -1616,6 +1625,99 @@ class PreviewService:
                 target=target,
                 top=buttons_region.y,
                 default_color=(235, 225, 175, 255),
+            )
+
+    def _draw_game_preset_sidebar(
+        self,
+        painter: QPainter,
+        context: PreviewWindowContext | None,
+        region: ResolvedPreviewRegion,
+        *,
+        target: bool,
+        default_color: tuple[int, int, int, int],
+    ) -> None:
+        if context is None:
+            return
+        data = item_preview_data(
+            self.game_root,
+            context.header_label,
+            context.body_label,
+        )
+        if data is None:
+            return
+        icon = self.ui_image(data.icon_asset)
+        icon_bottom = region.y
+        if icon is not None and not icon.isNull():
+            maximum = min(96, region.width, max(1, region.height - 42))
+            icon_size = icon.deviceIndependentSize().toSize().scaled(
+                maximum,
+                maximum,
+                Qt.AspectRatioMode.KeepAspectRatio,
+            )
+            icon_rect = QRect(
+                region.x + max(0, (region.width - icon_size.width()) // 2),
+                region.y,
+                icon_size.width(),
+                icon_size.height(),
+            )
+            painter.drawImage(icon_rect, icon)
+            icon_bottom = icon_rect.bottom() + 1
+        if not data.ingredients:
+            return
+        heading_text = self.localization.localized(
+            "_ONSCREENHELP_2_ITEMS_INGREDIENTS_+0",
+            target,
+        )
+        heading = self.render(
+            heading_text,
+            unit_key=f"engine:item:{data.name}:ingredients",
+            label="_ONSCREENHELP_2_ITEMS_INGREDIENTS_+0",
+            file_rel="Text.dbt",
+            kind="dbt",
+            target=target,
+        )
+        heading_top = min(region.y + region.height - 42, icon_bottom + 8)
+        heading_bottom = min(region.y + region.height, heading_top + 20)
+        self._draw_game_document(
+            painter,
+            heading,
+            target=target,
+            top=heading_top,
+            left=region.x,
+            right=region.x + region.width,
+            scale=0.54,
+            centered=False,
+            bottom=heading_bottom,
+            default_color=default_color,
+        )
+        ingredient_top = heading_bottom + 4
+        available_width = max(1, region.width - 8 * (len(data.ingredients) - 1))
+        ingredient_width = max(1, available_width // len(data.ingredients))
+        for index, ingredient in enumerate(data.ingredients):
+            left = region.x + index * (ingredient_width + 8)
+            ingredient_icon = self.ui_image(ingredient.icon_asset)
+            icon_size = min(24, ingredient_width, max(1, region.y + region.height - ingredient_top))
+            if ingredient_icon is not None and not ingredient_icon.isNull():
+                painter.drawImage(
+                    QRect(left, ingredient_top, icon_size, icon_size),
+                    ingredient_icon,
+                )
+            count_text = str(ingredient.count)
+            count = PreviewDocument.from_atoms(
+                count_text,
+                [PreviewAtom(count_text, 0, len(count_text))],
+            )
+            self._draw_game_document(
+                painter,
+                count,
+                target=target,
+                top=ingredient_top,
+                left=left + icon_size + 2,
+                right=left + ingredient_width,
+                scale=0.50,
+                centered=False,
+                bottom=region.y + region.height,
+                default_color=default_color,
             )
 
     def _draw_game_gui_documents(
@@ -2483,68 +2585,96 @@ class PreviewService:
         )
         button_width = GAME_BUTTON_WIDTH if buttons else 0
         icon_width = 52 if context.icon_asset else 0
+        sidebar_data = (
+            item_preview_data(
+                self.game_root,
+                context.header_label,
+                context.body_label,
+            )
+            if any(region.slot == "sidebar" for region in preset.regions)
+            else None
+        )
+        sidebar_width = 180 if sidebar_data is not None else 0
         content_gap = max(
             (region.gap for region in preset.regions),
             default=preset.gap,
         )
-        desired_content_width = max(header_width, body_width, button_width)
+        primary_content_width = max(body_width, button_width)
+        if sidebar_width:
+            primary_content_width += sidebar_width + content_gap
+        desired_content_width = max(header_width, primary_content_width)
         if icon_width and body is not None:
             desired_content_width += icon_width + content_gap
+        desired_width = desired_content_width + left_padding + right_padding
         width = max(
             preset.min_width,
             min(
-                preset.max_width,
-                desired_content_width + left_padding + right_padding,
+                preset.preferred_width,
+                desired_width,
             ),
         )
-        initial_sizes: dict[str, tuple[int, int]] = {}
-        if header is not None:
-            initial_sizes["header"] = (header_width, max(1, round(25 * preset.header_scale)))
-        if body is not None:
-            initial_sizes["body"] = (body_width, max(1, round(25 * preset.body_scale)))
-        if buttons:
-            initial_sizes["buttons"] = (
-                button_width,
-                _estimated_buttons_height(buttons, width),
+
+        def measured_slots(candidate_width: int) -> tuple[dict[str, tuple[int, int]], int]:
+            values: dict[str, tuple[int, int]] = {}
+            if header is not None:
+                values["header"] = (
+                    header_width,
+                    max(1, round(25 * preset.header_scale)),
+                )
+            if body is not None:
+                values["body"] = (
+                    body_width,
+                    max(1, round(25 * preset.body_scale)),
+                )
+            if buttons:
+                values["buttons"] = (
+                    button_width,
+                    _estimated_buttons_height(buttons, candidate_width),
+                )
+            if icon_width:
+                values["icon"] = (icon_width, icon_width)
+            if sidebar_width:
+                values["sidebar"] = (sidebar_width, 132)
+            provisional = resolve_preview_regions(
+                preset,
+                candidate_width,
+                preset.max_height,
+                values,
             )
-        if icon_width:
-            initial_sizes["icon"] = (icon_width, icon_width)
-        provisional = resolve_preview_regions(
-            preset,
-            width,
-            preset.max_height,
-            initial_sizes,
-        )
-        provisional_by_slot = {
-            region.slot: region for region in provisional if region.slot
-        }
-        slot_sizes = dict(initial_sizes)
-        header_region = provisional_by_slot.get("header")
-        if header is not None and header_region is not None:
-            slot_sizes["header"] = (
-                header_width,
-                self._preset_document_height(
-                    header,
-                    header_region.width,
-                    preset.header_scale,
-                    target=target,
-                ),
+            by_slot = {
+                region.slot: region for region in provisional if region.slot
+            }
+            header_region = by_slot.get("header")
+            if header is not None and header_region is not None:
+                values["header"] = (
+                    header_width,
+                    self._preset_document_height(
+                        header,
+                        header_region.width,
+                        preset.header_scale,
+                        target=target,
+                    ),
+                )
+            body_region = by_slot.get("body")
+            if body is not None and body_region is not None:
+                values["body"] = (
+                    body_width,
+                    self._preset_document_height(
+                        body,
+                        body_region.width,
+                        preset.body_scale,
+                        target=target,
+                    ),
+                )
+            return values, preview_preset_natural_size(preset, values)[1]
+
+        slot_sizes, natural_height = measured_slots(width)
+        if natural_height > preset.max_height and width < preset.max_width:
+            width = max(
+                width,
+                min(preset.max_width, desired_width),
             )
-        body_region = provisional_by_slot.get("body")
-        if body is not None and body_region is not None:
-            slot_sizes["body"] = (
-                body_width,
-                self._preset_document_height(
-                    body,
-                    body_region.width,
-                    preset.body_scale,
-                    target=target,
-                ),
-            )
-        _natural_width, natural_height = preview_preset_natural_size(
-            preset,
-            slot_sizes,
-        )
+            slot_sizes, natural_height = measured_slots(width)
         height = max(preset.min_height, min(preset.max_height, natural_height))
         regions = resolve_preview_regions(preset, width, height, slot_sizes)
         body_bounds = next(
@@ -2883,8 +3013,6 @@ class PreviewService:
 
     @staticmethod
     def _game_window_background_name(context: PreviewWindowContext | None) -> str:
-        if context is not None and context.kind == "quest_intro":
-            return ""
         if context is not None and context.background_asset:
             return context.background_asset
         if context is None or context.kind in {"message", "quest"}:
@@ -2902,8 +3030,6 @@ class PreviewService:
         rect: QRect,
     ) -> bool:
         if context is None:
-            return False
-        if context.kind == "quest_intro":
             return False
         if context.kind == "short" and context.layout == "dialog":
             return self._draw_game_dialog_frame(painter, rect)

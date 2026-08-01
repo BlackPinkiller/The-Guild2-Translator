@@ -1152,13 +1152,12 @@ def assert_game_preview_draws_all_buttons() -> None:
         ),
     )
     if (
-        (pamphlet.width(), pamphlet.height()) != (504, 496)
+        (pamphlet.width(), pamphlet.height()) != (360, 160)
         or len(multi_positions) != 1
-        or multi_positions[0][1] >= pamphlet.width() // 2
-        or multi_positions[0][2] >= pamphlet.width() // 2 + 10
+        or multi_positions[0][1:] != (44, 316, 34, 122)
     ):
         raise AssertionError(
-            f"pamphlet preview did not use one real four-cell text area: {multi_positions!r}"
+            f"pamphlet preview did not use its content-sized document body: {multi_positions!r}"
         )
     overlay_service = PreviewService()
     overhead = overlay_service.game_window_image(
@@ -1180,8 +1179,11 @@ def assert_game_preview_draws_all_buttons() -> None:
     if (
         quest_intro.background != "transparent"
         or PreviewService._game_window_background_name(quest_intro)
+        != "Hud/NoCompression/Priority3/PanelBackground_01.tga"
     ):
-        raise AssertionError("quest intro should compose its centered game panel over a transparent HUD root")
+        raise AssertionError(
+            "quest intro should retain its semantic overlay type while rendering an opaque document panel"
+        )
     quest_intro_image = overlay_service.game_window_image(
         None,
         PreviewDocument.from_atoms("Mission", [PreviewAtom("Mission", 0, 7)]),
@@ -1445,21 +1447,21 @@ def assert_game_preview_draws_all_buttons() -> None:
             if item[0] in {"Item title", "Item description"}
         ]
         if (
-            (help_image.width(), help_image.height()) != (603, 462)
+            (help_image.width(), help_image.height()) != (384, 210)
             or item_documents
             != [
-                ("Item title", 6, 0, 603, True),
-                ("Item description", 64, 20, 346, False),
+                ("Item title", 10, 20, 364, True),
+                ("Item description", 58, 20, 235, False),
             ]
         ):
             raise AssertionError(
-                f"item help text did not use the readable left content column: {gui_positions!r}"
+                f"item help text did not use the readable left content column: {help_image.size()!r}, {gui_positions!r}"
             )
         if (
             "Hud/NoCompression/header_red.tga" not in requested_help_assets
             or not any(
                 name.casefold().startswith(
-                    "hud/borders/border_header_red.tga"
+                    "hud/borders/border_gold_02.tga"
                 )
                 for name in requested_help_assets
             )
