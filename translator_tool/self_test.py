@@ -108,6 +108,7 @@ from .self_tests.preview_localization import (
 )
 from .self_tests.preview_assets import assert_bundled_preview_assets_are_complete
 from .self_tests.preview_presets import assert_preview_presets_are_complete_and_unambiguous
+from .self_tests.preview_format_layout import assert_preview_format_layout_controls_are_semantic
 from .source_sync import (
     discover_game_source_projects,
     local_project_roots,
@@ -5062,6 +5063,7 @@ def main() -> int:
     assert_editor_changes_reach_preview_localization()
     assert_bundled_preview_assets_are_complete()
     assert_preview_presets_are_complete_and_unambiguous()
+    assert_preview_format_layout_controls_are_semantic()
     assert_game_preview_parts_use_the_selected_call_site()
     assert_lazy_code_index_prioritizes_requested_labels_and_invalidates_cache()
     assert_lazy_code_index_links_cached_cross_file_facts()

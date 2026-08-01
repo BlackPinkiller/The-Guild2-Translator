@@ -221,6 +221,7 @@ class PreviewAtom:
     glyph_id: int | None = None
     color: tuple[int, int, int, int] | None = None
     final_style: bool = False
+    layout: str = ""
 
 
 @dataclass
@@ -228,6 +229,30 @@ class _NativeTextRun:
     text: str
     color: QColor
     width: int
+
+
+@dataclass(frozen=True)
+class _LayoutSpacer:
+    width: int
+
+
+def _aligned_line_left(
+    alignment: str,
+    left: int,
+    right: int,
+    width: int,
+) -> int:
+    available = max(0, right - left - width)
+    if alignment == "right":
+        return left + available
+    if alignment == "center":
+        return left + available // 2
+    return left
+
+
+def _next_tab_width(current_width: int, tab_width: int) -> int:
+    width = max(1, tab_width)
+    return width - current_width % width
 
 
 @dataclass(frozen=True)
@@ -262,6 +287,7 @@ class PreviewDocument:
                 atom.glyph_id,
                 atom.color,
                 atom.final_style,
+                atom.layout,
             )
             display_parts.append(text)
             display_end = display_position + len(text)
@@ -2812,9 +2838,12 @@ class PreviewService:
             if native_font is not None
             else None
         )
-        lines: list[list[QImage | _NativeTextRun]] = [[]]
+        lines: list[list[QImage | _NativeTextRun | _LayoutSpacer]] = [[]]
         widths = [0]
+        current_alignment = "center" if centered else "left"
+        alignments = [current_alignment]
         line_height = max(12, round(25 * scale))
+        tab_width = max(24, round(72 * scale))
         painter_scale = max(1.0, abs(painter.worldTransform().m22()))
         logical_device_height = round(painter.device().height() / painter_scale)
         content_bottom = bottom if bottom is not None else logical_device_height - 28
@@ -2826,6 +2855,7 @@ class PreviewService:
                 return False
             lines.append([])
             widths.append(0)
+            alignments.append(current_alignment)
             return True
 
         def append_image(image: QImage) -> bool:
@@ -2864,6 +2894,19 @@ class PreviewService:
             return True
 
         for atom in document.atoms:
+            if atom.layout in {"left", "right", "center"}:
+                current_alignment = atom.layout
+                alignments[-1] = current_alignment
+                continue
+            if atom.layout == "tab":
+                spacer = _next_tab_width(widths[-1], tab_width)
+                if widths[-1] + spacer >= right - left and lines[-1]:
+                    if not next_line():
+                        break
+                else:
+                    lines[-1].append(_LayoutSpacer(spacer))
+                    widths[-1] += spacer
+                continue
             if atom.glyph_id is not None:
                 glyph = (
                     symbol_atlas.glyph(atom.glyph_id)
@@ -2883,7 +2926,15 @@ class PreviewService:
                         break
                     continue
                 if char == "\t":
-                    char = " "
+                    spacer = _next_tab_width(widths[-1], tab_width)
+                    if widths[-1] + spacer >= right - left and lines[-1]:
+                        if not next_line():
+                            stopped = True
+                            break
+                    else:
+                        lines[-1].append(_LayoutSpacer(spacer))
+                        widths[-1] += spacer
+                    continue
                 if native_font is not None:
                     if not append_text(char, color):
                         stopped = True
@@ -2914,9 +2965,12 @@ class PreviewService:
         if native_font is not None:
             painter.setRenderHint(QPainter.RenderHint.TextAntialiasing, True)
             painter.setFont(native_font)
-        for items, width in zip(lines, widths):
-            x = left + max(0, (right - left - width) // 2) if centered else left
+        for items, width, alignment in zip(lines, widths, alignments):
+            x = _aligned_line_left(alignment, left, right, width)
             for item in items:
+                if isinstance(item, _LayoutSpacer):
+                    x += item.width
+                    continue
                 if isinstance(item, _NativeTextRun) and native_metrics is not None:
                     painter.setPen(item.color)
                     baseline = y + max(0, (line_height - native_metrics.height()) // 2) + native_metrics.ascent()
@@ -3176,6 +3230,7 @@ class _PreviewCompiler:
         replacement: bool = False,
         glyph_id: int | None = None,
         final_style: bool | None = None,
+        layout: str = "",
     ) -> None:
         self.atoms.append(
             PreviewAtom(
@@ -3186,6 +3241,7 @@ class _PreviewCompiler:
                 glyph_id,
                 self.color,
                 self.profile.final_style if final_style is None else final_style,
+                layout,
             )
         )
 
@@ -3260,6 +3316,7 @@ class _PreviewCompiler:
                             atom.glyph_id,
                             atom.color,
                             atom.final_style,
+                            atom.layout,
                         )
                     )
             self._emit("』", end - 1, end, replacement=True)
@@ -3289,6 +3346,7 @@ class _PreviewCompiler:
                         atom.glyph_id,
                         atom.color,
                         atom.final_style,
+                        atom.layout,
                     )
                 )
             self._emit(PREVIEW_MARK, end - 2, end, replacement=True)
@@ -3297,7 +3355,7 @@ class _PreviewCompiler:
             self._emit("\n", start, end, replacement=True)
             return
         if token == "$T":
-            self._emit("\t", start, end, replacement=True)
+            self._emit("\t", start, end, replacement=True, layout="tab")
             return
         if token in {"$>", "%>"}:
             self._emit("『", start, end, replacement=True)
@@ -3306,7 +3364,14 @@ class _PreviewCompiler:
             self._emit("』", start, end, replacement=True)
             return
         if token in {"$Z", "$L", "$R"}:
-            self._emit(PREVIEW_MARK, start, end, replacement=True)
+            alignment = {"$Z": "center", "$L": "left", "$R": "right"}[token]
+            self._emit(
+                PREVIEW_MARK,
+                start,
+                end,
+                replacement=True,
+                layout=alignment,
+            )
             return
         if COLOR_TOKEN_RE.fullmatch(token):
             values = [int(value) for value in COLOR_VALUE_RE.findall(token)]
