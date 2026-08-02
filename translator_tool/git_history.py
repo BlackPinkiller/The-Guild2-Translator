@@ -5,6 +5,7 @@ from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
 import argparse
+import hashlib
 import os
 import re
 import subprocess
@@ -107,6 +108,9 @@ class LanguageGit:
     COMMAND_TIMEOUT_SECONDS = 15
     ENTRY_CACHE_LIMIT = 128
     COMBINED_CACHE_LIMIT = 32
+    HISTORY_BATCH_COMMITS = 16
+    HISTORY_BLOB_CACHE_BYTES = 16 * 1024 * 1024
+    HISTORY_DOCUMENT_CACHE_LIMIT = 6
 
     def __init__(
         self,
@@ -125,6 +129,7 @@ class LanguageGit:
             if enable_codec
             else None
         )
+        self.history_cache_fingerprint = _codec_history_fingerprint(self.codec)
         self._cache_lock = threading.Lock()
         self._commit_list_cache: tuple[GitCommit, ...] | None = None
         self._all_commit_list_cache: tuple[GitCommit, ...] | None = None
@@ -290,6 +295,215 @@ class LanguageGit:
             cached = combined
         return list(cached)
 
+    def iter_entries_for_commits(
+        self,
+        commits_newest_first: Iterable[str],
+        cancel_event: threading.Event | None = None,
+    ) -> Iterable[tuple[str, list[TranslationLogEntry]]]:
+        """Read many commits with bounded Git batch calls and blob/document reuse."""
+        requested = tuple(commits_newest_first)
+        if not requested:
+            return
+        cached_entries: dict[str, tuple[TranslationLogEntry, ...]] = {}
+        with self._cache_lock:
+            for commit in requested:
+                cached = self._entry_cache.get(commit)
+                if cached is not None:
+                    cached_entries[commit] = cached
+                    self._entry_cache.move_to_end(commit)
+        missing_commits = set(requested) - cached_entries.keys()
+        commit_specs = self._history_commit_specs(missing_commits) if missing_commits else {}
+        blob_cache: OrderedDict[str, bytes] = OrderedDict()
+        blob_cache_bytes = 0
+        document_cache: OrderedDict[tuple[str, str], DbtDocument] = OrderedDict()
+
+        def cache_blob(oid: str, raw: bytes) -> None:
+            nonlocal blob_cache_bytes
+            if len(raw) > self.HISTORY_BLOB_CACHE_BYTES:
+                return
+            previous = blob_cache.pop(oid, None)
+            if previous is not None:
+                blob_cache_bytes -= len(previous)
+            blob_cache[oid] = raw
+            blob_cache_bytes += len(raw)
+            while blob_cache_bytes > self.HISTORY_BLOB_CACHE_BYTES and blob_cache:
+                _old_oid, old_raw = blob_cache.popitem(last=False)
+                blob_cache_bytes -= len(old_raw)
+
+        for start in range(0, len(requested), self.HISTORY_BATCH_COMMITS):
+            if cancel_event is not None and cancel_event.is_set():
+                return
+            chunk = requested[start : start + self.HISTORY_BATCH_COMMITS]
+            paths_by_commit: dict[str, list[tuple[str, str, str]]] = {}
+            specs: list[str] = []
+            for commit in chunk:
+                if commit in cached_entries:
+                    paths_by_commit[commit] = []
+                    continue
+                parent, changed = commit_specs.get(commit, ("", ()))
+                if not parent:
+                    paths_by_commit[commit] = []
+                    continue
+                commit_paths: list[tuple[str, str, str]] = []
+                prefix = self._language_pathspec()
+                for target_rel in changed:
+                    if not target_rel.startswith(prefix):
+                        continue
+                    file_rel = target_rel[len(prefix) :]
+                    after_spec = f"{commit}:{target_rel}"
+                    before_spec = f"{parent}:{target_rel}"
+                    source_spec = f"{commit}:{file_rel}"
+                    commit_paths.append((after_spec, before_spec, source_spec))
+                    specs.extend((after_spec, before_spec, source_spec))
+                paths_by_commit[commit] = commit_paths
+
+            resolved = self._batch_resolve_blobs(specs)
+            missing_oids = tuple(
+                dict.fromkeys(
+                    oid
+                    for oid, _size in resolved.values()
+                    if oid is not None and oid not in blob_cache
+                )
+            )
+            loaded_blobs = self._batch_read_blobs(missing_oids)
+
+            for commit in chunk:
+                if cancel_event is not None and cancel_event.is_set():
+                    return
+                if commit in cached_entries:
+                    yield commit, list(cached_entries[commit])
+                    continue
+                entries: list[TranslationLogEntry] = []
+                for after_spec, before_spec, source_spec in paths_by_commit.get(commit, ()):
+                    target_rel = after_spec.split(":", 1)[1]
+                    file_rel = target_rel[len(self._language_pathspec()) :]
+                    after_oid = resolved.get(after_spec, (None, 0))[0]
+                    before_oid = resolved.get(before_spec, (None, 0))[0]
+                    source_oid = resolved.get(source_spec, (None, 0))[0]
+                    after = (
+                        loaded_blobs.get(after_oid, blob_cache.get(after_oid)) if after_oid is not None else None
+                    )
+                    before = (
+                        loaded_blobs.get(before_oid, blob_cache.get(before_oid)) if before_oid is not None else None
+                    )
+                    source = (
+                        loaded_blobs.get(source_oid, blob_cache.get(source_oid)) if source_oid is not None else None
+                    )
+                    if source is None:
+                        continue
+                    if target_rel.lower().endswith(".dbt"):
+                        if after is None:
+                            continue
+                        source_doc = self._cached_dbt_document(document_cache, source_oid, file_rel, source)
+                        after_doc = self._cached_dbt_document(document_cache, after_oid, file_rel, after)
+                        before_doc = (
+                            self._cached_dbt_document(document_cache, before_oid, file_rel, before)
+                            if before is not None
+                            else None
+                        )
+                        entries.extend(self._dbt_entries_from_documents(file_rel, source_doc, before_doc, after_doc))
+                    elif target_rel.lower().endswith(".txt"):
+                        entries.extend(self._text_entries(file_rel, source, before, after))
+                packed = tuple(entries)
+                with self._cache_lock:
+                    self._entry_cache[commit] = packed
+                    self._entry_cache.move_to_end(commit)
+                    while len(self._entry_cache) > self.ENTRY_CACHE_LIMIT:
+                        self._entry_cache.popitem(last=False)
+                yield commit, list(packed)
+            for oid, raw in loaded_blobs.items():
+                cache_blob(oid, raw)
+
+    def _history_commit_specs(self, requested: set[str]) -> dict[str, tuple[str, tuple[str, ...]]]:
+        result = self._run(
+            "log",
+            "--format=%x1e%H%x1f%P",
+            "--name-only",
+            "--no-renames",
+            "--",
+            self._language_pathspec(),
+        )
+        specs: dict[str, tuple[str, tuple[str, ...]]] = {}
+        for block in result.stdout.split("\x1e"):
+            lines = [line.strip() for line in block.splitlines() if line.strip()]
+            if not lines or "\x1f" not in lines[0]:
+                continue
+            commit, parents = lines[0].split("\x1f", 1)
+            if commit not in requested:
+                continue
+            parent = parents.split()[0] if parents.split() else ""
+            specs[commit] = (parent, tuple(lines[1:]))
+        return specs
+
+    def _batch_resolve_blobs(self, specs: Iterable[str]) -> dict[str, tuple[str | None, int]]:
+        unique_specs = tuple(dict.fromkeys(specs))
+        if not unique_specs:
+            return {}
+        raw = self._run_with_input(
+            "cat-file",
+            "--batch-check",
+            input_data=("\n".join(unique_specs) + "\n").encode("utf-8"),
+        ).stdout
+        resolved: dict[str, tuple[str | None, int]] = {}
+        for spec, line in zip(unique_specs, raw.splitlines(), strict=True):
+            parts = line.split()
+            if not parts or parts[-1] == b"missing":
+                resolved[spec] = (None, 0)
+                continue
+            if len(parts) != 3:
+                raise GitError(translate("git.error.command_failed"))
+            resolved[spec] = (parts[0].decode("ascii"), int(parts[2]))
+        return resolved
+
+    def _batch_read_blobs(self, oids: Iterable[str]) -> dict[str, bytes]:
+        unique_oids = tuple(dict.fromkeys(oids))
+        if not unique_oids:
+            return {}
+        raw = self._run_with_input(
+            "cat-file",
+            "--batch",
+            input_data=("\n".join(unique_oids) + "\n").encode("ascii"),
+        ).stdout
+        position = 0
+        blobs: dict[str, bytes] = {}
+        for requested_oid in unique_oids:
+            line_end = raw.find(b"\n", position)
+            if line_end < 0:
+                raise GitError(translate("git.error.command_failed"))
+            parts = raw[position:line_end].split()
+            if len(parts) != 3 or parts[-1] == b"missing":
+                raise GitError(translate("git.error.command_failed"))
+            oid = parts[0].decode("ascii")
+            size = int(parts[2])
+            data_start = line_end + 1
+            data_end = data_start + size
+            if data_end >= len(raw) or raw[data_end : data_end + 1] != b"\n":
+                raise GitError(translate("git.error.command_failed"))
+            blobs[oid] = raw[data_start:data_end]
+            position = data_end + 1
+            if oid != requested_oid:
+                raise GitError(translate("git.error.command_failed"))
+        return blobs
+
+    def _cached_dbt_document(
+        self,
+        cache: OrderedDict[tuple[str, str], DbtDocument],
+        oid: str | None,
+        file_rel: str,
+        raw: bytes,
+    ) -> DbtDocument:
+        key = (oid or "", Path(file_rel).name.casefold())
+        document = cache.get(key)
+        if document is not None:
+            cache.move_to_end(key)
+            return document
+        document = load_dbt_bytes(Path(file_rel), raw)
+        cache[key] = document
+        cache.move_to_end(key)
+        while len(cache) > self.HISTORY_DOCUMENT_CACHE_LIMIT:
+            cache.popitem(last=False)
+        return document
+
     def _dbt_entries(
         self, file_rel: str, source_raw: bytes, before_raw: bytes | None, after_raw: bytes
     ) -> list[TranslationLogEntry]:
@@ -297,6 +511,16 @@ class LanguageGit:
         source_doc = load_dbt_bytes(Path(file_name), source_raw)
         after_doc = load_dbt_bytes(Path(file_name), after_raw)
         before_doc = load_dbt_bytes(Path(file_name), before_raw) if before_raw is not None else None
+        return self._dbt_entries_from_documents(file_rel, source_doc, before_doc, after_doc)
+
+    def _dbt_entries_from_documents(
+        self,
+        file_rel: str,
+        source_doc: DbtDocument,
+        before_doc: DbtDocument | None,
+        after_doc: DbtDocument,
+    ) -> list[TranslationLogEntry]:
+        file_name = Path(file_rel).name
         source_rows = source_doc.row_index
         after_rows = after_doc.row_index
         before_rows = before_doc.row_index if before_doc is not None else {}
@@ -445,6 +669,22 @@ class LanguageGit:
             raise GitError(stderr.strip() or translate("git.error.command_failed"))
         return result
 
+    def _run_with_input(self, *args: str, input_data: bytes) -> subprocess.CompletedProcess[bytes]:
+        try:
+            result = subprocess.run(
+                ["git", "-C", str(self.repo), *args],
+                input=input_data,
+                **self._subprocess_kwargs(text=False),
+            )
+        except FileNotFoundError as exc:
+            raise GitError(translate("git.error.not_found")) from exc
+        except subprocess.TimeoutExpired as exc:
+            raise GitError(translate("git.error.timeout", seconds=self.COMMAND_TIMEOUT_SECONDS)) from exc
+        if result.returncode != 0:
+            stderr = result.stderr.decode("utf-8", "replace")
+            raise GitError(stderr.strip() or translate("git.error.command_failed"))
+        return result
+
     @staticmethod
     def _subprocess_kwargs(*, text: bool) -> dict[str, object]:
         kwargs: dict[str, object] = {
@@ -526,6 +766,18 @@ def _display_subject(subject: str) -> str:
             parts.append(translate("history.change.delete", count=count))
     summary = " · ".join(parts) if parts else translate("history.subject.summary_default")
     return f"{summary} · {files}"
+
+
+def _codec_history_fingerprint(codec: Guild2Codec | None) -> str:
+    if codec is None:
+        return "plain"
+    digest = hashlib.sha256()
+    for encoded, decoded in sorted(codec.read_codec.items()):
+        digest.update(encoded.encode("utf-8"))
+        digest.update(b"\0")
+        digest.update(decoded.encode("utf-8"))
+        digest.update(b"\0")
+    return f"codec-{digest.hexdigest()[:16]}"
 
 
 def format_entries(entries: Iterable[TranslationLogEntry]) -> str:

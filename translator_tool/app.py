@@ -92,6 +92,11 @@ from .entry_clipboard import ENTRY_CLIPBOARD_MIME, decode_translations, encode_e
 from .git_history import GitCommit, GitError, LanguageGit, TranslationLogEntry
 from .game_theme import GameAssetSet, GameHeaderFrame, GamePanelFrame, install_game_theme_style
 from .history import OperationHistory, TranslationOperation, UnitChange
+from .history_index import (
+    MAX_INDEXED_COMMITS,
+    HistoryIndexCapacityError,
+    HistoryIndexStore,
+)
 from .history_render import (
     commit_search_blob,
     entry_meta as _history_entry_meta,
@@ -137,6 +142,23 @@ from .source_sync import (
     sync_source_project,
     sync_vanilla_sources,
 )
+from .text_import import (
+    IMPORT_MODE_KEYED,
+    IMPORT_MODE_TRANSLATIONS,
+    IMPORT_POLICY_EMPTY,
+    IMPORT_POLICY_OVERWRITE,
+    OUTCOME_AMBIGUOUS,
+    OUTCOME_DUPLICATE,
+    OUTCOME_EMPTY,
+    OUTCOME_EXISTING,
+    OUTCOME_NOT_FOUND,
+    OUTCOME_SAME,
+    OUTCOME_SOURCE_MISMATCH,
+    OUTCOME_UPDATE,
+    TextImportPlan,
+    build_import_plan,
+    parse_import_text,
+)
 from .validation import (
     COLOR_TOKEN_RE,
     FORMAT_GUILD2,
@@ -155,6 +177,7 @@ DEFAULT_PROJECT_ROOT = BUNDLED_ROOT
 APP_ICON_PATH = BUNDLED_ROOT / "assets" / "app-icon.ico"
 MANAGED_PROJECT_ROOT = managed_vanilla_project_root(APP_ROOT)
 TYPING_GROUP_DELAY_MS = 750
+HISTORY_ENTRY_RESULT_LIMIT = 500
 FILE_FILTER_ALL = "__all_files__"
 STATUS_FILTER_ALL = "__all_statuses__"
 STATUS_FILTER_TODO = "__needs_translation__"
@@ -1978,7 +2001,8 @@ class HistoryRenderWorker(QRunnable):
     def run(self) -> None:
         try:
             hashes = tuple(commit.full_hash for commit in self.commits_oldest_first)
-            entries = self.git.entries_for_commits(hashes)
+            by_commit = dict(self.git.iter_entries_for_commits(reversed(hashes)))
+            entries = [entry for commit in hashes for entry in by_commit.get(commit, ())]
             rendered = _render_history_html(self.commits_oldest_first, entries)
             self.signals.rendered.emit(self.request_id, rendered)
         except (GitError, OSError, UnicodeError) as exc:
@@ -2010,13 +2034,44 @@ class HistoryIndexWorker(QRunnable):
 
     def run(self) -> None:
         events: list[tuple[GitCommit, TranslationLogEntry]] = []
-        total = len(self.commits_newest_first)
+        commits = self.commits_newest_first[:MAX_INDEXED_COMMITS]
+        total = len(commits)
+        limited = len(commits) < len(self.commits_newest_first)
         try:
-            for number, commit in enumerate(self.commits_newest_first, start=1):
-                if self.cancel_event.is_set():
-                    return
-                events.extend((commit, entry) for entry in self.git.entries_for_commit(commit.full_hash))
-                self.signals.progress.emit(number, total)
+            store = HistoryIndexStore.for_repository(
+                self.git.repo,
+                self.git.language,
+                codec_fingerprint=self.git.history_cache_fingerprint,
+            )
+            hashes = tuple(commit.full_hash for commit in commits)
+            store.retain_commits(hashes)
+            indexed = store.indexed_hashes(hashes)
+            cached_entries = store.entries_for_commits(
+                commit.full_hash for commit in commits if commit.full_hash in indexed
+            )
+            loaded_entries: dict[str, list[TranslationLogEntry]] = dict(cached_entries)
+            missing = tuple(commit.full_hash for commit in commits if commit.full_hash not in indexed)
+            completed = len(indexed)
+            if completed:
+                self.signals.progress.emit(completed, total)
+            if missing:
+                with store.writer() as writer:
+                    for commit_hash, entries in self.git.iter_entries_for_commits(missing, self.cancel_event):
+                        if self.cancel_event.is_set():
+                            return
+                        try:
+                            writer.store_commit(commit_hash, entries)
+                        except HistoryIndexCapacityError:
+                            limited = True
+                            break
+                        loaded_entries[commit_hash] = entries
+                        completed += 1
+                        self.signals.progress.emit(completed, total)
+            for commit in commits:
+                entries = loaded_entries.get(commit.full_hash)
+                if entries is None:
+                    continue
+                events.extend((commit, entry) for entry in entries)
         except (GitError, OSError, UnicodeError) as exc:
             if not self.cancel_event.is_set():
                 self.signals.failed.emit(self.request_id, str(exc))
@@ -2026,7 +2081,205 @@ class HistoryIndexWorker(QRunnable):
                 self.signals.failed.emit(self.request_id, translate("error.unexpected", error=exc))
             return
         if not self.cancel_event.is_set():
-            self.signals.ready.emit(self.request_id, events)
+            self.signals.ready.emit(self.request_id, {"events": events, "limited": limited})
+
+
+class TextImportDialog(QDialog):
+    DETAIL_LIMIT = 200
+
+    def __init__(
+        self,
+        units: Iterable[TranslationUnit],
+        selected_units: Iterable[TranslationUnit],
+        parent: QWidget | None = None,
+    ) -> None:
+        super().__init__(parent)
+        self.units = tuple(units)
+        self.selected_units = tuple(selected_units)
+        self._units_by_uid = {unit.uid: unit for unit in self.units}
+        self._plan = TextImportPlan((), 0, ())
+        self.setWindowTitle(translate("text_import.title"))
+        self.resize(900, 680)
+
+        layout = QVBoxLayout(self)
+        intro = QLabel(translate("text_import.intro"))
+        intro.setWordWrap(True)
+        layout.addWidget(intro)
+
+        controls = QFormLayout()
+        self.mode_combo = QComboBox()
+        self.mode_combo.addItem(translate("text_import.mode.keyed"), IMPORT_MODE_KEYED)
+        self.mode_combo.addItem(
+            translate("text_import.mode.translations", count=len(self.selected_units)),
+            IMPORT_MODE_TRANSLATIONS,
+        )
+        controls.addRow(translate("text_import.mode.label"), self.mode_combo)
+        self.policy_combo = QComboBox()
+        self.policy_combo.addItem(translate("text_import.policy.empty"), IMPORT_POLICY_EMPTY)
+        self.policy_combo.addItem(translate("text_import.policy.overwrite"), IMPORT_POLICY_OVERWRITE)
+        controls.addRow(translate("text_import.policy.label"), self.policy_combo)
+        self.allow_empty = QCheckBox(translate("text_import.allow_empty"))
+        controls.addRow("", self.allow_empty)
+        layout.addLayout(controls)
+
+        self.input_edit = QPlainTextEdit()
+        self.input_edit.setPlaceholderText(translate("text_import.placeholder"))
+        layout.addWidget(self.input_edit, 1)
+
+        self.summary = QLabel(translate("text_import.summary.empty"))
+        self.summary.setObjectName("textImportSummary")
+        self.summary.setWordWrap(True)
+        layout.addWidget(self.summary)
+
+        self.details_button = QToolButton()
+        self.details_button.setCheckable(True)
+        self.details_button.setText(translate("text_import.details.show"))
+        self.details_button.toggled.connect(self._toggle_details)
+        layout.addWidget(self.details_button, 0, Qt.AlignmentFlag.AlignLeft)
+        self.details = QPlainTextEdit()
+        self.details.setReadOnly(True)
+        self.details.setMaximumHeight(210)
+        self.details.document().setMaximumBlockCount(self.DETAIL_LIMIT + 30)
+        self.details.hide()
+        layout.addWidget(self.details)
+
+        self.buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Cancel)
+        self.import_button = self.buttons.addButton(
+            translate("text_import.import"),
+            QDialogButtonBox.ButtonRole.AcceptRole,
+        )
+        self.import_button.setEnabled(False)
+        self.buttons.accepted.connect(self.accept)
+        self.buttons.rejected.connect(self.reject)
+        layout.addWidget(self.buttons)
+
+        self.refresh_timer = QTimer(self)
+        self.refresh_timer.setSingleShot(True)
+        self.refresh_timer.setInterval(100)
+        self.refresh_timer.timeout.connect(self._refresh_plan)
+        self.input_edit.textChanged.connect(self.refresh_timer.start)
+        self.mode_combo.currentIndexChanged.connect(self._schedule_refresh)
+        self.policy_combo.currentIndexChanged.connect(self._schedule_refresh)
+        self.allow_empty.toggled.connect(self._schedule_refresh)
+
+    def _schedule_refresh(self, _value: object = None) -> None:
+        self.refresh_timer.start()
+
+    def _toggle_details(self, shown: bool) -> None:
+        self.details.setVisible(shown)
+        self.details_button.setText(
+            translate("text_import.details.hide" if shown else "text_import.details.show")
+        )
+
+    def _refresh_plan(self) -> None:
+        mode = str(self.mode_combo.currentData() or IMPORT_MODE_KEYED)
+        policy = str(self.policy_combo.currentData() or IMPORT_POLICY_EMPTY)
+        parsed = parse_import_text(self.input_edit.toPlainText(), mode)
+        self._plan = build_import_plan(
+            parsed,
+            self.units,
+            self.selected_units,
+            mode=mode,
+            policy=policy,
+            allow_empty=self.allow_empty.isChecked(),
+        )
+        if not self.input_edit.toPlainText():
+            self.summary.setText(translate("text_import.summary.empty"))
+        else:
+            self.summary.setText(
+                translate(
+                    "text_import.summary",
+                    updates=len(self._plan.updates),
+                    skipped=self._plan.skipped_count,
+                    problems=self._plan.problem_count,
+                )
+            )
+        self.import_button.setEnabled(bool(self._plan.updates))
+        self.details.setPlainText(self._detail_text())
+
+    def _detail_text(self) -> str:
+        counts = self._plan.outcome_counts()
+        detail_lines = [
+            translate("text_import.count.update", count=counts[OUTCOME_UPDATE]),
+            translate("text_import.count.same", count=counts[OUTCOME_SAME]),
+            translate("text_import.count.existing", count=counts[OUTCOME_EXISTING]),
+            translate("text_import.count.empty", count=counts[OUTCOME_EMPTY]),
+            translate("text_import.count.blank", count=self._plan.blank_lines),
+            translate("text_import.count.not_found", count=counts[OUTCOME_NOT_FOUND]),
+            translate("text_import.count.source_mismatch", count=counts[OUTCOME_SOURCE_MISMATCH]),
+            translate("text_import.count.duplicate", count=counts[OUTCOME_DUPLICATE]),
+            translate("text_import.count.ambiguous", count=counts[OUTCOME_AMBIGUOUS]),
+            translate("text_import.count.issues", count=len(self._plan.issues)),
+        ]
+        rows: list[str] = []
+        detail_total = sum(row.outcome != OUTCOME_SAME for row in self._plan.rows) + len(self._plan.issues)
+        for planned in self._plan.rows:
+            if planned.outcome in {OUTCOME_UPDATE, OUTCOME_SAME}:
+                continue
+            unit = self._units_by_uid.get(planned.unit_uid)
+            key = planned.row.key or (unit.label if unit is not None else "")
+            rows.append(
+                translate(
+                    "text_import.detail.row",
+                    line=planned.row.line_number,
+                    entry_key=key or translate("text_import.detail.no_key"),
+                    result=translate(f"text_import.outcome.{planned.outcome}"),
+                )
+            )
+            if len(rows) >= self.DETAIL_LIMIT:
+                break
+        for issue in self._plan.issues:
+            if len(rows) >= self.DETAIL_LIMIT:
+                break
+            if issue.code == "selection_count":
+                imported, selected = (issue.preview.split("\t", 1) + [""])[:2]
+                result = translate(
+                    "text_import.issue.selection_count",
+                    imported=imported,
+                    selected=selected,
+                )
+            else:
+                result = translate(f"text_import.issue.{issue.code}")
+            line = str(issue.line_number) if issue.line_number else "-"
+            rows.append(
+                translate(
+                    "text_import.detail.row",
+                    line=line,
+                    entry_key=issue.preview or translate("text_import.detail.no_key"),
+                    result=result,
+                )
+            )
+        if len(rows) < self.DETAIL_LIMIT:
+            for planned in self._plan.updates:
+                unit = self._units_by_uid.get(planned.unit_uid)
+                key = planned.row.key or (unit.label if unit is not None else "")
+                before = (planned.current_text or translate("text_import.detail.empty_value")).replace("\n", " ↵ ")
+                after = (planned.row.translation or translate("text_import.detail.empty_value")).replace("\n", " ↵ ")
+                rows.append(
+                    translate(
+                        "text_import.detail.change",
+                        line=planned.row.line_number,
+                        entry_key=key or translate("text_import.detail.no_key"),
+                        before=before[:80],
+                        after=after[:80],
+                    )
+                )
+                if len(rows) >= self.DETAIL_LIMIT:
+                    break
+        if rows:
+            detail_lines.extend(("", translate("text_import.detail.preview")))
+            detail_lines.extend(rows)
+            if detail_total > len(rows):
+                detail_lines.append(
+                    translate("text_import.detail.limited", count=detail_total - len(rows))
+                )
+        return "\n".join(detail_lines)
+
+    def import_plan(self) -> TextImportPlan:
+        if self.refresh_timer.isActive():
+            self.refresh_timer.stop()
+            self._refresh_plan()
+        return self._plan
 
 
 class SettingsDialog(QDialog):
@@ -2757,7 +3010,7 @@ class HistoryDialog(QDialog):
         self.entry_search.setClearButtonEnabled(True)
         self.entry_search.setPlaceholderText(translate("history.search.entries"))
         entry_column.addWidget(self.entry_search)
-        self.entry_status = QLabel(translate("history.entry_index.starting"))
+        self.entry_status = QLabel(translate("history.entry_index.idle"))
         self.entry_status.setWordWrap(True)
         entry_column.addWidget(self.entry_status)
         self.entries = QListWidget()
@@ -2781,7 +3034,10 @@ class HistoryDialog(QDialog):
         self._commit_blobs: dict[str, str] = {}
         self._events_by_key: dict[tuple[str, str, str, str], list[tuple[GitCommit, TranslationLogEntry]]] = {}
         self._entry_keys: list[tuple[str, str, str, str]] = []
+        self._visible_entry_keys: list[tuple[str, str, str, str]] = []
         self._entry_blobs: dict[tuple[str, str, str, str], str] = {}
+        self._indexed_change_count = 0
+        self._index_limited = False
         self._request_id = 0
         self._selected_rows: tuple[int, ...] = ()
         self._rendered_rows: tuple[int, ...] = ()
@@ -2789,6 +3045,7 @@ class HistoryDialog(QDialog):
         self._index_request_id = 1
         self._index_cancel_event = threading.Event()
         self._index_worker: HistoryIndexWorker | None = None
+        self._index_started = False
         self._selection_timer = QTimer(self)
         self._selection_timer.setSingleShot(True)
         self._selection_timer.setInterval(110)
@@ -2801,16 +3058,19 @@ class HistoryDialog(QDialog):
             self.content.setHtml(_history_state_html(translate("history.read_error_title"), str(exc), kind="error"))
             self.entry_status.setText(str(exc))
         else:
-            self.content.setHtml(_history_state_html(translate("history.initial_title"), translate("history.initial_detail")))
-            self._start_entry_index()
+            self.content.setHtml(
+                _history_state_html(translate("history.initial_title"), translate("history.initial_detail"))
+            )
         self.commits.itemSelectionChanged.connect(self._show_selected_commits)
-        self.commit_search.textChanged.connect(self._filter_commits)
+        self.commit_search.textChanged.connect(self._on_commit_search_changed)
         self.entry_search.textChanged.connect(self._filter_entries)
         self.entries.itemSelectionChanged.connect(self._show_selected_entry)
+        self.left_tabs.currentChanged.connect(self._on_history_tab_changed)
         if self._items:
             QTimer.singleShot(0, self._select_latest_commit)
         if focus_key is not None:
             self.left_tabs.setCurrentIndex(1)
+            self._ensure_entry_index()
 
     @staticmethod
     def _matches_query(blob: str, query: str) -> bool:
@@ -2822,13 +3082,60 @@ class HistoryDialog(QDialog):
             if item is not None:
                 item.setHidden(not self._matches_query(self._commit_blobs.get(commit.full_hash, ""), query))
 
-    def _filter_entries(self, query: str) -> None:
-        for row, key in enumerate(self._entry_keys):
-            item = self.entries.item(row)
-            if item is not None:
-                item.setHidden(not self._matches_query(self._entry_blobs.get(key, ""), query))
+    def _on_commit_search_changed(self, query: str) -> None:
+        self._filter_commits(query)
+        if query.strip():
+            self._ensure_entry_index()
 
-    def _start_entry_index(self) -> None:
+    def _on_history_tab_changed(self, index: int) -> None:
+        if index == 1:
+            self._ensure_entry_index()
+
+    def _filter_entries(self, query: str) -> None:
+        matches = [
+            key
+            for key in self._entry_keys
+            if self._matches_query(self._entry_blobs.get(key, ""), query)
+        ]
+        self._populate_entry_items(matches[:HISTORY_ENTRY_RESULT_LIMIT])
+        if self._index_worker is None and self._index_started:
+            if len(matches) > HISTORY_ENTRY_RESULT_LIMIT:
+                self.entry_status.setText(
+                    translate(
+                        "history.entry_index.results_limited",
+                        shown=HISTORY_ENTRY_RESULT_LIMIT,
+                        total=len(matches),
+                    )
+                )
+            else:
+                status_key = "history.entry_index.limited" if self._index_limited else "history.entry_index.ready"
+                self.entry_status.setText(
+                    translate(status_key, entries=len(self._entry_keys), changes=self._indexed_change_count)
+                )
+
+    def _populate_entry_items(self, keys: Iterable[tuple[str, str, str, str]]) -> None:
+        selected = list(keys)
+        blocker = QSignalBlocker(self.entries)
+        self.entries.clear()
+        self._visible_entry_keys = selected
+        for key in selected:
+            events = self._events_by_key[key]
+            entry = events[0][1]
+            self.entries.addItem(
+                translate(
+                    "history.entry_list.item",
+                    title=_history_entry_title(entry),
+                    count=len(events),
+                    meta=_history_entry_meta(entry),
+                )
+            )
+        del blocker
+
+    def _ensure_entry_index(self) -> None:
+        if self._index_started or not self._items:
+            return
+        self._index_started = True
+        self.entry_status.setText(translate("history.entry_index.starting"))
         worker = HistoryIndexWorker(
             self._index_request_id,
             self.git,
@@ -2844,9 +3151,13 @@ class HistoryDialog(QDialog):
     def _apply_index_progress(self, current: int, total: int) -> None:
         self.entry_status.setText(translate("history.entry_index.progress", current=current, total=total))
 
-    def _apply_history_index(self, request_id: int, raw_events: object) -> None:
-        if request_id != self._index_request_id or not isinstance(raw_events, list):
+    def _apply_history_index(self, request_id: int, result: object) -> None:
+        if request_id != self._index_request_id or not isinstance(result, dict):
             return
+        raw_events = result.get("events")
+        if not isinstance(raw_events, list):
+            return
+        limited = bool(result.get("limited"))
         self._index_worker = None
         events_by_commit: dict[str, list[TranslationLogEntry]] = {}
         for event in raw_events:
@@ -2862,7 +3173,6 @@ class HistoryDialog(QDialog):
                 commit,
                 events_by_commit.get(commit.full_hash, ()),
             )
-        self.entries.clear()
         self._entry_keys = sorted(
             self._events_by_key,
             key=lambda key: (
@@ -2873,22 +3183,12 @@ class HistoryDialog(QDialog):
         self._entry_blobs.clear()
         for key in self._entry_keys:
             events = self._events_by_key[key]
-            entry = events[0][1]
-            self.entries.addItem(
-                translate(
-                    "history.entry_list.item",
-                    title=_history_entry_title(entry),
-                    count=len(events),
-                    meta=_history_entry_meta(entry),
-                )
-            )
             self._entry_blobs[key] = "\n".join(
                 [entry_search_blob(change) for _commit, change in events]
                 + [commit_search_blob(commit) for commit, _change in events]
             )
-        self.entry_status.setText(
-            translate("history.entry_index.ready", entries=len(self._entry_keys), changes=len(raw_events))
-        )
+        self._indexed_change_count = len(raw_events)
+        self._index_limited = limited
         self._filter_commits(self.commit_search.text())
         self._filter_entries(self.entry_search.text())
         if self._focus_key is not None:
@@ -2898,11 +3198,12 @@ class HistoryDialog(QDialog):
         if request_id != self._index_request_id:
             return
         self._index_worker = None
+        self._index_started = False
         self.entry_status.setText(translate("history.entry_index.failed", error=message))
 
     def _select_entry_key(self, key: tuple[str, str, str, str]) -> None:
         try:
-            row = self._entry_keys.index(key)
+            selected_key = self._entry_keys[self._entry_keys.index(key)]
         except ValueError:
             candidates = [
                 index
@@ -2912,7 +3213,12 @@ class HistoryDialog(QDialog):
             if not candidates:
                 self.entry_status.setText(translate("history.entry_index.not_found"))
                 return
-            row = candidates[0]
+            selected_key = self._entry_keys[candidates[0]]
+        if selected_key not in self._visible_entry_keys:
+            keys = [selected_key]
+            keys.extend(candidate for candidate in self._entry_keys if candidate != selected_key)
+            self._populate_entry_items(keys[:HISTORY_ENTRY_RESULT_LIMIT])
+        row = self._visible_entry_keys.index(selected_key)
         self.entries.setCurrentRow(row)
         item = self.entries.item(row)
         if item is not None:
@@ -2921,9 +3227,9 @@ class HistoryDialog(QDialog):
 
     def _show_selected_entry(self) -> None:
         row = self.entries.currentRow()
-        if row < 0 or row >= len(self._entry_keys):
+        if row < 0 or row >= len(self._visible_entry_keys):
             return
-        self.content.setHtml(render_entry_timeline_html(self._events_by_key[self._entry_keys[row]]))
+        self.content.setHtml(render_entry_timeline_html(self._events_by_key[self._visible_entry_keys[row]]))
 
     def _select_latest_commit(self) -> None:
         if not self._items:
@@ -3182,11 +3488,7 @@ class TranslatorWindow(QMainWindow):
         self.batch_ai_button.clicked.connect(self._on_batch_ai_button_clicked)
         toolbar_layout.addWidget(self.batch_ai_button)
         self.top_buttons: list[QPushButton] = []
-        for key, slot, primary in (
-            ("button.save", self.save_all, True),
-            ("button.history", self.show_history, False),
-            ("button.settings", self.show_settings, False),
-        ):
+        for key, slot, primary in (("button.save", self.save_all, True),):
             button = QPushButton()
             button.setProperty("text_key", key)
             if primary:
@@ -3194,6 +3496,21 @@ class TranslatorWindow(QMainWindow):
             button.clicked.connect(slot)
             title_layout.addWidget(button)
             self.top_buttons.append(button)
+        self.more_button = QToolButton()
+        self.more_button.setPopupMode(QToolButton.ToolButtonPopupMode.InstantPopup)
+        self.more_menu = QMenu(self.more_button)
+        self.more_actions: list[QAction] = []
+        for key, slot in (
+            ("button.import_text", self.show_text_import),
+            ("button.history", self.show_history),
+            ("button.settings", self.show_settings),
+        ):
+            action = self.more_menu.addAction("")
+            action.setProperty("text_key", key)
+            action.triggered.connect(slot)
+            self.more_actions.append(action)
+        self.more_button.setMenu(self.more_menu)
+        title_layout.addWidget(self.more_button)
         self.retry_button = QToolButton()
         self.retry_button.clicked.connect(self.retry_commit)
         self.retry_button.setVisible(False)
@@ -4791,6 +5108,9 @@ class TranslatorWindow(QMainWindow):
         self.review_attention_button.setToolTip(translate("review_attention.tooltip"))
         for button in self.top_buttons:
             button.setText(translate(str(button.property("text_key") or "")))
+        self.more_button.setText(translate("button.more"))
+        for action in self.more_actions:
+            action.setText(translate(str(action.property("text_key") or "")))
         self.retry_button.setText(translate("button.retry_commit"))
         self.retry_button.setToolTip(translate("button.retry_commit_tooltip"))
         self.source_box.setTitle(translate("editor.source_title"))
@@ -6076,6 +6396,49 @@ class TranslatorWindow(QMainWindow):
         if self.git_pending:
             self.statusBar().showMessage(translate("status.git_pending"))
         self._update_window_title()
+
+    def show_text_import(self) -> None:
+        if self.project is None:
+            QMessageBox.information(
+                self,
+                translate("text_import.title"),
+                translate("text_import.requires_project"),
+            )
+            return
+        if self.ai_worker is not None or self.suggestion_worker is not None:
+            self.statusBar().showMessage(translate("status.ai_already_running"), 4000)
+            return
+        dialog = TextImportDialog(self.project.units, self._selected_units(), self)
+        if dialog.exec() != QDialog.DialogCode.Accepted:
+            dialog.deleteLater()
+            return
+        plan = dialog.import_plan()
+        dialog.deleteLater()
+        texts: dict[str, str] = {}
+        units: list[TranslationUnit] = []
+        for planned in plan.updates:
+            unit = self.project.unit_by_uid(planned.unit_uid)
+            if unit is None:
+                continue
+            units.append(unit)
+            texts[unit.uid] = planned.row.translation
+        if not units:
+            return
+        self._replace_units_state(
+            units,
+            texts,
+            False,
+            translate("operation.import_text", count=len(units)),
+        )
+        self.statusBar().showMessage(
+            translate(
+                "status.import_text_done",
+                count=len(units),
+                skipped=plan.skipped_count,
+                problems=plan.problem_count,
+            ),
+            5000,
+        )
 
     def show_history(self) -> None:
         if self.git is None:

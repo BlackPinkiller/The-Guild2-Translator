@@ -41,6 +41,8 @@ from .git_history import GitCommit, GitError, LanguageGit, TranslationLogEntry, 
 from .history import OperationHistory, TranslationOperation, UnitChange
 from .self_tests.project_refresh import assert_saved_file_refresh
 from .self_tests.git_commit import assert_tracked_git_commit_skips_redundant_add
+from .self_tests.history_index import assert_history_index_is_persistent_and_bounded
+from .self_tests.text_import import assert_text_import_planning_is_safe_and_lightweight
 from .self_tests.diagnostics import assert_diagnostics_are_bounded_and_content_free
 from .self_tests.performance import AI_CONTEXT_BUILD_LIMIT_SECONDS, assert_within_budget
 from .i18n import set_language, status_text, translate
@@ -2695,6 +2697,11 @@ def assert_editor_undo_stays_local(root: Path) -> None:
 
         app_module.LanguageGit.ensure_repository = tracked_ensure_repository
         win = TranslatorWindow()
+        if len(win.top_buttons) != 1 or win.top_buttons[0].property("text_key") != "button.save":
+            raise AssertionError("low-frequency actions were still spread across the title bar")
+        more_action_keys = tuple(action.property("text_key") for action in win.more_actions)
+        if more_action_keys != ("button.import_text", "button.history", "button.settings"):
+            raise AssertionError("the More menu did not contain the expected low-frequency actions")
         git_init_deadline = time.monotonic() + 10.0
         while not win.git_ready and not win._git_init_failed and time.monotonic() < git_init_deadline:
             QTest.qWait(20)
@@ -3111,6 +3118,44 @@ def assert_editor_undo_stays_local(root: Path) -> None:
         app.processEvents()
         if tuple(unit.current_text for unit in clipboard_units[2:]) != target_before:
             raise AssertionError("one undo did not restore the complete one-to-many paste")
+
+        import_units = tuple(clipboard_units[2:])
+        if any(not unit.label for unit in import_units) or len({unit.label for unit in import_units}) != 2:
+            raise AssertionError("text import smoke test needs two uniquely labelled entries")
+        import_texts = ("text import A", "text import B")
+        import_dialog = app_module.TextImportDialog(win.project.units, import_units, win)
+        import_dialog.policy_combo.setCurrentIndex(
+            import_dialog.policy_combo.findData(app_module.IMPORT_POLICY_OVERWRITE)
+        )
+        import_dialog.input_edit.setPlainText(
+            "\n".join(
+                f"{unit.label}\t{text}"
+                for unit, text in zip(import_units, import_texts)
+            )
+        )
+        import_dialog._refresh_plan()
+        plan = import_dialog.import_plan()
+        if tuple(unit.current_text for unit in import_units) != target_before:
+            raise AssertionError("previewing a text import modified project translations")
+        if len(plan.updates) != 2 or not import_dialog.import_button.isEnabled():
+            raise AssertionError("text import dialog did not preview two valid updates")
+        import_dialog.close()
+        import_dialog.deleteLater()
+        win._replace_units_state(
+            import_units,
+            {row.unit_uid: row.row.translation for row in plan.updates},
+            False,
+            "text import smoke test",
+        )
+        app.processEvents()
+        if tuple(unit.current_text for unit in import_units) != import_texts:
+            raise AssertionError("confirmed text import did not apply all translations")
+        if tuple(unit.source_text for unit in clipboard_units) != source_texts:
+            raise AssertionError("text import modified source text")
+        win.undo()
+        app.processEvents()
+        if tuple(unit.current_text for unit in import_units) != target_before:
+            raise AssertionError("one undo did not restore the complete text import")
 
         ai_unit = clipboard_units[2]
         ai_before = ai_unit.current_text
@@ -4835,15 +4880,35 @@ def assert_history_dialog_search_and_entry_timeline() -> None:
     later = TranslationLogEntry("更新", "Text.dbt", "10", "Greeting", "Text", "Hello", "Second", "First")
     entries = {commits[0].full_hash: [later], commits[1].full_hash: [early]}
 
+    history_root = Path(tempfile.mkdtemp(prefix="translator_history_dialog_"))
+    history_repo = history_root / "languages"
+    (history_repo / ".git").mkdir(parents=True)
+
     class FakeHistoryGit:
-        project_root = Path("HistoryFixture")
+        project_root = history_root
+        repo = history_repo
         language = "#chinese"
+        history_cache_fingerprint = "plain"
+
+        def __init__(self):
+            self.entry_read_count = 0
+            self.full_index_read_count = 0
 
         def list_all_commits(self):
             return list(commits)
 
         def entries_for_commit(self, commit: str):
+            self.entry_read_count += 1
             return list(entries.get(commit, ()))
+
+        def iter_entries_for_commits(self, hashes, cancel_event=None):
+            requested = tuple(hashes)
+            if len(requested) > 1:
+                self.full_index_read_count += 1
+            for commit in requested:
+                if cancel_event is not None and cancel_event.is_set():
+                    return
+                yield commit, self.entries_for_commit(commit)
 
         def entries_for_commits(self, hashes):
             return [entry for commit in hashes for entry in entries.get(commit, ())]
@@ -4852,8 +4917,18 @@ def assert_history_dialog_search_and_entry_timeline() -> None:
     created_app = app is None
     if app is None:
         app = QApplication([])
+    fake_git = FakeHistoryGit()
+    lazy_dialog = HistoryDialog(fake_git)  # type: ignore[arg-type]
+    lazy_dialog.show()
+    app.processEvents()
+    if lazy_dialog._index_started or fake_git.full_index_read_count:
+        raise AssertionError("opening update log eagerly rebuilt the complete entry index")
+    lazy_dialog.close()
+    lazy_dialog.deleteLater()
+    app.processEvents()
+
     dialog = HistoryDialog(
-        FakeHistoryGit(),  # type: ignore[arg-type]
+        fake_git,  # type: ignore[arg-type]
         focus_key=("Text.dbt", "10", "Greeting", "Text"),
     )
     dialog.show()
@@ -4865,6 +4940,8 @@ def assert_history_dialog_search_and_entry_timeline() -> None:
             QTest.qWait(20)
         if dialog.entries.count() != 1:
             raise AssertionError("entry-history index did not group repeated changes by translation field")
+        if fake_git.full_index_read_count != 1:
+            raise AssertionError("first entry-history load did not index each missing commit exactly once")
         if dialog.entries.currentRow() != 0:
             raise AssertionError("opening history for a unit did not select its entry timeline")
         content = dialog.content.toPlainText()
@@ -4879,10 +4956,28 @@ def assert_history_dialog_search_and_entry_timeline() -> None:
         app.processEvents()
         if dialog.entries.item(0).isHidden():
             raise AssertionError("entry-history search did not match source text and label together")
+
+        cached_full_index_reads = fake_git.full_index_read_count
+        cached_dialog = HistoryDialog(
+            fake_git,  # type: ignore[arg-type]
+            focus_key=("Text.dbt", "10", "Greeting", "Text"),
+        )
+        cached_dialog.show()
+        for _ in range(100):
+            app.processEvents()
+            if cached_dialog.entries.count() == 1 and cached_dialog._index_worker is None:
+                break
+            QTest.qWait(20)
+        if fake_git.full_index_read_count != cached_full_index_reads:
+            raise AssertionError("reopening update log reparsed commits already stored in the reusable index")
+        cached_dialog.close()
+        cached_dialog.deleteLater()
+        app.processEvents()
     finally:
         dialog.close()
         dialog.deleteLater()
         app.processEvents()
+        safe_rmtree(history_root)
         if created_app:
             app.quit()
 
@@ -5058,21 +5153,27 @@ def assert_git_history_keeps_selected_commit_entries(root: Path) -> None:
         second = "A %1s, %4n %3s B"
         unit.set_text(first)
         first_result = project.save([unit])
-        first_commit = git.commit_saved(first_result.changed_files, first_result.saved_units, first_result.deleted_units)
+        first_commit = git.commit_saved(
+            first_result.changed_files, first_result.saved_units, first_result.deleted_units
+        )
         if first_commit is None:
             raise AssertionError("first selected-entry history commit was not created")
         project = Project.load(temp, "#chinese")
         unit = next(item for item in project.units if item.uid == unit.uid)
         unit.set_text(second)
         second_result = project.save([unit])
-        second_commit = git.commit_saved(second_result.changed_files, second_result.saved_units, second_result.deleted_units)
+        second_commit = git.commit_saved(
+            second_result.changed_files, second_result.saved_units, second_result.deleted_units
+        )
         if second_commit is None:
             raise AssertionError("second selected-entry history commit was not created")
         project = Project.load(temp, "#chinese")
         unit = next(item for item in project.units if item.uid == unit.uid)
         unit.set_text(unit.source_text)
         revert_result = project.save([unit])
-        revert_commit = git.commit_saved(revert_result.changed_files, revert_result.saved_units, revert_result.deleted_units)
+        revert_commit = git.commit_saved(
+            revert_result.changed_files, revert_result.saved_units, revert_result.deleted_units
+        )
         if revert_commit is None:
             raise AssertionError("revert selected-entry history commit was not created")
         entries = git.entries_for_commits((first_commit.full_hash, second_commit.full_hash, revert_commit.full_hash))
@@ -5080,6 +5181,33 @@ def assert_git_history_keeps_selected_commit_entries(root: Path) -> None:
             raise AssertionError("history returned an empty net result even though selected commits changed text")
         if not any(entry.translated_text == second for entry in entries):
             raise AssertionError("history did not preserve the placeholder reorder update")
+
+        expected_by_commit = {
+            commit.full_hash: git.entries_for_commit(commit.full_hash)
+            for commit in (revert_commit, second_commit, first_commit)
+        }
+        git._entry_cache.clear()
+        run_count = 0
+        original_run = git._run
+        original_run_with_input = git._run_with_input
+
+        def counted_run(*args, **kwargs):
+            nonlocal run_count
+            run_count += 1
+            return original_run(*args, **kwargs)
+
+        def counted_run_with_input(*args, **kwargs):
+            nonlocal run_count
+            run_count += 1
+            return original_run_with_input(*args, **kwargs)
+
+        git._run = counted_run  # type: ignore[method-assign]
+        git._run_with_input = counted_run_with_input  # type: ignore[method-assign]
+        batched = dict(git.iter_entries_for_commits(expected_by_commit))
+        if batched != expected_by_commit:
+            raise AssertionError("batched history extraction changed the recorded entry semantics")
+        if run_count > 3:
+            raise AssertionError(f"batched history extraction launched too many Git processes: {run_count}")
     finally:
         safe_rmtree(temp)
 
@@ -5210,6 +5338,7 @@ def main() -> int:
     finally:
         safe_rmtree(refresh_temp)
     assert_entry_clipboard_decoder()
+    assert_text_import_planning_is_safe_and_lightweight()
     assert_missing_insertions_follow_file_order(root)
     assert_unsaved_translation_status(root)
     assert_mod_label_match_inserts_source_formatted_row(root)
@@ -5243,6 +5372,7 @@ def main() -> int:
     assert_llm_suggestion_context_prompt()
     assert_git_history(root)
     assert_history_dialog_search_and_entry_timeline()
+    assert_history_index_is_persistent_and_bounded()
     assert_git_subprocess_hides_console()
     assert_git_subprocess_timeout_is_reported()
     assert_tracked_git_commit_skips_redundant_add()
