@@ -298,6 +298,8 @@ def assert_local_project_roots_detect_sources_projects() -> None:
 
 
 def assert_discover_game_source_projects_detects_vanilla_and_mods() -> None:
+    from .app import _compact_managed_path
+
     temp = Path(tempfile.gettempdir()) / f"translator_tool_smoke_game_projects_{uuid.uuid4().hex[:8]}"
     try:
         game_root = temp / "game"
@@ -322,6 +324,13 @@ def assert_discover_game_source_projects_detects_vanilla_and_mods() -> None:
         reforged = next(project for project in projects if project.name == "Reforged")
         if not reforged.added:
             raise AssertionError("existing local project should be marked as added")
+        if (
+            _compact_managed_path(reforged.source_root, ("GameRoot", game_root), ("App", app_root))
+            != "GameRoot/mods/Reforged/DB/Languages"
+            or _compact_managed_path(reforged.project_root, ("App", app_root), ("GameRoot", game_root))
+            != "App/sources/Reforged"
+        ):
+            raise AssertionError("project manager paths were not shortened against their known roots")
     finally:
         safe_rmtree(temp)
 
@@ -2666,7 +2675,7 @@ def assert_editor_undo_stays_local(root: Path) -> None:
     from PySide6.QtCore import QItemSelection, QItemSelectionModel, Qt
     from PySide6.QtGui import QTextCursor
     from PySide6.QtTest import QTest
-    from PySide6.QtWidgets import QApplication
+    from PySide6.QtWidgets import QApplication, QToolButton
 
     from . import app as app_module
     from .app import TYPING_GROUP_DELAY_MS, TranslatorWindow
@@ -2697,6 +2706,8 @@ def assert_editor_undo_stays_local(root: Path) -> None:
 
         app_module.LanguageGit.ensure_repository = tracked_ensure_repository
         win = TranslatorWindow()
+        if win.project_button.popupMode() != QToolButton.ToolButtonPopupMode.InstantPopup:
+            raise AssertionError("project button click did not open its existing project menu directly")
         if len(win.top_buttons) != 1 or win.top_buttons[0].property("text_key") != "button.save":
             raise AssertionError("low-frequency actions were still spread across the title bar")
         more_action_keys = tuple(action.property("text_key") for action in win.more_actions)

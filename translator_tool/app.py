@@ -2709,14 +2709,37 @@ class NewLanguageDialog(QDialog):
         return "#" + self.name_edit.text().strip().lstrip("#")
 
 
+def _compact_managed_path(path: Path, *anchors: tuple[str, Path]) -> str:
+    try:
+        resolved = path.resolve()
+    except OSError:
+        resolved = path
+    for label, root in anchors:
+        try:
+            relative = resolved.relative_to(root.resolve())
+        except (OSError, ValueError):
+            continue
+        suffix = relative.as_posix()
+        return label if suffix == "." else f"{label}/{suffix}"
+    return path.name or str(path)
+
+
 class ProjectManagerRow(QFrame):
     add_requested = Signal(object)
     update_requested = Signal(object)
 
-    def __init__(self, spec: SourceProjectSpec, parent: QWidget | None = None) -> None:
+    def __init__(
+        self,
+        spec: SourceProjectSpec,
+        game_root: Path,
+        app_root: Path,
+        parent: QWidget | None = None,
+    ) -> None:
         super().__init__(parent)
         self.setObjectName("projectManagerRow")
         self.spec = spec
+        self.game_root = game_root
+        self.app_root = app_root
 
         layout = QHBoxLayout(self)
         layout.setContentsMargins(12, 10, 12, 10)
@@ -2801,8 +2824,20 @@ class ProjectManagerRow(QFrame):
             if spec.added
             else translate("project.manager.state.not_added")
         )
-        self.source_label.setText(translate("project.manager.source_path", path=str(spec.source_root)))
-        self.project_label.setText(translate("project.manager.project_path", path=str(spec.project_root)))
+        source_path = _compact_managed_path(
+            spec.source_root,
+            ("GameRoot", self.game_root),
+            ("App", self.app_root),
+        )
+        project_path = _compact_managed_path(
+            spec.project_root,
+            ("App", self.app_root),
+            ("GameRoot", self.game_root),
+        )
+        self.source_label.setText(translate("project.manager.source_path", path=source_path))
+        self.source_label.setToolTip(str(spec.source_root))
+        self.project_label.setText(translate("project.manager.project_path", path=project_path))
+        self.project_label.setToolTip(str(spec.project_root))
         self.add_button.setVisible(not spec.added)
         self.added_check.setVisible(spec.added)
         self.update_button.setVisible(spec.added)
@@ -2841,7 +2876,10 @@ class ProjectManagerDialog(QDialog):
 
         self.game_root_label = QLabel()
         self.game_root_label.setObjectName("projectManagerGameRoot")
-        self.game_root_label.setText(translate("project.manager.game_root", path=str(self.game_root)))
+        self.game_root_label.setText(
+            translate("project.manager.game_root", path=f"GameRoot/{self.game_root.name}")
+        )
+        self.game_root_label.setToolTip(str(self.game_root))
         self.game_root_label.setWordWrap(True)
         layout.addWidget(self.game_root_label)
 
@@ -2884,7 +2922,7 @@ class ProjectManagerDialog(QDialog):
             return
 
         for spec in projects:
-            row = ProjectManagerRow(spec, self.list_container)
+            row = ProjectManagerRow(spec, self.game_root, self.app_root, self.list_container)
             row.add_requested.connect(self._sync_project)
             row.update_requested.connect(self._sync_project)
             self.list_layout.addWidget(row)
@@ -3440,8 +3478,7 @@ class TranslatorWindow(QMainWindow):
         self.project_manager_button.clicked.connect(self.show_project_manager)
         title_layout.addWidget(self.project_manager_button)
         self.project_button = QToolButton()
-        self.project_button.setPopupMode(QToolButton.ToolButtonPopupMode.MenuButtonPopup)
-        self.project_button.clicked.connect(self.choose_project_folder)
+        self.project_button.setPopupMode(QToolButton.ToolButtonPopupMode.InstantPopup)
         self.project_menu = QMenu(self.project_button)
         self.project_menu.aboutToShow.connect(self._populate_project_menu)
         self.project_button.setMenu(self.project_menu)
