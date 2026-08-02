@@ -2,12 +2,13 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 import filecmp
+import hashlib
 import re
 from pathlib import Path
 
 from .cache import cache_path, set_source_review_many
 from .file_utils import atomic_write_many
-from .format_io import load_dbt, load_plain_text, matching_source_field, translatable_fields
+from .format_io import dbt_row_values, load_dbt, load_plain_text, matching_source_field, translatable_fields
 
 
 DEFAULT_TRANSLATION_LANGUAGE = "#chinese"
@@ -29,8 +30,73 @@ class SourceProjectSpec:
 class SourceSyncResult:
     project_root: Path
     synced_source_files: tuple[str, ...]
+    added_source_files: tuple[str, ...]
+    modified_source_files: tuple[str, ...]
     removed_source_files: tuple[str, ...]
+    added_entries: int
+    modified_entries: int
+    removed_entries: int
     invalidated_units: int
+
+
+@dataclass(frozen=True)
+class SourceSyncFileChange:
+    rel_path: str
+    kind: str
+    added_entries: int = 0
+    modified_entries: int = 0
+    removed_entries: int = 0
+
+
+@dataclass(frozen=True)
+class SourceReviewBatch:
+    language: str
+    uids: tuple[str, ...]
+
+
+@dataclass(frozen=True)
+class SourceSyncPlan:
+    source_root: Path
+    project_root: Path
+    changes: tuple[SourceSyncFileChange, ...]
+    review_batches: tuple[SourceReviewBatch, ...]
+    basis_hash: str
+
+    @property
+    def added_files(self) -> tuple[str, ...]:
+        return tuple(change.rel_path for change in self.changes if change.kind == "added")
+
+    @property
+    def modified_files(self) -> tuple[str, ...]:
+        return tuple(change.rel_path for change in self.changes if change.kind == "modified")
+
+    @property
+    def removed_files(self) -> tuple[str, ...]:
+        return tuple(change.rel_path for change in self.changes if change.kind == "removed")
+
+    @property
+    def added_entries(self) -> int:
+        return sum(change.added_entries for change in self.changes)
+
+    @property
+    def modified_entries(self) -> int:
+        return sum(change.modified_entries for change in self.changes)
+
+    @property
+    def removed_entries(self) -> int:
+        return sum(change.removed_entries for change in self.changes)
+
+    @property
+    def invalidated_units(self) -> int:
+        return sum(len(batch.uids) for batch in self.review_batches)
+
+    @property
+    def has_changes(self) -> bool:
+        return bool(self.changes)
+
+
+class SourceSyncPlanStaleError(RuntimeError):
+    pass
 
 
 def managed_project_root(app_root: Path, name: str) -> Path:
@@ -111,39 +177,82 @@ def ensure_translation_dir(project_root: Path, language: str) -> Path:
 
 
 def sync_source_project(source_root: Path, project_root: Path) -> SourceSyncResult:
+    return apply_source_sync_plan(plan_source_project_sync(source_root, project_root))
+
+
+def plan_source_project_sync(source_root: Path, project_root: Path) -> SourceSyncPlan:
     source_root = source_root.expanduser().resolve()
     project_root = project_root.expanduser().resolve()
     _validate_source_root(source_root)
 
     target_languages_root = project_root / "languages"
-    target_languages_root.mkdir(parents=True, exist_ok=True)
-
     source_files = _collect_source_files(source_root)
     existing_files = _collect_source_files(target_languages_root)
-    synced_source_files: list[str] = []
-    removed_source_files: list[str] = []
-    invalidated_units = 0
+    changes: list[SourceSyncFileChange] = []
+    review_uids: dict[str, set[str]] = {}
+
+    for rel_path, source_file in source_files.items():
+        previous_file = existing_files.get(rel_path)
+        if previous_file is not None and filecmp.cmp(source_file, previous_file, shallow=False):
+            continue
+        kind = "added" if previous_file is None else "modified"
+        added, modified, removed = _entry_change_counts(rel_path, previous_file, source_file)
+        changes.append(SourceSyncFileChange(rel_path.as_posix(), kind, added, modified, removed))
+        if previous_file is not None:
+            _collect_translations_for_source_change(
+                project_root,
+                rel_path,
+                previous_file,
+                source_file,
+                review_uids,
+            )
+
+    for rel_path, previous_file in existing_files.items():
+        if rel_path in source_files:
+            continue
+        added, modified, removed = _entry_change_counts(rel_path, previous_file, None)
+        changes.append(SourceSyncFileChange(rel_path.as_posix(), "removed", added, modified, removed))
+
+    changes.sort(key=lambda change: (change.rel_path.casefold(), change.kind))
+    batches = tuple(
+        SourceReviewBatch(language, tuple(sorted(uids)))
+        for language, uids in sorted(review_uids.items(), key=lambda item: item[0].casefold())
+        if uids
+    )
+    return SourceSyncPlan(
+        source_root=source_root,
+        project_root=project_root,
+        changes=tuple(changes),
+        review_batches=batches,
+        basis_hash=_sync_basis_hash(source_files, existing_files),
+    )
+
+
+def apply_source_sync_plan(plan: SourceSyncPlan) -> SourceSyncResult:
+    current_plan = plan_source_project_sync(plan.source_root, plan.project_root)
+    if current_plan.basis_hash != plan.basis_hash or current_plan.changes != plan.changes:
+        raise SourceSyncPlanStaleError
+
+    target_languages_root = plan.project_root / "languages"
+    target_languages_root.mkdir(parents=True, exist_ok=True)
+    source_files = _collect_source_files(plan.source_root)
+    existing_files = _collect_source_files(target_languages_root)
     writes: dict[Path, bytes] = {}
     deletions: set[Path] = set()
-    workflow_cache_path = cache_path(project_root)
+    workflow_cache_path = cache_path(plan.project_root)
     workflow_cache_before = workflow_cache_path.read_bytes() if workflow_cache_path.exists() else None
 
     try:
-        for rel_path, source_file in source_files.items():
-            target_file = target_languages_root / rel_path
-            previous_file = existing_files.get(rel_path)
-            if previous_file is not None and filecmp.cmp(source_file, previous_file, shallow=False):
+        for batch in plan.review_batches:
+            set_source_review_many(plan.project_root, batch.language, batch.uids, True)
+        for change in plan.changes:
+            rel_path = Path(change.rel_path)
+            if change.kind == "removed":
+                previous_file = existing_files.get(rel_path)
+                if previous_file is not None:
+                    deletions.add(previous_file)
                 continue
-            if previous_file is not None:
-                invalidated_units += _mark_translations_for_source_change(project_root, rel_path, previous_file, source_file)
-            writes[target_file] = source_file.read_bytes()
-            synced_source_files.append(rel_path.as_posix())
-
-        for rel_path, previous_file in existing_files.items():
-            if rel_path in source_files:
-                continue
-            deletions.add(previous_file)
-            removed_source_files.append(rel_path.as_posix())
+            writes[target_languages_root / rel_path] = source_files[rel_path].read_bytes()
 
         atomic_write_many(writes, deletions)
     except Exception:
@@ -155,11 +264,18 @@ def sync_source_project(source_root: Path, project_root: Path) -> SourceSyncResu
     for previous_file in deletions:
         _prune_empty_directories(previous_file.parent, target_languages_root)
 
+    added_files = plan.added_files
+    modified_files = plan.modified_files
     return SourceSyncResult(
-        project_root=project_root,
-        synced_source_files=tuple(synced_source_files),
-        removed_source_files=tuple(removed_source_files),
-        invalidated_units=invalidated_units,
+        project_root=plan.project_root,
+        synced_source_files=added_files + modified_files,
+        added_source_files=added_files,
+        modified_source_files=modified_files,
+        removed_source_files=plan.removed_files,
+        added_entries=plan.added_entries,
+        modified_entries=plan.modified_entries,
+        removed_entries=plan.removed_entries,
+        invalidated_units=plan.invalidated_units,
     )
 
 
@@ -224,57 +340,59 @@ def _translation_roots(project_root: Path) -> list[Path]:
     ]
 
 
-def _mark_translations_for_source_change(
+def _collect_translations_for_source_change(
     project_root: Path,
     rel_path: Path,
     previous_source: Path,
     next_source: Path | None,
-) -> int:
+    review_uids: dict[str, set[str]],
+) -> None:
     suffix = rel_path.suffix.lower()
     if suffix == ".dbt":
-        return _mark_dbt_translations_for_review(project_root, rel_path, previous_source, next_source)
-    if suffix == ".txt":
-        return _mark_plain_text_translations_for_review(project_root, rel_path, previous_source, next_source)
-    return 0
+        _collect_dbt_translations_for_review(
+            project_root, rel_path, previous_source, next_source, review_uids
+        )
+    elif suffix == ".txt":
+        _collect_plain_text_translations_for_review(
+            project_root, rel_path, previous_source, next_source, review_uids
+        )
 
 
-def _mark_plain_text_translations_for_review(
+def _collect_plain_text_translations_for_review(
     project_root: Path,
     rel_path: Path,
     previous_source: Path,
     next_source: Path | None,
-) -> int:
+    review_uids: dict[str, set[str]],
+) -> None:
     if next_source is None:
-        return 0
+        return
     previous_text = load_plain_text(previous_source).text
     next_text = load_plain_text(next_source).text
     if previous_text == next_text:
-        return 0
-    flagged = 0
+        return
     for language_root in _translation_roots(project_root):
         target_path = language_root / rel_path
         if not target_path.is_file():
             continue
         if not load_plain_text(target_path).text:
             continue
-        set_source_review_many(project_root, language_root.name, (f"text:{rel_path.as_posix()}",), True)
-        flagged += 1
-    return flagged
+        review_uids.setdefault(language_root.name, set()).add(f"text:{rel_path.as_posix()}")
 
 
-def _mark_dbt_translations_for_review(
+def _collect_dbt_translations_for_review(
     project_root: Path,
     rel_path: Path,
     previous_source: Path,
     next_source: Path | None,
-) -> int:
+    review_uids_by_language: dict[str, set[str]],
+) -> None:
     if next_source is None:
-        return 0
+        return
     previous_doc = load_dbt(previous_source)
     next_doc = load_dbt(next_source)
     previous_index = previous_doc.row_index
     next_index = next_doc.row_index
-    flagged = 0
 
     for language_root in _translation_roots(project_root):
         target_path = language_root / rel_path
@@ -282,7 +400,7 @@ def _mark_dbt_translations_for_review(
             continue
         target_doc = load_dbt(target_path)
         target_fields = translatable_fields(rel_path.name, target_doc.string_columns)
-        review_uids: list[str] = []
+        planned_uids: list[str] = []
         for key, target_row in target_doc.row_index.items():
             previous_row = previous_index.get(key)
             next_row = next_index.get(key)
@@ -296,11 +414,49 @@ def _mark_dbt_translations_for_review(
                 if previous_row.get(previous_field) == next_row.get(next_field):
                     continue
                 if target_row.get(target_field):
-                    review_uids.append(f"dbt:{rel_path.name}:{key[0]}:{key[1]}:{target_field}")
-        if review_uids:
-            set_source_review_many(project_root, language_root.name, tuple(review_uids), True)
-            flagged += len(review_uids)
-    return flagged
+                    planned_uids.append(f"dbt:{rel_path.name}:{key[0]}:{key[1]}:{target_field}")
+        if planned_uids:
+            review_uids_by_language.setdefault(language_root.name, set()).update(planned_uids)
+
+
+def _entry_change_counts(
+    rel_path: Path,
+    previous_source: Path | None,
+    next_source: Path | None,
+) -> tuple[int, int, int]:
+    suffix = rel_path.suffix.lower()
+    if suffix == ".dbt":
+        previous_index = load_dbt(previous_source).row_index if previous_source is not None else {}
+        next_index = load_dbt(next_source).row_index if next_source is not None else {}
+        previous_keys = set(previous_index)
+        next_keys = set(next_index)
+        modified = sum(
+            dbt_row_values(previous_index[key]) != dbt_row_values(next_index[key])
+            for key in previous_keys & next_keys
+        )
+        return len(next_keys - previous_keys), modified, len(previous_keys - next_keys)
+    if suffix == ".txt":
+        if previous_source is None:
+            return (1, 0, 0)
+        if next_source is None:
+            return (0, 0, 1)
+        previous_text = load_plain_text(previous_source).text
+        next_text = load_plain_text(next_source).text
+        return (0, int(previous_text != next_text), 0)
+    return (0, 0, 0)
+
+
+def _sync_basis_hash(source_files: dict[Path, Path], existing_files: dict[Path, Path]) -> str:
+    digest = hashlib.sha256()
+    for scope, files in ((b"source", source_files), (b"managed", existing_files)):
+        for rel_path, path in sorted(files.items(), key=lambda item: item[0].as_posix().casefold()):
+            digest.update(scope)
+            digest.update(b"\0")
+            digest.update(rel_path.as_posix().encode("utf-8"))
+            digest.update(b"\0")
+            digest.update(path.read_bytes())
+            digest.update(b"\0")
+    return digest.hexdigest()
 
 
 def _prune_empty_directories(path: Path, stop_at: Path) -> None:

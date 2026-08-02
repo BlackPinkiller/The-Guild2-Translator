@@ -132,14 +132,17 @@ from .settings import AppSettings, load_settings, protect_secret, reveal_secret,
 from .source_sync import (
     DEFAULT_TRANSLATION_LANGUAGE,
     SourceProjectSpec,
+    SourceSyncPlan,
+    SourceSyncPlanStaleError,
     VANILLA_PROJECT_NAME,
+    apply_source_sync_plan,
     discover_game_source_projects,
     ensure_translation_dir,
     game_languages_root,
     has_vanilla_source_entries,
     local_project_roots,
     managed_vanilla_project_root,
-    sync_source_project,
+    plan_source_project_sync,
     sync_vanilla_sources,
 )
 from .text_import import (
@@ -2853,7 +2856,8 @@ class ProjectManagerDialog(QDialog):
         self,
         game_root: Path,
         app_root: Path,
-        sync_callback: Callable[[SourceProjectSpec], str],
+        plan_callback: Callable[[SourceProjectSpec], SourceSyncPlan],
+        apply_callback: Callable[[SourceProjectSpec, SourceSyncPlan], str],
         parent: QWidget | None = None,
     ) -> None:
         super().__init__(parent)
@@ -2862,7 +2866,8 @@ class ProjectManagerDialog(QDialog):
         self.setMinimumSize(880, 520)
         self.game_root = game_root
         self.app_root = app_root
-        self.sync_callback = sync_callback
+        self.plan_callback = plan_callback
+        self.apply_callback = apply_callback
         self.rows: list[ProjectManagerRow] = []
 
         layout = QVBoxLayout(self)
@@ -2931,13 +2936,123 @@ class ProjectManagerDialog(QDialog):
 
     def _sync_project(self, spec: SourceProjectSpec) -> None:
         try:
-            message = self.sync_callback(spec)
+            plan = self.plan_callback(spec)
+        except Exception as exc:
+            QMessageBox.warning(self, translate("dialog.project_manager_title"), str(exc))
+            return
+        if not plan.has_changes:
+            QMessageBox.information(
+                self,
+                translate("dialog.project_manager_title"),
+                translate("project.manager.update_none", name=spec.name),
+            )
+            return
+
+        confirmation = SourceSyncConfirmationDialog(spec, plan, self)
+        if confirmation.exec() != QDialog.DialogCode.Accepted:
+            return
+        try:
+            message = self.apply_callback(spec, plan)
+        except SourceSyncPlanStaleError:
+            QMessageBox.warning(
+                self,
+                translate("dialog.project_manager_title"),
+                translate("project.manager.update_stale"),
+            )
+            return
         except Exception as exc:
             QMessageBox.warning(self, translate("dialog.project_manager_title"), str(exc))
             return
         self.feedback_label.setText(message)
         self.feedback_label.show()
         self.refresh_projects()
+
+    @staticmethod
+    def _format_plan_details(plan: SourceSyncPlan) -> str:
+        kind_keys = {
+            "added": "project.manager.change.added",
+            "modified": "project.manager.change.modified",
+            "removed": "project.manager.change.removed",
+        }
+        return "\n".join(
+            translate(
+                "project.manager.change_line",
+                kind=translate(kind_keys[change.kind]),
+                path=change.rel_path,
+                added=change.added_entries,
+                modified=change.modified_entries,
+                removed=change.removed_entries,
+            )
+            for change in plan.changes
+        )
+
+
+class SourceSyncConfirmationDialog(QDialog):
+    def __init__(
+        self,
+        spec: SourceProjectSpec,
+        plan: SourceSyncPlan,
+        parent: QWidget | None = None,
+    ) -> None:
+        super().__init__(parent)
+        self.setObjectName("sourceSyncConfirmDialog")
+        self.setWindowTitle(translate("project.manager.update_confirm_title", name=spec.name))
+        self.setMinimumSize(720, 400)
+
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(18, 18, 18, 18)
+        layout.setSpacing(12)
+
+        title = QLabel(translate("project.manager.update_confirm_title", name=spec.name))
+        title.setObjectName("sourceSyncConfirmTitle")
+        layout.addWidget(title)
+
+        summary = QLabel(
+            translate(
+                "project.manager.update_confirm_summary",
+                added_files=len(plan.added_files),
+                modified_files=len(plan.modified_files),
+                removed_files=len(plan.removed_files),
+            )
+        )
+        summary.setObjectName("sourceSyncConfirmSummary")
+        summary.setWordWrap(True)
+        layout.addWidget(summary)
+
+        entries = QLabel(
+            translate(
+                "project.manager.update_confirm_entries",
+                added_entries=plan.added_entries,
+                modified_entries=plan.modified_entries,
+                removed_entries=plan.removed_entries,
+                invalidated=plan.invalidated_units,
+            )
+        )
+        entries.setObjectName("sourceSyncConfirmEntries")
+        entries.setWordWrap(True)
+        layout.addWidget(entries)
+
+        details = QPlainTextEdit(ProjectManagerDialog._format_plan_details(plan))
+        details.setObjectName("sourceSyncDetails")
+        details.setReadOnly(True)
+        details.setLineWrapMode(QPlainTextEdit.LineWrapMode.NoWrap)
+        layout.addWidget(details, 1)
+
+        buttons = QDialogButtonBox()
+        apply_button = buttons.addButton(
+            translate("project.manager.update_apply"),
+            QDialogButtonBox.ButtonRole.AcceptRole,
+        )
+        cancel_button = buttons.addButton(
+            translate("dialog.cancel"),
+            QDialogButtonBox.ButtonRole.RejectRole,
+        )
+        apply_button.setObjectName("sourceSyncApplyButton")
+        cancel_button.setObjectName("sourceSyncCancelButton")
+        cancel_button.setDefault(True)
+        buttons.accepted.connect(self.accept)
+        buttons.rejected.connect(self.reject)
+        layout.addWidget(buttons)
 
 
 class SuggestionDialog(QDialog):
@@ -5063,9 +5178,15 @@ class TranslatorWindow(QMainWindow):
             game_root = self._choose_management_game_root()
         if game_root is None:
             return
-        ProjectManagerDialog(game_root, APP_ROOT, self._sync_scanned_project, self).exec()
+        ProjectManagerDialog(
+            game_root,
+            APP_ROOT,
+            self._plan_scanned_project_sync,
+            self._apply_scanned_project_sync,
+            self,
+        ).exec()
 
-    def _sync_scanned_project(self, spec: SourceProjectSpec) -> str:
+    def _ensure_scanned_project_sync_allowed(self, spec: SourceProjectSpec) -> bool:
         if self.ai_worker is not None:
             raise RuntimeError(translate("dialog.translating_detail"))
         active_project = False
@@ -5078,8 +5199,15 @@ class TranslatorWindow(QMainWindow):
             self._commit_typing_operation()
             if self.project.has_dirty_units():
                 raise RuntimeError(translate("dialog.project_manager_unsaved_detail", name=spec.name))
+        return active_project
 
-        result = sync_source_project(spec.source_root, spec.project_root)
+    def _plan_scanned_project_sync(self, spec: SourceProjectSpec) -> SourceSyncPlan:
+        self._ensure_scanned_project_sync_allowed(spec)
+        return plan_source_project_sync(spec.source_root, spec.project_root)
+
+    def _apply_scanned_project_sync(self, spec: SourceProjectSpec, plan: SourceSyncPlan) -> str:
+        active_project = self._ensure_scanned_project_sync_allowed(spec)
+        result = apply_source_sync_plan(plan)
 
         if active_project:
             preferred = self.project.language if self.project is not None else self._normalized_language_name(self.language_combo.currentText())
@@ -5093,8 +5221,12 @@ class TranslatorWindow(QMainWindow):
         message = translate(
             "status.project_manager_synced",
             name=spec.name,
-            synced=len(result.synced_source_files),
+            added=len(result.added_source_files),
+            modified=len(result.modified_source_files),
             removed=len(result.removed_source_files),
+            added_entries=result.added_entries,
+            modified_entries=result.modified_entries,
+            removed_entries=result.removed_entries,
             invalidated=result.invalidated_units,
         )
         self.statusBar().showMessage(message, 7000)
@@ -7458,6 +7590,12 @@ def apply_game_style(app: QApplication) -> None:
         #editorPanel QPlainTextEdit {{ background-color: #211a12; background-image: url({asset("dark_panel_background_2048.png")}); background-repeat: no-repeat; color: #d8c68f; selection-background-color: #6c4d25; selection-color: #ead79a; padding: 10px; }}
         QSplitter::handle {{ background: #806537; }}
         QDialog {{ background-color: #2b2419; background-image: url({asset("dark_panel_background_2048.png")}); background-repeat: no-repeat; }}
+        #projectManagerSummary, #sourceSyncConfirmTitle {{ color: #e1c777; font-size: 16px; font-weight: 900; }}
+        #projectManagerGameRoot, #sourceSyncConfirmEntries {{ color: #bda86f; font-weight: 700; }}
+        #projectManagerRow {{ background-color: #241d14; border: 4px solid transparent; border-image: url({asset("Border_4px_4.png")}) 4 4 4 4 stretch stretch; }}
+        #projectManagerName, #sourceSyncConfirmSummary {{ color: #eadca7; font-weight: 900; }}
+        #projectManagerPath {{ color: #c8b77f; }}
+        #sourceSyncDetails {{ background-color: #17130e; color: #d8c68f; border: 4px solid transparent; border-image: url({asset("Border_4px_4.png")}) 4 4 4 4 stretch stretch; padding: 8px; }}
         QGroupBox {{ background: transparent; border: 0px; margin-top: 14px; padding-top: 8px; font-weight: 900; color: #eadca7; }}
         QGroupBox::title {{ subcontrol-origin: margin; subcontrol-position: top left; left: 12px; padding: 0 6px; background: #33291c; color: #d8c68f; }}
         QAbstractScrollArea {{ background: transparent; }}

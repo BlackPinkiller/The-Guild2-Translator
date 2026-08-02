@@ -113,9 +113,12 @@ from .self_tests.preview_assets import assert_bundled_preview_assets_are_complet
 from .self_tests.preview_presets import assert_preview_presets_are_complete_and_unambiguous
 from .self_tests.preview_format_layout import assert_preview_format_layout_controls_are_semantic
 from .source_sync import (
+    SourceSyncPlanStaleError,
+    apply_source_sync_plan,
     discover_game_source_projects,
     local_project_roots,
     managed_vanilla_project_root,
+    plan_source_project_sync,
     sync_source_project,
     sync_vanilla_sources,
 )
@@ -1846,8 +1849,23 @@ def assert_sync_source_project_invalidates_changed_translations(root: Path) -> N
         source_row.set_raw(source_field, source_row.get(source_field) + " [updated]")
         (source_root / unit.file_rel).write_bytes(source_doc.render_bytes())
         before_bytes = (project_root / "languages" / "#chinese" / unit.file_rel).read_bytes()
+        managed_source = project_root / "languages" / unit.file_rel
+        managed_source_before = managed_source.read_bytes()
+        workflow_path = cache_path(project_root)
+        workflow_before = workflow_path.read_bytes() if workflow_path.exists() else None
 
-        result = sync_source_project(source_root, project_root)
+        plan = plan_source_project_sync(source_root, project_root)
+        if len(plan.modified_files) != 1 or plan.modified_entries != 1:
+            raise AssertionError(f"source sync preview did not report the changed DBT entry: {plan}")
+        if plan.invalidated_units < 1:
+            raise AssertionError("source sync preview did not report affected existing translations")
+        if managed_source.read_bytes() != managed_source_before:
+            raise AssertionError("source sync preview changed the managed source file")
+        workflow_after_preview = workflow_path.read_bytes() if workflow_path.exists() else None
+        if workflow_after_preview != workflow_before:
+            raise AssertionError("source sync preview changed workflow review metadata")
+
+        result = apply_source_sync_plan(plan)
         if result.invalidated_units < 1:
             raise AssertionError("source sync did not invalidate any changed translations")
         after_bytes = (project_root / "languages" / "#chinese" / unit.file_rel).read_bytes()
@@ -1866,6 +1884,57 @@ def assert_sync_source_project_invalidates_changed_translations(root: Path) -> N
             raise AssertionError("changed translation should be flagged for manual confirmation")
         if updated.filter_status() != STATUS_REVIEW:
             raise AssertionError("changed translation should enter the needs-attention queue")
+
+        stale_doc = load_dbt(source_root / unit.file_rel)
+        stale_row = stale_doc.row_index[key]
+        stale_row.set_raw(source_field, stale_row.get(source_field) + " [preview]")
+        (source_root / unit.file_rel).write_bytes(stale_doc.render_bytes())
+        stale_plan = plan_source_project_sync(source_root, project_root)
+        stale_doc = load_dbt(source_root / unit.file_rel)
+        stale_row = stale_doc.row_index[key]
+        stale_row.set_raw(source_field, stale_row.get(source_field) + " [changed again]")
+        (source_root / unit.file_rel).write_bytes(stale_doc.render_bytes())
+        managed_before_stale_apply = managed_source.read_bytes()
+        try:
+            apply_source_sync_plan(stale_plan)
+        except SourceSyncPlanStaleError:
+            pass
+        else:
+            raise AssertionError("source sync applied a stale update preview")
+        if managed_source.read_bytes() != managed_before_stale_apply:
+            raise AssertionError("stale source sync preview changed the managed source file")
+    finally:
+        safe_rmtree(temp)
+
+
+def assert_source_sync_preview_classifies_file_and_entry_changes() -> None:
+    temp = Path(tempfile.gettempdir()) / f"translator_tool_smoke_source_plan_{uuid.uuid4().hex[:8]}"
+    try:
+        source_root = temp / "game" / "DB" / "Languages"
+        project_root = temp / "app" / "sources" / "Vanilla"
+        managed_root = project_root / "languages"
+        source_root.mkdir(parents=True)
+        managed_root.mkdir(parents=True)
+        (managed_root / "Changed.txt").write_text("old", encoding="utf-8")
+        (managed_root / "Removed.txt").write_text("removed", encoding="utf-8")
+        (source_root / "Changed.txt").write_text("new", encoding="utf-8")
+        (source_root / "Added.txt").write_text("added", encoding="utf-8")
+
+        plan = plan_source_project_sync(source_root, project_root)
+        if (len(plan.added_files), len(plan.modified_files), len(plan.removed_files)) != (1, 1, 1):
+            raise AssertionError(f"source sync preview misclassified changed files: {plan.changes}")
+        if (plan.added_entries, plan.modified_entries, plan.removed_entries) != (1, 1, 1):
+            raise AssertionError(f"source sync preview misclassified changed text entries: {plan.changes}")
+        if plan.invalidated_units != 0:
+            raise AssertionError("source sync preview invented affected translations without a target language")
+
+        result = apply_source_sync_plan(plan)
+        if (result.added_entries, result.modified_entries, result.removed_entries) != (1, 1, 1):
+            raise AssertionError("applied source sync did not retain its reviewed entry counts")
+        if (managed_root / "Changed.txt").read_text(encoding="utf-8") != "new":
+            raise AssertionError("source sync did not apply the reviewed text modification")
+        if (managed_root / "Removed.txt").exists():
+            raise AssertionError("source sync did not apply the reviewed file removal")
     finally:
         safe_rmtree(temp)
 
@@ -5404,6 +5473,7 @@ def main() -> int:
     assert_engine_owned_preview_styles()
     assert_startup_prefers_local_sources_over_game_root()
     assert_sync_vanilla_sources_only_imports_originals()
+    assert_source_sync_preview_classifies_file_and_entry_changes()
     assert_sync_source_project_invalidates_changed_translations(root)
     assert_failed_source_sync_restores_workflow_cache(root)
     assert_save_existing(root)
