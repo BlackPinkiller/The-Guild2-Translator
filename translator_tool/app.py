@@ -829,7 +829,11 @@ class EditorGroupBox(QGroupBox):
 
     def position_preview_button(self) -> None:
         height = self.fontMetrics().height() + 6
-        width = max(36, self.preview_button.fontMetrics().horizontalAdvance(self.preview_button.text()) + 16)
+        width = max(
+            36,
+            self.preview_button.sizeHint().width(),
+            self.preview_button.fontMetrics().horizontalAdvance(self.preview_button.text()) + 16,
+        )
         self.preview_button.setFixedSize(width, height)
         self.preview_button.move(max(8, self.width() - width - 12), 1)
         if self.code_button.isVisible():
@@ -7348,6 +7352,7 @@ def apply_dark_style(app: QApplication) -> None:
         QPushButton#reviewAttention, QPushButton#batchAi[mode="cancel"] { background: #793b43; color: #ffffff; border-color: #a85a64; }
         QPushButton#batchAi[mode="busy"] { background: #326848; color: #ffffff; }
         QPushButton#batchAi[mode="cancelling"] { background: #875626; color: #ffffff; }
+        QToolButton#previewToggle { padding: 0 6px; }
         QToolButton#previewToggle:checked, QToolButton#searchCaseButton:checked { background: #315f8a; color: #ffffff; border-color: #578bc0; }
         QToolButton#searchCaseButton { color: #9aa4b2; padding: 0; }
         QLabel#codeReferenceCount { background: #111318; color: #9aa4b2; padding: 0 6px; }

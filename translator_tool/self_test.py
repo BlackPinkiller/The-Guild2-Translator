@@ -3298,12 +3298,19 @@ def assert_ui_language_switching() -> None:
 
 
 def assert_dark_theme() -> None:
-    from PySide6.QtGui import QPalette
+    from PySide6.QtGui import QFont, QFontDatabase, QPalette
     from PySide6.QtWidgets import QApplication
 
-    from .app import SettingsDialog, _history_state_html, apply_theme
+    from .app import EditorGroupBox, SettingsDialog, _history_state_html, apply_theme
 
     app = QApplication.instance() or QApplication([])
+    previous_font = QFont(app.font())
+    chinese_font_path = Path(os.environ.get("WINDIR", "C:/Windows")) / "Fonts" / "msyh.ttc"
+    if chinese_font_path.is_file():
+        font_id = QFontDatabase.addApplicationFont(str(chinese_font_path))
+        if font_id < 0:
+            raise AssertionError("visual theme test could not load the Windows Chinese UI font")
+        app.setFont(QFont("Microsoft YaHei UI", 10))
     previous_theme = (
         "guild2"
         if app.property("guild2Theme") is True
@@ -3319,6 +3326,19 @@ def assert_dark_theme() -> None:
             raise AssertionError("dark theme did not apply its editor background palette")
         if "background: #111318" not in _history_state_html("Title", "Detail"):
             raise AssertionError("history HTML did not follow the active dark theme")
+
+        editor_box = EditorGroupBox()
+        try:
+            editor_box.preview_button.setText("预览")
+            if chinese_font_path.is_file() and not editor_box.preview_button.fontMetrics().inFontUcs4(ord("预")):
+                raise AssertionError("visual theme test rendered Chinese with a fallback missing-glyph box")
+            natural_width = editor_box.preview_button.sizeHint().width()
+            editor_box.resize(480, 200)
+            editor_box.position_preview_button()
+            if editor_box.preview_button.width() < natural_width:
+                raise AssertionError("dark theme clipped the preview toggle below its themed size hint")
+        finally:
+            editor_box.deleteLater()
 
         dialog = SettingsDialog(AppSettings(ui_theme="dark"))
         try:
@@ -3349,6 +3369,7 @@ def assert_dark_theme() -> None:
             raise AssertionError("switching from dark did not restore the game theme state")
     finally:
         apply_theme(app, previous_theme)
+        app.setFont(previous_font)
 
 
 def assert_external_project_uses_tool_codec(root: Path) -> None:
