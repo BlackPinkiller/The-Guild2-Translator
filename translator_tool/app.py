@@ -190,6 +190,7 @@ class SearchLineEdit(QLineEdit):
     def __init__(self, parent: QWidget | None = None) -> None:
         super().__init__(parent)
         self.case_button = QToolButton(self)
+        self.case_button.setObjectName("searchCaseButton")
         self.case_button.setText("Aa")
         self.case_button.setCheckable(True)
         self.case_button.setAutoRaise(True)
@@ -291,14 +292,14 @@ class UnitTableModel(QAbstractTableModel):
                 return label + suffix + detail
         if role == Qt.ItemDataRole.BackgroundRole:
             if unit.pending_delete:
-                return QColor("#f2d6d3")
+                return QColor(_theme_row_tint("delete", "#f2d6d3"))
             if unit.requires_manual_review:
-                return QColor("#f4b66f")
+                return QColor(_theme_row_tint("review", "#f4b66f"))
             if self.has_glyph_warning(index.row()):
-                return QColor("#f3d9a4")
-            return QColor("#dce5b5") if unit.uid in self._recently_translated else None
+                return QColor(_theme_row_tint("glyph", "#f3d9a4"))
+            return QColor(_theme_row_tint("recent", "#dce5b5")) if unit.uid in self._recently_translated else None
         if role == Qt.ItemDataRole.ForegroundRole and unit.pending_delete:
-            return QColor("#9d0006")
+            return QColor(_theme_color("bad_token", "#9d0006"))
         if role == Qt.ItemDataRole.FontRole and unit.pending_delete:
             font = QFont()
             font.setStrikeOut(True)
@@ -605,12 +606,16 @@ class RowTintDelegate(QStyledItemDelegate):
             font = index.data(Qt.ItemDataRole.FontRole)
             painter.setFont(font if isinstance(font, QFont) else option.font)
             foreground = index.data(Qt.ItemDataRole.ForegroundRole)
-            painter.setPen(foreground if isinstance(foreground, QColor) else QColor("#3c3836"))
+            painter.setPen(
+                foreground
+                if isinstance(foreground, QColor)
+                else QColor(_theme_color("text", "#3c3836"))
+            )
             text_rect = option.rect.adjusted(5, 0, -5, 0)
             text = str(index.data(Qt.ItemDataRole.DisplayRole) or "")
             text = painter.fontMetrics().elidedText(text, option.textElideMode, text_rect.width())
             painter.drawText(text_rect, option.displayAlignment or (Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter), text)
-            painter.setPen(QColor("#d5c4a1"))
+            painter.setPen(QColor(_theme_color("muted_text", "#d5c4a1")))
             painter.drawLine(option.rect.bottomLeft(), option.rect.bottomRight())
             painter.restore()
             return
@@ -2525,7 +2530,7 @@ class SettingsDialog(QDialog):
         current = str(self.ui_theme.currentData() or self.settings.ui_theme or "modern")
         blocker = QSignalBlocker(self.ui_theme)
         self.ui_theme.clear()
-        for value in ("modern", "guild2"):
+        for value in ("modern", "dark", "guild2"):
             self.ui_theme.addItem(
                 translate(f"settings.theme.{value}", locale=self._preview_language),
                 value,
@@ -3471,11 +3476,6 @@ class TranslatorWindow(QMainWindow):
         self.search_edit = SearchLineEdit()
         self.search_edit.setClearButtonEnabled(True)
         self.search_edit.setMinimumWidth(240)
-        self.search_edit.case_button.setStyleSheet(
-            "QToolButton { color: #665c54; font-weight: 800; border-radius: 4px; padding: 0; }"
-            "QToolButton:hover { background: #e5d6aa; }"
-            "QToolButton:checked { color: #fbf1c7; background: #458588; }"
-        )
         self.search_edit.case_sensitive_toggled.connect(self._on_search_case_toggled)
         self.search_debounce = QTimer(self)
         self.search_debounce.setSingleShot(True)
@@ -6709,26 +6709,57 @@ def _make_editor_selection(
     return selection
 
 
+def _history_colors() -> dict[str, str]:
+    app = QApplication.instance()
+    if app is not None and bool(app.property("guild2Theme")):
+        return {
+            "base": "#211a12", "text": "#eadca7", "panel": "#2b2419", "border": "#806537",
+            "error_bg": "#4b241d", "error_border": "#a84f36", "muted": "#b8a274",
+            "header": "#4a321d", "entry": "#30271a", "diff": "#211a12",
+            "add_bg": "#32462d", "add_text": "#b9d59e", "danger_bg": "#542822",
+            "danger_text": "#f0a18d", "diff_add_bg": "#735727", "diff_add_text": "#fff0b8",
+            "empty": "#a99667",
+        }
+    if app is not None and bool(app.property("darkTheme")):
+        return {
+            "base": "#111318", "text": "#e3e7ee", "panel": "#20252d", "border": "#3a424e",
+            "error_bg": "#45262b", "error_border": "#8f4d58", "muted": "#9aa4b2",
+            "header": "#252a33", "entry": "#1b1f26", "diff": "#111318",
+            "add_bg": "#20392d", "add_text": "#89d3a7", "danger_bg": "#45262b",
+            "danger_text": "#ff9b96", "diff_add_bg": "#315f8a", "diff_add_text": "#ffffff",
+            "empty": "#747d8b",
+        }
+    return {
+        "base": "#fbf1c7", "text": "#3c3836", "panel": "#f2e5bc", "border": "#bdae93",
+        "error_bg": "#f2d8d8", "error_border": "#cc241d", "muted": "#665c54",
+        "header": "#d5c4a1", "entry": "#f9efc9", "diff": "#fbf1c7",
+        "add_bg": "#d8f0d2", "add_text": "#076678", "danger_bg": "#f5d6d6",
+        "danger_text": "#9d0006", "diff_add_bg": "#c6a15b", "diff_add_text": "#1d2021",
+        "empty": "#928374",
+    }
+
+
 def _history_state_html(title: str, detail: str, *, kind: str = "info") -> str:
+    colors = _history_colors()
     return f"""
     <html>
       <head>
         <style>
           body.history-root {{
-            background: #fbf1c7;
-            color: #3c3836;
+            background: {colors["base"]};
+            color: {colors["text"]};
             font-family: "Segoe UI", "Microsoft YaHei UI";
             margin: 0;
           }}
           .history-state {{
-            background: #f2e5bc;
-            border: 2px solid #bdae93;
+            background: {colors["panel"]};
+            border: 2px solid {colors["border"]};
             border-radius: 10px;
             padding: 14px 16px;
           }}
           .history-state--error {{
-            background: #f2d8d8;
-            border-color: #cc241d;
+            background: {colors["error_bg"]};
+            border-color: {colors["error_border"]};
           }}
           .history-state__title {{
             font-size: 16px;
@@ -6736,7 +6767,7 @@ def _history_state_html(title: str, detail: str, *, kind: str = "info") -> str:
           }}
           .history-state__detail {{
             margin-top: 6px;
-            color: #665c54;
+            color: {colors["muted"]};
             font-weight: 600;
             white-space: pre-wrap;
           }}
@@ -6849,26 +6880,27 @@ def _render_history_html(commits_oldest_first: tuple[GitCommit, ...], entries: l
         delete=delete_count,
         files=len(file_counts),
     )
+    colors = _history_colors()
     return f"""
     <html>
       <head>
         <style>
           body.history-root {{
-            background: #fbf1c7;
-            color: #3c3836;
+            background: {colors["base"]};
+            color: {colors["text"]};
             font-family: "Segoe UI", "Microsoft YaHei UI";
             margin: 0;
           }}
           .history-summary, .history-state {{
-            background: #f2e5bc;
-            border: 2px solid #bdae93;
+            background: {colors["panel"]};
+            border: 2px solid {colors["border"]};
             border-radius: 10px;
             padding: 14px 16px;
             margin-bottom: 16px;
           }}
           .history-state--error {{
-            background: #f2d8d8;
-            border-color: #cc241d;
+            background: {colors["error_bg"]};
+            border-color: {colors["error_border"]};
           }}
           .history-state__title, .history-summary__title {{
             font-size: 16px;
@@ -6876,18 +6908,18 @@ def _render_history_html(commits_oldest_first: tuple[GitCommit, ...], entries: l
           }}
           .history-state__detail, .history-summary__meta, .history-summary__note {{
             margin-top: 6px;
-            color: #665c54;
+            color: {colors["muted"]};
             font-weight: 600;
           }}
           .history-summary__note {{
-            color: #3c3836;
+            color: {colors["text"]};
           }}
           .history-file {{
             margin-top: 14px;
           }}
           .history-file__name {{
-            background: #d5c4a1;
-            border: 2px solid #3c3836;
+            background: {colors["header"]};
+            border: 2px solid {colors["border"]};
             border-radius: 8px;
             font-size: 14px;
             font-weight: 900;
@@ -6895,8 +6927,8 @@ def _render_history_html(commits_oldest_first: tuple[GitCommit, ...], entries: l
             margin-bottom: 8px;
           }}
           .history-entry {{
-            background: #f9efc9;
-            border: 1px solid #d5c4a1;
+            background: {colors["entry"]};
+            border: 1px solid {colors["border"]};
             border-radius: 8px;
             padding: 8px 10px;
             margin-bottom: 8px;
@@ -6910,14 +6942,14 @@ def _render_history_html(commits_oldest_first: tuple[GitCommit, ...], entries: l
             font-size: 13px;
           }}
           .history-entry__meta {{
-            color: #7c6f64;
+            color: {colors["muted"]};
             font-size: 11px;
             font-weight: 700;
             margin-bottom: 6px;
           }}
           .history-entry__diff {{
-            background: #fbf1c7;
-            border: 1px solid #d5c4a1;
+            background: {colors["diff"]};
+            border: 1px solid {colors["border"]};
             border-radius: 6px;
             padding: 6px 8px;
             white-space: pre-wrap;
@@ -6927,7 +6959,7 @@ def _render_history_html(commits_oldest_first: tuple[GitCommit, ...], entries: l
           }}
           .history-entry__source {{
             margin-top: 5px;
-            color: #7c6f64;
+            color: {colors["muted"]};
             font-size: 11px;
             font-weight: 600;
             white-space: pre-wrap;
@@ -6942,33 +6974,33 @@ def _render_history_html(commits_oldest_first: tuple[GitCommit, ...], entries: l
             font-weight: 900;
           }}
           .history-badge--add {{
-            background: #d8f0d2;
-            color: #076678;
+            background: {colors["add_bg"]};
+            color: {colors["add_text"]};
           }}
           .history-badge--update {{
-            background: #f5d6d6;
-            color: #9d0006;
+            background: {colors["danger_bg"]};
+            color: {colors["danger_text"]};
           }}
           .history-badge--delete {{
-            background: #f5d6d6;
-            color: #9d0006;
+            background: {colors["danger_bg"]};
+            color: {colors["danger_text"]};
           }}
           .diff-del {{
-            background: #f5d6d6;
-            color: #9d0006;
+            background: {colors["danger_bg"]};
+            color: {colors["danger_text"]};
             border-radius: 3px;
             padding: 0 1px;
             text-decoration: line-through;
             text-decoration-thickness: 2px;
           }}
           .diff-add {{
-            background: #c6a15b;
-            color: #1d2021;
+            background: {colors["diff_add_bg"]};
+            color: {colors["diff_add_text"]};
             border-radius: 3px;
             padding: 0 1px;
           }}
           .diff-empty {{
-            color: #928374;
+            color: {colors["empty"]};
             font-style: italic;
           }}
         </style>
@@ -7104,6 +7136,36 @@ def _theme_color(name: str, fallback: str) -> str:
             "bad_token": "#d4775d",
             "glyph_token": "#d4775d",
         }.get(name, fallback)
+    if app is not None and bool(app.property("darkTheme")):
+        return {
+            "text": "#e3e7ee",
+            "muted_text": "#747d8b",
+            "format_token": "#79b8ff",
+            "color_token": "#d2a8ff",
+            "markup_token": "#e3b341",
+            "quote_token": "#7ee787",
+            "bad_token": "#ff7b72",
+            "glyph_token": "#ff9b8f",
+        }.get(name, fallback)
+    return fallback
+
+
+def _theme_row_tint(name: str, fallback: str) -> str:
+    app = QApplication.instance()
+    if app is not None and bool(app.property("darkTheme")):
+        return {
+            "delete": "#45262b",
+            "review": "#4b3823",
+            "glyph": "#433b25",
+            "recent": "#20392d",
+        }.get(name, fallback)
+    if app is not None and bool(app.property("guild2Theme")):
+        return {
+            "delete": "#4b241d",
+            "review": "#57401f",
+            "glyph": "#4b4025",
+            "recent": "#283c28",
+        }.get(name, fallback)
     return fallback
 
 
@@ -7123,18 +7185,28 @@ def _text_format(color: str, underline: bool = False) -> QTextCharFormat:
 
 def apply_modern_style(app: QApplication) -> None:
     app.setProperty("guild2Theme", False)
+    app.setProperty("darkTheme", False)
     app.setProperty("gameThemeQss", "")
     app.setStyleSheet("")
     app.setStyle("Fusion")
     app._game_theme_style = None
     palette = app.palette()
     palette.setColor(QPalette.ColorRole.Window, QColor("#ebdbb2"))
+    palette.setColor(QPalette.ColorRole.WindowText, QColor("#3c3836"))
     palette.setColor(QPalette.ColorRole.Base, QColor("#fbf1c7"))
     palette.setColor(QPalette.ColorRole.AlternateBase, QColor("#ebdbb2"))
+    palette.setColor(QPalette.ColorRole.ToolTipBase, QColor("#3c3836"))
+    palette.setColor(QPalette.ColorRole.ToolTipText, QColor("#fbf1c7"))
     palette.setColor(QPalette.ColorRole.Text, QColor("#3c3836"))
     palette.setColor(QPalette.ColorRole.Button, QColor("#d79921"))
+    palette.setColor(QPalette.ColorRole.ButtonText, QColor("#3c3836"))
+    palette.setColor(QPalette.ColorRole.BrightText, QColor("#cc241d"))
+    palette.setColor(QPalette.ColorRole.Link, QColor("#076678"))
     palette.setColor(QPalette.ColorRole.Highlight, QColor("#c6a15b"))
     palette.setColor(QPalette.ColorRole.HighlightedText, QColor("#3c3836"))
+    palette.setColor(QPalette.ColorRole.PlaceholderText, QColor("#7c6f64"))
+    palette.setColor(QPalette.ColorGroup.Disabled, QPalette.ColorRole.Text, QColor("#928374"))
+    palette.setColor(QPalette.ColorGroup.Disabled, QPalette.ColorRole.ButtonText, QColor("#928374"))
     app.setPalette(palette)
     app.setStyleSheet(
         """
@@ -7187,6 +7259,9 @@ def apply_modern_style(app: QApplication) -> None:
         QToolButton#previewToggle { border: 2px solid #3c3836; border-radius: 4px; padding: 0 6px; }
         QToolButton#previewToggle:pressed { border: 2px solid #3c3836; padding: 1px 5px 0 7px; }
         QToolButton#previewToggle:checked { background: #689d6a; color: #fbf1c7; }
+        QToolButton#searchCaseButton { color: #665c54; font-weight: 800; border-radius: 4px; padding: 0; }
+        QToolButton#searchCaseButton:hover { background: #e5d6aa; }
+        QToolButton#searchCaseButton:checked { color: #fbf1c7; background: #458588; }
         QPushButton:pressed, QToolButton:pressed { border-top: 5px solid #3c3836; border-bottom: 2px solid #3c3836; padding: 8px 8px 2px 12px; }
         QPushButton#primary { background: #458588; color: #fbf1c7; }
         QPushButton#primary:hover { background: #689d6a; }
@@ -7208,6 +7283,93 @@ def apply_modern_style(app: QApplication) -> None:
     )
 
 
+def apply_dark_style(app: QApplication) -> None:
+    app.setProperty("guild2Theme", False)
+    app.setProperty("darkTheme", True)
+    app.setProperty("gameThemeQss", "")
+    app.setStyleSheet("")
+    app.setStyle("Fusion")
+    app._game_theme_style = None
+    palette = app.palette()
+    palette.setColor(QPalette.ColorRole.Window, QColor("#171a1f"))
+    palette.setColor(QPalette.ColorRole.WindowText, QColor("#e3e7ee"))
+    palette.setColor(QPalette.ColorRole.Base, QColor("#111318"))
+    palette.setColor(QPalette.ColorRole.AlternateBase, QColor("#1d2128"))
+    palette.setColor(QPalette.ColorRole.ToolTipBase, QColor("#252a33"))
+    palette.setColor(QPalette.ColorRole.ToolTipText, QColor("#f2f4f8"))
+    palette.setColor(QPalette.ColorRole.Text, QColor("#e3e7ee"))
+    palette.setColor(QPalette.ColorRole.Button, QColor("#252a33"))
+    palette.setColor(QPalette.ColorRole.ButtonText, QColor("#e3e7ee"))
+    palette.setColor(QPalette.ColorRole.BrightText, QColor("#ff7b72"))
+    palette.setColor(QPalette.ColorRole.Link, QColor("#79b8ff"))
+    palette.setColor(QPalette.ColorRole.Highlight, QColor("#3f6693"))
+    palette.setColor(QPalette.ColorRole.HighlightedText, QColor("#ffffff"))
+    palette.setColor(QPalette.ColorRole.PlaceholderText, QColor("#747d8b"))
+    palette.setColor(QPalette.ColorGroup.Disabled, QPalette.ColorRole.Text, QColor("#68717d"))
+    palette.setColor(QPalette.ColorGroup.Disabled, QPalette.ColorRole.ButtonText, QColor("#68717d"))
+    app.setPalette(palette)
+    app.setStyleSheet(
+        """
+        QWidget { color: #e3e7ee; font-family: "Segoe UI", "Microsoft YaHei UI"; font-size: 13px; }
+        QMainWindow, #root, QDialog { background: #171a1f; }
+        #titlebar { background: #20252d; border: 1px solid #343b46; border-radius: 8px; }
+        #workspaceTitle { color: #f2f4f8; font-size: 18px; font-weight: 900; letter-spacing: 1px; }
+        #workspaceSubtitle { color: #8c96a5; font-size: 10px; font-weight: 800; letter-spacing: 2px; }
+        #toolbar { background: #20252d; border: 1px solid #343b46; border-radius: 8px; }
+        #toolbar QLabel { font-weight: 800; }
+        #counts { background: #111318; border: 1px solid #343b46; border-radius: 6px; color: #cdd3dc; font-weight: 800; padding: 5px 8px; }
+        #issues { background: #38252c; border: 1px solid #75414c; border-radius: 7px; padding: 8px 10px; color: #ffd7dc; font-weight: 600; }
+        #hint, #historyHint, #suggestionStatus { color: #9aa4b2; font-weight: 600; }
+        #projectManagerDialog { background: #171a1f; }
+        #projectManagerSummary, #projectManagerRow { background: #20252d; border: 1px solid #3a424e; border-radius: 8px; padding: 8px 10px; }
+        #projectManagerGameRoot { background: #111318; border: 1px solid #343b46; border-radius: 8px; padding: 7px 10px; }
+        #projectManagerPath { color: #9aa4b2; font-weight: 600; }
+        #projectManagerFeedback { background: #1f382d; border: 1px solid #3f765b; border-radius: 8px; padding: 8px 10px; }
+        #projectKindBadge[kind="vanilla"] { background: #315f78; color: #f2f4f8; }
+        #projectKindBadge[kind="mod"] { background: #376b4b; color: #f2f4f8; }
+        #projectStateBadge[state="added"] { background: #806b31; color: #ffffff; }
+        #projectStateBadge[state="missing"] { background: #8b5628; color: #ffffff; }
+        QGroupBox { background: #20252d; border: 1px solid #3a424e; border-radius: 8px; margin-top: 14px; padding-top: 8px; font-weight: 900; }
+        QGroupBox::title { subcontrol-origin: margin; subcontrol-position: top left; left: 12px; padding: 0 6px; background: #20252d; color: #dce1e8; }
+        QTableView, QListWidget, QPlainTextEdit, QTextEdit, QTextBrowser { background: #111318; color: #e3e7ee; border: 1px solid #343b46; border-radius: 7px; selection-background-color: #3f6693; selection-color: #ffffff; }
+        QTableView { gridline-color: #303641; }
+        QTableView::item { background: transparent; border-bottom: 1px solid #292f38; padding: 2px 4px; }
+        QTableView::item:selected, QListWidget::item:selected { background: #3f6693; color: #ffffff; }
+        QHeaderView::section { background: #252a33; color: #dce1e8; border: 0; border-right: 1px solid #3a424e; border-bottom: 1px solid #4b5563; padding: 8px; font-weight: 900; }
+        QLineEdit, QComboBox, QSpinBox { background: #111318; color: #e3e7ee; border: 1px solid #3a424e; border-radius: 5px; padding: 5px 7px; min-height: 20px; }
+        QLineEdit:focus, QComboBox:focus, QSpinBox:focus { border: 1px solid #6ea8e0; }
+        QComboBox QAbstractItemView { background: #20252d; color: #e3e7ee; border: 1px solid #4b5563; selection-background-color: #3f6693; selection-color: #ffffff; }
+        QPushButton, QToolButton { background: #2b313b; color: #e3e7ee; border: 1px solid #4b5563; border-radius: 5px; padding: 6px 10px; font-weight: 800; }
+        QPushButton:hover, QToolButton:hover { background: #353d49; border-color: #687483; }
+        QPushButton:pressed, QToolButton:pressed { background: #20252d; }
+        QPushButton:disabled, QToolButton:disabled { background: #20242b; color: #68717d; border-color: #303641; }
+        QPushButton#primary { background: #315f8a; color: #ffffff; border-color: #578bc0; }
+        QPushButton#primary:hover { background: #3b70a1; }
+        QPushButton#reviewAttention, QPushButton#batchAi[mode="cancel"] { background: #793b43; color: #ffffff; border-color: #a85a64; }
+        QPushButton#batchAi[mode="busy"] { background: #326848; color: #ffffff; }
+        QPushButton#batchAi[mode="cancelling"] { background: #875626; color: #ffffff; }
+        QToolButton#previewToggle:checked, QToolButton#searchCaseButton:checked { background: #315f8a; color: #ffffff; border-color: #578bc0; }
+        QToolButton#searchCaseButton { color: #9aa4b2; padding: 0; }
+        QLabel#codeReferenceCount { background: #111318; color: #9aa4b2; padding: 0 6px; }
+        QTabWidget::pane { background: #171a1f; border: 1px solid #3a424e; top: -1px; }
+        QTabBar::tab { background: #20252d; color: #aeb7c4; border: 1px solid #343b46; padding: 7px 12px; }
+        QTabBar::tab:selected { background: #2b313b; color: #ffffff; border-bottom-color: #2b313b; }
+        QMenu { background: #20252d; color: #e3e7ee; border: 1px solid #4b5563; padding: 4px; }
+        QMenu::item { padding: 7px 22px 7px 10px; }
+        QMenu::item:selected { background: #3f6693; color: #ffffff; }
+        QMenu::separator { height: 1px; background: #3a424e; margin: 6px 8px; }
+        QToolTip { background: #252a33; color: #f2f4f8; border: 1px solid #687483; padding: 5px; }
+        QStatusBar { background: #171a1f; color: #9aa4b2; }
+        QScrollBar:vertical { background: #111318; width: 14px; margin: 0; }
+        QScrollBar:horizontal { background: #111318; height: 14px; margin: 0; }
+        QScrollBar::handle { background: #3a424e; border-radius: 5px; min-height: 28px; min-width: 28px; }
+        QScrollBar::handle:hover { background: #4b5563; }
+        QScrollBar::add-line, QScrollBar::sub-line { width: 0; height: 0; }
+        QSplitter::handle { background: #343b46; }
+        """
+    )
+
+
 def _game_theme_asset(name: str) -> str:
     return (Path(__file__).resolve().parents[1] / "assets" / "game_theme" / name).as_posix()
 
@@ -7215,16 +7377,26 @@ def _game_theme_asset(name: str) -> str:
 def apply_game_style(app: QApplication) -> None:
     asset = _game_theme_asset
     app.setProperty("guild2Theme", True)
+    app.setProperty("darkTheme", False)
     app.setStyleSheet("")
     app.setStyle("Fusion")
     palette = app.palette()
     palette.setColor(QPalette.ColorRole.Window, QColor("#2b2419"))
+    palette.setColor(QPalette.ColorRole.WindowText, QColor("#eadca7"))
     palette.setColor(QPalette.ColorRole.Base, QColor("#2b2419"))
     palette.setColor(QPalette.ColorRole.AlternateBase, QColor("#33291c"))
+    palette.setColor(QPalette.ColorRole.ToolTipBase, QColor("#2b2419"))
+    palette.setColor(QPalette.ColorRole.ToolTipText, QColor("#eadca7"))
     palette.setColor(QPalette.ColorRole.Text, QColor("#eadca7"))
     palette.setColor(QPalette.ColorRole.Button, QColor("#4a321d"))
+    palette.setColor(QPalette.ColorRole.ButtonText, QColor("#eadca7"))
+    palette.setColor(QPalette.ColorRole.BrightText, QColor("#d4775d"))
+    palette.setColor(QPalette.ColorRole.Link, QColor("#d0ad61"))
     palette.setColor(QPalette.ColorRole.Highlight, QColor("#876a2f"))
     palette.setColor(QPalette.ColorRole.HighlightedText, QColor("#fff0b8"))
+    palette.setColor(QPalette.ColorRole.PlaceholderText, QColor("#a99667"))
+    palette.setColor(QPalette.ColorGroup.Disabled, QPalette.ColorRole.Text, QColor("#75684a"))
+    palette.setColor(QPalette.ColorGroup.Disabled, QPalette.ColorRole.ButtonText, QColor("#75684a"))
     app.setPalette(palette)
     install_game_theme_style(app)
     qss = f"""
@@ -7272,6 +7444,8 @@ def apply_theme(app: QApplication | None, theme: str) -> None:
         return
     if theme == "guild2":
         apply_game_style(app)
+    elif theme == "dark":
+        apply_dark_style(app)
     else:
         apply_modern_style(app)
 

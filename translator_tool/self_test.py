@@ -3297,6 +3297,60 @@ def assert_ui_language_switching() -> None:
         set_language(previous)
 
 
+def assert_dark_theme() -> None:
+    from PySide6.QtGui import QPalette
+    from PySide6.QtWidgets import QApplication
+
+    from .app import SettingsDialog, _history_state_html, apply_theme
+
+    app = QApplication.instance() or QApplication([])
+    previous_theme = (
+        "guild2"
+        if app.property("guild2Theme") is True
+        else "dark"
+        if app.property("darkTheme") is True
+        else "modern"
+    )
+    try:
+        apply_theme(app, "dark")
+        if app.property("darkTheme") is not True or app.property("guild2Theme") is True:
+            raise AssertionError("dark theme properties were not applied independently of the game theme")
+        if app.palette().color(QPalette.ColorRole.Base).name().lower() != "#111318":
+            raise AssertionError("dark theme did not apply its editor background palette")
+        if "background: #111318" not in _history_state_html("Title", "Detail"):
+            raise AssertionError("history HTML did not follow the active dark theme")
+
+        dialog = SettingsDialog(AppSettings(ui_theme="dark"))
+        try:
+            choices = tuple(
+                dialog.ui_theme.itemData(index)
+                for index in range(dialog.ui_theme.count())
+            )
+            if choices != ("modern", "dark", "guild2"):
+                raise AssertionError("settings did not expose the three fixed theme choices")
+            if dialog.ui_theme.currentData() != "dark" or dialog.result_settings().ui_theme != "dark":
+                raise AssertionError("dark theme selection was not retained")
+        finally:
+            dialog.deleteLater()
+
+        apply_theme(app, "modern")
+        if (
+            app.property("darkTheme") is not False
+            or app.property("guild2Theme") is not False
+            or app.palette().color(QPalette.ColorRole.Base).name().lower() != "#fbf1c7"
+        ):
+            raise AssertionError("switching away from dark did not restore the modern palette")
+        apply_theme(app, "guild2")
+        if (
+            app.property("guild2Theme") is not True
+            or app.property("darkTheme") is not False
+            or "background: #211a12" not in _history_state_html("Title", "Detail")
+        ):
+            raise AssertionError("switching from dark did not restore the game theme state")
+    finally:
+        apply_theme(app, previous_theme)
+
+
 def assert_external_project_uses_tool_codec(root: Path) -> None:
     temp = Path(tempfile.gettempdir()) / f"translator_tool_smoke_external_codec_{uuid.uuid4().hex[:8]}"
     temp.mkdir(parents=True, exist_ok=False)
@@ -5348,6 +5402,7 @@ def main() -> int:
     assert_bundled_settings_are_isolated_by_location()
     assert_editor_undo_stays_local(root)
     assert_ui_language_switching()
+    assert_dark_theme()
     assert_external_project_uses_tool_codec(root)
     assert_packaged_runtime_finds_sibling_codec(root)
     assert_non_chinese_language_bypasses_codec(root)
