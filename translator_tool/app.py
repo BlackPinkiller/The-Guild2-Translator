@@ -1085,7 +1085,12 @@ class AiButtonDelegate(QStyledItemDelegate):
             painter.setBrush(QColor("#3c3836"))
             shadow_offset = 4 if hovered else 3
             painter.drawRoundedRect(rect.translated(3, shadow_offset), 4, 4)
-        fill = QColor("#d79921") if self.provider == "google" else QColor("#b16286")
+        if self.provider == "google":
+            fill = QColor("#d79921")
+        elif self.provider == "deepl":
+            fill = QColor("#287fc4")
+        else:
+            fill = QColor("#b16286")
         if hovered:
             fill = fill.lighter(108 + int((math.sin(self._hover_phase) + 1) * 6))
         if pressed:
@@ -2129,18 +2134,33 @@ class SettingsDialog(QDialog):
         tab = QWidget()
         layout = QVBoxLayout(tab)
 
+        self.translation_languages_group = QGroupBox()
+        languages_form = QFormLayout(self.translation_languages_group)
+        self.source_language = QLineEdit(self.settings.source_language)
+        self.target_language = QLineEdit(self.settings.target_language)
+        self.source_language_label = QLabel()
+        self.target_language_label = QLabel()
+        languages_form.addRow(self.source_language_label, self.source_language)
+        languages_form.addRow(self.target_language_label, self.target_language)
+        layout.addWidget(self.translation_languages_group)
+
         self.google_group = QGroupBox()
         google_form = QFormLayout(self.google_group)
         self.google_endpoint = QLineEdit(self.settings.google_endpoint)
-        self.source_language = QLineEdit(self.settings.source_language)
-        self.target_language = QLineEdit(self.settings.target_language)
         self.google_endpoint_label = QLabel()
-        self.source_language_label = QLabel()
-        self.target_language_label = QLabel()
         google_form.addRow(self.google_endpoint_label, self.google_endpoint)
-        google_form.addRow(self.source_language_label, self.source_language)
-        google_form.addRow(self.target_language_label, self.target_language)
         layout.addWidget(self.google_group)
+
+        self.deepl_group = QGroupBox()
+        deepl_form = QFormLayout(self.deepl_group)
+        self.deepl_plan = QComboBox()
+        self.deepl_key = QLineEdit(reveal_secret(self.settings.deepl_api_key_protected))
+        self.deepl_key.setEchoMode(QLineEdit.EchoMode.Password)
+        self.deepl_plan_label = QLabel()
+        self.deepl_key_label = QLabel()
+        deepl_form.addRow(self.deepl_plan_label, self.deepl_plan)
+        deepl_form.addRow(self.deepl_key_label, self.deepl_key)
+        layout.addWidget(self.deepl_group)
 
         self.openai_group = QGroupBox()
         openai_form = QFormLayout(self.openai_group)
@@ -2216,9 +2236,23 @@ class SettingsDialog(QDialog):
         blocker = QSignalBlocker(self.provider)
         self.provider.clear()
         self.provider.addItem(translate("settings.group.google", locale=self._preview_language), "google")
+        self.provider.addItem(translate("settings.group.deepl", locale=self._preview_language), "deepl")
         self.provider.addItem(translate("dialog.ai_service_openai", locale=self._preview_language).lstrip("✦ ").strip(), "openai")
         index = self.provider.findData(current)
         self.provider.setCurrentIndex(index if index >= 0 else 0)
+        del blocker
+
+    def _populate_deepl_plan_combo(self) -> None:
+        current = str(self.deepl_plan.currentData() or self.settings.deepl_plan or "free")
+        blocker = QSignalBlocker(self.deepl_plan)
+        self.deepl_plan.clear()
+        for value in ("free", "pro"):
+            self.deepl_plan.addItem(
+                translate(f"settings.deepl_plan.{value}", locale=self._preview_language),
+                value,
+            )
+        index = self.deepl_plan.findData(current)
+        self.deepl_plan.setCurrentIndex(index if index >= 0 else 0)
         del blocker
 
     def _populate_preview_scope_combo(self) -> None:
@@ -2257,6 +2291,7 @@ class SettingsDialog(QDialog):
         self._populate_ui_language_combo()
         self._populate_theme_combo()
         self._populate_provider_combo()
+        self._populate_deepl_plan_combo()
         self._populate_preview_scope_combo()
 
         self.tabs.setTabText(0, translate("settings.tab.general", locale=locale))
@@ -2266,7 +2301,9 @@ class SettingsDialog(QDialog):
 
         self.interface_group.setTitle(translate("settings.group.ui", locale=locale))
         self.service_group.setTitle(translate("settings.group.service", locale=locale))
+        self.translation_languages_group.setTitle(translate("settings.group.languages", locale=locale))
         self.google_group.setTitle(translate("settings.group.google", locale=locale))
+        self.deepl_group.setTitle(translate("settings.group.deepl", locale=locale))
         self.openai_group.setTitle(translate("settings.group.openai", locale=locale))
         self.git_group.setTitle(translate("settings.group.git", locale=locale))
         self.save_group.setTitle(translate("settings.group.save", locale=locale))
@@ -2299,6 +2336,8 @@ class SettingsDialog(QDialog):
         self.google_endpoint_label.setText(translate("settings.endpoint", locale=locale))
         self.source_language_label.setText(translate("settings.source_language", locale=locale))
         self.target_language_label.setText(translate("settings.target_language", locale=locale))
+        self.deepl_plan_label.setText(translate("settings.deepl_plan", locale=locale))
+        self.deepl_key_label.setText(translate("settings.api_key", locale=locale))
         self.openai_base_url_label.setText(translate("settings.base_url", locale=locale))
         self.openai_model_label.setText(translate("settings.model", locale=locale))
         self.openai_key_label.setText(translate("settings.api_key", locale=locale))
@@ -2320,7 +2359,9 @@ class SettingsDialog(QDialog):
 
     def _update_enabled(self) -> None:
         locale = self._preview_language
-        if self.provider.currentData() == "openai":
+        if self.provider.currentData() == "deepl":
+            self.provider_note.setText(translate("settings.provider_note.deepl", locale=locale))
+        elif self.provider.currentData() == "openai":
             self.provider_note.setText(translate("settings.provider_note.openai", locale=locale))
         else:
             self.provider_note.setText(translate("settings.provider_note.google", locale=locale))
@@ -2346,6 +2387,8 @@ class SettingsDialog(QDialog):
             google_endpoint=self.google_endpoint.text().strip(),
             source_language=self.source_language.text().strip() or "en",
             target_language=self.target_language.text().strip() or "zh-CN",
+            deepl_plan=str(self.deepl_plan.currentData() or "free"),
+            deepl_api_key_protected=protect_secret(self.deepl_key.text().strip()),
             openai_base_url=self.openai_base_url.text().strip(),
             openai_model=self.openai_model.text().strip(),
             openai_api_key_protected=protect_secret(self.openai_key.text().strip()),
@@ -5584,7 +5627,10 @@ class TranslatorWindow(QMainWindow):
         menu.setTitle(translate("dialog.ai_service_title"))
         google = menu.addAction(translate("dialog.ai_service_google"))
         google.setCheckable(True)
-        google.setChecked(self.settings.provider != "openai")
+        google.setChecked(self.settings.provider == "google")
+        deepl = menu.addAction(translate("dialog.ai_service_deepl"))
+        deepl.setCheckable(True)
+        deepl.setChecked(self.settings.provider == "deepl")
         openai = menu.addAction(translate("dialog.ai_service_openai"))
         openai.setCheckable(True)
         openai.setChecked(self.settings.provider == "openai")
@@ -5593,6 +5639,8 @@ class TranslatorWindow(QMainWindow):
         action = menu.exec(global_point)
         if action == google:
             self._set_ai_provider("google")
+        elif action == deepl:
+            self._set_ai_provider("deepl")
         elif action == openai:
             self._set_ai_provider("openai")
         elif action == settings_action:
@@ -5604,7 +5652,12 @@ class TranslatorWindow(QMainWindow):
         self.settings = replace(self.settings, provider=provider)
         save_settings(self.settings)
         self.ai_delegate.set_provider(provider)
-        name = "Google Translate" if provider == "google" else translate("dialog.ai_service_openai").replace("✦ ", "")
+        if provider == "google":
+            name = "Google Translate"
+        elif provider == "deepl":
+            name = "DeepL"
+        else:
+            name = translate("dialog.ai_service_openai").replace("✦ ", "")
         self.statusBar().showMessage(translate("status.ai_provider_changed", name=name), 3500)
 
     def translate_one_unit(self, uid: str) -> None:

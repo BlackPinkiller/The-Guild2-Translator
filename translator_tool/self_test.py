@@ -18,6 +18,7 @@ from . import file_utils as file_utils_module
 from . import source_sync as source_sync_module
 from . import settings as settings_module
 from .ai import (
+    DeepLProvider,
     GoogleTranslateProvider,
     LlmNeighborContext,
     LlmSuggestionContext,
@@ -863,7 +864,13 @@ def assert_preview_window_scale_setting() -> None:
     from .app import SettingsDialog
 
     app = QApplication.instance() or QApplication([])
-    dialog = SettingsDialog(AppSettings(preview_window_scale_percent=150))
+    dialog = SettingsDialog(
+        AppSettings(
+            preview_window_scale_percent=150,
+            provider="deepl",
+            deepl_plan="pro",
+        )
+    )
     try:
         if (
             dialog.preview_window_scale.currentData() != 150
@@ -879,6 +886,13 @@ def assert_preview_window_scale_setting() -> None:
         )
         if dialog.result_settings().preview_window_scale_percent != 175:
             raise AssertionError("preview scale selection was not retained in settings")
+        if (
+            dialog.provider.currentData() != "deepl"
+            or dialog.provider.findData("deepl") < 0
+            or dialog.deepl_plan.currentData() != "pro"
+            or dialog.result_settings().deepl_plan != "pro"
+        ):
+            raise AssertionError("DeepL provider and fixed API plan choices were not retained")
     finally:
         dialog.deleteLater()
 
@@ -3454,6 +3468,23 @@ class FakeGoogleTransport:
         raise AssertionError("Google provider must not issue a POST request")
 
 
+class FakeDeepLTransport:
+    def __init__(self, response: str) -> None:
+        self.response = response
+        self.last_url = ""
+        self.last_payload = None
+        self.last_headers = None
+
+    def get_json(self, url: str):
+        raise AssertionError("DeepL provider must not issue a GET request")
+
+    def post_json(self, url: str, payload, headers):
+        self.last_url = url
+        self.last_payload = payload
+        self.last_headers = headers
+        return {"translations": [{"text": self.response}]}
+
+
 def assert_ai_token_protection() -> None:
     transport = FakeGoogleTransport("测试 __TG_FMT_0000__")
     provider = GoogleTranslateProvider("https://example.invalid/translate", "en", "zh-CN", transport)
@@ -3473,6 +3504,52 @@ def assert_ai_token_protection() -> None:
     except TranslationProviderError:
         return
     raise AssertionError("AI result missing a protected token was accepted")
+
+
+def assert_deepl_translation() -> None:
+    transport = FakeDeepLTransport("译文 __TG_FMT_0000__")
+    context = LlmSuggestionContext(
+        "Text.dbt",
+        "2",
+        "Label2",
+        (LlmNeighborContext("previous 1", "Label1", "Nearby source"),),
+    )
+    provider = DeepLProvider("test-key", "free", "en-US", "zh-CN", transport)
+    translated = provider.translate("Cost: %1t", dbt_field=True, context=context)
+    if translated != "译文 %1t":
+        raise AssertionError("DeepL translation did not restore protected tokens")
+    if transport.last_url != "https://api-free.deepl.com/v2/translate":
+        raise AssertionError("DeepL Free did not use the official Free API endpoint")
+    if transport.last_headers != {"Authorization": "DeepL-Auth-Key test-key"}:
+        raise AssertionError("DeepL did not authenticate through the required Authorization header")
+    if transport.last_payload != {
+        "text": ["Cost: __TG_FMT_0000__"],
+        "target_lang": "ZH-HANS",
+        "preserve_formatting": True,
+        "source_lang": "EN",
+        "context": "Nearby source",
+    }:
+        raise AssertionError("DeepL request did not preserve text, locale, formatting, and context")
+
+    pro_transport = FakeDeepLTransport("测试")
+    DeepLProvider("test-key", "pro", "auto", "zh-TW", pro_transport).translate(
+        "Test", dbt_field=False
+    )
+    if (
+        pro_transport.last_url != "https://api.deepl.com/v2/translate"
+        or pro_transport.last_payload.get("target_lang") != "ZH-HANT"
+        or "source_lang" in pro_transport.last_payload
+    ):
+        raise AssertionError("DeepL Pro endpoint or automatic source-language handling was incorrect")
+
+    try:
+        DeepLProvider("", "free", "en", "zh-CN", FakeDeepLTransport("测试")).translate(
+            "Test", dbt_field=False
+        )
+    except TranslationProviderError:
+        pass
+    else:
+        raise AssertionError("DeepL accepted a translation request without an API key")
 
 
 class CaptureTranslationTransport:
@@ -5154,6 +5231,7 @@ def main() -> int:
     assert_manual_status_cache()
     assert_operation_history()
     assert_ai_token_protection()
+    assert_deepl_translation()
     assert_ai_translation_context()
     assert_linebreak_format_is_ignored()
     assert_guild2_format_grammar()

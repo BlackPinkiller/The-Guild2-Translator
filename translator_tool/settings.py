@@ -27,6 +27,8 @@ class AppSettings:
     openai_base_url: str = "https://api.openai.com/v1"
     openai_model: str = "gpt-4o-mini"
     openai_api_key_protected: str = ""
+    deepl_plan: str = "free"
+    deepl_api_key_protected: str = ""
     google_endpoint: str = "https://translate.googleapis.com/translate_a/single"
     source_language: str = "en"
     target_language: str = "zh-CN"

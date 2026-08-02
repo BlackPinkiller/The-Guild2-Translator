@@ -271,6 +271,53 @@ class GoogleTranslateProvider:
         return _validate_result(source, restore_tokens(translated, protected), dbt_field)
 
 
+DEEPL_ENDPOINTS = {
+    "free": "https://api-free.deepl.com/v2/translate",
+    "pro": "https://api.deepl.com/v2/translate",
+}
+
+
+@dataclass
+class DeepLProvider:
+    api_key: str
+    plan: str
+    source_language: str
+    target_language: str
+    transport: JsonTransport
+    name: str = "DeepL"
+    request_delay_seconds: float = 0.0
+
+    def translate(
+        self, source: str, *, dbt_field: bool, context: LlmSuggestionContext | None = None
+    ) -> str:
+        if not self.api_key:
+            raise TranslationProviderError("请先在设置中填写 DeepL API Key。")
+        protected = protect_tokens(source)
+        payload: dict[str, Any] = {
+            "text": [protected.text],
+            "target_lang": _deepl_language_code(self.target_language, target=True),
+            "preserve_formatting": True,
+        }
+        source_language = _deepl_language_code(self.source_language, target=False)
+        if source_language:
+            payload["source_lang"] = source_language
+        context_text = _deepl_context_text(context)
+        if context_text:
+            payload["context"] = context_text
+        response = self.transport.post_json(
+            DEEPL_ENDPOINTS.get(self.plan, DEEPL_ENDPOINTS["free"]),
+            payload,
+            {"Authorization": f"DeepL-Auth-Key {self.api_key}"},
+        )
+        try:
+            translated = response["translations"][0]["text"]
+        except (IndexError, KeyError, TypeError) as exc:
+            raise TranslationProviderError("DeepL 返回了无法识别的数据。") from exc
+        if not isinstance(translated, str):
+            raise TranslationProviderError("DeepL 没有返回文本译文。")
+        return _validate_result(source, restore_tokens(translated, protected), dbt_field)
+
+
 @dataclass
 class OpenAICompatibleProvider:
     base_url: str
@@ -413,6 +460,14 @@ class OpenAICompatibleProvider:
 
 def provider_from_settings(settings: AppSettings, transport: JsonTransport | None = None) -> TranslationProvider:
     client = transport or UrlLibTransport()
+    if settings.provider == "deepl":
+        return DeepLProvider(
+            reveal_secret(settings.deepl_api_key_protected),
+            settings.deepl_plan,
+            settings.source_language.strip(),
+            settings.target_language.strip(),
+            client,
+        )
     if settings.provider == "openai":
         return OpenAICompatibleProvider(
             settings.openai_base_url.strip(),
@@ -423,6 +478,32 @@ def provider_from_settings(settings: AppSettings, transport: JsonTransport | Non
     return GoogleTranslateProvider(
         settings.google_endpoint.strip(), settings.source_language.strip(), settings.target_language.strip(), client
     )
+
+
+def _deepl_language_code(value: str, *, target: bool) -> str:
+    normalized = value.strip().replace("_", "-").upper()
+    if not normalized or normalized == "AUTO":
+        return ""
+    aliases = {
+        "ZH-CN": "ZH-HANS",
+        "ZH-SG": "ZH-HANS",
+        "ZH-TW": "ZH-HANT",
+        "ZH-HK": "ZH-HANT",
+    }
+    normalized = aliases.get(normalized, normalized)
+    if not target and "-" in normalized:
+        return normalized.split("-", 1)[0]
+    return normalized
+
+
+def _deepl_context_text(context: LlmSuggestionContext | None) -> str:
+    if context is None:
+        return ""
+    return "\n".join(
+        neighbor.source_text.strip()
+        for neighbor in context.neighbors
+        if neighbor.source_text.strip()
+    )[:4000]
 
 
 def llm_provider_from_settings(settings: AppSettings, transport: JsonTransport | None = None) -> OpenAICompatibleProvider:
