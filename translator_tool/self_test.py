@@ -4140,6 +4140,39 @@ def assert_preview_i18n_and_symbol_mapping() -> None:
             raise AssertionError("$S[2012] was not routed to the live glyph preview")
         if not any(atom.glyph_id == 2002 for atom in source.atoms):
             raise AssertionError("%2t did not preview the game's coin symbol")
+        unsuffixed_values = service.render(
+            "%1t | %2z",
+            unit_key="unsuffixed-value-placeholders",
+            label="UNSUFFIXED_VALUE_PLACEHOLDERS",
+            file_rel="Text.dbt",
+            kind="dbt",
+            target=False,
+        )
+        if any(unit in unsuffixed_values.display_text.casefold() for unit in ("coin", "gold", "hour")):
+            raise AssertionError(
+                "%t or %z preview invented a textual unit that the placeholder does not emit: "
+                f"{unsuffixed_values.display_text!r}"
+            )
+        if "1,000" not in unsuffixed_values.display_text or "2" not in unsuffixed_values.display_text:
+            raise AssertionError(
+                "unit-free %t/%z fallback values were not retained in preview: "
+                f"{unsuffixed_values.display_text!r}"
+            )
+        if not any(atom.glyph_id == 2002 for atom in unsuffixed_values.atoms):
+            raise AssertionError("unit-free %t preview lost the game-rendered coin glyph")
+        unsuffixed_target = service.render(
+            "%1t | %2z",
+            unit_key="unsuffixed-value-placeholders",
+            label="UNSUFFIXED_VALUE_PLACEHOLDERS",
+            file_rel="Text.dbt",
+            kind="dbt",
+            target=True,
+        )
+        if "金币" in unsuffixed_target.display_text or "小时" in unsuffixed_target.display_text:
+            raise AssertionError(
+                "Chinese %t or %z preview invented a textual unit: "
+                f"{unsuffixed_target.display_text!r}"
+            )
         strong_placeholders = service.render(
             "%1GG | %1GN | %1GT | %4SN | %4SV | %4SZ | %4SK | %4ST | %4SA | %4SD | %4SB | %4SL",
             unit_key="same-entry",
