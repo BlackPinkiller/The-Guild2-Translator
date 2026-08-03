@@ -69,7 +69,7 @@ BACKGROUND_TOKEN = r"\$B\[[^\]\r\n]*\]"
 # semantics, and real text may use short forms such as `$[ $(` to show bracket
 # glyphs, so recognize it broadly and exclude it from source/target diffs.
 HEADER_TOKEN = r"\$\[(?:[^\r\n]*?\$\]|[^\r\n]*?\$|(?=\s|$))"
-TAB_LAYOUT_TOKEN = r"(?:\$[1-9]\d*T|\$T(?=\$|#|@|%|<|>|[ \t\r\n.,:;!?()\[\]{}]|$))"
+TAB_LAYOUT_TOKEN = r"\$[1-9]\d*T"
 LINE_OR_LAYOUT_TOKEN = rf"\$[NLRZ<>]|{TAB_LAYOUT_TOKEN}"
 EMOTION_TOKEN = r"#E\[[A-Za-z0-9_]+\]"
 SPEECH_TIMING_TOKEN = r"#SP[+-]"

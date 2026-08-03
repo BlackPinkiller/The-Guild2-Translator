@@ -10,7 +10,7 @@ from ..preview import (
 
 def assert_preview_format_layout_controls_are_semantic() -> None:
     document = PreviewService().render(
-        "$Lleft$N$Zcenter$N$Rright$N$T tabbed$Nvalue:$5Taligned$N等级：$5T马马虎虎",
+        "$Lleft$N$Zcenter$N$Rright$Nliteral $T remains$Nvalue:$5Taligned$N等级：$5T马马虎虎",
         unit_key="layout-controls",
         label="_LAYOUT_CONTROLS_+0",
         file_rel="Text.dbt",
@@ -18,10 +18,12 @@ def assert_preview_format_layout_controls_are_semantic() -> None:
         target=False,
     )
     controls = [atom.layout for atom in document.atoms if atom.layout]
-    if controls != ["left", "center", "right", "tab", "tab:5", "tab:5"]:
+    if controls != ["left", "center", "right", "tab:5", "tab:5"]:
         raise AssertionError(f"format layout controls lost their semantics: {controls!r}")
-    if any(token in document.display_text for token in ("$L", "$T", "$5T")):
+    if "$L" in document.display_text or "$5T" in document.display_text:
         raise AssertionError("format layout controls leaked into preview text")
+    if "$T" not in document.display_text:
+        raise AssertionError("bare $T should remain visible because the game does not interpret it")
     if _aligned_line_left("left", 10, 210, 40) != 10:
         raise AssertionError("left-aligned preview line did not use the content edge")
     if _aligned_line_left("center", 10, 210, 40) != 90:

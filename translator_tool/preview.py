@@ -3779,7 +3779,6 @@ class _PreviewCompiler:
         text = NUMBERED_TAB_INLINE_RE.sub(lambda match: "\t" * int(match.group(1)), text)
         return (
             text.replace("$N", "\n")
-            .replace("$T", "\t")
             .replace(">", "『")
             .replace("<", "』")
         )
@@ -3852,16 +3851,13 @@ class _PreviewCompiler:
             return
         if TAB_LAYOUT_TOKEN_RE.fullmatch(token):
             tab_stop = token[1:-1]
-            if tab_stop:
-                self._emit(
-                    "\t" * int(tab_stop),
-                    start,
-                    end,
-                    replacement=True,
-                    layout=f"tab:{tab_stop}",
-                )
-            else:
-                self._emit("\t", start, end, replacement=True, layout="tab")
+            self._emit(
+                "\t" * int(tab_stop),
+                start,
+                end,
+                replacement=True,
+                layout=f"tab:{tab_stop}",
+            )
             return
         if token in {"$>", "%>"}:
             self._emit("『", start, end, replacement=True)
