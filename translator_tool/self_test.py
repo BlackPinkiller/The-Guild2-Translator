@@ -200,6 +200,38 @@ def assert_loaded_order_matches_file_lines(root: Path) -> None:
         last_position[unit.file_rel] = position
 
 
+def assert_table_model_preserves_full_display_text() -> None:
+    from PySide6.QtCore import Qt
+
+    from .app import UnitTableModel
+
+    label = "_" + "LONG_LABEL_SEGMENT_" * 12
+    source = "source " + "content " * 40 + "\nsecond line"
+    translation = "译文" * 180
+    unit = SimpleNamespace(
+        file_rel="Text.dbt",
+        record_id="1",
+        label=label,
+        source_text=source,
+        current_text=translation,
+        display_status=lambda: STATUS_TRANSLATED,
+        issues=lambda: [],
+    )
+    model = UnitTableModel()
+    model.units = [unit]
+    expected = {
+        UnitTableModel.LABEL: label,
+        UnitTableModel.SOURCE: source.replace("\n", "\\n"),
+        UnitTableModel.TRANSLATION: translation,
+    }
+    for column, full_text in expected.items():
+        displayed = model.data(model.index(0, column), Qt.ItemDataRole.DisplayRole)
+        if displayed != full_text:
+            raise AssertionError(
+                f"table model clipped column {column} before the delegate could use its actual width"
+            )
+
+
 def copy_project_subset(src_root: Path, dst_root: Path) -> None:
     (dst_root / "encoder" / "data").mkdir(parents=True)
     shutil.copy2(tool_root() / "encoder" / "guild2_codec.py", dst_root / "encoder")
@@ -5464,6 +5496,7 @@ def main() -> int:
     assert_round_trip(root)
     assert_statuses(root)
     assert_loaded_order_matches_file_lines(root)
+    assert_table_model_preserves_full_display_text()
     assert_local_project_roots_detect_sources_projects()
     assert_discover_game_source_projects_detects_vanilla_and_mods()
     assert_code_reference_index_avoids_db_and_uses_vanilla_fallback()

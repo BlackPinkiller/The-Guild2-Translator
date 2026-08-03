@@ -313,9 +313,9 @@ class UnitTableModel(QAbstractTableModel):
         values = {
             self.FILE: unit.file_rel,
             self.ID: unit.record_id,
-            self.LABEL: _clip(unit.label, 72),
-            self.SOURCE: _clip(unit.source_text, 130),
-            self.TRANSLATION: _clip(unit.current_text, 130),
+            self.LABEL: _single_line_table_text(unit.label),
+            self.SOURCE: _single_line_table_text(unit.source_text),
+            self.TRANSLATION: _single_line_table_text(unit.current_text),
             self.STATUS: unit.display_status(),
             self.FORMAT: _format_diff_text(unit),
             self.AI: translate("table.ai_action"),
@@ -6819,9 +6819,8 @@ class TranslatorWindow(QMainWindow):
         self.code_reference_index_token += 1
 
 
-def _clip(text: str, limit: int) -> str:
-    text = text.replace("\r", "\\r").replace("\n", "\\n")
-    return text if len(text) <= limit else text[: limit - 1] + "…"
+def _single_line_table_text(text: str) -> str:
+    return text.replace("\r", "\\r").replace("\n", "\\n")
 
 
 def _localized_list_join(items: Iterable[str]) -> str:
