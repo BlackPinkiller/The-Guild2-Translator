@@ -69,7 +69,7 @@ BACKGROUND_TOKEN = r"\$B\[[^\]\r\n]*\]"
 # semantics, and real text may use short forms such as `$[ $(` to show bracket
 # glyphs, so recognize it broadly and exclude it from source/target diffs.
 HEADER_TOKEN = r"\$\[(?:[^\r\n]*?\$\]|[^\r\n]*?\$|(?=\s|$))"
-TAB_LAYOUT_TOKEN = r"\$T(?=\$|#|@|%|<|>|[ \t\r\n.,:;!?()\[\]{}]|$)"
+TAB_LAYOUT_TOKEN = r"(?:\$[1-9]\d*T|\$T(?=\$|#|@|%|<|>|[ \t\r\n.,:;!?()\[\]{}]|$))"
 LINE_OR_LAYOUT_TOKEN = rf"\$[NLRZ<>]|{TAB_LAYOUT_TOKEN}"
 EMOTION_TOKEN = r"#E\[[A-Za-z0-9_]+\]"
 SPEECH_TIMING_TOKEN = r"#SP[+-]"
@@ -163,6 +163,7 @@ PROTECTED_TOKEN_RE = re.compile(
 
 ARG_TOKEN_RE = re.compile(ARG_TOKEN)
 NAME_SUFFIX_TOKEN_RE = re.compile(rf"^{NAME_SUFFIX_TOKEN}$")
+TAB_LAYOUT_TOKEN_RE = re.compile(rf"^{TAB_LAYOUT_TOKEN}$")
 UNKNOWN_PERCENT_RE = re.compile(r"%(?:\d*[A-Za-z][A-Za-z0-9]*|[^\s])?")
 
 
@@ -241,7 +242,7 @@ def normalize_color_token_spacing(text: str) -> str:
 def _is_color_spacing_prefix_token(token: str) -> bool:
     if COLOR_TOKEN_RE.fullmatch(token):
         return True
-    if token in {"$N", "$Z", "$L", "$R", "$T", "$>", "$<"}:
+    if token in {"$N", "$Z", "$L", "$R", "$>", "$<"} or TAB_LAYOUT_TOKEN_RE.fullmatch(token):
         return True
     if token.startswith("#E[") or token.startswith("#SP"):
         return True

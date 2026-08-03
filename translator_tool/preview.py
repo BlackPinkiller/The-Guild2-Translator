@@ -48,6 +48,7 @@ from .validation import (
     ARG_PREVIEW_TOKEN,
     PRINTF_TOKEN,
     QUOTE_STYLE_TOKEN,
+    TAB_LAYOUT_TOKEN_RE,
     TOOLTIP_TOKEN_RE,
     format_dialect,
 )
@@ -55,6 +56,7 @@ from .validation import (
 
 PREVIEW_MARK = "\u200b"
 GLYPH_MARK = "\ufffc"
+NUMBERED_TAB_INLINE_RE = re.compile(r"\$([1-9]\d*)T")
 FONT_RECORD_RE = re.compile(
     r"(?:^|/)fonts/(?P<font>.+)_(?P<start>\d+)-(?P<end>\d+)\.tga(?P<index>\d+)$",
     re.IGNORECASE,
@@ -260,6 +262,16 @@ def _aligned_line_left(
 def _next_tab_width(current_width: int, tab_width: int) -> int:
     width = max(1, tab_width)
     return width - current_width % width
+
+
+def _numbered_tab_width(current_width: int, tab_width: int, tab_stop: int) -> int:
+    width = max(1, tab_width)
+    target = max(1, tab_stop) * width
+    return (
+        target - current_width
+        if current_width < target
+        else _next_tab_width(current_width, width)
+    )
 
 
 @dataclass(frozen=True)
@@ -3380,6 +3392,16 @@ class PreviewService:
                     lines[-1].append(_LayoutSpacer(spacer))
                     widths[-1] += spacer
                 continue
+            if atom.layout and atom.layout.startswith("tab:"):
+                tab_stop = int(atom.layout.partition(":")[2])
+                spacer = _numbered_tab_width(widths[-1], tab_width, tab_stop)
+                if widths[-1] + spacer >= right - left and lines[-1]:
+                    if not next_line():
+                        break
+                else:
+                    lines[-1].append(_LayoutSpacer(spacer))
+                    widths[-1] += spacer
+                continue
             if atom.glyph_id is not None:
                 glyph = (
                     symbol_atlas.glyph(atom.glyph_id)
@@ -3754,6 +3776,7 @@ class _PreviewCompiler:
     @staticmethod
     def _embedded_argument_text(text: str) -> str:
         """Apply game display controls contained in a referenced label value."""
+        text = NUMBERED_TAB_INLINE_RE.sub(lambda match: "\t" * int(match.group(1)), text)
         return (
             text.replace("$N", "\n")
             .replace("$T", "\t")
@@ -3827,8 +3850,18 @@ class _PreviewCompiler:
         if token == "$N":
             self._emit("\n", start, end, replacement=True)
             return
-        if token == "$T":
-            self._emit("\t", start, end, replacement=True, layout="tab")
+        if TAB_LAYOUT_TOKEN_RE.fullmatch(token):
+            tab_stop = token[1:-1]
+            if tab_stop:
+                self._emit(
+                    "\t" * int(tab_stop),
+                    start,
+                    end,
+                    replacement=True,
+                    layout=f"tab:{tab_stop}",
+                )
+            else:
+                self._emit("\t", start, end, replacement=True, layout="tab")
             return
         if token in {"$>", "%>"}:
             self._emit("『", start, end, replacement=True)

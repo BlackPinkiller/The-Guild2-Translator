@@ -3857,7 +3857,7 @@ def assert_guild2_format_grammar() -> None:
         "%1NAME %2n %3i %4f %5t %6c %7z %8j %9s %10l "
         "%11GG %12GN %13GT %% %> %< %14SN %15Sn %16SV %17Sv %18SZ %19Sz "
         "%20SK %21ST %22SA %23SD %24SB %25SL %26DN %27DS "
-        "$N $Z $L $R $T $> $< $C[1,2,3,255] $F[Body] $S[12] $B[label] "
+        "$N $Z $L $R $T $1T $3T $5T $8T $> $< $C[1,2,3,255] $F[Body] $S[12] $B[label] "
         "$[ornament$] #E[NT_NEUTRAL] #SP+ #SP- @NMale @L_TEST_KEY_+n @T\"fallback\""
     )
     tokens = format_tokens(syntax)
@@ -3867,6 +3867,7 @@ def assert_guild2_format_grammar() -> None:
         "%14SN",
         "$C[1,2,3,255]",
         "$[ornament$]",
+        "$5T",
         "#SP+",
         "@NMale",
         "@L_TEST_KEY_+n",
