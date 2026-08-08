@@ -3228,7 +3228,7 @@ class HistoryDialog(QDialog):
         self.entry_search.textChanged.connect(self._filter_entries)
         self.entries.itemSelectionChanged.connect(self._show_selected_entry)
         self.left_tabs.currentChanged.connect(self._on_history_tab_changed)
-        if self._items:
+        if self._items and focus_key is None:
             QTimer.singleShot(0, self._select_latest_commit)
         if focus_key is not None:
             self.left_tabs.setCurrentIndex(1)
@@ -3252,6 +3252,10 @@ class HistoryDialog(QDialog):
     def _on_history_tab_changed(self, index: int) -> None:
         if index == 1:
             self._ensure_entry_index()
+        elif self.commits.selectedItems():
+            self._show_selected_commits()
+        elif self._items:
+            self._select_latest_commit()
 
     def _filter_entries(self, query: str) -> None:
         matches = [
@@ -3391,6 +3395,12 @@ class HistoryDialog(QDialog):
         row = self.entries.currentRow()
         if row < 0 or row >= len(self._visible_entry_keys):
             return
+        # Entry selection owns the content pane until the user explicitly
+        # selects or returns to a commit. Invalidate any delayed/in-flight
+        # commit render so it cannot overwrite the requested entry timeline.
+        self._selection_timer.stop()
+        self._request_id += 1
+        self._rendered_rows = ()
         self.content.setHtml(render_entry_timeline_html(self._events_by_key[self._visible_entry_keys[row]]))
 
     def _select_latest_commit(self) -> None:
