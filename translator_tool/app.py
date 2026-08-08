@@ -13,14 +13,18 @@ from typing import Callable, Iterable
 
 from PySide6.QtCore import (
     QAbstractTableModel,
+    QEasingCurve,
     QEvent,
     QMimeData,
     QModelIndex,
     QObject,
     QPoint,
     QPointF,
+    QParallelAnimationGroup,
+    QPropertyAnimation,
     QRect,
     QRunnable,
+    QSize,
     QSignalBlocker,
     QSortFilterProxyModel,
     Qt,
@@ -30,7 +34,7 @@ from PySide6.QtCore import (
     QUrl,
     Signal,
 )
-from PySide6.QtGui import QAction, QCloseEvent, QColor, QCursor, QFont, QFontMetrics, QIcon, QImage, QKeyEvent, QKeySequence, QPainter, QPalette, QPen, QStandardItemModel, QSyntaxHighlighter, QTextBlockFormat, QTextCharFormat, QTextCursor, QTextDocument, QTextImageFormat, QWheelEvent
+from PySide6.QtGui import QAction, QCloseEvent, QColor, QCursor, QFont, QFontMetrics, QIcon, QImage, QKeyEvent, QKeySequence, QPainter, QPalette, QPen, QPixmap, QStandardItemModel, QSyntaxHighlighter, QTextBlockFormat, QTextCharFormat, QTextCursor, QTextDocument, QTextImageFormat, QWheelEvent
 from PySide6.QtWidgets import (
     QApplication,
     QAbstractItemView,
@@ -78,6 +82,7 @@ from .ai import (
     provider_from_settings,
 )
 from .code_index import CodeReference, CodeReferenceIndex, CodeReferenceSet, label_group_key, normalize_label
+from .file_tree import FileTreeNode, build_file_tree
 from .code_index_lazy import LazyCodeIndexBuilder, LazyIndexProgress
 from .code_window_context import (
     PreviewWindowContext,
@@ -1032,6 +1037,281 @@ class PopupSelectionComboBox(QComboBox):
                 selection_model.SelectionFlag.ClearAndSelect,
             )
         view.scrollTo(model_index)
+
+
+class HierarchicalFileComboBox(QComboBox):
+    """Keep flat filter data while presenting a navigable folder list."""
+
+    def __init__(self, parent: QWidget | None = None) -> None:
+        super().__init__(parent)
+        self._tree: tuple[FileTreeNode, ...] = ()
+        self._file_popup: SlidingFilePopup | None = None
+
+    def set_file_paths(self, file_paths: Iterable[str]) -> None:
+        self._tree = build_file_tree(file_paths)
+        if self._file_popup is not None:
+            self._file_popup.set_tree(self._tree)
+
+    def showPopup(self) -> None:  # noqa: N802
+        if self.count() <= 0:
+            return
+        if self._file_popup is None:
+            self._file_popup = SlidingFilePopup(self)
+            self._file_popup.set_tree(self._tree)
+            self._file_popup.file_selected.connect(self._select_file)
+        self._file_popup.open_for(str(self.currentData() or FILE_FILTER_ALL))
+
+    def hidePopup(self) -> None:  # noqa: N802
+        if self._file_popup is not None:
+            self._file_popup.hide()
+
+    def _select_file(self, file_rel: str) -> None:
+        index = self.findData(file_rel)
+        if index >= 0:
+            self.setCurrentIndex(index)
+        self.hidePopup()
+
+
+class _SlidingFileViewport(QWidget):
+    def __init__(self, parent: QWidget | None = None) -> None:
+        super().__init__(parent)
+        self.active = QListWidget(self)
+        self.incoming = QListWidget(self)
+        self.incoming.hide()
+        self.animating = False
+        self.animation: QParallelAnimationGroup | None = None
+
+    def resizeEvent(self, event) -> None:  # noqa: N802
+        if not self.animating:
+            self.active.setGeometry(self.rect())
+            self.incoming.setGeometry(self.rect())
+        super().resizeEvent(event)
+
+    def slide(self, forward: bool, finished: Callable[[], None]) -> None:
+        width = max(self.width(), 1)
+        height = self.height()
+        direction = 1 if forward else -1
+        self.animating = True
+        self.active.setEnabled(False)
+        self.incoming.setEnabled(False)
+        self.incoming.setGeometry(direction * width, 0, width, height)
+        self.incoming.show()
+        self.incoming.raise_()
+        outgoing_animation = QPropertyAnimation(self.active, b"pos", self)
+        outgoing_animation.setDuration(150)
+        outgoing_animation.setStartValue(QPoint(0, 0))
+        outgoing_animation.setEndValue(QPoint(-direction * width, 0))
+        incoming_animation = QPropertyAnimation(self.incoming, b"pos", self)
+        incoming_animation.setDuration(150)
+        incoming_animation.setStartValue(QPoint(direction * width, 0))
+        incoming_animation.setEndValue(QPoint(0, 0))
+        for animation in (outgoing_animation, incoming_animation):
+            animation.setEasingCurve(QEasingCurve.Type.OutCubic)
+        group = QParallelAnimationGroup(self)
+        group.addAnimation(outgoing_animation)
+        group.addAnimation(incoming_animation)
+        self.animation = group
+
+        def complete() -> None:
+            self.active.hide()
+            self.active, self.incoming = self.incoming, self.active
+            self.active.setEnabled(True)
+            self.incoming.setEnabled(True)
+            self.active.setGeometry(self.rect())
+            self.incoming.setGeometry(self.rect())
+            self.animating = False
+            self.animation = None
+            finished()
+
+        group.finished.connect(complete)
+        group.start()
+
+
+class SlidingFilePopup(QFrame):
+    file_selected = Signal(str)
+    ITEM_KIND_ROLE = Qt.ItemDataRole.UserRole
+    ITEM_VALUE_ROLE = Qt.ItemDataRole.UserRole + 1
+
+    def __init__(self, combo: HierarchicalFileComboBox) -> None:
+        super().__init__(combo, Qt.WindowType.Popup)
+        self.combo = combo
+        self.tree: tuple[FileTreeNode, ...] = ()
+        self.folder_parts: tuple[str, ...] = ()
+        self._all_files_icon = self.style().standardIcon(QStyle.StandardPixmap.SP_DirHomeIcon)
+        self._row_height = max(self.combo.fontMetrics().height() + 14, 32)
+        self._fixed_popup_height = self._row_height + 4
+        self.back_list = QListWidget(self)
+        self.back_list.setObjectName("fileTreeBackList")
+        self.back_list.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        self.back_list.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        self.back_list.setFixedHeight(self._row_height)
+        self.back_item = QListWidgetItem(self._back_icon(), translate("filter.parent_folder"))
+        self.back_item.setSizeHint(QSize(0, self._row_height))
+        self.back_item.setData(self.ITEM_KIND_ROLE, "back")
+        self.back_list.addItem(self.back_item)
+        self.back_list.itemClicked.connect(lambda _item: self._go_back())
+        self.back_list.hide()
+        self.viewport = _SlidingFileViewport(self)
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(1, 1, 1, 1)
+        layout.setSpacing(0)
+        layout.addWidget(self.back_list)
+        layout.addWidget(self.viewport)
+        self.setObjectName("fileTreePopup")
+        self.setStyleSheet(
+            "QFrame#fileTreePopup QListWidget { border: 0; border-radius: 0; }"
+        )
+        self.setFrameShape(QFrame.Shape.StyledPanel)
+        self._folder_icon = self.style().standardIcon(QStyle.StandardPixmap.SP_DirIcon)
+        self._file_icon = self.style().standardIcon(QStyle.StandardPixmap.SP_FileIcon)
+        for widget in (self.viewport.active, self.viewport.incoming):
+            widget.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+            widget.itemClicked.connect(self._activate_item)
+            widget.itemActivated.connect(self._activate_item)
+
+    def set_tree(self, tree: tuple[FileTreeNode, ...]) -> None:
+        self.tree = tree
+        root_rows = len(tree) + int(self.combo.findData(FILE_FILTER_ALL) >= 0)
+        self._fixed_popup_height = min(max(root_rows, 1) * self._row_height + 4, 420)
+
+    def open_for(self, file_rel: str) -> None:
+        folder_parts: tuple[str, ...] = ()
+        selected = file_rel
+        if file_rel != FILE_FILTER_ALL:
+            normalized = file_rel.replace("\\", "/").strip("/")
+            parts = tuple(part for part in normalized.split("/") if part)
+            folder_parts = parts[:-1]
+        self._show_folder(folder_parts, selected, animate=False)
+        self._position_popup()
+        self.show()
+        self.raise_()
+        self.viewport.active.setFocus(Qt.FocusReason.PopupFocusReason)
+
+    def _position_popup(self) -> None:
+        width = max(self.combo.width(), 300)
+        height = self._fixed_popup_height
+        origin = self.combo.mapToGlobal(QPoint(0, self.combo.height()))
+        screen = QApplication.screenAt(origin) or QApplication.primaryScreen()
+        if screen is not None:
+            available = screen.availableGeometry()
+            width = min(width, available.width())
+            if origin.y() + height > available.bottom():
+                origin.setY(self.combo.mapToGlobal(QPoint(0, 0)).y() - height)
+            origin.setX(max(available.left(), min(origin.x(), available.right() - width + 1)))
+        self.setGeometry(origin.x(), origin.y(), width, height)
+
+    def _nodes_at(self, folder_parts: tuple[str, ...]) -> tuple[FileTreeNode, ...]:
+        nodes = self.tree
+        for part in folder_parts:
+            folder = next((node for node in nodes if node.is_folder and node.name == part), None)
+            if folder is None:
+                return self.tree
+            nodes = folder.children
+        return nodes
+
+    def _populate_list(
+        self,
+        widget: QListWidget,
+        folder_parts: tuple[str, ...],
+        selected: str,
+    ) -> None:
+        widget.clear()
+        if not folder_parts and self.combo.findData(FILE_FILTER_ALL) >= 0:
+            all_files = QListWidgetItem(
+                self._all_files_icon,
+                self.combo.itemText(self.combo.findData(FILE_FILTER_ALL)),
+            )
+            all_files.setData(self.ITEM_KIND_ROLE, "file")
+            all_files.setData(self.ITEM_VALUE_ROLE, FILE_FILTER_ALL)
+            self._add_popup_item(widget, all_files)
+        for node in self._nodes_at(folder_parts):
+            if node.is_folder:
+                item = QListWidgetItem(self._folder_icon, f"{node.name}   ›")
+                item.setData(self.ITEM_KIND_ROLE, "folder")
+                item.setData(self.ITEM_VALUE_ROLE, node.name)
+            else:
+                item = QListWidgetItem(self._file_icon, node.name)
+                item.setData(self.ITEM_KIND_ROLE, "file")
+                item.setData(self.ITEM_VALUE_ROLE, node.file_rel)
+                item.setToolTip(node.file_rel)
+            self._add_popup_item(widget, item)
+        selected_row = next(
+            (
+                row
+                for row in range(widget.count())
+                if widget.item(row).data(self.ITEM_VALUE_ROLE) == selected
+            ),
+            0,
+        )
+        widget.setCurrentRow(selected_row)
+        current_item = widget.item(selected_row)
+        if current_item is not None:
+            widget.scrollToItem(current_item, QAbstractItemView.ScrollHint.PositionAtCenter)
+
+    def _add_popup_item(self, widget: QListWidget, item: QListWidgetItem) -> None:
+        item.setSizeHint(QSize(0, self._row_height))
+        widget.addItem(item)
+
+    def _back_icon(self) -> QIcon:
+        pixmap = QPixmap(20, 20)
+        pixmap.fill(Qt.GlobalColor.transparent)
+        painter = QPainter(pixmap)
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+        painter.setPen(QPen(self.palette().color(QPalette.ColorRole.Text), 2.2))
+        painter.drawLine(QPoint(13, 4), QPoint(6, 10))
+        painter.drawLine(QPoint(6, 10), QPoint(13, 16))
+        painter.drawLine(QPoint(6, 10), QPoint(17, 10))
+        painter.end()
+        return QIcon(pixmap)
+
+    def _show_folder(
+        self,
+        folder_parts: tuple[str, ...],
+        selected: str = "",
+        *,
+        animate: bool,
+        forward: bool = True,
+    ) -> None:
+        if self.viewport.animating:
+            return
+        self.folder_parts = folder_parts
+        self.back_list.setVisible(bool(folder_parts))
+        if folder_parts:
+            self.back_item.setText(translate("filter.parent_folder"))
+            self.back_item.setIcon(self._back_icon())
+            self.back_list.clearSelection()
+        # The fixed back row changes the content viewport by exactly one row.
+        # Resolve that layout change before the first animation frame so both
+        # sliding lists start at the final page height without a blank flash.
+        layout = self.layout()
+        if layout is not None:
+            layout.invalidate()
+            layout.activate()
+        target = self.viewport.incoming if animate else self.viewport.active
+        self._populate_list(target, folder_parts, selected)
+        if not animate:
+            self.viewport.active.setGeometry(self.viewport.rect())
+            return
+
+        def finish_navigation() -> None:
+            self._position_popup()
+            self.viewport.active.setFocus(Qt.FocusReason.PopupFocusReason)
+
+        self.viewport.slide(forward, finish_navigation)
+
+    def _activate_item(self, item: QListWidgetItem) -> None:
+        if self.viewport.animating:
+            return
+        kind = str(item.data(self.ITEM_KIND_ROLE) or "")
+        value = str(item.data(self.ITEM_VALUE_ROLE) or "")
+        if kind == "folder":
+            self._show_folder((*self.folder_parts, value), animate=True, forward=True)
+        elif kind == "file" and value:
+            self.file_selected.emit(value)
+
+    def _go_back(self) -> None:
+        if self.folder_parts and not self.viewport.animating:
+            self._show_folder(self.folder_parts[:-1], animate=True, forward=False)
 
 
 def _paint_review_background(painter: QPainter, option: QStyleOptionViewItem, index: QModelIndex) -> bool:
@@ -3621,7 +3901,7 @@ class TranslatorWindow(QMainWindow):
         toolbar_layout.addWidget(self.status_combo)
         self.file_label = QLabel()
         toolbar_layout.addWidget(self.file_label)
-        self.file_combo = PopupSelectionComboBox()
+        self.file_combo = HierarchicalFileComboBox()
         self.file_combo.setMinimumWidth(190)
         self.file_combo.currentTextChanged.connect(self._apply_filters)
         toolbar_layout.addWidget(self.file_combo)
@@ -5366,6 +5646,7 @@ class TranslatorWindow(QMainWindow):
         self.file_combo.addItem(translate("filter.all_files"), FILE_FILTER_ALL)
         for file_rel in files:
             self.file_combo.addItem(file_rel, file_rel)
+        self.file_combo.set_file_paths(files)
         desired = previous if previous in files or previous == FILE_FILTER_ALL else default_file
         index = self.file_combo.findData(desired)
         self.file_combo.setCurrentIndex(index if index >= 0 else 0)
