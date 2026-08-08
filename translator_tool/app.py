@@ -1089,7 +1089,7 @@ class AiButtonDelegate(QStyledItemDelegate):
             font = painter.font()
             font.setBold(True)
             painter.setFont(font)
-            painter.setPen(QColor("#9d0006"))
+            painter.setPen(QColor(_theme_color("bad_token", "#9d0006")))
             painter.drawText(option.rect, Qt.AlignmentFlag.AlignCenter, status_text(STATUS_PENDING_DELETE))
             painter.restore()
             return
@@ -1232,7 +1232,7 @@ class FormatDiffDelegate(QStyledItemDelegate):
             font.setBold(True)
             font.setStrikeOut(True)
             painter.setFont(font)
-            painter.setPen(QColor("#9d0006"))
+            painter.setPen(QColor(_theme_color("bad_token", "#9d0006")))
             painter.drawText(option.rect.adjusted(5, 0, -5, 0), Qt.AlignmentFlag.AlignCenter, history_kind_text("删除"))
             painter.restore()
             return
@@ -1348,7 +1348,7 @@ class BatchTranslateButton(QPushButton):
             return
         painter = QPainter(self)
         painter.setRenderHint(QPainter.RenderHint.Antialiasing)
-        pen = QPen(QColor("#3c3836"), 2)
+        pen = QPen(self.palette().color(QPalette.ColorRole.ButtonText), 2)
         pen.setCapStyle(Qt.PenCapStyle.RoundCap)
         painter.setPen(pen)
         spinner_rect = QRectF(10, (self.height() - 14) / 2, 14, 14)
@@ -5630,20 +5630,34 @@ class TranslatorWindow(QMainWindow):
         unit = self._current_unit()
         source_selections: list[QTextEdit.ExtraSelection] = []
         translation_selections: list[QTextEdit.ExtraSelection] = []
+        search_background, search_foreground = _theme_editor_highlight("search")
 
         for start, end in self._search_ranges(self.source_edit.toPlainText(), "source"):
             display_start, display_end = self.source_edit.map_raw_range(start, end)
             source_selections.append(
-                _make_editor_selection(self.source_edit, display_start, display_end, background="#f6e58d")
+                _make_editor_selection(
+                    self.source_edit,
+                    display_start,
+                    display_end,
+                    background=search_background,
+                    foreground=search_foreground,
+                )
             )
         for start, end in self._search_ranges(self.translation_edit.toPlainText(), "translation"):
             display_start, display_end = self.translation_edit.map_raw_range(start, end)
             translation_selections.append(
-                _make_editor_selection(self.translation_edit, display_start, display_end, background="#f6e58d")
+                _make_editor_selection(
+                    self.translation_edit,
+                    display_start,
+                    display_end,
+                    background=search_background,
+                    foreground=search_foreground,
+                )
             )
 
         if unit is not None:
             dialect = format_dialect(unit.file_rel, unit.ref.kind)
+            missing_background, missing_foreground = _theme_editor_highlight("missing_format")
             for start, end in _missing_source_token_ranges(unit.source_text, unit.current_text, dialect=dialect):
                 display_start, display_end = self.source_edit.map_raw_range(start, end)
                 source_selections.append(
@@ -5651,8 +5665,8 @@ class TranslatorWindow(QMainWindow):
                         self.source_edit,
                         display_start,
                         display_end,
-                        background="#f5c2c7",
-                        foreground="#7f1d1d",
+                        background=missing_background,
+                        foreground=missing_foreground,
                     )
                 )
 
@@ -7349,6 +7363,26 @@ def _theme_row_tint(name: str, fallback: str) -> str:
             "recent": "#283c28",
         }.get(name, fallback)
     return fallback
+
+
+def _theme_editor_highlight(kind: str) -> tuple[str, str]:
+    app = QApplication.instance()
+    if app is not None and bool(app.property("guild2Theme")):
+        colors = {
+            "search": ("#735727", "#fff0b8"),
+            "missing_format": ("#542822", "#f0a18d"),
+        }
+    elif app is not None and bool(app.property("darkTheme")):
+        colors = {
+            "search": ("#31445a", "#f2f4f8"),
+            "missing_format": ("#4b2c34", "#ffd7dc"),
+        }
+    else:
+        colors = {
+            "search": ("#f6e58d", "#3c3836"),
+            "missing_format": ("#f5c2c7", "#7f1d1d"),
+        }
+    return colors[kind]
 
 
 def _theme_rgba(name: str, fallback: tuple[int, int, int, int]) -> tuple[int, int, int, int]:
