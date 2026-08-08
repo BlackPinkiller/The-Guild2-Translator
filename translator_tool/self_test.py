@@ -42,6 +42,9 @@ from .history import OperationHistory, TranslationOperation, UnitChange
 from .self_tests.project_refresh import assert_saved_file_refresh
 from .self_tests.git_commit import assert_tracked_git_commit_skips_redundant_add
 from .self_tests.history_index import assert_history_index_is_persistent_and_bounded
+from .self_tests.format_io import assert_guild2_encoding_detection
+from .self_tests.file_tree import assert_file_tree_groups_nested_paths
+from .self_tests.project_order import assert_missing_translations_follow_source_order
 from .self_tests.text_import import assert_text_import_planning_is_safe_and_lightweight
 from .self_tests.diagnostics import assert_diagnostics_are_bounded_and_content_free
 from .self_tests.performance import AI_CONTEXT_BUILD_LIMIT_SECONDS, assert_within_budget
@@ -3413,7 +3416,7 @@ def assert_dark_theme() -> None:
     from PySide6.QtGui import QFont, QFontDatabase, QPalette
     from PySide6.QtWidgets import QApplication
 
-    from .app import EditorGroupBox, SettingsDialog, _history_state_html, apply_theme
+    from .app import EditorGroupBox, SettingsDialog, _history_state_html, _theme_editor_highlight, apply_theme
 
     app = QApplication.instance() or QApplication([])
     previous_font = QFont(app.font())
@@ -3438,6 +3441,10 @@ def assert_dark_theme() -> None:
             raise AssertionError("dark theme did not apply its editor background palette")
         if "background: #111318" not in _history_state_html("Title", "Detail"):
             raise AssertionError("history HTML did not follow the active dark theme")
+        if _theme_editor_highlight("search") != ("#31445a", "#f2f4f8"):
+            raise AssertionError("editor search matches kept the light-theme highlight colors")
+        if _theme_editor_highlight("missing_format") != ("#4b2c34", "#ffd7dc"):
+            raise AssertionError("missing format-token highlights kept the light-theme colors")
 
         editor_box = EditorGroupBox()
         try:
@@ -5167,9 +5174,20 @@ def assert_history_dialog_search_and_entry_timeline() -> None:
             raise AssertionError("first entry-history load did not index each missing commit exactly once")
         if dialog.entries.currentRow() != 0:
             raise AssertionError("opening history for a unit did not select its entry timeline")
+        if dialog.commits.selectedItems():
+            raise AssertionError("focused entry history also selected the latest commit during startup")
         content = dialog.content.toPlainText()
         if "Greeting" not in content or "First" not in content or "Second" not in content or "2" not in content:
             raise AssertionError("entry timeline did not show its count and every before/after value")
+
+        dialog._selection_timer.start()
+        stale_commit_request = dialog._request_id
+        dialog._show_selected_entry()
+        if dialog._selection_timer.isActive() or dialog._request_id == stale_commit_request:
+            raise AssertionError("entry selection did not cancel and invalidate pending commit rendering")
+        dialog._apply_history_render(stale_commit_request, "<p>STALE COMMIT RENDER</p>")
+        if "STALE COMMIT RENDER" in dialog.content.toPlainText():
+            raise AssertionError("a stale commit render overwrote the requested entry timeline")
 
         dialog.commit_search.setText("Second")
         app.processEvents()
@@ -5497,8 +5515,11 @@ def main() -> int:
     assert_diagnostics_are_bounded_and_content_free()
     assert_font_glyph_validation(root)
     assert_round_trip(root)
+    assert_guild2_encoding_detection()
+    assert_file_tree_groups_nested_paths()
     assert_statuses(root)
     assert_loaded_order_matches_file_lines(root)
+    assert_missing_translations_follow_source_order()
     assert_table_model_preserves_full_display_text()
     assert_local_project_roots_detect_sources_projects()
     assert_discover_game_source_projects_detects_vanilla_and_mods()
