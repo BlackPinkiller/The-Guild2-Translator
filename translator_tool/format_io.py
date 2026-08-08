@@ -171,6 +171,20 @@ def detect_encoding(raw: bytes) -> str:
         return "utf-16"
     if raw.startswith(b"\xef\xbb\xbf"):
         return "utf-8-sig"
+    # Guild 2 language tables are normally UTF-16 LE, but a few files are
+    # UTF-8.  Some original UTF-16 files (for example Kontor.dbt) omit the
+    # BOM, so detect their alternating NUL-byte pattern without changing the
+    # original no-BOM representation on save.
+    sample = raw[:4096]
+    if len(sample) >= 4:
+        even = sample[0::2]
+        odd = sample[1::2]
+        even_nuls = even.count(0)
+        odd_nuls = odd.count(0)
+        if odd_nuls * 2 >= len(odd) and even_nuls * 10 <= len(even):
+            return "utf-16-le"
+        if even_nuls * 2 >= len(even) and odd_nuls * 10 <= len(odd):
+            return "utf-16-be"
     return "utf-8"
 
 

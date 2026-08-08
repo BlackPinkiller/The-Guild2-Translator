@@ -317,9 +317,7 @@ class Project:
         units.sort(
             key=lambda unit: (
                 file_order.get(unit.file_rel, len(file_order)),
-                unit.ref.display_order,
-                unit.ref.field_order,
-                unit.uid,
+                *_unit_display_sort_key(unit),
             )
         )
 
@@ -688,13 +686,7 @@ class Project:
                 replacements[file_rel] = []
 
         for replacement in replacements.values():
-            replacement.sort(
-                key=lambda unit: (
-                    unit.ref.display_order,
-                    unit.ref.field_order,
-                    unit.uid,
-                )
-            )
+            replacement.sort(key=_unit_display_sort_key)
         refreshed = [unit for units in replacements.values() for unit in units]
         _apply_workflow_metadata(refreshed, self.root, self.language)
         replaced_uids = {unit.uid for unit in self.units if unit.file_rel in replacements}
@@ -741,6 +733,19 @@ def _build_insertion_anchors(
     return anchors
 
 
+def _unit_display_sort_key(unit: TranslationUnit) -> tuple[int, int, int, str]:
+    ref = unit.ref
+    if ref.kind == "dbt" and ref.source_row is not None:
+        # Existing and missing translations must use the same coordinate
+        # system.  Target line numbers shift whenever a source row is absent.
+        return (0, ref.source_order, ref.field_order, unit.uid)
+    if ref.kind == "dbt":
+        # Target-only rows have no source position, so keep their target-file
+        # order after all source-backed entries.
+        return (1, ref.display_order, ref.field_order, unit.uid)
+    return (0, ref.display_order, ref.field_order, unit.uid)
+
+
 def _apply_workflow_metadata(units: Iterable[TranslationUnit], root: Path, language: str) -> None:
     ignored = ignored_uids(root, language)
     confirmed = confirmed_uids(root, language)
@@ -785,7 +790,7 @@ def build_dbt_units(
         translation_row = label_row if matched_by_label else target_row
         if target_row is not None:
             matched_target_keys.add(row_key(file_name, target_row))
-        display_order = target_row.line_index if target_row is not None else source_row.line_index
+        display_order = source_row.line_index
         for field_order, target_field in enumerate(target_fields):
             source_field = matching_source_field(target_field, source_doc.string_columns)
             source_text = source_row.get(source_field)
