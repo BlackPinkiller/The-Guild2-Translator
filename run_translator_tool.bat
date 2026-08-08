@@ -10,4 +10,4 @@ if errorlevel 1 (
     exit /b 1
   )
 )
-py -3.12 -m translator_tool.app
+start "" pyw -3.12 -m translator_tool.app
