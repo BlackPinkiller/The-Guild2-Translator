@@ -41,6 +41,7 @@ from .git_history import GitCommit, GitError, LanguageGit, TranslationLogEntry, 
 from .history import OperationHistory, TranslationOperation, UnitChange
 from .self_tests.project_refresh import assert_saved_file_refresh
 from .self_tests.git_commit import assert_tracked_git_commit_skips_redundant_add
+from .self_tests.git_history_source import assert_history_uses_live_source_missing_from_old_commits
 from .self_tests.history_index import assert_history_index_is_persistent_and_bounded
 from .self_tests.format_io import assert_guild2_encoding_detection
 from .self_tests.file_tree import assert_file_tree_groups_nested_paths
@@ -5629,6 +5630,7 @@ def main() -> int:
     assert_git_recovers_stale_index_lock(root)
     assert_combined_git_history_format()
     assert_git_history_keeps_dbt_changes_without_source_row()
+    assert_history_uses_live_source_missing_from_old_commits()
     assert_git_history_keeps_selected_commit_entries(root)
     print("translator_tool self-test ok")
     return 0

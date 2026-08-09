@@ -129,12 +129,17 @@ class LanguageGit:
             if enable_codec
             else None
         )
-        self.history_cache_fingerprint = _codec_history_fingerprint(self.codec)
+        self._codec_history_fingerprint = _codec_history_fingerprint(self.codec)
         self._cache_lock = threading.Lock()
         self._commit_list_cache: tuple[GitCommit, ...] | None = None
         self._all_commit_list_cache: tuple[GitCommit, ...] | None = None
         self._entry_cache: OrderedDict[str, tuple[TranslationLogEntry, ...]] = OrderedDict()
         self._combined_cache: OrderedDict[tuple[str, ...], tuple[TranslationLogEntry, ...]] = OrderedDict()
+
+    @property
+    def history_cache_fingerprint(self) -> str:
+        """Include live sources used when older commits have no source blob."""
+        return f"{self._codec_history_fingerprint}-{_working_source_fingerprint(self.repo)}"
 
     def ensure_repository(self, settings: AppSettings) -> bool:
         """Create the initial language baseline. Returns true when it was created."""
@@ -257,6 +262,8 @@ class LanguageGit:
             after = self._show_bytes(commit, target_rel)
             before = self._show_bytes(parent, target_rel)
             source = self._show_bytes(commit, file_rel)
+            if source is None:
+                source = self._working_source_bytes(file_rel)
             if source is None:
                 continue
             if target_rel.lower().endswith(".dbt"):
@@ -389,6 +396,8 @@ class LanguageGit:
                     source = (
                         loaded_blobs.get(source_oid, blob_cache.get(source_oid)) if source_oid is not None else None
                     )
+                    if source is None:
+                        source = self._working_source_bytes(file_rel)
                     if source is None:
                         continue
                     if target_rel.lower().endswith(".dbt"):
@@ -606,6 +615,17 @@ class LanguageGit:
         result = self._run("show", f"{commit}:{path}", text=False, check=False)
         return result.stdout if result.returncode == 0 else None
 
+    def _working_source_bytes(self, file_rel: str) -> bytes | None:
+        path = (self.repo / file_rel).resolve()
+        try:
+            path.relative_to(self.repo)
+        except ValueError:
+            return None
+        try:
+            return path.read_bytes()
+        except OSError:
+            return None
+
     def _ensure_identity(self, settings: AppSettings) -> None:
         name = self._run("config", "--get", "user.name", check=False).stdout.strip()
         email = self._run("config", "--get", "user.email", check=False).stdout.strip()
@@ -778,6 +798,25 @@ def _codec_history_fingerprint(codec: Guild2Codec | None) -> str:
         digest.update(decoded.encode("utf-8"))
         digest.update(b"\0")
     return f"codec-{digest.hexdigest()[:16]}"
+
+
+def _working_source_fingerprint(repo: Path) -> str:
+    """Fingerprint the small source set that may backfill older Git history."""
+    paths = [path for path in repo.glob("*.dbt") if path.is_file()]
+    guides_root = repo / "Guides"
+    if guides_root.is_dir():
+        paths.extend(path for path in guides_root.rglob("*.txt") if path.is_file())
+    digest = hashlib.sha256()
+    for path in sorted(paths, key=lambda item: item.relative_to(repo).as_posix().casefold()):
+        relative = path.relative_to(repo).as_posix()
+        digest.update(relative.encode("utf-8"))
+        digest.update(b"\0")
+        try:
+            digest.update(path.read_bytes())
+        except OSError:
+            digest.update(b"<unreadable>")
+        digest.update(b"\0")
+    return f"source-{digest.hexdigest()[:16]}"
 
 
 def format_entries(entries: Iterable[TranslationLogEntry]) -> str:
