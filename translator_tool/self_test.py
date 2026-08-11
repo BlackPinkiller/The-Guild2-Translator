@@ -84,6 +84,7 @@ from .self_tests.code_semantics import (
     assert_code_semantics_follow_fields_panels_and_initdata,
     assert_feedback_message_contracts_do_not_depend_on_label_names,
     assert_dynamic_table_and_engine_label_semantics_are_preserved,
+    assert_nonlocalized_scripts_skip_runtime_semantic_resolution,
     assert_code_semantics_are_scope_and_role_aware,
     assert_code_semantics_resolve_local_function_returns,
     assert_placeholder_values_avoid_ambiguous_random_branches,
@@ -92,7 +93,11 @@ from .self_tests.code_semantics import (
     assert_variadic_runtime_arguments_map_to_placeholder_positions,
 )
 from .self_tests.code_index_lazy import (
+    assert_code_facts_cache_defers_and_yields_manifest_write,
+    assert_incremental_code_index_merge_preserves_compiled_wildcards,
     assert_code_index_requests_selected_and_visible_rows_without_moving_viewport,
+    assert_hot_ui_updates_are_coalesced,
+    assert_lazy_batches_advance_without_rescanning_prefix,
     assert_lazy_code_index_loads_cached_value_providers,
     assert_lazy_code_index_loads_effective_item_id_ranges,
     assert_lazy_code_index_links_cached_cross_file_facts,
@@ -102,6 +107,7 @@ from .self_tests.code_index_lazy import (
 from .self_tests.performance import (
     LARGE_BATCH_MIN_ENTRIES,
     LARGE_BATCH_SAVE_LIMIT_SECONDS,
+    assert_large_cached_search_filter_stays_interactive,
     assert_within_budget,
 )
 from .self_tests.preview_context_selection import (
@@ -114,12 +120,14 @@ from .self_tests.preview_context_selection import (
 )
 from .self_tests.preview_localization import (
     assert_editor_changes_reach_preview_localization,
+    assert_preview_localization_fallback_keeps_selection_nonblocking,
     assert_project_localization_updates_invalidate_placeholder_previews,
 )
 from .self_tests.preview_assets import assert_bundled_preview_assets_are_complete
 from .self_tests.preview_presets import assert_preview_presets_are_complete_and_unambiguous
 from .self_tests.preview_format_layout import assert_preview_format_layout_controls_are_semantic
 from .source_sync import (
+    SourceSyncCancelledError,
     SourceSyncPlanStaleError,
     apply_source_sync_plan,
     discover_game_source_projects,
@@ -2135,6 +2143,52 @@ def assert_source_sync_preview_classifies_file_and_entry_changes() -> None:
         safe_rmtree(temp)
 
 
+def assert_source_sync_cancellation_precedes_mutation() -> None:
+    temp = Path(tempfile.gettempdir()) / f"translator_tool_smoke_source_cancel_{uuid.uuid4().hex[:8]}"
+    try:
+        source_root = temp / "game" / "DB" / "Languages"
+        project_root = temp / "app" / "sources" / "Vanilla"
+        managed_root = project_root / "languages"
+        source_root.mkdir(parents=True)
+        managed_root.mkdir(parents=True)
+        (source_root / "Changed.txt").write_text("new", encoding="utf-8")
+        managed_path = managed_root / "Changed.txt"
+        managed_path.write_text("old", encoding="utf-8")
+        managed_before = managed_path.read_bytes()
+
+        checks = 0
+
+        def cancel_during_plan() -> bool:
+            nonlocal checks
+            checks += 1
+            return checks >= 3
+
+        try:
+            plan_source_project_sync(
+                source_root,
+                project_root,
+                cancelled=cancel_during_plan,
+            )
+        except SourceSyncCancelledError:
+            pass
+        else:
+            raise AssertionError("cancelled source planning continued to completion")
+        if managed_path.read_bytes() != managed_before:
+            raise AssertionError("cancelled source planning changed a managed source file")
+
+        plan = plan_source_project_sync(source_root, project_root)
+        try:
+            apply_source_sync_plan(plan, cancelled=lambda: True)
+        except SourceSyncCancelledError:
+            pass
+        else:
+            raise AssertionError("cancelled source apply entered its mutation phase")
+        if managed_path.read_bytes() != managed_before:
+            raise AssertionError("cancelled source apply changed a managed source file")
+    finally:
+        safe_rmtree(temp)
+
+
 def assert_failed_source_sync_restores_workflow_cache(root: Path) -> None:
     temp = Path(tempfile.gettempdir()) / f"translator_tool_smoke_source_rollback_{uuid.uuid4().hex[:8]}"
     original_atomic_write_many = source_sync_module.atomic_write_many
@@ -3027,14 +3081,22 @@ def assert_editor_undo_stays_local(root: Path) -> None:
             app = QApplication([])
         LanguageGit(temp, "#chinese", codec_root=root).ensure_repository(AppSettings())
         original_ensure_repository = app_module.LanguageGit.ensure_repository
+        original_project_load_descriptor = app_module.Project.__dict__["load"]
+        original_project_load = app_module.Project.load
         main_thread_id = threading.get_ident()
         git_init_thread_ids: list[int] = []
+        project_load_thread_ids: list[int] = []
 
         def tracked_ensure_repository(git: LanguageGit, settings: AppSettings) -> bool:
             git_init_thread_ids.append(threading.get_ident())
             return original_ensure_repository(git, settings)
 
+        def tracked_project_load(*args, **kwargs):
+            project_load_thread_ids.append(threading.get_ident())
+            return original_project_load(*args, **kwargs)
+
         app_module.LanguageGit.ensure_repository = tracked_ensure_repository
+        app_module.Project.load = staticmethod(tracked_project_load)
         win = TranslatorWindow()
         if win.project_button.popupMode() != QToolButton.ToolButtonPopupMode.InstantPopup:
             raise AssertionError("project button click did not open its existing project menu directly")
@@ -3048,6 +3110,11 @@ def assert_editor_undo_stays_local(root: Path) -> None:
             QTest.qWait(20)
             app.processEvents()
         app_module.LanguageGit.ensure_repository = original_ensure_repository
+        app_module.Project.load = original_project_load_descriptor
+        if not project_load_thread_ids:
+            raise AssertionError("project parsing did not run during project startup")
+        if main_thread_id in project_load_thread_ids:
+            raise AssertionError("project parsing blocked the Qt UI thread during startup")
         if not git_init_thread_ids:
             raise AssertionError("Git initialization did not run during project startup")
         if main_thread_id in git_init_thread_ids:
@@ -3385,6 +3452,25 @@ def assert_editor_undo_stays_local(root: Path) -> None:
         app.processEvents()
         if win.proxy.mapFromSource(search_source_index).isValid():
             raise AssertionError("Chinese-comma search did not apply the excluded ID condition")
+        search_translation_before = search_unit.current_text
+        search_translation_marker = "proxy-live-search-marker-7f41"
+        win.search_edit.setText(f'translation:"{search_translation_marker}"')
+        win._apply_filters()
+        app.processEvents()
+        if win.proxy.mapFromSource(search_source_index).isValid():
+            raise AssertionError("translation search fixture unexpectedly matched before its edit")
+        win._set_unit_text(search_unit, search_translation_marker)
+        win.model.refresh_unit(search_unit)
+        QTest.qWait(10)
+        app.processEvents()
+        if not win.proxy.mapFromSource(search_source_index).isValid():
+            raise AssertionError("cached proxy did not reveal a row whose translation began matching")
+        win._set_unit_text(search_unit, search_translation_before)
+        win.model.refresh_unit(search_unit)
+        QTest.qWait(10)
+        app.processEvents()
+        if win.proxy.mapFromSource(search_source_index).isValid():
+            raise AssertionError("cached proxy kept a row whose translation stopped matching")
         bracket_clauses = app_module.parse_search_query(
             '$C[1,2,3], label:test',
             case_sensitive=False,
@@ -3632,6 +3718,8 @@ def assert_editor_undo_stays_local(root: Path) -> None:
     finally:
         if "original_ensure_repository" in locals():
             app_module.LanguageGit.ensure_repository = original_ensure_repository
+        if "original_project_load_descriptor" in locals():
+            app_module.Project.load = original_project_load_descriptor
         app_module.MANAGED_PROJECT_ROOT = previous_managed_root
         if previous_localappdata is None:
             os.environ.pop("LOCALAPPDATA", None)
@@ -5450,6 +5538,8 @@ def assert_history_dialog_search_and_entry_timeline() -> None:
     early = TranslationLogEntry("新增", "Text.dbt", "10", "Greeting", "Text", "Hello", "First")
     later = TranslationLogEntry("更新", "Text.dbt", "10", "Greeting", "Text", "Hello", "Second", "First")
     entries = {commits[0].full_hash: [later], commits[1].full_hash: [early]}
+    main_thread_id = threading.get_ident()
+    commit_list_thread_ids: list[int] = []
 
     history_root = Path(tempfile.mkdtemp(prefix="translator_history_dialog_"))
     history_repo = history_root / "languages"
@@ -5466,6 +5556,7 @@ def assert_history_dialog_search_and_entry_timeline() -> None:
             self.full_index_read_count = 0
 
         def list_all_commits(self):
+            commit_list_thread_ids.append(threading.get_ident())
             return list(commits)
 
         def entries_for_commit(self, commit: str):
@@ -5511,6 +5602,8 @@ def assert_history_dialog_search_and_entry_timeline() -> None:
             QTest.qWait(20)
         if dialog.entries.count() != 1:
             raise AssertionError("entry-history index did not group repeated changes by translation field")
+        if not commit_list_thread_ids or main_thread_id in commit_list_thread_ids:
+            raise AssertionError("opening update history read the Git commit list on the UI thread")
         if fake_git.full_index_read_count != 1:
             raise AssertionError("first entry-history load did not index each missing commit exactly once")
         if dialog.entries.currentRow() != 0:
@@ -5871,6 +5964,7 @@ def main() -> int:
     assert_code_semantics_follow_fields_panels_and_initdata()
     assert_feedback_message_contracts_do_not_depend_on_label_names()
     assert_dynamic_table_and_engine_label_semantics_are_preserved()
+    assert_nonlocalized_scripts_skip_runtime_semantic_resolution()
     assert_preview_variable_source_cache_reuses_script_text()
     assert_cross_file_return_labels_flow_only_to_real_callers()
     assert_cross_file_function_summaries_bind_arguments_and_expand_returns()
@@ -5886,16 +5980,22 @@ def main() -> int:
     assert_cross_entry_labels_preserve_literal_suffixes()
     assert_project_localization_updates_invalidate_placeholder_previews()
     assert_editor_changes_reach_preview_localization()
+    assert_preview_localization_fallback_keeps_selection_nonblocking()
     assert_bundled_preview_assets_are_complete()
     assert_preview_presets_are_complete_and_unambiguous()
     assert_preview_format_layout_controls_are_semantic()
     assert_game_preview_parts_use_the_selected_call_site()
+    assert_code_facts_cache_defers_and_yields_manifest_write()
+    assert_incremental_code_index_merge_preserves_compiled_wildcards()
+    assert_lazy_batches_advance_without_rescanning_prefix()
     assert_lazy_code_index_prioritizes_requested_labels_and_invalidates_cache()
     assert_lazy_code_index_loads_effective_item_id_ranges()
     assert_lazy_code_index_links_cached_cross_file_facts()
     assert_lazy_code_index_loads_cached_value_providers()
     assert_lazy_code_index_survives_unwritable_cache()
     assert_code_index_requests_selected_and_visible_rows_without_moving_viewport()
+    assert_hot_ui_updates_are_coalesced()
+    assert_large_cached_search_filter_stays_interactive()
     assert_stale_code_index_workers_are_released()
     assert_code_window_context_extracts_window_labels_and_buttons()
     assert_code_preview_unit_lookup_accepts_leading_underscore_labels()
@@ -5908,6 +6008,7 @@ def main() -> int:
     assert_startup_prefers_local_sources_over_game_root()
     assert_sync_vanilla_sources_only_imports_originals()
     assert_source_sync_preview_classifies_file_and_entry_changes()
+    assert_source_sync_cancellation_precedes_mutation()
     assert_sync_source_project_invalidates_changed_translations(root)
     assert_failed_source_sync_restores_workflow_cache(root)
     assert_save_existing(root)

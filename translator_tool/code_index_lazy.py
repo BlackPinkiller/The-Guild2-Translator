@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from functools import lru_cache
 import hashlib
+import io
 import json
 from pathlib import Path
 import re
@@ -34,6 +36,8 @@ ANALYZER_REVISION = "script-semantics-2026-08-10-1"
 MAX_CACHE_MANIFESTS = 8
 MAX_CACHE_BYTES = 128 * 1024 * 1024
 MAX_CACHED_FILES = 8192
+MAX_SPEC_KEY_CACHE = 16384
+CACHE_SERIALIZE_YIELD_SECONDS = 0.008
 _LABEL_FRAGMENT_RE = re.compile(rb"@l_[a-z0-9_+*]{5,}|_[a-z][a-z0-9_+*]{5,}")
 _CALL_NAME_RE = re.compile(rb"\b([a-z_][a-z0-9_.:]*)\s*\(", re.IGNORECASE)
 _FUNCTION_NAME_RE = re.compile(
@@ -57,7 +61,6 @@ class CodeFactsCache:
         self.path = path
         self._files: dict[str, dict[str, object]] = {}
         self._dirty = False
-        self._dirty_updates = 0
         self._load()
 
     def lexical_blob(self, spec: CodeFileSpec) -> bytes | None:
@@ -182,7 +185,9 @@ class CodeFactsCache:
         self._mark_dirty()
 
     def flush_if_needed(self, *, force: bool = False) -> None:
-        if not self._dirty or (not force and self._dirty_updates < 32):
+        # This cache is disposable. Persist once at completion/close instead of
+        # repeatedly serializing a growing manifest while the user is editing.
+        if not self._dirty or not force:
             return
         self._trim_entries()
         payload = {
@@ -192,10 +197,9 @@ class CodeFactsCache:
         }
         atomic_write(
             self.path,
-            (json.dumps(payload, ensure_ascii=True, separators=(",", ":")) + "\n").encode("utf-8"),
+            _encode_cache_manifest(payload),
         )
         self._dirty = False
-        self._dirty_updates = 0
         _prune_cache_manifests(self.path.parent)
 
     def _load(self) -> None:
@@ -231,7 +235,6 @@ class CodeFactsCache:
 
     def _mark_dirty(self) -> None:
         self._dirty = True
-        self._dirty_updates += 1
 
     def _trim_entries(self) -> None:
         if len(self._files) <= MAX_CACHED_FILES:
@@ -266,6 +269,7 @@ class LazyCodeIndexBuilder:
         self.cache: CodeFactsCache | None = None
         self._search_blobs: dict[str, bytes] = {}
         self._analyzed: set[str] = set()
+        self._batch_cursor = 0
         self._linker = CrossFileSemanticLinker()
         self._pending_aliases: set[str] = set()
         self._pending_value_aliases: set[tuple[str, str]] = set()
@@ -365,7 +369,7 @@ class LazyCodeIndexBuilder:
                     result.merge(self._analyze_spec(spec))
                     self._queue_return_aliases(requested_keys, processed_aliases)
                     self._queue_value_aliases(processed_value_aliases)
-        self._flush_cache(force=True)
+        self._flush_cache(force=False)
         return result
 
     def analyze_next_batch(
@@ -377,9 +381,14 @@ class LazyCodeIndexBuilder:
         self.prepare()
         result = CodeReferenceIndex()
         count = 0
-        for spec in self.files:
-            if count >= max(1, limit) or cancelled():
-                break
+        batch_limit = max(1, limit)
+        while (
+            self._batch_cursor < len(self.files)
+            and count < batch_limit
+            and not cancelled()
+        ):
+            spec = self.files[self._batch_cursor]
+            self._batch_cursor += 1
             if _spec_key(spec) in self._analyzed:
                 continue
             result.merge(self._analyze_spec(spec))
@@ -426,13 +435,13 @@ class LazyCodeIndexBuilder:
             raw = spec.path.read_bytes()
         except OSError:
             return CodeReferenceIndex()
-        lexical = _lexical_blob(raw)
-        self._search_blobs[key] = lexical
         assert self.cache is not None
         cached = self.cache.verified_analysis(spec, raw, self.catalog_digest)
         if cached is not None:
             self._remember_return_aliases(cached)
             return self._linker.add(cached)
+        lexical = _lexical_blob(raw)
+        self._search_blobs[key] = lexical
         analysis = analyze_code_file(
             spec,
             label_catalog=self.label_catalog,
@@ -464,6 +473,20 @@ class LazyCodeIndexBuilder:
         self._pending_value_aliases.update(
             set(self._linker.unresolved_value_aliases()) - processed_aliases
         )
+
+
+def _encode_cache_manifest(payload: dict[str, object]) -> bytes:
+    """Encode a large disposable cache without monopolizing the GUI thread's GIL."""
+    output = io.StringIO()
+    encoder = json.JSONEncoder(ensure_ascii=True, separators=(",", ":"))
+    yield_deadline = time.perf_counter() + CACHE_SERIALIZE_YIELD_SECONDS
+    for number, chunk in enumerate(encoder.iterencode(payload), start=1):
+        output.write(chunk)
+        if number % 256 == 0 and time.perf_counter() >= yield_deadline:
+            time.sleep(0)
+            yield_deadline = time.perf_counter() + CACHE_SERIALIZE_YIELD_SECONDS
+    output.write("\n")
+    return output.getvalue().encode("utf-8")
 
 
 def default_cache_path(game_root: Path, project_root: Path) -> Path:
@@ -818,6 +841,7 @@ def _analyzer_revision() -> str:
     return f"{ANALYZER_REVISION}:{_IMPLEMENTATION_REVISION}"
 
 
+@lru_cache(maxsize=MAX_SPEC_KEY_CACHE)
 def _spec_key(spec: CodeFileSpec) -> str:
     identity = f"{spec.source}\0{str(spec.path.expanduser().resolve()).casefold()}"
     return hashlib.sha256(identity.encode("utf-8")).hexdigest()

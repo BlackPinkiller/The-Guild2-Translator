@@ -3,7 +3,85 @@ from __future__ import annotations
 from pathlib import Path
 
 from ..code_index import CodeReference
-from ..preview import PreviewService
+from ..preview import GameLocalization, PreviewService
+
+
+def assert_preview_localization_fallback_keeps_selection_nonblocking() -> None:
+    service = PreviewService(Path("missing-game"), "#chinese")
+    service.set_project_localization(
+        {"_PROMPT_+0": "Choose a name"},
+        {"_PROMPT_+0": "选择一个名字"},
+    )
+    original_read_labels = GameLocalization._read_labels
+    try:
+        GameLocalization._read_labels = staticmethod(
+            lambda _path: (_ for _ in ()).throw(
+                AssertionError("a row selection synchronously read game localization")
+            )
+        )
+        service.use_project_localization_fallback()
+        reference = CodeReference(
+            "body_+0",
+            Path("Fixture.lua"),
+            1,
+            1,
+            "MsgQuick",
+            1,
+            runtime_arguments=("Prompt",),
+            runtime_argument_values=(("@L_PROMPT_+0",),),
+            runtime_argument_kinds=(("label",),),
+            role="body",
+        )
+        rendered = service.render(
+            "%1l",
+            unit_key="body",
+            label="_BODY_+0",
+            file_rel="Text.dbt",
+            kind="dbt",
+            target=True,
+            references=(reference,),
+        ).display_text
+        if rendered != "选择一个名字":
+            raise AssertionError(f"the immediate project fallback changed preview output: {rendered!r}")
+        covered_game = GameLocalization(
+            Path("covered-game"),
+            "#chinese",
+            {"_PROMPT_+0": "Choose a name"},
+            {"_PROMPT_+0": "选择一个名字"},
+            load_game_labels=False,
+        )
+        if covered_game.resolve_label("_PROMPT_+0", True) != "选择一个名字":
+            raise AssertionError(
+                "covered Vanilla labels changed when redundant game DB reads were skipped"
+            )
+    finally:
+        GameLocalization._read_labels = staticmethod(original_read_labels)
+
+    game_root, language, source, target, revision = service.localization_load_spec()
+    prepared = GameLocalization(game_root, language, source, target)
+    service.update_project_localization("_PROMPT_+0", "Choose", "请选择")
+    if service.install_background_localization(prepared, revision):
+        raise AssertionError("stale background localization replaced a newer editor value")
+
+    font_scans = 0
+
+    def count_font_scan(_target: bool) -> tuple[Path, ...]:
+        nonlocal font_scans
+        font_scans += 1
+        return ()
+
+    service = PreviewService(None, "#chinese")
+    service._standard_font_files = count_font_scan  # type: ignore[method-assign]
+    for number in range(3):
+        service.render(
+            f"plain text {number}",
+            unit_key=f"plain-{number}",
+            file_rel="Text.dbt",
+            kind="dbt",
+            target=False,
+        )
+    if font_scans != 1:
+        raise AssertionError(f"row previews repeatedly rescanned the game font directory: {font_scans}")
 
 
 def assert_project_localization_updates_invalidate_placeholder_previews() -> None:
@@ -128,8 +206,50 @@ def assert_project_localization_updates_invalidate_placeholder_previews() -> Non
         target=True,
         references=(raw_label_reference,),
     ).display_text
-    if raw_labels != "\u626d\u4f24 / \u611f\u5192":
+    if raw_labels != "\u626d\u4f24":
         raise AssertionError(f"suffix-bearing runtime labels stayed generic: {raw_labels!r}")
+
+    service.set_project_localization(
+        {
+            "Hostility": "Hostility",
+            "Neutral": "Neutral",
+            "NAP": "Non-aggression pact",
+            "Alliance": "Alliance",
+        },
+        {
+            "Hostility": "\u4e16\u4ec7",
+            "Neutral": "\u4e2d\u7acb",
+            "NAP": "\u4e92\u4e0d\u4fb5\u72af",
+            "Alliance": "\u540c\u76df",
+        },
+    )
+    relationship_reference = CodeReference(
+        "measure_administrate_diplomacy_special_body_+0",
+        Path("ms_047_AdministrateDiplomacy.lua"),
+        1594,
+        1,
+        "MsgBoxNoWait",
+        4,
+        role="body",
+        runtime_arguments=("Unused",) * 10 + ("Label",),
+        runtime_argument_values=((),) * 10
+        + (("", "@LHostility", "@LNeutral", "@LNAP", "@LAlliance"),),
+        runtime_argument_kinds=((),) * 10
+        + (("structure", "label", "label", "label", "label"),),
+    )
+    relationship = service.render(
+        "\u72b6\u6001\uff1a%11l",
+        unit_key="relationship-overview",
+        label="_MEASURE_ADMINISTRATE_DIPLOMACY_SPECIAL_BODY_+0",
+        file_rel="Text.dbt",
+        kind="dbt",
+        target=True,
+        references=(relationship_reference,),
+    ).display_text
+    if relationship != "\u72b6\u6001\uff1a\u4e16\u4ec7":
+        raise AssertionError(
+            f"mutually exclusive relationship labels leaked into the game preview: {relationship!r}"
+        )
 
     service.set_project_localization(
         {

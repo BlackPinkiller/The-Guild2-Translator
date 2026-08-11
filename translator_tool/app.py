@@ -26,7 +26,6 @@ from PySide6.QtCore import (
     QRunnable,
     QSize,
     QSignalBlocker,
-    QSortFilterProxyModel,
     Qt,
     QThreadPool,
     QTimer,
@@ -56,6 +55,7 @@ from PySide6.QtWidgets import (
     QMenu,
     QMessageBox,
     QPlainTextEdit,
+    QProgressBar,
     QPushButton,
     QScrollArea,
     QSplitter,
@@ -129,17 +129,24 @@ from .project import (
     SaveValidationError,
     TranslationUnit,
 )
-from .preview import GLYPH_MARK, PREVIEW_MARK, PreviewAtom, PreviewDocument, PreviewService
+from .preview import GameLocalization, GLYPH_MARK, PREVIEW_MARK, PreviewAtom, PreviewDocument, PreviewService
 from .preview_coverage import preview_placeholder_coverage, preview_reference_coverage
 from .preview_context_selection import rank_preview_references, select_preview_context
 from .recovery import apply_recovery_draft, clear_recovery_draft, load_recovery_draft, save_recovery_draft
-from .search import SearchClause, parse_search_query, search_blob as _search_blob, search_field_values as _search_field_values
+from .search import (
+    SearchClause,
+    parse_search_query,
+    search_blob as _search_blob,
+    search_field_values as _search_field_values,
+)
 from .settings import AppSettings, load_settings, protect_secret, reveal_secret, save_settings
 from .source_sync import (
     DEFAULT_TRANSLATION_LANGUAGE,
     SourceProjectSpec,
+    SourceSyncCancelledError,
     SourceSyncPlan,
     SourceSyncPlanStaleError,
+    SourceSyncResult,
     VANILLA_PROJECT_NAME,
     apply_source_sync_plan,
     discover_game_source_projects,
@@ -149,7 +156,7 @@ from .source_sync import (
     local_project_roots,
     managed_vanilla_project_root,
     plan_source_project_sync,
-    sync_vanilla_sources,
+    sync_source_project,
 )
 from .text_import import (
     IMPORT_MODE_KEYED,
@@ -186,6 +193,8 @@ DEFAULT_PROJECT_ROOT = BUNDLED_ROOT
 APP_ICON_PATH = BUNDLED_ROOT / "assets" / "app-icon.ico"
 MANAGED_PROJECT_ROOT = managed_vanilla_project_root(APP_ROOT)
 TYPING_GROUP_DELAY_MS = 750
+COUNTS_REFRESH_DELAY_MS = 120
+CODE_CONTEXT_PREVIEW_DELAY_MS = 300
 HISTORY_ENTRY_RESULT_LIMIT = 500
 FILE_FILTER_ALL = "__all_files__"
 STATUS_FILTER_ALL = "__all_statuses__"
@@ -238,6 +247,8 @@ class UnitTableModel(QAbstractTableModel):
         self._units_by_normalized_label: dict[str, tuple[TranslationUnit, ...]] = {}
         self._search: dict[str, str] = {}
         self._search_case_sensitive: dict[str, str] = {}
+        self._search_rows: list[str] = []
+        self._search_rows_case_sensitive: list[str] = []
         self._format_warning: dict[str, bool] = {}
         self._format_rank: dict[str, int] = {}
         self._glyph_warning: dict[str, bool] = {}
@@ -261,6 +272,8 @@ class UnitTableModel(QAbstractTableModel):
         self.units = []
         self._search.clear()
         self._search_case_sensitive.clear()
+        self._search_rows.clear()
+        self._search_rows_case_sensitive.clear()
         self._row_by_uid.clear()
         self._units_by_file.clear()
         self._units_by_exact_label.clear()
@@ -344,9 +357,8 @@ class UnitTableModel(QAbstractTableModel):
         return self.project.unit_by_uid(uid)
 
     def search_blob(self, row: int, *, case_sensitive: bool = False) -> str:
-        unit = self.units[row]
-        index = self._search_case_sensitive if case_sensitive else self._search
-        return index.get(unit.uid, "")
+        index = self._search_rows_case_sensitive if case_sensitive else self._search_rows
+        return index[row] if 0 <= row < len(index) else ""
 
     def matches_search(
         self,
@@ -375,6 +387,8 @@ class UnitTableModel(QAbstractTableModel):
         raw_search = _search_blob(unit)
         self._search_case_sensitive[unit.uid] = raw_search
         self._search[unit.uid] = raw_search.casefold()
+        self._search_rows_case_sensitive[row] = raw_search
+        self._search_rows[row] = raw_search.casefold()
         self._format_warning.pop(unit.uid, None)
         self._format_rank.pop(unit.uid, None)
         self._glyph_warning.pop(unit.uid, None)
@@ -389,6 +403,8 @@ class UnitTableModel(QAbstractTableModel):
             raw_search = _search_blob(unit)
             self._search_case_sensitive[unit.uid] = raw_search
             self._search[unit.uid] = raw_search.casefold()
+            self._search_rows_case_sensitive[row] = raw_search
+            self._search_rows[row] = raw_search.casefold()
             self._format_warning.pop(unit.uid, None)
             self._format_rank.pop(unit.uid, None)
             self._glyph_warning.pop(unit.uid, None)
@@ -460,7 +476,12 @@ class UnitTableModel(QAbstractTableModel):
 
     def _rebuild_indexes(self) -> None:
         self._row_by_uid = {unit.uid: index for index, unit in enumerate(self.units)}
-        self._search_case_sensitive = {unit.uid: _search_blob(unit) for unit in self.units}
+        self._search_rows_case_sensitive = [_search_blob(unit) for unit in self.units]
+        self._search_rows = [text.casefold() for text in self._search_rows_case_sensitive]
+        self._search_case_sensitive = {
+            unit.uid: self._search_rows_case_sensitive[row]
+            for row, unit in enumerate(self.units)
+        }
         self._search = {uid: text.casefold() for uid, text in self._search_case_sensitive.items()}
         units_by_file: dict[str, list[TranslationUnit]] = {}
         units_by_exact_label: dict[str, list[TranslationUnit]] = {}
@@ -485,9 +506,24 @@ class UnitTableModel(QAbstractTableModel):
             self.dataChanged.emit(self.index(0, 0), self.index(self.rowCount() - 1, self.columnCount() - 1))
 
 
-class UnitFilterProxyModel(QSortFilterProxyModel):
+class UnitFilterProxyModel(QAbstractTableModel):
+    """A row-mapping proxy that filters in one Python pass.
+
+    QSortFilterProxyModel calls a Python ``filterAcceptsRow`` override once per
+    source row.  On large projects that Qt/Python boundary dominated every
+    search even though the cached text match itself took only a few milliseconds.
+    """
+
     def __init__(self) -> None:
         super().__init__()
+        self._source_model: UnitTableModel | None = None
+        self._source_rows: list[int] = []
+        self._proxy_row_by_source: dict[int, int] = {}
+        self._source_resetting = False
+        self._changed_source_rows: set[int] = set()
+        self._source_refresh_timer = QTimer(self)
+        self._source_refresh_timer.setSingleShot(True)
+        self._source_refresh_timer.timeout.connect(self._refresh_changed_source_rows)
         self.file_filter = FILE_FILTER_ALL
         self.status_filter = STATUS_FILTER_ALL
         self.only_missing = True
@@ -495,49 +531,77 @@ class UnitFilterProxyModel(QSortFilterProxyModel):
         self.query = ""
         self.case_sensitive = False
         self.search_clauses: tuple[SearchClause, ...] = ()
-        self._sort_rank_by_uid: dict[str, int] = {}
-        # Edits and filter changes must not continuously re-sort a large project.
-        # Sorting is only performed when the user explicitly clicks a column.
-        self.setDynamicSortFilter(False)
+        self._sort_column = -1
+        self._sort_order = Qt.SortOrder.AscendingOrder
 
     def setSourceModel(self, source_model) -> None:  # noqa: N802
-        super().setSourceModel(source_model)
-        if source_model is not None:
-            source_model.modelReset.connect(self._resort_after_model_reset)
+        if source_model is self._source_model:
+            return
+        self.beginResetModel()
+        self._source_model = source_model if isinstance(source_model, UnitTableModel) else None
+        if self._source_model is not None:
+            self._source_model.modelAboutToBeReset.connect(self._source_model_about_to_reset)
+            self._source_model.modelReset.connect(self._source_model_reset)
+            self._source_model.dataChanged.connect(self._source_data_changed)
+            self._source_model.headerDataChanged.connect(self.headerDataChanged.emit)
+        self._rebuild_row_mapping()
+        self.endResetModel()
 
-    def _resort_after_model_reset(self) -> None:
-        column = self.sortColumn()
-        if column >= 0:
-            self.sort(column, self.sortOrder())
+    def sourceModel(self) -> UnitTableModel | None:  # noqa: N802
+        return self._source_model
+
+    def rowCount(self, parent: QModelIndex = QModelIndex()) -> int:  # noqa: N802
+        return 0 if parent.isValid() else len(self._source_rows)
+
+    def columnCount(self, parent: QModelIndex = QModelIndex()) -> int:  # noqa: N802
+        source = self._source_model
+        return 0 if parent.isValid() or source is None else source.columnCount()
+
+    def data(self, index: QModelIndex, role: int = Qt.ItemDataRole.DisplayRole):  # noqa: N802
+        source_index = self.mapToSource(index)
+        source = self._source_model
+        return source.data(source_index, role) if source is not None and source_index.isValid() else None
+
+    def flags(self, index: QModelIndex) -> Qt.ItemFlag:
+        source_index = self.mapToSource(index)
+        source = self._source_model
+        return source.flags(source_index) if source is not None and source_index.isValid() else Qt.ItemFlag.NoItemFlags
+
+    def headerData(
+        self,
+        section: int,
+        orientation: Qt.Orientation,
+        role: int = Qt.ItemDataRole.DisplayRole,
+    ):  # noqa: N802
+        source = self._source_model
+        return source.headerData(section, orientation, role) if source is not None else None
+
+    def mapToSource(self, proxy_index: QModelIndex) -> QModelIndex:  # noqa: N802
+        source = self._source_model
+        if (
+            source is None
+            or not proxy_index.isValid()
+            or not (0 <= proxy_index.row() < len(self._source_rows))
+        ):
+            return QModelIndex()
+        return source.index(self._source_rows[proxy_index.row()], proxy_index.column())
+
+    def mapFromSource(self, source_index: QModelIndex) -> QModelIndex:  # noqa: N802
+        if not source_index.isValid() or source_index.model() is not self._source_model:
+            return QModelIndex()
+        proxy_row = self._proxy_row_by_source.get(source_index.row())
+        return self.index(proxy_row, source_index.column()) if proxy_row is not None else QModelIndex()
+
+    def sortColumn(self) -> int:  # noqa: N802
+        return self._sort_column
+
+    def sortOrder(self) -> Qt.SortOrder:  # noqa: N802
+        return self._sort_order
 
     def sort(self, column: int, order: Qt.SortOrder = Qt.SortOrder.AscendingOrder) -> None:
-        self._sort_rank_by_uid.clear()
-        source = self.sourceModel()
-        if column >= 0 and isinstance(source, UnitTableModel):
-            ranked = sorted(
-                range(source.rowCount()),
-                key=lambda row: self._sort_key(source, source.unit_at(row), row, column),
-            )
-            self._sort_rank_by_uid = {
-                unit.uid: rank
-                for rank, row in enumerate(ranked)
-                if (unit := source.unit_at(row)) is not None
-            }
-        super().sort(column, order)
-
-    def lessThan(self, left: QModelIndex, right: QModelIndex) -> bool:  # noqa: N802
-        source = self.sourceModel()
-        if not isinstance(source, UnitTableModel):
-            return super().lessThan(left, right)
-        left_unit = source.unit_at(left.row())
-        right_unit = source.unit_at(right.row())
-        if left_unit is None or right_unit is None:
-            return left.row() < right.row()
-        left_rank = self._sort_rank_by_uid.get(left_unit.uid)
-        right_rank = self._sort_rank_by_uid.get(right_unit.uid)
-        if left_rank is None or right_rank is None:
-            return left.row() < right.row()
-        return left_rank < right_rank
+        self._sort_column = column
+        self._sort_order = order
+        self._reset_rows()
 
     def _sort_key(
         self,
@@ -602,13 +666,11 @@ class UnitFilterProxyModel(QSortFilterProxyModel):
         self.query = query.strip()
         self.case_sensitive = case_sensitive
         self.search_clauses = parse_search_query(self.query, case_sensitive=case_sensitive)
-        self.beginFilterChange()
-        self.endFilterChange(QSortFilterProxyModel.Direction.Rows)
+        self._reset_rows()
 
     def refresh_rows(self) -> None:
         """Re-evaluate status-dependent rows without resetting the source model."""
-        self.beginFilterChange()
-        self.endFilterChange(QSortFilterProxyModel.Direction.Rows)
+        self._reset_rows()
 
     def filterAcceptsRow(self, source_row: int, source_parent: QModelIndex) -> bool:  # noqa: N802
         source = self.sourceModel()
@@ -642,6 +704,155 @@ class UnitFilterProxyModel(QSortFilterProxyModel):
             self.search_clauses,
             case_sensitive=self.case_sensitive,
         )
+
+    def _accepted_source_rows(self) -> list[int]:
+        source = self._source_model
+        if source is None:
+            return []
+        row_count = source.rowCount()
+        clauses = self.search_clauses
+        has_base_filter = (
+            self.file_filter != FILE_FILTER_ALL
+            or self.status_filter != STATUS_FILTER_ALL
+            or self.only_missing
+            or self.only_format_warnings
+        )
+        if not has_base_filter and not clauses:
+            rows = list(range(row_count))
+        elif not has_base_filter and all(not clause.field for clause in clauses):
+            blobs = (
+                source._search_rows_case_sensitive
+                if self.case_sensitive
+                else source._search_rows
+            )
+            rows = [
+                row
+                for row, blob in enumerate(blobs)
+                if all((clause.needle in blob) != clause.excluded for clause in clauses)
+            ]
+        else:
+            file_filter = self.file_filter
+            status_filter = self.status_filter
+            only_missing = self.only_missing
+            only_format_warnings = self.only_format_warnings
+            recently_translated = source._recently_translated
+            rows = []
+            for row, unit in enumerate(source.units):
+                if file_filter != FILE_FILTER_ALL and file_filter.lower().endswith(".txt"):
+                    if unit.file_rel != file_filter:
+                        continue
+                elif file_filter != FILE_FILTER_ALL and unit.file_rel != file_filter:
+                    continue
+                effective_status = unit.filter_status()
+                needs_review = unit.requires_manual_review
+                needs_translation = effective_status in MISSING_WORK_STATUSES and not needs_review
+                keep_visible = unit.uid in recently_translated or unit.pending_delete
+                if status_filter == STATUS_FILTER_REVIEW and not needs_review:
+                    continue
+                if status_filter == STATUS_FILTER_TODO and not needs_translation and not keep_visible:
+                    continue
+                if status_filter == STATUS_FILTER_ALL and only_missing and not needs_translation and not keep_visible:
+                    continue
+                if (
+                    status_filter not in {STATUS_FILTER_ALL, STATUS_FILTER_TODO, STATUS_FILTER_REVIEW}
+                    and effective_status != status_filter
+                ):
+                    continue
+                if only_format_warnings and not source.has_format_warning(row):
+                    continue
+                if clauses and not source.matches_search(
+                    row,
+                    clauses,
+                    case_sensitive=self.case_sensitive,
+                ):
+                    continue
+                rows.append(row)
+        if self._sort_column >= 0:
+            rows.sort(
+                key=lambda row: self._sort_key(
+                    source,
+                    source.unit_at(row),
+                    row,
+                    self._sort_column,
+                ),
+                reverse=self._sort_order == Qt.SortOrder.DescendingOrder,
+            )
+        return rows
+
+    def _rebuild_row_mapping(self) -> None:
+        self._source_rows = self._accepted_source_rows()
+        self._proxy_row_by_source = {
+            source_row: proxy_row
+            for proxy_row, source_row in enumerate(self._source_rows)
+        }
+
+    def _reset_rows(self) -> None:
+        next_rows = self._accepted_source_rows()
+        if next_rows == self._source_rows:
+            return
+        self.beginResetModel()
+        self._source_rows = next_rows
+        self._proxy_row_by_source = {
+            source_row: proxy_row
+            for proxy_row, source_row in enumerate(next_rows)
+        }
+        self.endResetModel()
+
+    def _source_model_about_to_reset(self) -> None:
+        if self._source_resetting:
+            return
+        self._source_refresh_timer.stop()
+        self._changed_source_rows.clear()
+        self.beginResetModel()
+        self._source_resetting = True
+
+    def _source_model_reset(self) -> None:
+        self._rebuild_row_mapping()
+        if self._source_resetting:
+            self._source_resetting = False
+            self.endResetModel()
+        else:
+            self._reset_rows()
+
+    def _source_data_changed(
+        self,
+        top_left: QModelIndex,
+        bottom_right: QModelIndex,
+        roles: list[int] | None = None,
+    ) -> None:
+        if (
+            self.file_filter != FILE_FILTER_ALL
+            or self.status_filter != STATUS_FILTER_ALL
+            or self.only_missing
+            or self.only_format_warnings
+            or self.search_clauses
+        ):
+            self._changed_source_rows.update(
+                range(top_left.row(), bottom_right.row() + 1)
+            )
+            self._source_refresh_timer.start()
+        proxy_rows = [
+            self._proxy_row_by_source[row]
+            for row in range(top_left.row(), bottom_right.row() + 1)
+            if row in self._proxy_row_by_source
+        ]
+        if not proxy_rows:
+            return
+        self.dataChanged.emit(
+            self.index(min(proxy_rows), top_left.column()),
+            self.index(max(proxy_rows), bottom_right.column()),
+            roles or [],
+        )
+
+    def _refresh_changed_source_rows(self) -> None:
+        changed_rows = tuple(self._changed_source_rows)
+        self._changed_source_rows.clear()
+        if any(
+            (row in self._proxy_row_by_source)
+            != self.filterAcceptsRow(row, QModelIndex())
+            for row in changed_rows
+        ):
+            self._reset_rows()
 
 
 class RowTintDelegate(QStyledItemDelegate):
@@ -1365,7 +1576,7 @@ def _paint_review_background(painter: QPainter, option: QStyleOptionViewItem, in
 
 def _unit_from_model_index(index: QModelIndex) -> TranslationUnit | None:
     model = index.model()
-    if isinstance(model, QSortFilterProxyModel):
+    if isinstance(model, UnitFilterProxyModel):
         source_index = model.mapToSource(index)
         source_model = model.sourceModel()
         return source_model.unit_at(source_index.row()) if isinstance(source_model, UnitTableModel) else None
@@ -2147,6 +2358,7 @@ class AiWorker(QRunnable):
 
 class CodeIndexWorkerSignals(QObject):
     partial = Signal(int, object, object)
+    labels_ready = Signal(int, object)
     finished = Signal(int)
     failed = Signal(int, str)
 
@@ -2161,38 +2373,66 @@ class CodeIndexWorker(QRunnable):
         self.signals = CodeIndexWorkerSignals()
         self.cancel_event = threading.Event()
         self._request_lock = threading.Lock()
-        self._requested: dict[str, int] = {}
+        self._requested: dict[str, tuple[int, int]] = {}
+        self._request_generation = 0
 
     def request_labels(self, labels: Iterable[str], priority: int) -> None:
         with self._request_lock:
-            for label in labels:
-                normalized = normalize_label(label)
-                if not normalized:
-                    continue
-                current = self._requested.get(normalized)
-                if current is None or priority < current:
-                    self._requested[normalized] = priority
+            normalized_labels = tuple(
+                dict.fromkeys(
+                    normalized
+                    for label in labels
+                    if (normalized := normalize_label(label))
+                )
+            )
+            if not normalized_labels:
+                return
+            self._request_generation += 1
+            generation = self._request_generation
+            # The newest selection or viewport replaces stale work at the same priority.
+            self._requested = {
+                label: request
+                for label, request in self._requested.items()
+                if request[0] != priority
+            }
+            for normalized in normalized_labels:
+                self._requested[normalized] = (priority, generation)
 
     def cancel(self) -> None:
         self.cancel_event.set()
 
-    def _take_requested(self) -> tuple[str, ...]:
+    def _take_requested(self) -> tuple[int, int, tuple[str, ...]] | None:
         with self._request_lock:
             if not self._requested:
-                return ()
-            priority = min(self._requested.values())
+                return None
+            priority = min(request[0] for request in self._requested.values())
+            generation = max(
+                request[1]
+                for request in self._requested.values()
+                if request[0] == priority
+            )
             labels = tuple(
                 label
-                for label, requested_priority in self._requested.items()
-                if requested_priority == priority
+                for label, request in self._requested.items()
+                if request == (priority, generation)
             )
-            for label in labels:
-                self._requested.pop(label, None)
-            return labels
+            self._requested = {
+                label: request
+                for label, request in self._requested.items()
+                if request[0] != priority
+            }
+            return priority, generation, labels
 
     def _has_requested(self) -> bool:
         with self._request_lock:
             return bool(self._requested)
+
+    def _has_higher_priority_request(self, priority: int) -> bool:
+        with self._request_lock:
+            return any(
+                requested_priority < priority
+                for requested_priority, _requested_generation in self._requested.values()
+            )
 
     def run(self) -> None:
         if self.game_root is None or self.project_root is None:
@@ -2205,12 +2445,17 @@ class CodeIndexWorker(QRunnable):
         )
         try:
             while not self.cancel_event.is_set():
-                labels = self._take_requested()
-                if labels:
+                request = self._take_requested()
+                labels_ready: tuple[str, ...] = ()
+                if request is not None:
+                    priority, _generation, labels = request
                     index = builder.analyze_labels(
                         labels,
-                        cancelled=self.cancel_event.is_set,
+                        cancelled=lambda: self.cancel_event.is_set()
+                        or self._has_higher_priority_request(priority),
                     )
+                    if not self._has_higher_priority_request(priority):
+                        labels_ready = labels
                 else:
                     index = builder.analyze_next_batch(
                         12,
@@ -2219,6 +2464,8 @@ class CodeIndexWorker(QRunnable):
                 progress = builder.progress
                 if not index.is_empty:
                     self.signals.partial.emit(self.token, index, progress)
+                if labels_ready:
+                    self.signals.labels_ready.emit(self.token, labels_ready)
                 if progress.complete:
                     break
         except Exception as exc:
@@ -2235,6 +2482,221 @@ class CodeIndexWorker(QRunnable):
             self.signals.finished.emit(self.token)
         except RuntimeError:
             pass
+
+
+class PreviewLocalizationWorkerSignals(QObject):
+    ready = Signal(int, int, object)
+    failed = Signal(int, str)
+
+
+class PreviewLocalizationWorker(QRunnable):
+    def __init__(
+        self,
+        token: int,
+        game_root: Path,
+        target_language: str,
+        source: dict[str, str],
+        target: dict[str, str],
+        revision: int,
+        load_game_labels: bool,
+    ) -> None:
+        super().__init__()
+        self.setAutoDelete(False)
+        self.token = token
+        self.game_root = game_root
+        self.target_language = target_language
+        self.source = source
+        self.target = target
+        self.revision = revision
+        self.load_game_labels = load_game_labels
+        self.cancel_event = threading.Event()
+        self.signals = PreviewLocalizationWorkerSignals()
+
+    def cancel(self) -> None:
+        self.cancel_event.set()
+
+    def run(self) -> None:
+        try:
+            localization = GameLocalization(
+                self.game_root,
+                self.target_language,
+                self.source,
+                self.target,
+                load_game_labels=self.load_game_labels,
+            )
+        except Exception as exc:
+            if not self.cancel_event.is_set():
+                try:
+                    self.signals.failed.emit(self.token, str(exc))
+                except RuntimeError:
+                    pass
+            return
+        if self.cancel_event.is_set():
+            return
+        try:
+            self.signals.ready.emit(self.token, self.revision, localization)
+        except RuntimeError:
+            pass
+
+
+class SourceSyncWorkerSignals(QObject):
+    planned = Signal(int, object)
+    applied = Signal(int, object)
+    cancelled = Signal(int)
+    failed = Signal(int, str, bool)
+    finished = Signal(int)
+
+
+class SourceSyncWorker(QRunnable):
+    """Plan or apply source updates without blocking Qt's event loop."""
+
+    def __init__(
+        self,
+        token: int,
+        operation: str,
+        source_root: Path,
+        project_root: Path,
+        plan: SourceSyncPlan | None = None,
+    ) -> None:
+        super().__init__()
+        self.setAutoDelete(False)
+        self.token = token
+        self.operation = operation
+        self.source_root = source_root
+        self.project_root = project_root
+        self.plan = plan
+        self.cancel_event = threading.Event()
+        self.signals = SourceSyncWorkerSignals()
+
+    def cancel(self) -> None:
+        self.cancel_event.set()
+
+    def run(self) -> None:
+        try:
+            if self.operation == "plan":
+                result = plan_source_project_sync(
+                    self.source_root,
+                    self.project_root,
+                    cancelled=self.cancel_event.is_set,
+                )
+                if not self.cancel_event.is_set():
+                    self.signals.planned.emit(self.token, result)
+            elif self.operation == "apply":
+                if self.plan is None:
+                    raise ValueError("source sync apply requires a plan")
+                result = apply_source_sync_plan(
+                    self.plan,
+                    cancelled=self.cancel_event.is_set,
+                )
+                self.signals.applied.emit(self.token, result)
+            elif self.operation == "sync":
+                result = sync_source_project(
+                    self.source_root,
+                    self.project_root,
+                    cancelled=self.cancel_event.is_set,
+                )
+                self.signals.applied.emit(self.token, result)
+            else:
+                raise ValueError(f"unknown source sync operation: {self.operation}")
+        except SourceSyncCancelledError:
+            try:
+                self.signals.cancelled.emit(self.token)
+            except RuntimeError:
+                pass
+        except SourceSyncPlanStaleError:
+            try:
+                self.signals.failed.emit(self.token, "", True)
+            except RuntimeError:
+                pass
+        except Exception as exc:
+            try:
+                self.signals.failed.emit(self.token, str(exc), False)
+            except RuntimeError:
+                pass
+        finally:
+            try:
+                self.signals.finished.emit(self.token)
+            except RuntimeError:
+                pass
+
+
+class ProjectLoadWorkerSignals(QObject):
+    ready = Signal(int, object, bool, bool)
+    failed = Signal(int, str)
+    finished = Signal(int)
+
+
+class ProjectLoadWorker(QRunnable):
+    """Load and parse a project while the main window remains responsive."""
+
+    def __init__(
+        self,
+        token: int,
+        project_root: Path,
+        language: str,
+        git: LanguageGit | None,
+        settings: AppSettings,
+    ) -> None:
+        super().__init__()
+        self.setAutoDelete(False)
+        self.token = token
+        self.project_root = project_root
+        self.language = language
+        self.git = git
+        self.settings = settings
+        self.cancel_event = threading.Event()
+        self.signals = ProjectLoadWorkerSignals()
+
+    def cancel(self) -> None:
+        self.cancel_event.set()
+
+    def run(self) -> None:
+        try:
+            initialized_repository = bool(
+                self.git is not None and not self.git.has_repository_metadata()
+            )
+            if initialized_repository and self.git is not None:
+                self.git.ensure_repository(self.settings)
+            pending = bool(
+                initialized_repository
+                and self.git is not None
+                and self.git.has_pending_changes()
+            )
+            if self.cancel_event.is_set():
+                return
+            project = Project.load(
+                self.project_root,
+                self.language,
+                codec_root=DEFAULT_PROJECT_ROOT,
+                enable_codec=self.settings.enable_chinese_codec,
+            )
+            if not self.cancel_event.is_set():
+                self.signals.ready.emit(
+                    self.token,
+                    project,
+                    initialized_repository,
+                    pending,
+                )
+        except (ProjectError, GitError, OSError, ValueError) as exc:
+            if not self.cancel_event.is_set():
+                try:
+                    self.signals.failed.emit(self.token, str(exc))
+                except RuntimeError:
+                    pass
+        except Exception as exc:
+            if not self.cancel_event.is_set():
+                try:
+                    self.signals.failed.emit(
+                        self.token,
+                        translate("error.unexpected", error=exc),
+                    )
+                except RuntimeError:
+                    pass
+        finally:
+            try:
+                self.signals.finished.emit(self.token)
+            except RuntimeError:
+                pass
 
 
 class GitInitWorkerSignals(QObject):
@@ -2314,6 +2776,46 @@ class LlmSuggestionWorker(QRunnable):
                 self.signals.failed.emit(translate("error.unexpected", error=exc))
         finally:
             self.signals.finished.emit()
+
+
+class HistoryCommitListWorkerSignals(QObject):
+    ready = Signal(object)
+    failed = Signal(str)
+
+
+class HistoryCommitListWorker(QRunnable):
+    def __init__(self, git: LanguageGit) -> None:
+        super().__init__()
+        self.setAutoDelete(False)
+        self.git = git
+        self.cancel_event = threading.Event()
+        self.signals = HistoryCommitListWorkerSignals()
+
+    def cancel(self) -> None:
+        self.cancel_event.set()
+
+    def run(self) -> None:
+        try:
+            commits = self.git.list_all_commits()
+        except (GitError, OSError, ValueError) as exc:
+            if not self.cancel_event.is_set():
+                try:
+                    self.signals.failed.emit(str(exc))
+                except RuntimeError:
+                    pass
+            return
+        except Exception as exc:
+            if not self.cancel_event.is_set():
+                try:
+                    self.signals.failed.emit(translate("error.unexpected", error=exc))
+                except RuntimeError:
+                    pass
+            return
+        if not self.cancel_event.is_set():
+            try:
+                self.signals.ready.emit(commits)
+            except RuntimeError:
+                pass
 
 
 class HistoryRenderWorkerSignals(QObject):
@@ -3175,8 +3677,8 @@ class ProjectManagerDialog(QDialog):
         self,
         game_root: Path,
         app_root: Path,
-        plan_callback: Callable[[SourceProjectSpec], SourceSyncPlan],
-        apply_callback: Callable[[SourceProjectSpec, SourceSyncPlan], str],
+        preflight_callback: Callable[[SourceProjectSpec], bool],
+        applied_callback: Callable[[SourceProjectSpec, SourceSyncResult], str],
         parent: QWidget | None = None,
     ) -> None:
         super().__init__(parent)
@@ -3185,9 +3687,13 @@ class ProjectManagerDialog(QDialog):
         self.setMinimumSize(880, 520)
         self.game_root = game_root
         self.app_root = app_root
-        self.plan_callback = plan_callback
-        self.apply_callback = apply_callback
+        self.preflight_callback = preflight_callback
+        self.applied_callback = applied_callback
         self.rows: list[ProjectManagerRow] = []
+        self._worker_token = 0
+        self._worker: SourceSyncWorker | None = None
+        self._worker_spec: SourceProjectSpec | None = None
+        self._close_when_idle = False
 
         layout = QVBoxLayout(self)
         layout.setContentsMargins(16, 16, 16, 16)
@@ -3222,6 +3728,19 @@ class ProjectManagerDialog(QDialog):
         self.feedback_label.setWordWrap(True)
         self.feedback_label.hide()
         layout.addWidget(self.feedback_label)
+
+        progress_row = QHBoxLayout()
+        self.progress = QProgressBar()
+        self.progress.setObjectName("projectManagerProgress")
+        self.progress.setRange(0, 0)
+        self.progress.hide()
+        progress_row.addWidget(self.progress, 1)
+        self.cancel_button = QPushButton(translate("dialog.cancel"))
+        self.cancel_button.setObjectName("projectManagerCancel")
+        self.cancel_button.clicked.connect(self._cancel_work)
+        self.cancel_button.hide()
+        progress_row.addWidget(self.cancel_button)
+        layout.addLayout(progress_row)
         self.refresh_projects()
 
     def refresh_projects(self) -> None:
@@ -3255,9 +3774,68 @@ class ProjectManagerDialog(QDialog):
 
     def _sync_project(self, spec: SourceProjectSpec) -> None:
         try:
-            plan = self.plan_callback(spec)
+            self.preflight_callback(spec)
         except Exception as exc:
             QMessageBox.warning(self, translate("dialog.project_manager_title"), str(exc))
+            return
+        self._start_worker("plan", spec)
+
+    def _start_worker(
+        self,
+        operation: str,
+        spec: SourceProjectSpec,
+        plan: SourceSyncPlan | None = None,
+    ) -> None:
+        if self._worker is not None:
+            return
+        self._worker_token += 1
+        worker = SourceSyncWorker(
+            self._worker_token,
+            operation,
+            spec.source_root,
+            spec.project_root,
+            plan,
+        )
+        worker.signals.planned.connect(self._worker_planned)
+        worker.signals.applied.connect(self._worker_applied)
+        worker.signals.cancelled.connect(self._worker_cancelled)
+        worker.signals.failed.connect(self._worker_failed)
+        worker.signals.finished.connect(self._worker_finished)
+        self._worker = worker
+        self._worker_spec = spec
+        self.list_container.setEnabled(False)
+        self.progress.show()
+        self.cancel_button.setEnabled(True)
+        self.cancel_button.show()
+        self.feedback_label.setText(
+            translate(
+                "project.manager.applying"
+                if operation == "apply"
+                else "project.manager.planning",
+                name=spec.name,
+            )
+        )
+        self.feedback_label.show()
+        QThreadPool.globalInstance().start(worker)
+
+    def _clear_worker(self, token: int) -> SourceProjectSpec | None:
+        if self._worker is None or token != self._worker_token:
+            return None
+        spec = self._worker_spec
+        self._worker = None
+        self._worker_spec = None
+        self.list_container.setEnabled(True)
+        self.progress.hide()
+        self.cancel_button.hide()
+        self.cancel_button.setEnabled(True)
+        if self._close_when_idle:
+            QTimer.singleShot(0, self.reject)
+            return None
+        return spec
+
+    def _worker_planned(self, token: int, plan: SourceSyncPlan) -> None:
+        spec = self._clear_worker(token)
+        if spec is None:
             return
         if not plan.has_changes:
             QMessageBox.information(
@@ -3271,20 +3849,59 @@ class ProjectManagerDialog(QDialog):
         if confirmation.exec() != QDialog.DialogCode.Accepted:
             return
         try:
-            message = self.apply_callback(spec, plan)
-        except SourceSyncPlanStaleError:
-            QMessageBox.warning(
-                self,
-                translate("dialog.project_manager_title"),
-                translate("project.manager.update_stale"),
-            )
+            self.preflight_callback(spec)
+        except Exception as exc:
+            QMessageBox.warning(self, translate("dialog.project_manager_title"), str(exc))
             return
+        self._start_worker("apply", spec, plan)
+
+    def _worker_applied(self, token: int, result: SourceSyncResult) -> None:
+        spec = self._clear_worker(token)
+        if spec is None:
+            return
+        try:
+            message = self.applied_callback(spec, result)
         except Exception as exc:
             QMessageBox.warning(self, translate("dialog.project_manager_title"), str(exc))
             return
         self.feedback_label.setText(message)
         self.feedback_label.show()
         self.refresh_projects()
+
+    def _worker_cancelled(self, token: int) -> None:
+        if self._clear_worker(token) is None:
+            return
+        self.feedback_label.setText(translate("project.manager.cancelled"))
+        self.feedback_label.show()
+
+    def _worker_failed(self, token: int, message: str, stale: bool) -> None:
+        if self._clear_worker(token) is None:
+            return
+        QMessageBox.warning(
+            self,
+            translate("dialog.project_manager_title"),
+            translate("project.manager.update_stale") if stale else message,
+        )
+
+    def _worker_finished(self, token: int) -> None:
+        if self._worker is None or token != self._worker_token:
+            return
+        self._worker_cancelled(token)
+
+    def _cancel_work(self) -> None:
+        if self._worker is None:
+            return
+        self._worker.cancel()
+        self.cancel_button.setEnabled(False)
+        self.feedback_label.setText(translate("project.manager.cancelling"))
+
+    def closeEvent(self, event: QCloseEvent) -> None:  # noqa: N802
+        if self._worker is None:
+            super().closeEvent(event)
+            return
+        self._close_when_idle = True
+        self._cancel_work()
+        event.ignore()
 
     @staticmethod
     def _format_plan_details(plan: SourceSyncPlan) -> str:
@@ -3523,6 +4140,7 @@ class HistoryDialog(QDialog):
         self._selected_rows: tuple[int, ...] = ()
         self._rendered_rows: tuple[int, ...] = ()
         self._history_workers: set[HistoryRenderWorker] = set()
+        self._commit_list_worker: HistoryCommitListWorker | None = None
         self._index_request_id = 1
         self._index_cancel_event = threading.Event()
         self._index_worker: HistoryIndexWorker | None = None
@@ -3531,27 +4149,64 @@ class HistoryDialog(QDialog):
         self._selection_timer.setSingleShot(True)
         self._selection_timer.setInterval(110)
         self._selection_timer.timeout.connect(self._load_selected_commits)
-        try:
-            self._items = git.list_all_commits()
-            self.commits.addItems([commit.display for commit in self._items])
-            self._commit_blobs = {commit.full_hash: commit_search_blob(commit) for commit in self._items}
-        except GitError as exc:
-            self.content.setHtml(_history_state_html(translate("history.read_error_title"), str(exc), kind="error"))
-            self.entry_status.setText(str(exc))
-        else:
-            self.content.setHtml(
-                _history_state_html(translate("history.initial_title"), translate("history.initial_detail"))
-            )
         self.commits.itemSelectionChanged.connect(self._show_selected_commits)
         self.commit_search.textChanged.connect(self._on_commit_search_changed)
         self.entry_search.textChanged.connect(self._filter_entries)
         self.entries.itemSelectionChanged.connect(self._show_selected_entry)
         self.left_tabs.currentChanged.connect(self._on_history_tab_changed)
-        if self._items and focus_key is None:
-            QTimer.singleShot(0, self._select_latest_commit)
+        self.content.setHtml(
+            _history_state_html(
+                translate("history.commit_list_loading_title"),
+                translate("history.commit_list_loading_detail"),
+            )
+        )
+        self.commits.setEnabled(False)
         if focus_key is not None:
             self.left_tabs.setCurrentIndex(1)
+        self._start_commit_list_load()
+
+    def _start_commit_list_load(self) -> None:
+        worker = HistoryCommitListWorker(self.git)
+        self._commit_list_worker = worker
+        worker.signals.ready.connect(self._commit_list_ready)
+        worker.signals.failed.connect(self._commit_list_failed)
+        QThreadPool.globalInstance().start(worker)
+
+    def _commit_list_ready(self, commits: object) -> None:
+        if self._commit_list_worker is None or not isinstance(commits, list):
+            return
+        self._commit_list_worker = None
+        self._items = [commit for commit in commits if isinstance(commit, GitCommit)]
+        self.commits.addItems([commit.display for commit in self._items])
+        self.commits.setEnabled(True)
+        self._commit_blobs = {
+            commit.full_hash: commit_search_blob(commit)
+            for commit in self._items
+        }
+        self.content.setHtml(
+            _history_state_html(
+                translate("history.initial_title"),
+                translate("history.initial_detail"),
+            )
+        )
+        if self._focus_key is None:
+            QTimer.singleShot(0, self._select_latest_commit)
+        else:
             self._ensure_entry_index()
+
+    def _commit_list_failed(self, message: str) -> None:
+        if self._commit_list_worker is None:
+            return
+        self._commit_list_worker = None
+        self.commits.setEnabled(True)
+        self.content.setHtml(
+            _history_state_html(
+                translate("history.read_error_title"),
+                message,
+                kind="error",
+            )
+        )
+        self.entry_status.setText(message)
 
     @staticmethod
     def _matches_query(blob: str, query: str) -> bool:
@@ -3776,6 +4431,9 @@ class HistoryDialog(QDialog):
 
     def closeEvent(self, event) -> None:  # noqa: N802
         self._selection_timer.stop()
+        if self._commit_list_worker is not None:
+            self._commit_list_worker.cancel()
+            self._commit_list_worker = None
         self._index_cancel_event.set()
         self._index_request_id += 1
         super().closeEvent(event)
@@ -3847,7 +4505,7 @@ class TranslatorWindow(QMainWindow):
         self._recovery_warning_shown = False
         self.counts_refresh_timer = QTimer(self)
         self.counts_refresh_timer.setSingleShot(True)
-        self.counts_refresh_timer.setInterval(50)
+        self.counts_refresh_timer.setInterval(COUNTS_REFRESH_DELAY_MS)
         self.counts_refresh_timer.timeout.connect(self._update_counts)
         self.ai_cancel_event: threading.Event | None = None
         self.ai_results: dict[str, str] = {}
@@ -3868,6 +4526,15 @@ class TranslatorWindow(QMainWindow):
         self._table_context_click: tuple[QModelIndex, QPoint] | None = None
         self._suppress_table_context_event = False
         self.thread_pool = QThreadPool.globalInstance()
+        self.preview_localization_token = 0
+        self.preview_localization_workers: list[PreviewLocalizationWorker] = []
+        self.project_load_token = 0
+        self.project_load_workers: list[ProjectLoadWorker] = []
+        self._project_load_created_language: dict[int, bool] = {}
+        self._project_load_resolved: set[int] = set()
+        self.source_sync_token = 0
+        self.source_sync_workers: list[SourceSyncWorker] = []
+        self._pending_game_root_sync: dict[int, tuple[Path, str]] = {}
 
         self._build_ui()
         if self.project_root is not None:
@@ -4098,12 +4765,18 @@ class TranslatorWindow(QMainWindow):
         self.code_button_hold_timer.timeout.connect(self._show_code_reference_popup)
         self.code_reference_index: CodeReferenceIndex | None = None
         self.code_reference_index_complete = False
+        self.code_reference_labels_ready: set[str] = set()
         self.code_reference_index_token = 0
         self.code_reference_workers: list[CodeIndexWorker] = []
         self.code_index_visible_timer = QTimer(self)
         self.code_index_visible_timer.setSingleShot(True)
         self.code_index_visible_timer.setInterval(90)
         self.code_index_visible_timer.timeout.connect(self._request_visible_code_contexts)
+        self.code_context_preview_uid = ""
+        self.code_context_preview_timer = QTimer(self)
+        self.code_context_preview_timer.setSingleShot(True)
+        self.code_context_preview_timer.setInterval(CODE_CONTEXT_PREVIEW_DELAY_MS)
+        self.code_context_preview_timer.timeout.connect(self._refresh_current_code_context_preview)
         self.table.verticalScrollBar().valueChanged.connect(
             lambda _value: self.code_index_visible_timer.start()
         )
@@ -4344,21 +5017,77 @@ class TranslatorWindow(QMainWindow):
         for stale_worker in self.code_reference_workers:
             stale_worker.cancel()
         self.code_reference_workers.clear()
+        self.code_context_preview_timer.stop()
+        self.code_context_preview_uid = ""
         self.code_reference_index = CodeReferenceIndex()
         self.code_reference_index_complete = False
+        self.code_reference_labels_ready.clear()
         self.code_reference_index_token += 1
         token = self.code_reference_index_token
         self._update_code_reference_display()
         worker = CodeIndexWorker(token, self.game_root, self.project_root)
         worker.signals.partial.connect(self._code_reference_index_partial)
+        worker.signals.labels_ready.connect(self._code_reference_labels_ready)
         worker.signals.finished.connect(self._code_reference_index_finished)
         worker.signals.failed.connect(self._code_reference_index_failed)
         self.code_reference_workers.append(worker)
-        self.thread_pool.start(worker)
         unit = self._current_unit()
         if unit is not None:
             self._request_code_context_for_unit(unit)
+        self.thread_pool.start(worker)
         self.code_index_visible_timer.start()
+
+    def _start_preview_localization(self) -> None:
+        for stale_worker in self.preview_localization_workers:
+            stale_worker.cancel()
+        self.preview_localization_workers.clear()
+        self.preview_localization_token += 1
+        token = self.preview_localization_token
+        self.preview_service.use_project_localization_fallback()
+        game_root, target_language, source, target, revision = (
+            self.preview_service.localization_load_spec()
+        )
+        if game_root is None:
+            return
+        worker = PreviewLocalizationWorker(
+            token,
+            game_root,
+            target_language,
+            source,
+            target,
+            revision,
+            not (
+                self.project_root is not None
+                and self.project_root.name.casefold() == VANILLA_PROJECT_NAME.casefold()
+            ),
+        )
+        worker.signals.ready.connect(self._preview_localization_ready)
+        worker.signals.failed.connect(self._preview_localization_failed)
+        self.preview_localization_workers.append(worker)
+        self.thread_pool.start(worker)
+
+    def _preview_localization_ready(
+        self,
+        token: int,
+        revision: int,
+        localization: object,
+    ) -> None:
+        self.preview_localization_workers = [
+            worker for worker in self.preview_localization_workers if worker.token != token
+        ]
+        if token != self.preview_localization_token or not isinstance(localization, GameLocalization):
+            return
+        if not self.preview_service.install_background_localization(localization, revision):
+            self._start_preview_localization()
+            return
+        self._game_preview_cache.clear()
+
+    def _preview_localization_failed(self, token: int, _message: str) -> None:
+        self.preview_localization_workers = [
+            worker for worker in self.preview_localization_workers if worker.token != token
+        ]
+        if token == self.preview_localization_token:
+            log_metrics("preview_localization_fallback")
 
     def _code_reference_index_partial(
         self,
@@ -4373,8 +5102,35 @@ class TranslatorWindow(QMainWindow):
         self.code_reference_index.merge(index)
         if isinstance(progress, LazyIndexProgress):
             self.code_reference_index_complete = progress.complete
-        self._update_code_reference_display()
-        self._refresh_preview_presentations()
+
+    def _code_reference_labels_ready(self, token: int, labels: object) -> None:
+        if token != self.code_reference_index_token or not isinstance(labels, tuple):
+            return
+        normalized = {
+            value
+            for label in labels
+            if isinstance(label, str)
+            if (value := normalize_label(label))
+        }
+        if not normalized:
+            return
+        self.code_reference_labels_ready.update(normalized)
+        unit = self._current_unit()
+        if unit is not None and normalize_label(unit.label) in normalized:
+            self._update_code_reference_display()
+            if self._current_code_reference_set().active:
+                self.code_context_preview_uid = unit.uid
+                self.code_context_preview_timer.start()
+
+    def _refresh_current_code_context_preview(self) -> None:
+        uid, self.code_context_preview_uid = self.code_context_preview_uid, ""
+        unit = self._current_unit()
+        if unit is None or unit.uid != uid:
+            return
+        self._game_preview_cache.clear()
+        self.source_edit.refresh_preview()
+        self.translation_edit.refresh_preview()
+        self._update_preview_tooltips()
 
     def _code_reference_index_finished(self, token: int) -> None:
         self.code_reference_workers = [
@@ -4400,7 +5156,6 @@ class TranslatorWindow(QMainWindow):
                 ).metrics(),
             )
         self._update_code_reference_display()
-        self._refresh_preview_presentations()
 
     def _code_reference_index_ready(self, token: int, index: object) -> None:
         """Compatibility entry point for stale-worker cleanup tests and old signals."""
@@ -4427,6 +5182,8 @@ class TranslatorWindow(QMainWindow):
     def _request_code_context_for_unit(self, unit: TranslationUnit) -> None:
         if unit.ref.kind != "dbt" or not unit.label or not self.code_reference_workers:
             return
+        if normalize_label(unit.label) in self.code_reference_labels_ready:
+            return
         self.code_reference_workers[-1].request_labels((unit.label,), 0)
 
     def _request_visible_code_contexts(self) -> None:
@@ -4450,7 +5207,12 @@ class TranslatorWindow(QMainWindow):
         labels: list[str] = []
         for row in range(start, stop):
             unit = self._unit_from_proxy_index(self.proxy.index(row, 0))
-            if unit is not None and unit.ref.kind == "dbt" and unit.label:
+            if (
+                unit is not None
+                and unit.ref.kind == "dbt"
+                and unit.label
+                and normalize_label(unit.label) not in self.code_reference_labels_ready
+            ):
                 labels.append(unit.label)
         self.code_reference_workers[-1].request_labels(labels, 1)
 
@@ -4502,7 +5264,10 @@ class TranslatorWindow(QMainWindow):
             elif self._project_is_mod() and references.vanilla_count:
                 self.code_reference_label.setText(translate("code.references.vanilla_count", count=references.vanilla_count))
                 self.source_code_button.setEnabled(True)
-            elif self.code_reference_index_complete:
+            elif (
+                self.code_reference_index_complete
+                or normalize_label(unit.label) in self.code_reference_labels_ready
+            ):
                 self.code_reference_label.setText(translate("code.references.zero"))
                 self.source_code_button.setEnabled(False)
             else:
@@ -4684,18 +5449,12 @@ class TranslatorWindow(QMainWindow):
 
     def _update_preview_tooltips(self) -> None:
         unit = self._current_unit()
-        for target, button in (
-            (False, self.source_preview_button),
-            (True, self.translation_preview_button),
-        ):
-            if button.isChecked():
-                button.setToolTip("")
-                continue
-            if unit is None:
-                button.setToolTip(translate("editor.preview_empty"))
-                continue
-            document = self._render_unit_preview(unit, target)
-            button.setToolTip(self.preview_service.tooltip_html(document, target=target))
+        # GamePreviewHoverFilter builds the visible preview only after a real
+        # hover.  Eagerly compiling two hidden HTML tooltips here made the first
+        # placeholder-bearing row synchronously load all game localization data.
+        tooltip = "" if unit is not None else translate("editor.preview_empty")
+        for button in (self.source_preview_button, self.translation_preview_button):
+            button.setToolTip("" if button.isChecked() else tooltip)
 
     def _game_preview_image(self, target: bool) -> QImage | None:
         unit = self._current_unit()
@@ -5159,6 +5918,15 @@ class TranslatorWindow(QMainWindow):
         return root if self._project_folder_problem(root) is None else None
 
     def _clear_loaded_project(self) -> None:
+        for worker in self.project_load_workers:
+            worker.cancel()
+        self.project_load_token += 1
+        self._project_load_created_language.clear()
+        self._project_load_resolved.clear()
+        for worker in self.preview_localization_workers:
+            worker.cancel()
+        self.preview_localization_workers.clear()
+        self.preview_localization_token += 1
         self.project = None
         self.git = None
         self.git_ready = False
@@ -5181,6 +5949,9 @@ class TranslatorWindow(QMainWindow):
         self._update_pending_state()
         self._update_project_button()
         self._update_window_title()
+        central = self.centralWidget()
+        if central is not None:
+            central.setEnabled(True)
 
     def _update_language_input_prompt(self) -> None:
         self.language_combo.setToolTip(translate("toolbar.language_tooltip"))
@@ -5423,29 +6194,90 @@ class TranslatorWindow(QMainWindow):
                     codec_root=DEFAULT_PROJECT_ROOT,
                     enable_codec=self.settings.enable_chinese_codec,
                 ))
-            # A first-time baseline must finish before editing can begin. Once
-            # repository metadata exists, routine validation is safe to defer.
-            if self.git is not None and not self.git.has_repository_metadata():
-                self.git.ensure_repository(self.settings)
-                self.git_ready = True
-            project = Project.load(
-                self.project_root,
-                language,
-                codec_root=DEFAULT_PROJECT_ROOT,
-                enable_codec=self.settings.enable_chinese_codec,
-            )
         except (ProjectError, GitError, OSError, ValueError) as exc:
             QMessageBox.critical(self, translate("dialog.load_error"), str(exc))
             return
+        self._start_project_load(self.project_root, language, created_language_dir)
+
+    def _start_project_load(
+        self,
+        project_root: Path,
+        language: str,
+        created_language_dir: bool,
+    ) -> None:
+        for worker in self.project_load_workers:
+            worker.cancel()
+        self.project_load_token += 1
+        token = self.project_load_token
+        worker = ProjectLoadWorker(token, project_root, language, self.git, self.settings)
+        worker.signals.ready.connect(self._project_load_ready)
+        worker.signals.failed.connect(self._project_load_failed)
+        worker.signals.finished.connect(self._project_load_finished)
+        self.project_load_workers.append(worker)
+        self._project_load_created_language[token] = created_language_dir
+        self._project_load_resolved.discard(token)
+        central = self.centralWidget()
+        if central is not None:
+            central.setEnabled(False)
+        self.statusBar().showMessage(translate("status.project_loading"))
+        self.thread_pool.start(worker)
+
+    def _project_load_ready(
+        self,
+        token: int,
+        project: Project,
+        initialized_repository: bool,
+        pending: bool,
+    ) -> None:
+        if token != self.project_load_token:
+            return
+        self._project_load_resolved.add(token)
+        # Activation updates controls and must never run `git status` on the
+        # GUI thread. New-repository pending state was already computed by the
+        # load worker; existing repositories use GitInitWorker afterwards.
+        self.git_ready = False
         self._activate_project(project)
-        self._start_git_initialization()
-        if created_language_dir:
+        if initialized_repository:
+            self.git_ready = True
+            self.git_pending = bool(pending or self._git_pending_forced)
+            self.retry_button.setVisible(self.git_pending)
+            self._update_window_title()
+        else:
+            self._start_git_initialization()
+        central = self.centralWidget()
+        if central is not None:
+            central.setEnabled(True)
+        if self._project_load_created_language.get(token):
             self.statusBar().showMessage(
-                translate("status.language_created_loaded", language=language, count=len(project.units)),
+                translate(
+                    "status.language_created_loaded",
+                    language=project.language,
+                    count=len(project.units),
+                ),
                 5000,
             )
-        if self.project_root is not None:
-            self._remember_project_root(self.project_root)
+        self._remember_project_root(project.root)
+
+    def _project_load_failed(self, token: int, message: str) -> None:
+        if token != self.project_load_token:
+            return
+        self._project_load_resolved.add(token)
+        central = self.centralWidget()
+        if central is not None:
+            central.setEnabled(True)
+        QMessageBox.critical(self, translate("dialog.load_error"), message)
+
+    def _project_load_finished(self, token: int) -> None:
+        self.project_load_workers = [
+            worker for worker in self.project_load_workers if worker.token != token
+        ]
+        self._project_load_created_language.pop(token, None)
+        if token == self.project_load_token and token not in self._project_load_resolved:
+            central = self.centralWidget()
+            if central is not None:
+                central.setEnabled(True)
+            self.statusBar().showMessage(translate("status.project_load_cancelled"), 3500)
+        self._project_load_resolved.discard(token)
 
     def _activate_project(self, project: Project) -> None:
         self.recovery_timer.stop()
@@ -5475,6 +6307,7 @@ class TranslatorWindow(QMainWindow):
             for unit in project.units
             if unit.label
         )
+        self._start_preview_localization()
         self.translation_highlighter.set_glyph_codec(self.project.codec if ENABLE_FONT_GLYPH_VALIDATION else None)
         self._start_code_reference_index()
         self._update_file_choices()
@@ -5543,12 +6376,36 @@ class TranslatorWindow(QMainWindow):
                 if answer != QMessageBox.StandardButton.Yes:
                     return
         preferred = self._normalized_language_name(self.language_combo.currentText())
-        try:
-            sync_vanilla_sources(root, MANAGED_PROJECT_ROOT)
-            self.project_root = MANAGED_PROJECT_ROOT
-        except (ProjectError, GitError, OSError, ValueError) as exc:
-            QMessageBox.critical(self, translate("dialog.load_error"), str(exc))
+        self._start_game_root_sync(root, preferred)
+
+    def _start_game_root_sync(self, root: Path, preferred_language: str) -> None:
+        for worker in self.source_sync_workers:
+            worker.cancel()
+        self.source_sync_token += 1
+        token = self.source_sync_token
+        worker = SourceSyncWorker(
+            token,
+            "sync",
+            game_languages_root(root),
+            MANAGED_PROJECT_ROOT,
+        )
+        worker.signals.applied.connect(self._game_root_sync_applied)
+        worker.signals.cancelled.connect(self._game_root_sync_cancelled)
+        worker.signals.failed.connect(self._game_root_sync_failed)
+        worker.signals.finished.connect(self._game_root_sync_finished)
+        self.source_sync_workers.append(worker)
+        self._pending_game_root_sync[token] = (root, preferred_language)
+        central = self.centralWidget()
+        if central is not None:
+            central.setEnabled(False)
+        self.statusBar().showMessage(translate("status.source_syncing"))
+        self.thread_pool.start(worker)
+
+    def _game_root_sync_applied(self, token: int, _result: SourceSyncResult) -> None:
+        pending = self._pending_game_root_sync.pop(token, None)
+        if token != self.source_sync_token or pending is None:
             return
+        root, preferred = pending
         self.game_root = root
         self._remember_game_root(root)
         self.project_root = MANAGED_PROJECT_ROOT
@@ -5557,10 +6414,39 @@ class TranslatorWindow(QMainWindow):
         # install path itself.
         choices = self._load_language_choices(preferred)
         if not choices:
+            central = self.centralWidget()
+            if central is not None:
+                central.setEnabled(True)
             self._clear_loaded_project()
             self._show_language_setup_hint()
             return
         self.load_project(discard_changes=True)
+
+    def _game_root_sync_cancelled(self, token: int) -> None:
+        if token != self.source_sync_token:
+            return
+        self._pending_game_root_sync.pop(token, None)
+        central = self.centralWidget()
+        if central is not None:
+            central.setEnabled(True)
+        self.statusBar().showMessage(translate("status.source_sync_cancelled"), 3500)
+
+    def _game_root_sync_failed(self, token: int, message: str, stale: bool) -> None:
+        if token != self.source_sync_token:
+            return
+        self._pending_game_root_sync.pop(token, None)
+        central = self.centralWidget()
+        if central is not None:
+            central.setEnabled(True)
+        detail = translate("project.manager.update_stale") if stale else message
+        QMessageBox.critical(self, translate("dialog.load_error"), detail)
+
+    def _game_root_sync_finished(self, token: int) -> None:
+        self.source_sync_workers = [
+            worker for worker in self.source_sync_workers if worker.token != token
+        ]
+        if token == self.source_sync_token and token in self._pending_game_root_sync:
+            self._game_root_sync_cancelled(token)
 
     def _choose_management_game_root(self) -> Path | None:
         current = self.game_root or APP_ROOT
@@ -5590,6 +6476,7 @@ class TranslatorWindow(QMainWindow):
                 self.settings.preview_translation_font_dir,
                 self.settings.preview_ui_assets_dir,
             )
+            self._start_preview_localization()
             self._refresh_preview_presentations()
         self._update_project_button()
         return root
@@ -5603,8 +6490,8 @@ class TranslatorWindow(QMainWindow):
         ProjectManagerDialog(
             game_root,
             APP_ROOT,
-            self._plan_scanned_project_sync,
-            self._apply_scanned_project_sync,
+            self._ensure_scanned_project_sync_allowed,
+            self._finish_scanned_project_sync,
             self,
         ).exec()
 
@@ -5623,13 +6510,12 @@ class TranslatorWindow(QMainWindow):
                 raise RuntimeError(translate("dialog.project_manager_unsaved_detail", name=spec.name))
         return active_project
 
-    def _plan_scanned_project_sync(self, spec: SourceProjectSpec) -> SourceSyncPlan:
-        self._ensure_scanned_project_sync_allowed(spec)
-        return plan_source_project_sync(spec.source_root, spec.project_root)
-
-    def _apply_scanned_project_sync(self, spec: SourceProjectSpec, plan: SourceSyncPlan) -> str:
+    def _finish_scanned_project_sync(
+        self,
+        spec: SourceProjectSpec,
+        result: SourceSyncResult,
+    ) -> str:
         active_project = self._ensure_scanned_project_sync_allowed(spec)
-        result = apply_source_sync_plan(plan)
 
         if active_project:
             preferred = self.project.language if self.project is not None else self._normalized_language_name(self.language_combo.currentText())
@@ -5990,6 +6876,8 @@ class TranslatorWindow(QMainWindow):
         if self._is_document_file_selected():
             return
         self._commit_typing_operation()
+        self.code_context_preview_timer.stop()
+        self.code_context_preview_uid = ""
         unit = self._unit_from_proxy_index(current)
         self.current_uid = unit.uid if unit else ""
         if unit is not None:
@@ -6103,6 +6991,7 @@ class TranslatorWindow(QMainWindow):
             self.typing_before = unit.current_text
             self.typing_before_deleted = unit.pending_delete
         before_status = unit.filter_status()
+        before_dirty = unit.is_dirty
         self._set_unit_text(unit, text)
         self.model.refresh_unit(unit)
         self._update_recent_translation_marker(unit, before_status)
@@ -6110,7 +6999,8 @@ class TranslatorWindow(QMainWindow):
         self._update_preview_tooltips()
         self._refresh_editor_highlights()
         self._schedule_counts_update()
-        self._update_window_title()
+        if unit.is_dirty != before_dirty:
+            self._update_window_title()
         self._schedule_recovery_snapshot()
         self.typing_timer.start()
 
@@ -6146,8 +7036,7 @@ class TranslatorWindow(QMainWindow):
                 self._recovery_warning_shown = True
 
     def _schedule_counts_update(self) -> None:
-        if not self.counts_refresh_timer.isActive():
-            self.counts_refresh_timer.start()
+        self.counts_refresh_timer.start()
 
     def _clear_current_recovery(self) -> None:
         self.recovery_timer.stop()
@@ -7181,6 +8070,7 @@ class TranslatorWindow(QMainWindow):
                 self.project.language if self.project is not None else "#chinese",
                 *current_preview_resources,
             )
+            self._start_preview_localization()
             self._refresh_preview_presentations()
         if self.settings.preview_game_font_in_editors != previous_game_font:
             self.source_edit.set_game_font_builder(
@@ -7317,6 +8207,8 @@ class TranslatorWindow(QMainWindow):
         self.ai_filter_refresh_timer.stop()
         self.code_button_hold_timer.stop()
         self.code_index_visible_timer.stop()
+        self.code_context_preview_timer.stop()
+        self.code_context_preview_uid = ""
         self.source_preview_tooltip_filter.cancel()
         self.translation_preview_tooltip_filter.cancel()
         if self.ai_cancel_event is not None:
@@ -7326,6 +8218,15 @@ class TranslatorWindow(QMainWindow):
         for worker in self.code_reference_workers:
             worker.cancel()
         self.code_reference_index_token += 1
+        for worker in self.preview_localization_workers:
+            worker.cancel()
+        self.preview_localization_token += 1
+        for worker in self.project_load_workers:
+            worker.cancel()
+        self.project_load_token += 1
+        for worker in self.source_sync_workers:
+            worker.cancel()
+        self.source_sync_token += 1
 
 
 def _single_line_table_text(text: str) -> str:

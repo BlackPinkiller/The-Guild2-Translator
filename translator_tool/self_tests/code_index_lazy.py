@@ -2,11 +2,115 @@ from __future__ import annotations
 
 from pathlib import Path
 from types import SimpleNamespace
+import json
 import shutil
 import tempfile
 
 from .. import code_index_lazy as lazy_module
+from ..code_index import CodeReference, CodeReferenceIndex
 from ..code_index_lazy import LazyCodeIndexBuilder
+
+
+def assert_code_facts_cache_defers_and_yields_manifest_write() -> None:
+    temp = Path(tempfile.mkdtemp(prefix="translator_tool_code_cache_flush_"))
+    original_atomic_write = lazy_module.atomic_write
+    original_sleep = lazy_module.time.sleep
+    original_yield_seconds = lazy_module.CACHE_SERIALIZE_YIELD_SECONDS
+    writes: list[bytes] = []
+    yields: list[float] = []
+    try:
+        lazy_module.atomic_write = lambda _path, data: writes.append(data)
+        lazy_module.time.sleep = lambda seconds: yields.append(seconds)
+        lazy_module.CACHE_SERIALIZE_YIELD_SECONDS = 0.0
+        cache = lazy_module.CodeFactsCache(temp / "cache.json")
+        cache._files["fixture"] = {
+            "used_ns": 1,
+            "references": [{"label": f"LABEL_{number}"} for number in range(400)],
+        }
+        cache._mark_dirty()
+        cache.flush_if_needed()
+        if writes:
+            raise AssertionError("code-facts cache rewrote its manifest before completion or close")
+        cache.flush_if_needed(force=True)
+        if len(writes) != 1:
+            raise AssertionError("forced cache flush did not preserve shutdown persistence")
+        if not yields:
+            raise AssertionError("large cache serialization did not yield to the GUI thread")
+        payload = json.loads(writes[0].decode("utf-8"))
+        if len(payload.get("files", {}).get("fixture", {}).get("references", ())) != 400:
+            raise AssertionError("cooperative cache serialization changed the manifest payload")
+    finally:
+        lazy_module.atomic_write = original_atomic_write
+        lazy_module.time.sleep = original_sleep
+        lazy_module.CACHE_SERIALIZE_YIELD_SECONDS = original_yield_seconds
+        shutil.rmtree(temp, ignore_errors=True)
+
+
+def assert_incremental_code_index_merge_preserves_compiled_wildcards() -> None:
+    first = CodeReference("family_*_+*", Path("First.lua"), 1, 1)
+    second = CodeReference("family_*_+*", Path("Second.lua"), 2, 1)
+    exact = CodeReference("exact_+0", Path("Exact.lua"), 3, 1)
+    index = CodeReferenceIndex({"family_*_+*": (first,)})
+
+    if index.references_for("FAMILY_BRANCH_+0").project != (first,):
+        raise AssertionError("wildcard fixture did not resolve before incremental merging")
+    assert index._project_wildcards is not None
+    compiled_before = index._project_wildcards["family_*_+*"][0]
+
+    index.merge(CodeReferenceIndex({"exact_+0": (exact,)}))
+    if index._project_wildcards["family_*_+*"][0] is not compiled_before:
+        raise AssertionError("an exact-label merge recompiled an unrelated wildcard")
+    index.merge(CodeReferenceIndex({"family_*_+*": (second,)}))
+    if index._project_wildcards["family_*_+*"][0] is not compiled_before:
+        raise AssertionError("a wildcard-reference merge needlessly recompiled its pattern")
+    if index.references_for("FAMILY_BRANCH_+0").project != (first, second):
+        raise AssertionError("incremental wildcard cache did not receive merged references")
+
+
+def assert_lazy_batches_advance_without_rescanning_prefix() -> None:
+    temp = Path(tempfile.mkdtemp(prefix="translator_tool_lazy_batch_cursor_"))
+    try:
+        game = temp / "game"
+        project = temp / "sources" / "Vanilla"
+        scripts = game / "Scripts"
+        scripts.mkdir(parents=True)
+        project.mkdir(parents=True)
+        for number in range(40):
+            (scripts / f"Batch{number:02d}.lua").write_text(
+                f'MsgQuick("", "@L_BATCH_{number:02d}_BODY_+0", Value)',
+                encoding="utf-8",
+            )
+
+        class CountingFiles:
+            def __init__(self, items) -> None:
+                self.items = tuple(items)
+                self.reads = 0
+
+            def __len__(self) -> int:
+                return len(self.items)
+
+            def __getitem__(self, index):
+                self.reads += 1
+                return self.items[index]
+
+            def __iter__(self):
+                for item in self.items:
+                    self.reads += 1
+                    yield item
+
+        builder = LazyCodeIndexBuilder(game, project, cache_path=temp / "cache.json")
+        builder.prepare()
+        counted = CountingFiles(builder.files)
+        builder.files = counted  # type: ignore[assignment]
+        while not builder.complete:
+            builder.analyze_next_batch(1)
+        builder.close()
+        if counted.reads > len(counted) * 2:
+            raise AssertionError(
+                f"lazy batches repeatedly rescanned completed file prefixes: {counted.reads} reads"
+            )
+    finally:
+        shutil.rmtree(temp, ignore_errors=True)
 
 
 def assert_lazy_code_index_loads_effective_item_id_ranges() -> None:
@@ -71,6 +175,7 @@ def assert_lazy_code_index_prioritizes_requested_labels_and_invalidates_cache() 
     temp = Path(tempfile.mkdtemp(prefix="translator_tool_lazy_code_index_"))
     original_revision = lazy_module.ANALYZER_REVISION
     original_analyze_code_file = lazy_module.analyze_code_file
+    original_lexical_blob = lazy_module._lexical_blob
     try:
         game = temp / "game"
         project = temp / "sources" / "Vanilla"
@@ -106,6 +211,7 @@ def assert_lazy_code_index_prioritizes_requested_labels_and_invalidates_cache() 
             raise AssertionError("a valid semantic file cache was reparsed")
 
         lazy_module.analyze_code_file = fail_if_reparsed
+        lazy_module._lexical_blob = fail_if_reparsed
         warm = LazyCodeIndexBuilder(game, project, cache_path=cache_path)
         cached = warm.analyze_labels(("LATER_BODY_+0",))
         if cached.references_for("LATER_BODY_+0").project_count != 1:
@@ -113,6 +219,7 @@ def assert_lazy_code_index_prioritizes_requested_labels_and_invalidates_cache() 
         warm.close()
 
         lazy_module.analyze_code_file = original_analyze_code_file
+        lazy_module._lexical_blob = original_lexical_blob
         later_path = scripts / "Later.lua"
         later_path.write_text(
             'MsgQuick("", "@L_UPDATED_LATER_BODY_+0", ChangedValue)',
@@ -141,10 +248,12 @@ def assert_lazy_code_index_prioritizes_requested_labels_and_invalidates_cache() 
     finally:
         lazy_module.ANALYZER_REVISION = original_revision
         lazy_module.analyze_code_file = original_analyze_code_file
+        lazy_module._lexical_blob = original_lexical_blob
         shutil.rmtree(temp, ignore_errors=True)
 
 
 def assert_code_index_requests_selected_and_visible_rows_without_moving_viewport() -> None:
+    from .. import app as app_module
     from ..app import CodeIndexWorker, TranslatorWindow
 
     worker = CodeIndexWorker(1, None, None)
@@ -152,10 +261,69 @@ def assert_code_index_requests_selected_and_visible_rows_without_moving_viewport
     worker.request_labels(("selected",), 0)
     if not worker._has_requested():
         raise AssertionError("queued code-context request was not visible to batch preemption")
-    if worker._take_requested() != ("selected",):
+    if worker._take_requested() != (0, 2, ("selected",)):
         raise AssertionError("selected code-context request did not outrank visible prefetch")
-    if worker._take_requested() != ("visible",):
+    if worker._take_requested() != (1, 1, ("visible",)):
         raise AssertionError("visible prefetch was lost after the selected request")
+    worker.request_labels(("old-selected",), 0)
+    worker.request_labels(("new-selected",), 0)
+    if worker._take_requested() != (0, 4, ("new-selected",)):
+        raise AssertionError("a stale selected-row request delayed the current selection")
+
+    original_builder = app_module.LazyCodeIndexBuilder
+    runtime_worker = CodeIndexWorker(2, Path("game"), Path("project"))
+    calls: list[tuple[str, ...]] = []
+    ready: list[str] = []
+
+    class FakeBuilder:
+        def __init__(self, *_args, **_kwargs) -> None:
+            self.complete = False
+
+        @property
+        def progress(self):
+            return lazy_module.LazyIndexProgress(len(calls), 4, self.complete)
+
+        def analyze_labels(self, labels, *, cancelled):
+            calls.append(tuple(labels))
+            if labels == ("visible-old",):
+                runtime_worker.request_labels(("selected-now",), 0)
+                if not cancelled():
+                    raise AssertionError("selected request did not preempt visible-row analysis")
+            elif labels == ("selected-now",):
+                runtime_worker.request_labels(("selected-new",), 0)
+                runtime_worker.request_labels(("visible-new",), 1)
+                if cancelled():
+                    raise AssertionError("a new selection restarted active selected-row analysis")
+            elif labels == ("selected-new",):
+                pass
+            elif labels == ("visible-new",):
+                self.complete = True
+            return CodeReferenceIndex()
+
+        def analyze_next_batch(self, *_args, **_kwargs):
+            raise AssertionError("worker ignored queued priority requests")
+
+        def close(self) -> None:
+            pass
+
+    try:
+        app_module.LazyCodeIndexBuilder = FakeBuilder
+        runtime_worker.signals.labels_ready.connect(
+            lambda _token, labels: ready.extend(labels)
+        )
+        runtime_worker.request_labels(("visible-old",), 1)
+        runtime_worker.run()
+    finally:
+        app_module.LazyCodeIndexBuilder = original_builder
+    if calls != [
+        ("visible-old",),
+        ("selected-now",),
+        ("selected-new",),
+        ("visible-new",),
+    ]:
+        raise AssertionError(f"priority requests ran in the wrong order: {calls!r}")
+    if ready != ["selected-now", "selected-new", "visible-new"]:
+        raise AssertionError(f"interrupted or empty priority results reported wrong readiness: {ready!r}")
 
     units = tuple(
         SimpleNamespace(
@@ -177,6 +345,7 @@ def assert_code_index_requests_selected_and_visible_rows_without_moving_viewport
     )
     window = SimpleNamespace(
         code_reference_workers=[fake_worker],
+        code_reference_labels_ready=set(),
         table_frame=SimpleNamespace(isVisible=lambda: True),
         proxy=SimpleNamespace(rowCount=lambda: len(units), index=lambda row, _column: row),
         table=fake_table,
@@ -188,6 +357,175 @@ def assert_code_index_requests_selected_and_visible_rows_without_moving_viewport
         raise AssertionError(f"wrong visible-row prefetch range or priority: {requested[-1]!r}")
     if scroll_calls:
         raise AssertionError("visible code-context prefetch moved the table viewport")
+
+
+def assert_hot_ui_updates_are_coalesced() -> None:
+    from ..app import TranslatorWindow
+    from ..i18n import translate
+
+    class FakeTimer:
+        def __init__(self) -> None:
+            self.active = False
+            self.starts = 0
+
+        def isActive(self) -> bool:
+            return self.active
+
+        def start(self) -> None:
+            self.active = True
+            self.starts += 1
+
+        def stop(self) -> None:
+            self.active = False
+
+    preview_timer = FakeTimer()
+    display_refreshes: list[None] = []
+    preview_refreshes: list[str] = []
+    current = [SimpleNamespace(uid="selected", label="SELECTED_+0")]
+    game_preview_cache = {"stale": object()}
+    window = SimpleNamespace(
+        code_reference_index_token=7,
+        code_reference_index=CodeReferenceIndex(),
+        code_reference_index_complete=False,
+        code_reference_labels_ready=set(),
+        code_context_preview_uid="",
+        code_context_preview_timer=preview_timer,
+        _game_preview_cache=game_preview_cache,
+        source_edit=SimpleNamespace(
+            refresh_preview=lambda: preview_refreshes.append("source")
+        ),
+        translation_edit=SimpleNamespace(
+            refresh_preview=lambda: preview_refreshes.append("translation")
+        ),
+        _update_code_reference_display=lambda: display_refreshes.append(None),
+        _update_preview_tooltips=lambda: preview_refreshes.append("tooltips"),
+        _current_unit=lambda: current[0],
+        _current_code_reference_set=lambda: SimpleNamespace(active=(object(),)),
+    )
+    for analyzed in (1, 2):
+        TranslatorWindow._code_reference_index_partial(
+            window,
+            7,
+            CodeReferenceIndex(),
+            lazy_module.LazyIndexProgress(analyzed, 10, False),
+        )
+    if display_refreshes or preview_refreshes or preview_timer.starts:
+        raise AssertionError("background code-index batches performed selection-path UI work")
+    TranslatorWindow._code_reference_labels_ready(window, 7, ("SELECTED_+0",))
+    if (
+        "selected_+0" not in window.code_reference_labels_ready
+        or len(display_refreshes) != 1
+        or preview_refreshes
+        or preview_timer.starts != 1
+        or window.code_context_preview_uid != "selected"
+    ):
+        raise AssertionError("selected code status was not cheap and immediate with preview work deferred")
+    preview_timer.active = False
+    TranslatorWindow._refresh_current_code_context_preview(window)
+    if preview_refreshes != ["source", "translation", "tooltips"] or game_preview_cache:
+        raise AssertionError("settled selected context did not refresh its preview once")
+    window.code_context_preview_uid = "old-selection"
+    current[0] = SimpleNamespace(uid="new-selection", label="NEW_+0")
+    TranslatorWindow._refresh_current_code_context_preview(window)
+    if preview_refreshes != ["source", "translation", "tooltips"]:
+        raise AssertionError("a stale code-context callback refreshed previews after row switching")
+
+    shown_text: list[str] = []
+    enabled: list[bool] = []
+    empty_window = SimpleNamespace(
+        code_reference_index=CodeReferenceIndex(),
+        code_reference_index_complete=False,
+        code_reference_labels_ready={"selected_+0"},
+        code_reference_label=SimpleNamespace(
+            setText=lambda text: shown_text.append(text),
+            text=lambda: shown_text[-1],
+        ),
+        source_code_button=SimpleNamespace(
+            setEnabled=lambda value: enabled.append(value),
+            setToolTip=lambda _text: None,
+        ),
+        source_box=object(),
+        _current_unit=lambda: SimpleNamespace(
+            label="SELECTED_+0",
+            ref=SimpleNamespace(kind="dbt"),
+        ),
+        _current_code_reference_set=lambda: SimpleNamespace(
+            project_count=0,
+            vanilla_count=0,
+        ),
+        _project_is_mod=lambda: False,
+    )
+    TranslatorWindow._update_code_reference_display(empty_window)
+    if shown_text[-1] != translate("code.references.zero") or enabled[-1]:
+        raise AssertionError("an empty priority result stayed loading until the full index completed")
+
+    counts_timer = FakeTimer()
+    counts_window = SimpleNamespace(counts_refresh_timer=counts_timer)
+    TranslatorWindow._schedule_counts_update(counts_window)
+    TranslatorWindow._schedule_counts_update(counts_window)
+    if counts_timer.starts != 2:
+        raise AssertionError("typing count refresh is not a trailing debounce")
+
+    class FakeUnit:
+        uid = "fixture"
+        translate_text = "base"
+        current_text = "base"
+        pending_delete = False
+
+        @property
+        def is_dirty(self) -> bool:
+            return self.current_text != self.translate_text
+
+        def filter_status(self) -> str:
+            return "translated"
+
+    unit = FakeUnit()
+    texts = iter(("basex", "basexy", "base"))
+    title_refreshes: list[None] = []
+    editor_window = SimpleNamespace(
+        loading_editor=False,
+        typing_uid="",
+        typing_before="",
+        typing_before_deleted=False,
+        translation_edit=SimpleNamespace(toPlainText=lambda: next(texts)),
+        typing_timer=SimpleNamespace(start=lambda: None),
+        model=SimpleNamespace(refresh_unit=lambda _unit: None),
+        _current_unit=lambda: unit,
+        _commit_typing_operation=lambda: None,
+        _set_unit_text=lambda item, text: setattr(item, "current_text", text),
+        _update_recent_translation_marker=lambda *_args: None,
+        _update_issue_detail=lambda _unit: None,
+        _update_preview_tooltips=lambda: None,
+        _refresh_editor_highlights=lambda: None,
+        _schedule_counts_update=lambda: None,
+        _update_window_title=lambda: title_refreshes.append(None),
+        _schedule_recovery_snapshot=lambda: None,
+    )
+    for _ in range(3):
+        TranslatorWindow._on_editor_changed(editor_window)
+    if len(title_refreshes) != 2:
+        raise AssertionError(
+            "typing rescanned the full-project dirty count without a dirty-state transition"
+        )
+
+    tooltip_values: list[str] = []
+    tooltip_button = SimpleNamespace(
+        isChecked=lambda: False,
+        setToolTip=lambda value: tooltip_values.append(value),
+    )
+    tooltip_window = SimpleNamespace(
+        source_preview_button=tooltip_button,
+        translation_preview_button=tooltip_button,
+        _current_unit=lambda: SimpleNamespace(uid="placeholder-row"),
+        preview_service=SimpleNamespace(
+            render=lambda *_args, **_kwargs: (_ for _ in ()).throw(
+                AssertionError("row switching eagerly rendered a hidden preview tooltip")
+            )
+        ),
+    )
+    TranslatorWindow._update_preview_tooltips(tooltip_window)
+    if tooltip_values != ["", ""]:
+        raise AssertionError("selected preview buttons kept stale native tooltip content")
 
 
 def assert_lazy_code_index_survives_unwritable_cache() -> None:

@@ -582,6 +582,25 @@ def analyze_script_facts(
         _lexical_value_constraints(tokens, branch_path_tokens, branch_paths),
         dict(item_names_by_id),
     )
+    has_localization_work = any(
+        _literal_labels(token.value, label_catalog, allow_patterns=True)
+        for token in tokens
+        if token.kind == "string"
+    ) or any(
+        call_contract(call.name) is not None
+        or any("@B[" in argument for argument in call.arguments)
+        for call in calls
+    )
+    if not has_localization_work:
+        # Many animation and style helpers contain hundreds of ordinary calls
+        # but no localization producer or consumer. Resolving every argument in
+        # those files caused multi-second cold-index work while yielding no uses.
+        return ScriptSemanticFacts(
+            (),
+            (),
+            (),
+            _function_value_summaries(analysis),
+        )
     uses: list[SemanticLabelUse] = []
     external_flows: list[ExternalCallFlow] = []
     claimed_ranges: list[tuple[int, int]] = []

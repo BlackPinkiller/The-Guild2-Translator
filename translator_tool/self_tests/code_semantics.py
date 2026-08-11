@@ -4,6 +4,7 @@ from pathlib import Path
 import shutil
 import tempfile
 
+from .. import script_semantics as script_semantics_module
 from ..code_index import (
     CodeFileSpec,
     CodeReference,
@@ -28,10 +29,38 @@ from ..preview_placeholders import (
 )
 from ..script_semantics import (
     analyze_script,
+    analyze_script_facts,
     call_contract,
     resolve_native_semantic_function,
     semantic_literal,
 )
+
+
+def assert_nonlocalized_scripts_skip_runtime_semantic_resolution() -> None:
+    script = "\n".join(
+        (
+            "function ResolveOwner(Owner)",
+            '    return GetID(Owner)',
+            "end",
+            "function Main()",
+            *(f'    PlayAnimation("Owner", "idle_{index}")' for index in range(512)),
+            "end",
+        )
+    )
+    original = script_semantics_module._resolved_call_arguments
+
+    def fail_if_resolved(*_args, **_kwargs):
+        raise AssertionError("a script without localization work resolved runtime call arguments")
+
+    script_semantics_module._resolved_call_arguments = fail_if_resolved
+    try:
+        facts = analyze_script_facts(script, Path("AnimationOnly.lua"))
+    finally:
+        script_semantics_module._resolved_call_arguments = original
+    if facts.uses or facts.return_labels or facts.external_flows:
+        raise AssertionError("a nonlocalized animation script produced localization facts")
+    if not facts.function_summaries:
+        raise AssertionError("the localization fast path discarded reusable function summaries")
 
 
 def assert_display_call_contracts_match_engine_signatures() -> None:
@@ -1320,9 +1349,9 @@ def assert_placeholder_values_avoid_ambiguous_random_branches() -> None:
     if crest.text != GLYPH_MARK or crest.glyph_id is None:
         raise AssertionError("an optional proven dynasty crest did not render as a game glyph")
     value = builder.argument_value(1, "l", context).text
-    if value != "Beggar / Emperor":
+    if value != "Beggar":
         raise AssertionError(
-            f"an unresolved runtime branch did not present its bounded alternatives: {value!r}"
+            f"an unresolved runtime branch did not use one representative value: {value!r}"
         )
 
     optional_label = CodeReference(

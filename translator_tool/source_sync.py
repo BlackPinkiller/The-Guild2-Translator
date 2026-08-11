@@ -5,6 +5,7 @@ import filecmp
 import hashlib
 import re
 from pathlib import Path
+from typing import Callable
 
 from .cache import cache_path, set_source_review_many
 from .file_utils import atomic_write_many
@@ -99,6 +100,13 @@ class SourceSyncPlanStaleError(RuntimeError):
     pass
 
 
+class SourceSyncCancelledError(RuntimeError):
+    """Raised before source-sync mutation when a background request is cancelled."""
+
+
+CancelCheck = Callable[[], bool]
+
+
 def managed_project_root(app_root: Path, name: str) -> Path:
     return app_root / "sources" / name
 
@@ -176,27 +184,47 @@ def ensure_translation_dir(project_root: Path, language: str) -> Path:
     return path
 
 
-def sync_source_project(source_root: Path, project_root: Path) -> SourceSyncResult:
-    return apply_source_sync_plan(plan_source_project_sync(source_root, project_root))
+def sync_source_project(
+    source_root: Path,
+    project_root: Path,
+    *,
+    cancelled: CancelCheck | None = None,
+) -> SourceSyncResult:
+    return apply_source_sync_plan(
+        plan_source_project_sync(source_root, project_root, cancelled=cancelled),
+        cancelled=cancelled,
+    )
 
 
-def plan_source_project_sync(source_root: Path, project_root: Path) -> SourceSyncPlan:
+def plan_source_project_sync(
+    source_root: Path,
+    project_root: Path,
+    *,
+    cancelled: CancelCheck | None = None,
+) -> SourceSyncPlan:
     source_root = source_root.expanduser().resolve()
     project_root = project_root.expanduser().resolve()
+    _raise_if_cancelled(cancelled)
     _validate_source_root(source_root)
 
     target_languages_root = project_root / "languages"
-    source_files = _collect_source_files(source_root)
-    existing_files = _collect_source_files(target_languages_root)
+    source_files = _collect_source_files(source_root, cancelled=cancelled)
+    existing_files = _collect_source_files(target_languages_root, cancelled=cancelled)
     changes: list[SourceSyncFileChange] = []
     review_uids: dict[str, set[str]] = {}
 
     for rel_path, source_file in source_files.items():
+        _raise_if_cancelled(cancelled)
         previous_file = existing_files.get(rel_path)
         if previous_file is not None and filecmp.cmp(source_file, previous_file, shallow=False):
             continue
         kind = "added" if previous_file is None else "modified"
-        added, modified, removed = _entry_change_counts(rel_path, previous_file, source_file)
+        added, modified, removed = _entry_change_counts(
+            rel_path,
+            previous_file,
+            source_file,
+            cancelled=cancelled,
+        )
         changes.append(SourceSyncFileChange(rel_path.as_posix(), kind, added, modified, removed))
         if previous_file is not None:
             _collect_translations_for_source_change(
@@ -205,12 +233,19 @@ def plan_source_project_sync(source_root: Path, project_root: Path) -> SourceSyn
                 previous_file,
                 source_file,
                 review_uids,
+                cancelled=cancelled,
             )
 
     for rel_path, previous_file in existing_files.items():
+        _raise_if_cancelled(cancelled)
         if rel_path in source_files:
             continue
-        added, modified, removed = _entry_change_counts(rel_path, previous_file, None)
+        added, modified, removed = _entry_change_counts(
+            rel_path,
+            previous_file,
+            None,
+            cancelled=cancelled,
+        )
         changes.append(SourceSyncFileChange(rel_path.as_posix(), "removed", added, modified, removed))
 
     changes.sort(key=lambda change: (change.rel_path.casefold(), change.kind))
@@ -224,14 +259,26 @@ def plan_source_project_sync(source_root: Path, project_root: Path) -> SourceSyn
         project_root=project_root,
         changes=tuple(changes),
         review_batches=batches,
-        basis_hash=_sync_basis_hash(source_files, existing_files),
+        basis_hash=_sync_basis_hash(source_files, existing_files, cancelled=cancelled),
     )
 
 
-def apply_source_sync_plan(plan: SourceSyncPlan) -> SourceSyncResult:
-    current_plan = plan_source_project_sync(plan.source_root, plan.project_root)
+def apply_source_sync_plan(
+    plan: SourceSyncPlan,
+    *,
+    cancelled: CancelCheck | None = None,
+) -> SourceSyncResult:
+    current_plan = plan_source_project_sync(
+        plan.source_root,
+        plan.project_root,
+        cancelled=cancelled,
+    )
     if current_plan.basis_hash != plan.basis_hash or current_plan.changes != plan.changes:
         raise SourceSyncPlanStaleError
+    # Cancellation is intentionally accepted only before mutation starts. Once
+    # workflow metadata and source files begin their atomic transaction, the
+    # operation must finish or roll back as one unit.
+    _raise_if_cancelled(cancelled)
 
     target_languages_root = plan.project_root / "languages"
     target_languages_root.mkdir(parents=True, exist_ok=True)
@@ -279,10 +326,15 @@ def apply_source_sync_plan(plan: SourceSyncPlan) -> SourceSyncResult:
     )
 
 
-def sync_vanilla_sources(game_root: Path, project_root: Path) -> Path:
+def sync_vanilla_sources(
+    game_root: Path,
+    project_root: Path,
+    *,
+    cancelled: CancelCheck | None = None,
+) -> Path:
     source_root = game_languages_root(game_root.expanduser().resolve())
     project_root = project_root.expanduser().resolve()
-    sync_source_project(source_root, project_root)
+    sync_source_project(source_root, project_root, cancelled=cancelled)
     return project_root
 
 
@@ -306,11 +358,16 @@ def _modinfo_declares_translation(modinfo_path: Path) -> bool:
     return bool(TRANSLATION_TYPE_RE.search(content))
 
 
-def _collect_source_files(root: Path) -> dict[Path, Path]:
+def _collect_source_files(
+    root: Path,
+    *,
+    cancelled: CancelCheck | None = None,
+) -> dict[Path, Path]:
     files: dict[Path, Path] = {}
     if not root.is_dir():
         return files
     for path in sorted(root.rglob("*"), key=lambda item: item.as_posix().casefold()):
+        _raise_if_cancelled(cancelled)
         if not path.is_file():
             continue
         rel_path = path.relative_to(root)
@@ -346,15 +403,27 @@ def _collect_translations_for_source_change(
     previous_source: Path,
     next_source: Path | None,
     review_uids: dict[str, set[str]],
+    *,
+    cancelled: CancelCheck | None = None,
 ) -> None:
     suffix = rel_path.suffix.lower()
     if suffix == ".dbt":
         _collect_dbt_translations_for_review(
-            project_root, rel_path, previous_source, next_source, review_uids
+            project_root,
+            rel_path,
+            previous_source,
+            next_source,
+            review_uids,
+            cancelled=cancelled,
         )
     elif suffix == ".txt":
         _collect_plain_text_translations_for_review(
-            project_root, rel_path, previous_source, next_source, review_uids
+            project_root,
+            rel_path,
+            previous_source,
+            next_source,
+            review_uids,
+            cancelled=cancelled,
         )
 
 
@@ -364,7 +433,10 @@ def _collect_plain_text_translations_for_review(
     previous_source: Path,
     next_source: Path | None,
     review_uids: dict[str, set[str]],
+    *,
+    cancelled: CancelCheck | None = None,
 ) -> None:
+    _raise_if_cancelled(cancelled)
     if next_source is None:
         return
     previous_text = load_plain_text(previous_source).text
@@ -372,6 +444,7 @@ def _collect_plain_text_translations_for_review(
     if previous_text == next_text:
         return
     for language_root in _translation_roots(project_root):
+        _raise_if_cancelled(cancelled)
         target_path = language_root / rel_path
         if not target_path.is_file():
             continue
@@ -386,7 +459,10 @@ def _collect_dbt_translations_for_review(
     previous_source: Path,
     next_source: Path | None,
     review_uids_by_language: dict[str, set[str]],
+    *,
+    cancelled: CancelCheck | None = None,
 ) -> None:
+    _raise_if_cancelled(cancelled)
     if next_source is None:
         return
     previous_doc = load_dbt(previous_source)
@@ -395,13 +471,16 @@ def _collect_dbt_translations_for_review(
     next_index = next_doc.row_index
 
     for language_root in _translation_roots(project_root):
+        _raise_if_cancelled(cancelled)
         target_path = language_root / rel_path
         if not target_path.is_file():
             continue
         target_doc = load_dbt(target_path)
         target_fields = translatable_fields(rel_path.name, target_doc.string_columns)
         planned_uids: list[str] = []
-        for key, target_row in target_doc.row_index.items():
+        for number, (key, target_row) in enumerate(target_doc.row_index.items()):
+            if number % 256 == 0:
+                _raise_if_cancelled(cancelled)
             previous_row = previous_index.get(key)
             next_row = next_index.get(key)
             if previous_row is None:
@@ -423,11 +502,16 @@ def _entry_change_counts(
     rel_path: Path,
     previous_source: Path | None,
     next_source: Path | None,
+    *,
+    cancelled: CancelCheck | None = None,
 ) -> tuple[int, int, int]:
+    _raise_if_cancelled(cancelled)
     suffix = rel_path.suffix.lower()
     if suffix == ".dbt":
         previous_index = load_dbt(previous_source).row_index if previous_source is not None else {}
+        _raise_if_cancelled(cancelled)
         next_index = load_dbt(next_source).row_index if next_source is not None else {}
+        _raise_if_cancelled(cancelled)
         previous_keys = set(previous_index)
         next_keys = set(next_index)
         modified = sum(
@@ -446,17 +530,31 @@ def _entry_change_counts(
     return (0, 0, 0)
 
 
-def _sync_basis_hash(source_files: dict[Path, Path], existing_files: dict[Path, Path]) -> str:
+def _sync_basis_hash(
+    source_files: dict[Path, Path],
+    existing_files: dict[Path, Path],
+    *,
+    cancelled: CancelCheck | None = None,
+) -> str:
     digest = hashlib.sha256()
     for scope, files in ((b"source", source_files), (b"managed", existing_files)):
         for rel_path, path in sorted(files.items(), key=lambda item: item[0].as_posix().casefold()):
+            _raise_if_cancelled(cancelled)
             digest.update(scope)
             digest.update(b"\0")
             digest.update(rel_path.as_posix().encode("utf-8"))
             digest.update(b"\0")
-            digest.update(path.read_bytes())
+            with path.open("rb") as stream:
+                while chunk := stream.read(1024 * 1024):
+                    _raise_if_cancelled(cancelled)
+                    digest.update(chunk)
             digest.update(b"\0")
     return digest.hexdigest()
+
+
+def _raise_if_cancelled(cancelled: CancelCheck | None) -> None:
+    if cancelled is not None and cancelled():
+        raise SourceSyncCancelledError
 
 
 def _prune_empty_directories(path: Path, stop_at: Path) -> None:

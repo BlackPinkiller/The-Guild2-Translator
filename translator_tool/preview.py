@@ -9,7 +9,6 @@ import math
 from pathlib import Path
 import re
 import struct
-import time
 import unicodedata
 
 from PySide6.QtCore import QBuffer, QIODevice, QRect, Qt
@@ -696,7 +695,15 @@ class GameUiAtlas:
 class GameLocalization:
     MAX_LABEL_PATTERN_CACHE = 256
 
-    def __init__(self, game_root: Path | None, target_language: str) -> None:
+    def __init__(
+        self,
+        game_root: Path | None,
+        target_language: str,
+        project_source: dict[str, str] | None = None,
+        project_target: dict[str, str] | None = None,
+        *,
+        load_game_labels: bool = True,
+    ) -> None:
         self.game_root = game_root
         self.target_language = target_language
         self.source: dict[str, str] = {}
@@ -713,7 +720,11 @@ class GameLocalization:
             tuple[str, tuple[str, ...]],
             tuple[tuple[str, tuple[str, ...]], ...],
         ] = {}
-        self._load()
+        self._load(
+            project_source or {},
+            project_target or {},
+            load_game_labels=load_game_labels,
+        )
 
     @staticmethod
     def _read_labels(path: Path) -> dict[str, str]:
@@ -740,15 +751,20 @@ class GameLocalization:
             return "#chinese"
         return "#" + normalized if normalized else ""
 
-    def _load(self) -> None:
-        if self.game_root is None:
-            return
-        languages = self.game_root / "DB" / "Languages"
-        self._game_source = self._read_labels(languages / "Text.dbt")
-        folder = self._language_folder(self.target_language)
-        self._game_target = self._read_labels(languages / folder / "Text.dbt") if folder else {}
-        self.source = dict(self._game_source)
-        self.target = dict(self._game_target)
+    def _load(
+        self,
+        project_source: dict[str, str],
+        project_target: dict[str, str],
+        *,
+        load_game_labels: bool,
+    ) -> None:
+        if self.game_root is not None and load_game_labels:
+            languages = self.game_root / "DB" / "Languages"
+            self._game_source = self._read_labels(languages / "Text.dbt")
+            folder = self._language_folder(self.target_language)
+            self._game_target = self._read_labels(languages / folder / "Text.dbt") if folder else {}
+        self.source = {**self._game_source, **project_source}
+        self.target = {**self._game_target, **project_target}
         self._rebuild_label_indexes()
         self._refresh_name_keys()
         self._load_character_metadata()
@@ -1028,6 +1044,7 @@ class PreviewService:
         self._project_source_labels: dict[str, str] = {}
         self._project_target_labels: dict[str, str] = {}
         self._project_label_owners: dict[str, str] = {}
+        self._project_localization_revision = 0
         self._atlases: dict[bool, GameGlyphAtlas | None] = {}
         self._ui_atlas: GameUiAtlas | None = None
         self._ui_image_cache: dict[str, QImage | None] = {}
@@ -1041,7 +1058,6 @@ class PreviewService:
         self._translation_font_family = ""
         self._translation_font_key = ""
         self._translation_font_checked = False
-        self._translation_font_check_after = 0.0
 
     def _store_render_document(
         self,
@@ -1084,17 +1100,59 @@ class PreviewService:
         self._translation_font_family = ""
         self._translation_font_key = ""
         self._translation_font_checked = False
-        self._translation_font_check_after = 0.0
 
     @property
     def localization(self) -> GameLocalization:
         if self._localization is None:
-            self._localization = GameLocalization(self.game_root, self.target_language)
-            self._localization.set_project_labels(
+            self._localization = GameLocalization(
+                self.game_root,
+                self.target_language,
                 self._project_source_labels,
                 self._project_target_labels,
             )
         return self._localization
+
+    def use_project_localization_fallback(self) -> None:
+        """Keep placeholder rendering responsive while game data loads elsewhere."""
+        if (
+            self._localization is not None
+            and self._localization.game_root is None
+            and self._localization.target_language == self.target_language
+        ):
+            return
+        self._localization = GameLocalization(
+            None,
+            self.target_language,
+            self._project_source_labels,
+            self._project_target_labels,
+        )
+        self._render_cache.clear()
+
+    def localization_load_spec(
+        self,
+    ) -> tuple[Path | None, str, dict[str, str], dict[str, str], int]:
+        return (
+            self.game_root,
+            self.target_language,
+            dict(self._project_source_labels),
+            dict(self._project_target_labels),
+            self._project_localization_revision,
+        )
+
+    def install_background_localization(
+        self,
+        localization: GameLocalization,
+        revision: int,
+    ) -> bool:
+        if (
+            revision != self._project_localization_revision
+            or localization.game_root != self.game_root
+            or localization.target_language != self.target_language
+        ):
+            return False
+        self._localization = localization
+        self._render_cache.clear()
+        return True
 
     def set_project_localization(
         self,
@@ -1109,6 +1167,7 @@ class PreviewService:
                 self._project_source_labels,
                 self._project_target_labels,
             )
+        self._project_localization_revision += 1
         self._render_cache.clear()
 
     def set_project_localization_entries(
@@ -1136,6 +1195,7 @@ class PreviewService:
         self._project_label_owners = owners
         if self._localization is not None:
             self._localization.set_project_labels(source, target)
+        self._project_localization_revision += 1
         self._render_cache.clear()
 
     def update_project_localization(
@@ -1153,6 +1213,7 @@ class PreviewService:
         self._project_target_labels[label] = target
         if self._localization is not None:
             self._localization.update_project_label(label, source, target)
+        self._project_localization_revision += 1
         self._render_cache.clear()
 
     def locale(self, target: bool) -> str:
@@ -1364,10 +1425,11 @@ class PreviewService:
         return self._translation_font_family
 
     def _refresh_standard_font(self) -> None:
-        now = time.monotonic()
-        if now < self._translation_font_check_after:
+        # Configuration changes reset this flag. Re-enumerating a large game
+        # font directory on every render put unpredictable disk stalls directly
+        # in the row-selection path.
+        if self._translation_font_checked:
             return
-        self._translation_font_check_after = now + 1.0
         font_files = self._standard_font_files(True)
         key_parts: list[str] = []
         for path in font_files:
@@ -1379,8 +1441,6 @@ class PreviewService:
                 f"{path.resolve()}:{stat.st_size}:{stat.st_mtime_ns}"
             )
         key = "|".join(key_parts)
-        if self._translation_font_checked and key == self._translation_font_key:
-            return
         for font_id in self._translation_font_ids:
             QFontDatabase.removeApplicationFont(font_id)
         self._translation_font_ids.clear()

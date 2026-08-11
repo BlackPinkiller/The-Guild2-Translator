@@ -66,6 +66,9 @@ class CodeReference:
         return f"{self.path.name}:{self.line}"
 
 
+_WildcardReference = tuple[re.Pattern[str], int, tuple[CodeReference, ...]]
+
+
 @dataclass(frozen=True)
 class CodeReferenceSet:
     project: tuple[CodeReference, ...] = ()
@@ -146,14 +149,8 @@ class CodeReferenceIndex:
         self.project_references = project_references or {}
         self.vanilla_references = vanilla_references or {}
         self._lookup_cache: dict[str, CodeReferenceSet] = {}
-        self._project_wildcards: tuple[
-            tuple[re.Pattern[str], int, tuple[CodeReference, ...]],
-            ...,
-        ] | None = None
-        self._vanilla_wildcards: tuple[
-            tuple[re.Pattern[str], int, tuple[CodeReference, ...]],
-            ...,
-        ] | None = None
+        self._project_wildcards: dict[str, _WildcardReference] | None = None
+        self._vanilla_wildcards: dict[str, _WildcardReference] | None = None
 
     def references_for(self, label: str) -> CodeReferenceSet:
         cached = self._lookup_cache.get(label)
@@ -172,12 +169,12 @@ class CodeReferenceIndex:
             _matching_references(
                 self.project_references,
                 labels,
-                self._project_wildcards,
+                self._project_wildcards.values(),
             ),
             _matching_references(
                 self.vanilla_references,
                 labels,
-                self._vanilla_wildcards,
+                self._vanilla_wildcards.values(),
             ),
         )
         if len(self._lookup_cache) >= 4096:
@@ -186,11 +183,29 @@ class CodeReferenceIndex:
         return result
 
     def merge(self, other: CodeReferenceIndex) -> None:
-        _merge_reference_maps(self.project_references, other.project_references)
-        _merge_reference_maps(self.vanilla_references, other.vanilla_references)
+        project_changed = _merge_reference_maps(
+            self.project_references,
+            other.project_references,
+        )
+        vanilla_changed = _merge_reference_maps(
+            self.vanilla_references,
+            other.vanilla_references,
+        )
+        if not project_changed and not vanilla_changed:
+            return
         self._lookup_cache.clear()
-        self._project_wildcards = None
-        self._vanilla_wildcards = None
+        if self._project_wildcards is not None:
+            _update_compiled_wildcard_references(
+                self._project_wildcards,
+                self.project_references,
+                project_changed,
+            )
+        if self._vanilla_wildcards is not None:
+            _update_compiled_wildcard_references(
+                self._vanilla_wildcards,
+                self.vanilla_references,
+                vanilla_changed,
+            )
 
     @property
     def is_empty(self) -> bool:
@@ -1022,9 +1037,16 @@ def _dedupe_references(references: list[CodeReference]) -> tuple[CodeReference, 
 def _merge_reference_maps(
     target: dict[str, tuple[CodeReference, ...]],
     incoming: dict[str, tuple[CodeReference, ...]],
-) -> None:
+) -> tuple[str, ...]:
+    changed: list[str] = []
     for label, references in incoming.items():
-        target[label] = _dedupe_references([*target.get(label, ()), *references])
+        previous = target.get(label, ())
+        merged = _dedupe_references([*previous, *references])
+        if merged == previous:
+            continue
+        target[label] = merged
+        changed.append(label)
+    return tuple(changed)
 
 
 def dynamic_label_matches(text: str) -> tuple[tuple[str, int], ...]:
@@ -1206,10 +1228,7 @@ def dynamic_label_keys(label: str) -> tuple[str, ...]:
 def _matching_references(
     references: dict[str, tuple[CodeReference, ...]],
     labels: tuple[str, ...],
-    wildcard_references: tuple[
-        tuple[re.Pattern[str], int, tuple[CodeReference, ...]],
-        ...,
-    ] = (),
+    wildcard_references: Iterable[_WildcardReference] = (),
 ) -> tuple[CodeReference, ...]:
     family_bases = {
         base
@@ -1246,17 +1265,43 @@ def _matching_references(
 
 def _compiled_wildcard_references(
     references: dict[str, tuple[CodeReference, ...]],
-) -> tuple[tuple[re.Pattern[str], int, tuple[CodeReference, ...]], ...]:
-    values: list[tuple[re.Pattern[str], int, tuple[CodeReference, ...]]] = []
+) -> dict[str, _WildcardReference]:
+    values: dict[str, _WildcardReference] = {}
     for pattern, found in references.items():
         if "*" not in pattern:
             continue
-        regex = re.compile(
-            "^" + re.escape(pattern).replace(r"\*", "[a-z0-9_+]+") + "$"
-        )
-        specificity = len(pattern.replace("*", "")) - pattern.count("*") * 8
-        values.append((regex, specificity, found))
-    return tuple(values)
+        values[pattern] = _compile_wildcard_reference(pattern, found)
+    return values
+
+
+def _compile_wildcard_reference(
+    pattern: str,
+    found: tuple[CodeReference, ...],
+) -> _WildcardReference:
+    regex = re.compile(
+        "^" + re.escape(pattern).replace(r"\*", "[a-z0-9_+]+") + "$"
+    )
+    specificity = len(pattern.replace("*", "")) - pattern.count("*") * 8
+    return regex, specificity, found
+
+
+def _update_compiled_wildcard_references(
+    compiled: dict[str, _WildcardReference],
+    references: dict[str, tuple[CodeReference, ...]],
+    changed: tuple[str, ...],
+) -> None:
+    for pattern in changed:
+        if "*" not in pattern:
+            continue
+        found = references.get(pattern)
+        if found is None:
+            compiled.pop(pattern, None)
+            continue
+        previous = compiled.get(pattern)
+        if previous is None:
+            compiled[pattern] = _compile_wildcard_reference(pattern, found)
+        else:
+            compiled[pattern] = previous[0], previous[1], found
 
 
 def _rank_references(references: tuple[CodeReference, ...]) -> tuple[CodeReference, ...]:

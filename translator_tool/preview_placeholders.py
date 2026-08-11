@@ -1090,7 +1090,7 @@ def _localized_runtime_argument_value(
     if len(meaningful_values) == 1:
         return meaningful_values[0]
     if len(meaningful_values) > 1:
-        return _alternative_preview(meaningful_values)
+        return _representative_preview(meaningful_values)
     unique_values = tuple(dict.fromkeys(value for _kind, value in values))
     return unique_values[0] if len(unique_values) == 1 else ""
 
@@ -1187,10 +1187,9 @@ def _resolved_label_value(
     return ""
 
 
-def _alternative_preview(values: tuple[str, ...], limit: int = 2) -> str:
-    visible = values[:limit]
-    result = " / ".join(visible)
-    return result + " / ..." if len(values) > limit else result
+def _representative_preview(values: tuple[str, ...]) -> str:
+    """Render one possible runtime value without discarding semantic candidates."""
+    return values[0] if values else ""
 
 
 def _localized_variable_value(
@@ -1221,7 +1220,7 @@ def _localized_variable_value(
     if len(resolved_values) == 1:
         return resolved_values[0]
     if len(resolved_values) > 1:
-        return _alternative_preview(tuple(resolved_values))
+        return _representative_preview(tuple(resolved_values))
     path = getattr(reference, "path", None)
     line = getattr(reference, "line", None)
     if path is None or not isinstance(line, int):
@@ -1239,7 +1238,7 @@ def _localized_variable_value(
     values = list(dict.fromkeys(values))
     if len(values) == 1:
         return values[0]
-    return _alternative_preview(tuple(values)) if values else ""
+    return _representative_preview(tuple(values))
 
 
 def _contextual_dynamic_label(expression: str, context_label: str) -> str:
