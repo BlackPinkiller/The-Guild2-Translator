@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from collections.abc import Mapping
 from dataclasses import dataclass
 from functools import lru_cache
 from pathlib import Path
@@ -360,20 +361,32 @@ class _Analysis:
     table_fields_by_base: dict[tuple[int | None, str], tuple[str, ...]]
     calls_by_alias: dict[str, tuple[int, ...]]
     functions_by_alias: dict[str, tuple[int, ...]]
+    indirect_calls_by_target: dict[str, tuple[int, ...]]
     returns_by_function: dict[int, tuple[tuple[int, int, int], ...]]
     branch_paths: dict[int, tuple[tuple[int, int], ...]]
     alias_type_events: dict[
         tuple[int | None, str],
         tuple[tuple[int, int, str], ...],
     ]
+    value_type_events: dict[
+        tuple[int | None, str],
+        tuple[tuple[int, int, str], ...],
+    ]
+    lexical_value_constraints: dict[int, dict[str, tuple[str, ...]]]
+    item_names_by_id: dict[int, str]
 
 
 LABEL_RE = re.compile(
     r"@L_[A-Za-z0-9_]+_\+(?![A-Za-z0-9])|"
     r"@L_[A-Za-z0-9_]+_\+[A-Za-z0-9]+|"
+    r"@L_[A-Za-z0-9_]+\+[A-Za-z0-9]+|"
     r"@L_[A-Za-z0-9_]+"
 )
-RAW_LABEL_RE = re.compile(r"^_[A-Za-z0-9_]+(?:_\+[A-Za-z0-9]+)?$")
+RAW_LABEL_RE = re.compile(r"^_[A-Za-z0-9_]+(?:(?:_\+|\+)[A-Za-z0-9]+)?$")
+COMPACT_LABEL_RE = re.compile(
+    r"^@L(?P<label>[A-Za-z_][A-Za-z0-9_]*(?:(?:_\+|\+)[A-Za-z0-9]+)?)$"
+)
+DYNASTY_CREST_LITERAL_RE = re.compile(r"^@L\$S\[20(?:\d+|\*)\]$")
 _IDENTIFIER_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 _BLOCK_OPENERS = {"function", "if", "for", "while", "repeat"}
 _VARIADIC_RETURN_FUNCTIONS = {
@@ -420,6 +433,7 @@ _SEMANTIC_MARKER_KINDS = frozenset(
 )
 
 _NATIVE_ALIAS_OUTPUT_KINDS = {
+    "buildinggetowner": ((1, SEMANTIC_CHARACTER),),
     "buildinggetsim": ((2, SEMANTIC_CHARACTER),),
     "buildinggetcity": ((1, SEMANTIC_SETTLEMENT),),
     "citygetrandombuilding": ((6, SEMANTIC_BUILDING),),
@@ -432,6 +446,7 @@ _NATIVE_ALIAS_OUTPUT_KINDS = {
 
 _NATIVE_ALIAS_INPUT_KINDS = {
     "buildinggetcity": ((0, SEMANTIC_BUILDING),),
+    "buildinggetowner": ((0, SEMANTIC_BUILDING),),
     "buildinggetsim": ((0, SEMANTIC_BUILDING),),
     "citygetbuildingcount": ((0, SEMANTIC_SETTLEMENT),),
     "citygetbuildings": ((0, SEMANTIC_SETTLEMENT),),
@@ -440,8 +455,17 @@ _NATIVE_ALIAS_INPUT_KINDS = {
     "cityiskontor": ((0, SEMANTIC_SETTLEMENT),),
     "cartgettype": ((0, SEMANTIC_VEHICLE),),
     "dynastygetmember": ((0, SEMANTIC_DYNASTY),),
+    "getinsidebuilding": ((0, SEMANTIC_CHARACTER),),
+    "kill": ((0, SEMANTIC_CHARACTER),),
+    "playanimation": ((0, SEMANTIC_CHARACTER),),
+    "playanimationnowait": ((0, SEMANTIC_CHARACTER),),
+    "simgetclass": ((0, SEMANTIC_CHARACTER),),
     "simgetgender": ((0, SEMANTIC_CHARACTER),),
     "simgetlevel": ((0, SEMANTIC_CHARACTER),),
+}
+
+_SCENARIO_LOOKUP_VALUE_KINDS = {
+    "cl_sim": SEMANTIC_CHARACTER,
 }
 
 _FIXED_ALIAS_KINDS = {
@@ -467,8 +491,14 @@ def analyze_script(
     path: Path,
     *,
     label_catalog: frozenset[str] = frozenset(),
+    item_names_by_id: tuple[tuple[int, str], ...] = (),
 ) -> tuple[SemanticLabelUse, ...]:
-    return analyze_script_facts(text, path, label_catalog=label_catalog).uses
+    return analyze_script_facts(
+        text,
+        path,
+        label_catalog=label_catalog,
+        item_names_by_id=item_names_by_id,
+    ).uses
 
 
 def script_calls(text: str, path: Path) -> tuple[ScriptCall, ...]:
@@ -482,6 +512,7 @@ def analyze_script_facts(
     path: Path,
     *,
     label_catalog: frozenset[str] = frozenset(),
+    item_names_by_id: tuple[tuple[int, str], ...] = (),
 ) -> ScriptSemanticFacts:
     tokens = tokenize_lua(text)
     functions = _functions(tokens, path)
@@ -512,11 +543,16 @@ def analyze_script_facts(
         (
             *(assignment.token_start for assignment in assignments),
             *(
+                bisect.bisect_left(token_starts, assignment.position)
+                for assignment in assignments
+            ),
+            *(
                 bisect.bisect_left(token_starts, call.start)
                 for call in calls
             ),
         )
     )
+    branch_paths = _conditional_branch_paths(tokens, branch_path_tokens)
     analysis = _Analysis(
         text,
         path,
@@ -530,9 +566,21 @@ def analyze_script_facts(
         {key: tuple(values) for key, values in table_fields_by_base.items()},
         {name: tuple(indices) for name, indices in calls_by_alias.items()},
         {name: tuple(indices) for name, indices in functions_by_alias.items()},
+        _indirect_function_calls(
+            tokens,
+            assignments_by_name,
+            calls,
+            calls_by_alias,
+            functions_by_alias,
+            token_starts,
+            branch_paths,
+        ),
         _return_expressions_by_function(tokens, functions),
-        _conditional_branch_paths(tokens, branch_path_tokens),
+        branch_paths,
         _native_alias_type_events(tokens, calls, token_starts),
+        _native_value_type_events(tokens, calls, token_starts),
+        _lexical_value_constraints(tokens, branch_path_tokens, branch_paths),
+        dict(item_names_by_id),
     )
     uses: list[SemanticLabelUse] = []
     external_flows: list[ExternalCallFlow] = []
@@ -563,7 +611,7 @@ def analyze_script_facts(
                 else ("button" if "@B[" in expression else "template")
             )
             runtime_start = contract.runtime_start if contract is not None else argument_index + 1
-            runtime_arguments = call.arguments[runtime_start:]
+            runtime_arguments = _runtime_argument_expressions(call, runtime_start)
             runtime_argument_values, runtime_argument_kinds = (
                 _runtime_argument_semantics(
                     analysis,
@@ -935,6 +983,366 @@ def _conditional_branch_paths(
                 if frame[0] == "if"
             )
     return paths
+
+
+def _lexical_value_constraints(
+    tokens: tuple[Token, ...],
+    tracked_indices: frozenset[int],
+    branch_paths: dict[int, tuple[tuple[int, int], ...]],
+) -> dict[int, dict[str, tuple[str, ...]]]:
+    """Collect only finite values proven by enclosing code ranges.
+
+    Equality sets in a true ``if``/``elseif`` arm and small literal numeric
+    ``for`` ranges are exact code evidence.  Unknown or large ranges are left
+    unresolved rather than partially enumerated.
+    """
+    branch_constraints = _conditional_branch_constraints(tokens)
+    loop_constraints = _loop_constraints_at_tokens(tokens, tracked_indices)
+    values: dict[int, dict[str, tuple[str, ...]]] = {}
+    for token_index in tracked_indices:
+        combined: dict[str, tuple[str, ...]] = {}
+        for branch_key in branch_paths.get(token_index, ()):
+            activation = branch_constraints.get(branch_key)
+            if activation is None or token_index <= activation[0]:
+                continue
+            combined = _merge_conjunctive_constraints(combined, activation[1])
+        combined = _merge_conjunctive_constraints(
+            combined,
+            loop_constraints.get(token_index, {}),
+        )
+        if combined:
+            values[token_index] = combined
+    return values
+
+
+def _conditional_branch_constraints(
+    tokens: tuple[Token, ...],
+) -> dict[tuple[int, int], tuple[int, dict[str, tuple[str, ...]]]]:
+    constraints: dict[
+        tuple[int, int],
+        tuple[int, dict[str, tuple[str, ...]]],
+    ] = {}
+    stack: list[list[object]] = []
+    for index, token in enumerate(tokens):
+        value = token.value.casefold() if token.kind == "identifier" else ""
+        if value == "if":
+            then_index = _condition_keyword(tokens, index + 1, "then")
+            if then_index is not None:
+                constraints[(index, 0)] = (
+                    then_index,
+                    _condition_value_constraints(tokens, index + 1, then_index),
+                )
+            stack.append(["if", index, 0, False])
+        elif value == "elseif":
+            if stack and stack[-1][0] == "if":
+                stack[-1][2] = int(stack[-1][2]) + 1
+                then_index = _condition_keyword(tokens, index + 1, "then")
+                if then_index is not None:
+                    constraints[(int(stack[-1][1]), int(stack[-1][2]))] = (
+                        then_index,
+                        _condition_value_constraints(tokens, index + 1, then_index),
+                    )
+        elif value == "else":
+            if stack and stack[-1][0] == "if":
+                stack[-1][2] = int(stack[-1][2]) + 1
+        elif value == "end":
+            if stack:
+                stack.pop()
+        elif value == "until":
+            if stack and stack[-1][0] == "repeat":
+                stack.pop()
+        elif value in {"for", "while"}:
+            stack.append([value, index, 0, True])
+        elif value == "function":
+            stack.append(["function", index, 0, False])
+        elif value == "repeat":
+            stack.append(["repeat", index, 0, False])
+        elif value == "do":
+            if stack and stack[-1][3] is True:
+                stack[-1][3] = False
+            else:
+                stack.append(["do", index, 0, False])
+    return constraints
+
+
+def _loop_constraints_at_tokens(
+    tokens: tuple[Token, ...],
+    tracked_indices: frozenset[int],
+) -> dict[int, dict[str, tuple[str, ...]]]:
+    stack: list[list[object]] = []
+    constraints: dict[int, dict[str, tuple[str, ...]]] = {}
+    for index, token in enumerate(tokens):
+        value = token.value.casefold() if token.kind == "identifier" else ""
+        if value in {"elseif", "else"}:
+            if stack and stack[-1][0] == "if" and value == "elseif":
+                stack[-1][2] = int(stack[-1][2]) + 1
+        elif value == "end":
+            if stack:
+                stack.pop()
+        elif value == "until":
+            if stack and stack[-1][0] == "repeat":
+                stack.pop()
+        elif value == "if":
+            stack.append(["if", index, 0, False, {}])
+        elif value == "for":
+            stack.append(["for", index, 0, True, _numeric_for_constraint(tokens, index)])
+        elif value == "while":
+            stack.append(["while", index, 0, True, {}])
+        elif value == "function":
+            stack.append(["function", index, 0, False, {}])
+        elif value == "repeat":
+            stack.append(["repeat", index, 0, False, {}])
+        elif value == "do":
+            if stack and stack[-1][3] is True:
+                stack[-1][3] = False
+            else:
+                stack.append(["do", index, 0, False, {}])
+        if index not in tracked_indices:
+            continue
+        combined: dict[str, tuple[str, ...]] = {}
+        for frame in stack:
+            if frame[0] == "for" and frame[3] is False:
+                combined = _merge_conjunctive_constraints(
+                    combined,
+                    frame[4] if isinstance(frame[4], dict) else {},
+                )
+        if combined:
+            constraints[index] = combined
+    return constraints
+
+
+def _numeric_for_constraint(
+    tokens: tuple[Token, ...],
+    for_index: int,
+) -> dict[str, tuple[str, ...]]:
+    do_index = _condition_keyword(tokens, for_index + 1, "do")
+    if (
+        do_index is None
+        or for_index + 3 >= do_index
+        or tokens[for_index + 1].kind != "identifier"
+        or tokens[for_index + 2].value != "="
+    ):
+        return {}
+    parts = _split_token_range(tokens, for_index + 3, do_index, ",")
+    if len(parts) not in {2, 3}:
+        return {}
+    bounds = tuple(_integer_token_value(tokens, start, end) for start, end in parts)
+    if any(value is None for value in bounds):
+        return {}
+    first = int(bounds[0])
+    last = int(bounds[1])
+    step = int(bounds[2]) if len(bounds) == 3 else 1
+    if step == 0 or (step > 0 and first > last) or (step < 0 and first < last):
+        return {}
+    stop = last + (1 if step > 0 else -1)
+    numbers = tuple(range(first, stop, step))
+    if not numbers or len(numbers) > 64:
+        return {}
+    return {tokens[for_index + 1].value.casefold(): tuple(str(value) for value in numbers)}
+
+
+def _condition_keyword(
+    tokens: tuple[Token, ...],
+    start: int,
+    keyword: str,
+) -> int | None:
+    depth = 0
+    for index in range(start, len(tokens)):
+        token = tokens[index]
+        if token.value in {"(", "[", "{"}:
+            depth += 1
+        elif token.value in {")",
+            "]",
+            "}",
+        }:
+            depth = max(0, depth - 1)
+        elif (
+            depth == 0
+            and token.kind == "identifier"
+            and token.value.casefold() == keyword
+        ):
+            return index
+    return None
+
+
+def _condition_value_constraints(
+    tokens: tuple[Token, ...],
+    start: int,
+    end: int,
+) -> dict[str, tuple[str, ...]]:
+    while start < end and tokens[start].value == "(":
+        close = _matching_token(tokens, start, "(", ")")
+        if close != end - 1:
+            break
+        start += 1
+        end -= 1
+    if start >= end or (
+        tokens[start].kind == "identifier"
+        and tokens[start].value.casefold() == "not"
+    ):
+        return {}
+    disjunctions = _split_token_range(tokens, start, end, "or")
+    if len(disjunctions) > 1:
+        branches = [
+            _condition_value_constraints(tokens, part_start, part_end)
+            for part_start, part_end in disjunctions
+        ]
+        common = set(branches[0]) if branches else set()
+        for branch in branches[1:]:
+            common.intersection_update(branch)
+        return {
+            name: tuple(
+                dict.fromkeys(
+                    value
+                    for branch in branches
+                    for value in branch[name]
+                )
+            )[:64]
+            for name in common
+        }
+    conjunctions = _split_token_range(tokens, start, end, "and")
+    if len(conjunctions) > 1:
+        combined: dict[str, tuple[str, ...]] = {}
+        for part_start, part_end in conjunctions:
+            combined = _merge_conjunctive_constraints(
+                combined,
+                _condition_value_constraints(tokens, part_start, part_end),
+            )
+        combined = _merge_conjunctive_constraints(
+            combined,
+            _bounded_integer_constraints(tokens, conjunctions),
+        )
+        return combined
+    equality = _split_token_range(tokens, start, end, "==")
+    if len(equality) != 2:
+        return {}
+    left_name = _lvalue_name(tokens, equality[0][0], equality[0][1])
+    right_name = _lvalue_name(tokens, equality[1][0], equality[1][1])
+    left_value = _literal_token_value(tokens, equality[0][0], equality[0][1])
+    right_value = _literal_token_value(tokens, equality[1][0], equality[1][1])
+    if left_name and right_value is not None:
+        return {left_name.casefold(): (right_value,)}
+    if right_name and left_value is not None:
+        return {right_name.casefold(): (left_value,)}
+    return {}
+
+
+def _bounded_integer_constraints(
+    tokens: tuple[Token, ...],
+    parts: tuple[tuple[int, int], ...],
+) -> dict[str, tuple[str, ...]]:
+    bounds: dict[str, list[int | None]] = {}
+    for start, end in parts:
+        comparison = _integer_comparison_bound(tokens, start, end)
+        if comparison is None:
+            continue
+        name, lower, upper = comparison
+        current = bounds.setdefault(name, [None, None])
+        if lower is not None:
+            current[0] = lower if current[0] is None else max(int(current[0]), lower)
+        if upper is not None:
+            current[1] = upper if current[1] is None else min(int(current[1]), upper)
+    values: dict[str, tuple[str, ...]] = {}
+    for name, (lower, upper) in bounds.items():
+        if lower is None or upper is None or lower > upper or upper - lower >= 64:
+            continue
+        values[name] = tuple(str(value) for value in range(lower, upper + 1))
+    return values
+
+
+def _integer_comparison_bound(
+    tokens: tuple[Token, ...],
+    start: int,
+    end: int,
+) -> tuple[str, int | None, int | None] | None:
+    while start < end and tokens[start].value == "(":
+        close = _matching_token(tokens, start, "(", ")")
+        if close != end - 1:
+            break
+        start += 1
+        end -= 1
+    for operator in (">=", ">", "<=", "<"):
+        operands = _split_token_range(tokens, start, end, operator)
+        if len(operands) != 2:
+            continue
+        left_name = _lvalue_name(tokens, operands[0][0], operands[0][1])
+        right_name = _lvalue_name(tokens, operands[1][0], operands[1][1])
+        left_value = _integer_token_value(tokens, operands[0][0], operands[0][1])
+        right_value = _integer_token_value(tokens, operands[1][0], operands[1][1])
+        if left_name and right_value is not None:
+            if operator == ">=":
+                return left_name.casefold(), right_value, None
+            if operator == ">":
+                return left_name.casefold(), right_value + 1, None
+            if operator == "<=":
+                return left_name.casefold(), None, right_value
+            return left_name.casefold(), None, right_value - 1
+        if right_name and left_value is not None:
+            if operator == ">=":
+                return right_name.casefold(), None, left_value
+            if operator == ">":
+                return right_name.casefold(), None, left_value - 1
+            if operator == "<=":
+                return right_name.casefold(), left_value, None
+            return right_name.casefold(), left_value + 1, None
+    return None
+
+
+def _merge_conjunctive_constraints(
+    left: dict[str, tuple[str, ...]],
+    right: Mapping[str, tuple[str, ...]],
+) -> dict[str, tuple[str, ...]]:
+    if not right:
+        return dict(left)
+    merged = dict(left)
+    for name, values in right.items():
+        if name not in merged:
+            merged[name] = values
+            continue
+        allowed = set(values)
+        intersection = tuple(value for value in merged[name] if value in allowed)
+        if intersection:
+            merged[name] = intersection
+        else:
+            merged.pop(name, None)
+    return merged
+
+
+def _literal_token_value(
+    tokens: tuple[Token, ...],
+    start: int,
+    end: int,
+) -> str | None:
+    while start < end and tokens[start].value == "(":
+        close = _matching_token(tokens, start, "(", ")")
+        if close != end - 1:
+            break
+        start += 1
+        end -= 1
+    if end - start == 1 and tokens[start].kind in {"string", "number"}:
+        return tokens[start].value
+    if (
+        end - start == 1
+        and tokens[start].kind == "identifier"
+        and tokens[start].value.casefold() in {"true", "false"}
+    ):
+        return tokens[start].value.casefold()
+    if (
+        end - start == 2
+        and tokens[start].value in {"+", "-"}
+        and tokens[start + 1].kind == "number"
+    ):
+        return tokens[start].value + tokens[start + 1].value
+    return None
+
+
+def _integer_token_value(
+    tokens: tuple[Token, ...],
+    start: int,
+    end: int,
+) -> int | None:
+    value = _literal_token_value(tokens, start, end)
+    return int(value) if value is not None and re.fullmatch(r"[-+]?\d+", value) else None
 
 
 def _branch_path_for_token(
@@ -1466,12 +1874,24 @@ def _evaluate_tokens(
                 part_values = ("*",)
             combined = tuple(
                 dict.fromkeys(
-                    left + right
+                    left + _concatenation_value(right)
                     for left in combined
                     for right in part_values
                 )
             )[:64]
         return combined
+    numeric_values = _numeric_binary_values(
+        analysis,
+        start,
+        end,
+        position,
+        function_index,
+        resolving,
+        parameter_bindings,
+        required_branches,
+    )
+    if numeric_values is not None:
+        return numeric_values
     call = _call_for_token_range(analysis, start, end)
     if call is not None:
         return _evaluate_local_function_call(
@@ -1483,6 +1903,12 @@ def _evaluate_tokens(
             parameter_bindings,
             required_branches,
         )
+    if (
+        end - start == 2
+        and analysis.tokens[start].value in {"+", "-"}
+        and analysis.tokens[start + 1].kind == "number"
+    ):
+        return (analysis.tokens[start].value + analysis.tokens[start + 1].value,)
     if end - start == 1:
         token = analysis.tokens[start]
         if token.kind in {"string", "number"}:
@@ -1513,6 +1939,78 @@ def _evaluate_tokens(
     return ()
 
 
+def _numeric_binary_values(
+    analysis: _Analysis,
+    start: int,
+    end: int,
+    position: int,
+    function_index: int | None,
+    resolving: set[tuple[str, int | None]],
+    parameter_bindings: dict[tuple[int, str], tuple[str, ...]] | None,
+    required_branches: tuple[tuple[int, int], ...],
+) -> tuple[str, ...] | None:
+    depth = 0
+    operator_index: int | None = None
+    for index in range(start, end):
+        value = analysis.tokens[index].value
+        if value in {"(", "[", "{"}:
+            depth += 1
+            continue
+        if value in {")",
+            "]",
+            "}",
+        }:
+            depth = max(0, depth - 1)
+            continue
+        if depth or value not in {"+", "-"} or index == start:
+            continue
+        previous = analysis.tokens[index - 1].value
+        if previous in {"(", "[", "{", ",", "+", "-", "*", "/", "%", "==", "~="}:
+            continue
+        operator_index = index
+    if operator_index is None:
+        return None
+    left_values = _evaluate_tokens(
+        analysis,
+        start,
+        operator_index,
+        position,
+        function_index,
+        resolving,
+        parameter_bindings,
+        required_branches,
+    )
+    right_values = _evaluate_tokens(
+        analysis,
+        operator_index + 1,
+        end,
+        position,
+        function_index,
+        resolving,
+        parameter_bindings,
+        required_branches,
+    )
+    if (
+        not left_values
+        or not right_values
+        or any(not re.fullmatch(r"[-+]?\d+", value) for value in (*left_values, *right_values))
+    ):
+        return None
+    operator = analysis.tokens[operator_index].value
+    return tuple(
+        dict.fromkeys(
+            str(int(left) + int(right) if operator == "+" else int(left) - int(right))
+            for left in left_values
+            for right in right_values
+        )
+    )[:64]
+
+
+def _concatenation_value(value: str) -> str:
+    """Keep unresolved calls useful as wildcard evidence inside dynamic strings."""
+    return "*" if semantic_literal(value).kind == SEMANTIC_EXPRESSION else value
+
+
 def _call_for_token_range(
     analysis: _Analysis,
     start: int,
@@ -1538,7 +2036,8 @@ def _evaluate_local_function_call(
     parameter_bindings: dict[tuple[int, str], tuple[str, ...]] | None,
     required_branches: tuple[tuple[int, int], ...],
 ) -> tuple[str, ...]:
-    if re.split(r"[.:]", call.name)[-1].casefold() == "getid":
+    terminal_name = re.split(r"[.:]", call.name)[-1].casefold()
+    if terminal_name == "getid":
         object_kinds = _getid_object_kinds(
             analysis,
             call,
@@ -1549,9 +2048,24 @@ def _evaluate_local_function_call(
                 _semantic_candidate(SemanticValue(kind, ""))
                 for kind in object_kinds
             )
+        return ()
+    if terminal_name == "getname":
+        object_kinds = _getid_object_kinds(
+            analysis,
+            call,
+            required_branches,
+        )
+        if object_kinds:
+            return tuple(
+                _semantic_candidate(SemanticValue(kind, ""))
+                for kind in object_kinds
+            )
+        expression = analysis.text[call.start : call.end].strip()
+        return (expression,) if expression else ()
     target_indices = analysis.functions_by_alias.get(call.name.casefold(), ())
     if not target_indices and native_semantic_function_name(call.name) is None:
-        return ()
+        expression = analysis.text[call.start : call.end].strip()
+        return (expression,) if expression else ()
     argument_values: list[tuple[str, ...]] = []
     for start, end in call.argument_spans:
         token_indices = _tokens_in_span(analysis, start, end)
@@ -1577,7 +2091,11 @@ def _evaluate_local_function_call(
             else (SemanticValue(SEMANTIC_EXPRESSION, "*"),)
             for candidates in argument_values
         )
-        resolved = resolve_native_semantic_function(call.name, semantic_arguments)
+        resolved = resolve_native_semantic_function(
+            call.name,
+            semantic_arguments,
+            item_names_by_id=analysis.item_names_by_id,
+        )
         if not resolved:
             return ()
         return tuple(_semantic_candidate(value) for value in resolved[0])
@@ -1731,6 +2249,106 @@ def _native_alias_type_events(
             for key in keys:
                 grouped.setdefault(key, []).append(event)
     return {key: tuple(events) for key, events in grouped.items()}
+
+
+def _native_value_type_events(
+    tokens: tuple[Token, ...],
+    calls: tuple[ScriptCall, ...],
+    token_starts: tuple[int, ...],
+) -> dict[tuple[int | None, str], tuple[tuple[int, int, str], ...]]:
+    """Record native calls that prove the domain of a scalar identifier."""
+    grouped: dict[
+        tuple[int | None, str],
+        list[tuple[int, int, str]],
+    ] = {}
+    for call in calls:
+        name = re.split(r"[.:]", call.name)[-1].casefold()
+        if name != "scenariogetobjectbyname" or len(call.argument_spans) < 2:
+            continue
+        class_start, class_end = call.argument_spans[0]
+        class_first = bisect.bisect_left(token_starts, class_start)
+        class_last = bisect.bisect_left(token_starts, class_end)
+        class_indices = tuple(
+            index
+            for index in range(class_first, class_last)
+            if tokens[index].end <= class_end
+        )
+        value_start, value_end = call.argument_spans[1]
+        value_first = bisect.bisect_left(token_starts, value_start)
+        value_last = bisect.bisect_left(token_starts, value_end)
+        value_indices = tuple(
+            index
+            for index in range(value_first, value_last)
+            if tokens[index].end <= value_end
+        )
+        if (
+            len(class_indices) != 1
+            or tokens[class_indices[0]].kind != "string"
+            or len(value_indices) != 1
+            or tokens[value_indices[0]].kind != "identifier"
+        ):
+            continue
+        kind = _SCENARIO_LOOKUP_VALUE_KINDS.get(
+            tokens[class_indices[0]].value.casefold()
+        )
+        if kind is None:
+            continue
+        value_token = tokens[value_indices[0]]
+        grouped.setdefault(
+            (call.function_index, value_token.value.casefold()),
+            [],
+        ).append(
+            (
+                call.start,
+                bisect.bisect_left(token_starts, call.start),
+                kind,
+            )
+        )
+    return {key: tuple(events) for key, events in grouped.items()}
+
+
+def _indirect_function_calls(
+    tokens: tuple[Token, ...],
+    assignments_by_name: dict[tuple[int | None, str], list[Assignment]],
+    calls: tuple[ScriptCall, ...],
+    calls_by_alias: dict[str, list[int]],
+    functions_by_alias: dict[str, list[int]],
+    token_starts: tuple[int, ...],
+    branch_paths: dict[int, tuple[tuple[int, int], ...]],
+) -> dict[str, tuple[int, ...]]:
+    """Index calls through locals assigned a known script function."""
+    grouped: dict[str, list[int]] = {}
+    for variable, call_indices in calls_by_alias.items():
+        if variable in functions_by_alias or not _IDENTIFIER_RE.fullmatch(variable):
+            continue
+        for call_index in call_indices:
+            call = calls[call_index]
+            call_token = bisect.bisect_left(token_starts, call.start)
+            call_path = branch_paths.get(call_token, ())
+            reaching_by_path: dict[tuple[tuple[int, int], ...], Assignment] = {}
+            for assignment in assignments_by_name.get(
+                (call.function_index, variable),
+                (),
+            ):
+                if assignment.position >= call.start:
+                    continue
+                assignment_path = branch_paths.get(assignment.token_start, ())
+                if not _branches_compatible(assignment_path, call_path):
+                    continue
+                reaching_by_path[assignment_path] = assignment
+            for assignment in reaching_by_path.values():
+                if assignment.token_end - assignment.token_start != 1:
+                    continue
+                target_token = tokens[assignment.token_start]
+                if target_token.kind != "identifier":
+                    continue
+                target = target_token.value.casefold()
+                if target not in functions_by_alias:
+                    continue
+                targets = grouped.setdefault(target, [])
+                if call_index not in targets:
+                    targets.append(call_index)
+    return {target: tuple(indices) for target, indices in grouped.items()}
 
 
 def _dependent_label_values(
@@ -2001,10 +2619,14 @@ def semantic_literal(value: str) -> SemanticValue:
     stripped = value.strip()
     if value in {"", "$N"}:
         kind = SEMANTIC_STRUCTURE
-    elif stripped.startswith(("@L_", "_")):
+    elif DYNASTY_CREST_LITERAL_RE.fullmatch(stripped):
+        kind = SEMANTIC_DYNASTY_CREST
+    elif stripped.startswith(("@L_", "_")) or COMPACT_LABEL_RE.fullmatch(stripped):
         kind = SEMANTIC_LABEL
     elif re.fullmatch(r"[-+]?\d+(?:\.\d+)?|true|false", stripped, re.IGNORECASE):
         kind = SEMANTIC_NUMBER
+    elif re.fullmatch(r"[A-Za-z_][A-Za-z0-9_.:]*\s*\(.*\)", stripped, re.DOTALL):
+        kind = SEMANTIC_EXPRESSION
     else:
         kind = SEMANTIC_TEXT
     return SemanticValue(kind, value)
@@ -2037,7 +2659,7 @@ def native_semantic_function_name(alias: str) -> str | None:
         "professiongetlabel",
     }:
         return name
-    if name in {"ceil", "floor"}:
+    if name in {"ceil", "floor", "rand", "sub"}:
         return name
     return None
 
@@ -2045,6 +2667,8 @@ def native_semantic_function_name(alias: str) -> str | None:
 def resolve_native_semantic_function(
     alias: str,
     argument_values: tuple[tuple[SemanticValue, ...], ...],
+    *,
+    item_names_by_id: Mapping[int, str] | None = None,
 ) -> tuple[tuple[SemanticValue, ...], ...] | None:
     """Apply engine function contracts shared by local and cross-file evaluation."""
     name = native_semantic_function_name(alias)
@@ -2059,12 +2683,25 @@ def resolve_native_semantic_function(
     if name == "itemgetlabel":
         item_values = argument_values[0] if argument_values else ()
         singular_values = argument_values[1] if len(argument_values) > 1 else ()
-        item_names = tuple(
-            value.text
-            for value in item_values
-            if re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", value.text)
-            and value.text.casefold() not in {"true", "false"}
-        ) or ("*",)
+        item_names: list[str] = []
+        unresolved = False
+        for value in item_values:
+            if (
+                re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", value.text)
+                and value.text.casefold() not in {"true", "false"}
+            ):
+                item_names.append(value.text)
+            elif re.fullmatch(r"[-+]?\d+", value.text):
+                item_name = (item_names_by_id or {}).get(int(value.text))
+                if item_name:
+                    item_names.append(item_name)
+                else:
+                    unresolved = True
+            else:
+                unresolved = True
+        item_names = list(dict.fromkeys(item_names))
+        if unresolved or not item_names:
+            item_names.append("*")
         singular_text = {value.text.casefold() for value in singular_values}
         if singular_text and singular_text <= {"true", "1"}:
             suffixes = ("0",)
@@ -2101,6 +2738,36 @@ def resolve_native_semantic_function(
         # The engine selects a profession and gender-specific localization
         # member. Runtime values vary, but the returned label family is fixed.
         return ((semantic_literal("_CHARACTERS_2_PROFESSIONS_*_NAME_+*"),),)
+    if name == "sub":
+        source_values = argument_values[0] if argument_values else ()
+        starts = _semantic_integer_candidates(argument_values, 1)
+        ends = _semantic_integer_candidates(argument_values, 2)
+        if not source_values or not starts or (len(argument_values) > 2 and not ends):
+            return ((),)
+        requested_ends: tuple[int | None, ...] = ends or (None,)
+        values: list[SemanticValue] = []
+        for source in source_values:
+            if not source.text:
+                continue
+            for start in starts:
+                for end in requested_ends:
+                    value = semantic_literal(_lua_substring(source.text, start, end))
+                    if value not in values:
+                        values.append(value)
+                    if len(values) >= 64:
+                        return (tuple(values),)
+        return (tuple(values),)
+    if name == "rand":
+        maxima = _semantic_integer_candidates(argument_values, 0)
+        values: list[SemanticValue] = []
+        for maximum in maxima:
+            if maximum <= 0 or maximum > 64:
+                continue
+            values.extend(
+                semantic_literal(str(value))
+                for value in range(maximum)
+            )
+        return (tuple(dict.fromkeys(values))[:64],)
     if name in {"ceil", "floor"}:
         return ((SemanticValue(SEMANTIC_NUMBER, ""),),)
     if name != "generateprivilegelistlabels":
@@ -2152,6 +2819,18 @@ def _semantic_integer_candidates(
     return tuple(values)
 
 
+def _lua_substring(value: str, start: int, end: int | None) -> str:
+    """Apply Lua's inclusive, one-based string.sub index rules."""
+    size = len(value)
+    first = start if start > 0 else size + start + 1 if start < 0 else 1
+    last = size if end is None else end if end > 0 else size + end + 1
+    first = max(1, first)
+    last = min(size, last)
+    if first > last:
+        return ""
+    return value[first - 1 : last]
+
+
 def _dependency_names(tokens: tuple[Token, ...], start: int, end: int) -> tuple[str, ...]:
     names: list[str] = []
     index = start
@@ -2193,6 +2872,22 @@ def _resolve_variable(
         return ()
     next_resolving = set(resolving)
     next_resolving.add(key)
+    proven_kind = _proven_variable_value_kind(
+        analysis,
+        name,
+        position,
+        function_index,
+        required_branches,
+    )
+    if proven_kind:
+        return (_semantic_candidate(SemanticValue(proven_kind, "")),)
+    token_index = bisect.bisect_right(analysis.token_starts, position) - 1
+    constrained = analysis.lexical_value_constraints.get(token_index, {}).get(
+        name.casefold(),
+        (),
+    )
+    if constrained:
+        return constrained
     values: list[str] = list(
         _accumulated_variable_values(
             analysis,
@@ -2265,27 +2960,73 @@ def _resolve_variable(
     )
     if parameter_index is None:
         return ()
+    call_indices: list[int] = []
     for alias in function.aliases:
-        for call_index in analysis.calls_by_alias.get(alias.casefold(), ()):
-            call = analysis.calls[call_index]
-            if call.start == function.start or parameter_index >= len(call.argument_spans):
-                continue
-            span_start, span_end = call.argument_spans[parameter_index]
-            token_indices = _tokens_in_span(analysis, span_start, span_end)
-            if token_indices:
-                values.extend(
-                    _evaluate_tokens(
-                        analysis,
-                        token_indices[0],
-                        token_indices[-1] + 1,
-                        call.start,
-                        call.function_index,
-                        next_resolving,
-                        parameter_bindings,
-                        (),
-                    )
+        normalized_alias = alias.casefold()
+        for call_index in (
+            *analysis.calls_by_alias.get(normalized_alias, ()),
+            *analysis.indirect_calls_by_target.get(normalized_alias, ()),
+        ):
+            if call_index not in call_indices:
+                call_indices.append(call_index)
+    for call_index in call_indices:
+        call = analysis.calls[call_index]
+        if call.start == function.start or parameter_index >= len(call.argument_spans):
+            continue
+        span_start, span_end = call.argument_spans[parameter_index]
+        token_indices = _tokens_in_span(analysis, span_start, span_end)
+        if token_indices:
+            values.extend(
+                _evaluate_tokens(
+                    analysis,
+                    token_indices[0],
+                    token_indices[-1] + 1,
+                    call.start,
+                    call.function_index,
+                    next_resolving,
+                    parameter_bindings,
+                    (),
                 )
+            )
     return tuple(dict.fromkeys(values))[:64]
+
+
+def _proven_variable_value_kind(
+    analysis: _Analysis,
+    name: str,
+    position: int,
+    function_index: int | None,
+    required_branches: tuple[tuple[int, int], ...],
+) -> str:
+    key = (function_index, name.casefold())
+    latest_assignment = max(
+        (
+            assignment.position
+            for assignment in analysis.assignments_by_name.get(key, ())
+            if assignment.position < position
+            and (
+                not required_branches
+                or _branches_compatible(
+                    _branch_path_for_token(analysis, assignment.token_start),
+                    required_branches,
+                )
+            )
+        ),
+        default=-1,
+    )
+    kinds = {
+        kind
+        for event_position, producer_token, kind in analysis.value_type_events.get(key, ())
+        if latest_assignment < event_position < position
+        and (
+            not required_branches
+            or _branches_compatible(
+                _branch_path_for_token(analysis, producer_token),
+                required_branches,
+            )
+        )
+    }
+    return next(iter(kinds)) if len(kinds) == 1 else ""
 
 
 def _accumulated_variable_values(
@@ -2337,7 +3078,11 @@ def _accumulated_variable_values(
                 suffix = ("*",)
             bases = current or ("",)
             current = tuple(
-                dict.fromkeys(left + right for left in bases for right in suffix)
+                dict.fromkeys(
+                    left + _concatenation_value(right)
+                    for left in bases
+                    for right in suffix
+                )
             )[:64]
             accumulated = True
             continue
@@ -2364,6 +3109,12 @@ def _literal_labels(
 ) -> tuple[tuple[str, int], ...]:
     labels: list[tuple[str, int]] = []
     stripped = value.strip()
+    compact = COMPACT_LABEL_RE.fullmatch(stripped)
+    if compact is not None and not stripped.startswith("@L_"):
+        normalized = compact.group("label").casefold()
+        catalog_values = {normalized, normalized.lstrip("_")}
+        if catalog_values & catalog or (not catalog and "_+" in normalized):
+            return ((normalized, value.find(stripped)),)
     if allow_patterns and stripped.startswith("@L_") and "*" in stripped:
         label = _normalize_label(stripped)
         if label:
@@ -2396,6 +3147,8 @@ def _normalize_label(label: str) -> str:
     value = label.strip()
     if value.startswith("@L_"):
         value = value[3:]
+    elif value.startswith("@L"):
+        value = value[2:]
     if value.endswith("_+"):
         value += "*"
     return value.casefold()
@@ -2486,7 +3239,59 @@ def _runtime_argument_semantics(
                 for value in candidates
             )
         )
+    if call.name.casefold() == "feedback_messageoffice":
+        privilege_labels = _feedback_office_privilege_labels(analysis, call)
+        values.append(privilege_labels)
+        kinds.append((SEMANTIC_LABEL,) * len(privilege_labels))
     return tuple(values), tuple(kinds)
+
+
+def _runtime_argument_expressions(
+    call: ScriptCall,
+    runtime_start: int,
+) -> tuple[str, ...]:
+    expressions = call.arguments[runtime_start:]
+    if call.name.casefold() != "feedback_messageoffice":
+        return expressions
+    provider = call.arguments[1].strip() if len(call.arguments) > 1 else ""
+    generated = f"{provider}()" if provider else "feedback_MessageOffice privileges"
+    return (*expressions, generated)
+
+
+def _feedback_office_privilege_labels(
+    analysis: _Analysis,
+    call: ScriptCall,
+) -> tuple[str, ...]:
+    """Model the extra privilege-list argument injected by feedback_MessageOffice."""
+    if len(call.arguments) <= 1:
+        return ("_MEASURE_*_NAME_+0",)
+    provider = call.arguments[1].strip().casefold()
+    target_indices = analysis.functions_by_alias.get(provider, ())
+    privileges: list[str] = []
+    for target_index in target_indices:
+        recursion_key = (f"@office-privileges:{provider}", target_index)
+        for start, end, position in analysis.returns_by_function.get(target_index, ()):
+            for part_start, part_end in _split_token_range(
+                analysis.tokens,
+                start,
+                end,
+                ",",
+            ):
+                for value in _evaluate_tokens(
+                    analysis,
+                    part_start,
+                    part_end,
+                    position,
+                    target_index,
+                    {recursion_key},
+                    required_branches=(),
+                ):
+                    if re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", value):
+                        privileges.append(value)
+    labels = tuple(
+        dict.fromkeys(f"_MEASURE_{privilege}_NAME_+0" for privilege in privileges)
+    )
+    return labels or ("_MEASURE_*_NAME_+0",)
 
 
 def _runtime_argument_semantics_for_paths(

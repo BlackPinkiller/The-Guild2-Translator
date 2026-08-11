@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from collections import Counter
 from dataclasses import dataclass
+import hashlib
 import re
 import unicodedata
 
@@ -164,7 +165,39 @@ PROTECTED_TOKEN_RE = re.compile(
 ARG_TOKEN_RE = re.compile(ARG_TOKEN)
 NAME_SUFFIX_TOKEN_RE = re.compile(rf"^{NAME_SUFFIX_TOKEN}$")
 TAB_LAYOUT_TOKEN_RE = re.compile(rf"^{TAB_LAYOUT_TOKEN}$")
-UNKNOWN_PERCENT_RE = re.compile(r"%(?:\d*[A-Za-z][A-Za-z0-9]*|[^\s])?")
+
+ISSUE_BLOCKING = "blocking"
+ISSUE_ACTION = "action"
+ISSUE_REVIEW = "review"
+ISSUE_INFO = "info"
+
+ACTION_ISSUE_CODES = {
+    "argument-index",
+    "argument-type",
+    "argument-omitted",
+    "format-missing",
+    "unknown-format",
+    "font-glyph",
+}
+INFO_ISSUE_CODES = {
+    "format-color-missing",
+    "format-color-extra",
+    "format-fallback",
+    "source-format-suspect",
+}
+ACKNOWLEDGEABLE_ISSUE_CODES = {
+    "argument-index",
+    "argument-type",
+    "argument-variant",
+    "argument-omitted",
+    "format-missing",
+    "format-extra",
+    "format-color-missing",
+    "format-color-extra",
+    "format-fallback",
+    "source-format-suspect",
+    "unknown-format",
+}
 
 
 @dataclass(frozen=True)
@@ -176,6 +209,26 @@ class ValidationIssue:
     @property
     def blocks_save(self) -> bool:
         return self.severity == "error"
+
+    @property
+    def concern_level(self) -> str:
+        """Stable UI priority independent of the save-blocking severity."""
+        if self.blocks_save:
+            return ISSUE_BLOCKING
+        if self.code in ACTION_ISSUE_CODES:
+            return ISSUE_ACTION
+        if self.code in INFO_ISSUE_CODES:
+            return ISSUE_INFO
+        return ISSUE_REVIEW
+
+    @property
+    def needs_action(self) -> bool:
+        return self.concern_level in {ISSUE_BLOCKING, ISSUE_ACTION}
+
+    @property
+    def acknowledgeable(self) -> bool:
+        """Whether a user may mark this non-blocking difference as intentional."""
+        return not self.blocks_save and self.code in ACKNOWLEDGEABLE_ISSUE_CODES
 
 
 def format_dialect(file_rel: str, kind: str = "dbt") -> str:
@@ -205,6 +258,22 @@ def highlight_re_for(dialect: str) -> re.Pattern[str]:
 
 def format_tokens(text: str, *, dialect: str = FORMAT_GUILD2) -> Counter[str]:
     return Counter(match.group(0) for match in token_re_for(dialect).finditer(text))
+
+
+def format_confirmation_fingerprint(
+    source: str,
+    target: str,
+    *,
+    dbt_field: bool,
+    dialect: str = FORMAT_GUILD2,
+) -> str:
+    """Return a stable signature that expires after either confirmed text changes."""
+    digest = hashlib.blake2s(digest_size=16)
+    for value in ("format-confirmation-v1", dialect, "1" if dbt_field else "0", source, target):
+        encoded = value.encode("utf-8")
+        digest.update(len(encoded).to_bytes(8, "big"))
+        digest.update(encoded)
+    return digest.hexdigest()
 
 
 def normalize_color_token_spacing(text: str) -> str:
@@ -274,8 +343,6 @@ def split_soft_color_tokens(tokens: Counter[str]) -> tuple[Counter[str], Counter
         if COLOR_TOKEN_RE.fullmatch(token):
             # `$C[115,5,20]` and `$C[115, 5, 20]` are identical game data.
             soft[re.sub(r"\s+", "", token)] = count
-        elif token == "%":
-            hard["%%"] += count
         elif NAME_SUFFIX_TOKEN_RE.fullmatch(token):
             hard[_canonical_name_suffix(token)] += count
         else:
@@ -361,6 +428,13 @@ def _drop_decoration_tokens(tokens: Counter[str]) -> None:
         del tokens[token]
 
 
+def _drop_nonsemantic_percent_tokens(tokens: Counter[str]) -> None:
+    # These forms only affect literal/quote presentation. The game accepts
+    # single and doubled percent signs, so none belongs in format diagnostics.
+    for token in ("%", "%%", "%>", "%<"):
+        tokens.pop(token, None)
+
+
 def _compare_argument_tokens(
     source: Counter[str], target: Counter[str], optional_source: Counter[str] | None = None
 ) -> list[ValidationIssue]:
@@ -424,20 +498,6 @@ def _compare_argument_tokens(
     return issues
 
 
-def _literal_percent_end(text: str, position: int) -> int | None:
-    if position < 0 or position >= len(text) or text[position] != "%":
-        return None
-    next_char = text[position + 1] if position + 1 < len(text) else ""
-    previous_char = text[position - 1] if position > 0 else ""
-    if not next_char or next_char.isspace():
-        return position + 1
-    if previous_char.isdigit() and not (next_char.isascii() and (next_char.isalnum() or next_char in {"_", ":"})):
-        return position + 1
-    if next_char in '$.,:;!?)]}"\'”’':
-        return position + 1
-    return None
-
-
 def unknown_syntax_tokens(text: str, *, dialect: str = FORMAT_GUILD2) -> list[str]:
     if dialect != FORMAT_GUILD2:
         return []
@@ -446,19 +506,10 @@ def unknown_syntax_tokens(text: str, *, dialect: str = FORMAT_GUILD2) -> list[st
     while position < len(text):
         marker = text[position]
         if marker == "%":
-            known = TOKEN_RE.match(text, position)
-            if known is not None:
-                position = known.end()
-                continue
-            literal = _literal_percent_end(text, position)
-            if literal is not None:
-                position = literal
-                continue
-            candidate = UNKNOWN_PERCENT_RE.match(text, position)
-            if candidate is not None:
-                unknown.append(candidate.group(0))
-                position = candidate.end()
-                continue
+            # Invalid/standalone percent forms are rendered literally by the
+            # game. Only recognized placeholders participate in token diffs.
+            position += 1
+            continue
         elif marker in "#@":
             known = TOKEN_RE.match(text, position)
             if known is not None:
@@ -587,6 +638,8 @@ def compare_tokens(
     target_fallbacks = _take_inline_fallbacks(target_tokens)
     _drop_decoration_tokens(source_tokens)
     _drop_decoration_tokens(target_tokens)
+    _drop_nonsemantic_percent_tokens(source_tokens)
+    _drop_nonsemantic_percent_tokens(target_tokens)
     source_hard, source_color = split_soft_color_tokens(source_tokens)
     target_hard, target_color = split_soft_color_tokens(target_tokens)
     repaired, source_suspect = _match_source_unknown_repairs(
@@ -623,7 +676,13 @@ def compare_tokens(
             ValidationIssue("warning", translate("validation.format_color_extra", items=items), code="format-color-extra")
         )
     if source_fallbacks != target_fallbacks:
-        issues.append(ValidationIssue("warning", "@T inline fallback count differs", code="format-fallback"))
+        issues.append(
+            ValidationIssue(
+                "warning",
+                translate("validation.format_fallback"),
+                code="format-fallback",
+            )
+        )
     return issues, source_suspect
 
 

@@ -2,9 +2,10 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
-from .code_index import CodeReference
+from .code_index import CodeReference, runtime_label_argument_number
 from .code_window_context import (
     PreviewWindowContext,
+    context_displays_label,
     context_has_label,
     related_window_references,
     window_context_for_reference,
@@ -31,7 +32,7 @@ def select_preview_context(
         return PreviewContextSelection()
     ranked: list[
         tuple[
-            tuple[int, int, int, int, int, int],
+            tuple[int, int, int, int, int, int, int],
             int,
             CodeReference,
             PreviewWindowContext | None,
@@ -39,12 +40,24 @@ def select_preview_context(
     ] = []
     for index, reference in enumerate(references):
         window = window_context_for_reference(reference, current_label)
+        displayed_window = bool(
+            window is not None
+            and current_label
+            and context_displays_label(window, current_label)
+        )
         relevant_window = window is not None and (
-            not current_label or context_has_label(window, current_label)
+            not current_label
+            or displayed_window
+            or (
+                reference.role == "runtime_label"
+                and context_has_label(window, current_label)
+                and runtime_label_argument_number(reference, current_label) is not None
+            )
         )
         complete = placeholder_reference_complete(text, reference)
         context_detail = _window_context_detail(window) if relevant_window else 0
         key = (
+            int(displayed_window),
             int(relevant_window),
             int(complete),
             placeholder_reference_score(text, reference),

@@ -7,12 +7,14 @@ from itertools import product
 from pathlib import Path
 import re
 
+from .game_items import game_item_names_by_id
 from .script_semantics import (
     ExternalCallFlow,
     FunctionValueSummary,
     FunctionReturnLabel,
     SUMMARY_PARAMETER_PREFIX,
     SEMANTIC_EXPRESSION,
+    SEMANTIC_LABEL,
     SemanticValue,
     ScriptSemanticFacts,
     analyze_script_facts,
@@ -25,6 +27,7 @@ from .script_semantics import (
 LABEL_RE = re.compile(
     r"@L_[A-Za-z0-9_]+_\+(?![A-Za-z0-9])|"
     r"@L_[A-Za-z0-9_]+_\+[A-Za-z0-9]+|"
+    r"@L_[A-Za-z0-9_]+\+[A-Za-z0-9]+|"
     r"@L_[A-Za-z0-9_]+"
 )
 LABEL_EXPRESSION_TOKEN = (
@@ -197,7 +200,10 @@ class CodeReferenceIndex:
 class CrossFileSemanticLinker:
     """Incrementally joins returned labels to real UI-call data-flow dependencies."""
 
-    def __init__(self) -> None:
+    def __init__(
+        self,
+        item_names_by_id: tuple[tuple[int, str], ...] = (),
+    ) -> None:
         self._returns: dict[tuple[str, str, Path | None], list[CodeReturnLabel]] = {}
         self._flows: dict[tuple[str, str, Path | None], list[CodeExternalFlow]] = {}
         self._emitted: set[tuple[object, ...]] = set()
@@ -208,6 +214,7 @@ class CrossFileSemanticLinker:
         ] = {}
         self._seen_value_references: set[tuple[object, ...]] = set()
         self._emitted_values: set[tuple[object, ...]] = set()
+        self._item_names_by_id = dict(item_names_by_id)
 
     def add(self, analysis: CodeFileAnalysis) -> CodeReferenceIndex:
         result = CodeReferenceIndex()
@@ -377,6 +384,28 @@ class CrossFileSemanticLinker:
                 else ()
             )
             if not resolved:
+                resolved = self._resolve_existing_expressions(
+                    reference.source,
+                    reference.path,
+                    existing,
+                    existing_kinds,
+                    dependencies,
+                )
+            if not resolved:
+                values.append(existing)
+                kinds.append(existing_kinds)
+                continue
+            if existing and _semantic_specificity(
+                tuple(
+                    SemanticValue(
+                        existing_kinds[candidate_index]
+                        if candidate_index < len(existing_kinds)
+                        else semantic_literal(candidate).kind,
+                        candidate,
+                    )
+                    for candidate_index, candidate in enumerate(existing)
+                )
+            ) > _semantic_specificity(resolved[0]):
                 values.append(existing)
                 kinds.append(existing_kinds)
                 continue
@@ -392,6 +421,33 @@ class CrossFileSemanticLinker:
             tuple(kinds),
             dependencies,
         )
+
+    def _resolve_existing_expressions(
+        self,
+        source: str,
+        path: Path,
+        values: tuple[str, ...],
+        kinds: tuple[str, ...],
+        dependencies: set[tuple[str, str, Path]],
+    ) -> tuple[tuple[SemanticValue, ...], ...] | None:
+        if not values or len(values) != len(kinds):
+            return None
+        resolved_values: list[SemanticValue] = []
+        for value, kind in zip(values, kinds):
+            if kind != SEMANTIC_EXPRESSION:
+                return None
+            resolved = self._resolve_expression(
+                source,
+                path,
+                value,
+                set(),
+                dependencies,
+            )
+            if not resolved or not resolved[0]:
+                return None
+            resolved_values.extend(resolved[0])
+        unique = tuple(dict.fromkeys(resolved_values))[:64]
+        return (unique,) if unique else None
 
     def _resolve_expression(
         self,
@@ -434,7 +490,11 @@ class CrossFileSemanticLinker:
                 argument_values.extend(resolved)
             else:
                 argument_values.append(resolved[0])
-        native = resolve_native_semantic_function(alias, tuple(argument_values))
+        native = resolve_native_semantic_function(
+            alias,
+            tuple(argument_values),
+            item_names_by_id=self._item_names_by_id,
+        )
         if native is not None:
             return native
         summaries = (
@@ -582,6 +642,18 @@ def _semantic_kind_candidates(
     return tuple(value.kind for value in values)
 
 
+def _semantic_specificity(values: tuple[SemanticValue, ...]) -> int:
+    if not values:
+        return 0
+    uncertain = sum(
+        value.kind == SEMANTIC_EXPRESSION or "*" in value.text
+        for value in values
+    )
+    if uncertain == 0:
+        return 2
+    return 1 if uncertain < len(values) else 0
+
+
 def _instantiate_summary_value(
     candidate: SemanticValue,
     argument_values: tuple[tuple[SemanticValue, ...], ...],
@@ -632,10 +704,22 @@ def build_code_reference_index(
         project_root,
         vanilla_project_name=vanilla_project_name,
     )
-    linker = CrossFileSemanticLinker()
+    mod_name = (
+        ""
+        if project_root.name.casefold() == vanilla_project_name.casefold()
+        else project_root.name
+    )
+    item_names = game_item_names_by_id(game_root, mod_name)
+    linker = CrossFileSemanticLinker(item_names)
     result = CodeReferenceIndex()
     for spec in files:
-        partial = linker.add(analyze_code_file(spec, label_catalog=label_catalog))
+        partial = linker.add(
+            analyze_code_file(
+                spec,
+                label_catalog=label_catalog,
+                item_names_by_id=item_names,
+            )
+        )
         result.merge(partial)
     return result
 
@@ -673,11 +757,13 @@ def index_code_file(
     spec: CodeFileSpec,
     *,
     label_catalog: frozenset[str] = frozenset(),
+    item_names_by_id: tuple[tuple[int, str], ...] = (),
     raw: bytes | None = None,
 ) -> CodeReferenceIndex:
     return analyze_code_file(
         spec,
         label_catalog=label_catalog,
+        item_names_by_id=item_names_by_id,
         raw=raw,
     ).index
 
@@ -686,6 +772,7 @@ def analyze_code_file(
     spec: CodeFileSpec,
     *,
     label_catalog: frozenset[str] = frozenset(),
+    item_names_by_id: tuple[tuple[int, str], ...] = (),
     raw: bytes | None = None,
 ) -> CodeFileAnalysis:
     if raw is None:
@@ -697,6 +784,7 @@ def analyze_code_file(
         spec.path,
         source=spec.source,
         label_catalog=label_catalog,
+        item_names_by_id=item_names_by_id,
         raw=raw,
     )
     index = (
@@ -720,6 +808,7 @@ def scan_code_roots(
     *,
     source: str = "project",
     label_catalog: frozenset[str] = frozenset(),
+    item_names_by_id: tuple[tuple[int, str], ...] = (),
 ) -> dict[str, tuple[CodeReference, ...]]:
     merged: dict[str, list[CodeReference]] = {}
     for root in roots:
@@ -727,6 +816,7 @@ def scan_code_roots(
             root,
             source=source,
             label_catalog=label_catalog,
+            item_names_by_id=item_names_by_id,
         ).items():
             merged.setdefault(label, []).extend(references)
     return {label: _dedupe_references(items) for label, items in merged.items()}
@@ -737,6 +827,7 @@ def scan_scripts_root(
     *,
     source: str = "project",
     label_catalog: frozenset[str] = frozenset(),
+    item_names_by_id: tuple[tuple[int, str], ...] = (),
 ) -> dict[str, tuple[CodeReference, ...]]:
     root = root.expanduser()
     if not root.is_dir():
@@ -747,6 +838,7 @@ def scan_scripts_root(
             path,
             source=source,
             label_catalog=label_catalog,
+            item_names_by_id=item_names_by_id,
         ).items():
             grouped.setdefault(label, []).extend(references)
     return {label: _dedupe_references(items) for label, items in grouped.items()}
@@ -757,12 +849,14 @@ def scan_code_file(
     *,
     source: str = "project",
     label_catalog: frozenset[str] = frozenset(),
+    item_names_by_id: tuple[tuple[int, str], ...] = (),
     raw: bytes | None = None,
 ) -> dict[str, tuple[CodeReference, ...]]:
     references, _facts = _scan_code_file(
         path,
         source=source,
         label_catalog=label_catalog,
+        item_names_by_id=item_names_by_id,
         raw=raw,
     )
     return references
@@ -773,6 +867,7 @@ def _scan_code_file(
     *,
     source: str,
     label_catalog: frozenset[str],
+    item_names_by_id: tuple[tuple[int, str], ...],
     raw: bytes | None,
 ) -> tuple[dict[str, tuple[CodeReference, ...]], ScriptSemanticFacts | None]:
     if raw is None:
@@ -800,7 +895,12 @@ def _scan_code_file(
 
     text = raw.decode("utf-8-sig", errors="ignore")
     line_starts = _line_starts(text)
-    facts = analyze_script_facts(text, path, label_catalog=label_catalog)
+    facts = analyze_script_facts(
+        text,
+        path,
+        label_catalog=label_catalog,
+        item_names_by_id=item_names_by_id,
+    )
     for use in facts.uses:
         line_number, column = _line_column(line_starts, use.position)
         label = normalize_label(use.label)
@@ -998,6 +1098,53 @@ def normalize_label(label: str) -> str:
     return value.casefold()
 
 
+def runtime_label_argument_number(reference: CodeReference, label: str) -> int | None:
+    """Return the proven runtime slot for one concrete localization label.
+
+    A wildcard family documents a possible label shape, not that every matching
+    localization row can reach the call.  Indirect previews therefore require
+    either an exact candidate at one runtime position or an exact reference
+    whose call argument identifies that position.
+    """
+    if reference.role != "runtime_label":
+        return None
+    normalized = normalize_label(label).lstrip("_")
+    if not normalized or "*" in normalized:
+        return None
+    positions: list[int] = []
+    for position, candidates in enumerate(reference.runtime_argument_values, start=1):
+        kinds = (
+            reference.runtime_argument_kinds[position - 1]
+            if position <= len(reference.runtime_argument_kinds)
+            else ()
+        )
+        for index, candidate in enumerate(candidates):
+            kind = str(kinds[index]) if index < len(kinds) else ""
+            candidate_label = normalize_label(str(candidate)).lstrip("_")
+            if (
+                candidate_label
+                and "*" not in candidate_label
+                and candidate_label == normalized
+                and (kind == SEMANTIC_LABEL or not kind)
+            ):
+                positions.append(position)
+                break
+    unique_positions = tuple(dict.fromkeys(positions))
+    if len(unique_positions) == 1:
+        return unique_positions[0]
+
+    reference_label = normalize_label(reference.label).lstrip("_")
+    if "*" in reference_label or reference_label != normalized:
+        return None
+    argument_index = reference.argument_index
+    if not isinstance(argument_index, int) or not reference.runtime_arguments:
+        return None
+    runtime_start = len(reference.arguments) - len(reference.runtime_arguments)
+    if runtime_start <= argument_index < len(reference.arguments):
+        return argument_index - runtime_start + 1
+    return None
+
+
 def label_group_key(label: str) -> str | None:
     normalized = normalize_label(label)
     match = re.match(r"^(.*_\+)[A-Za-z0-9]+$", normalized)
@@ -1079,7 +1226,7 @@ def _matching_references(
                 if reference.match_kind in {"family", "dynamic"}
             )
         if found:
-            return _rank_references(found)
+            return _dedupe_reference_sites(found)
     matches: list[tuple[int, tuple[CodeReference, ...]]] = []
     concrete_labels = tuple(label for label in labels if "*" not in label)
     for regex, specificity, found in wildcard_references:
@@ -1094,7 +1241,7 @@ def _matching_references(
         if specificity == best_specificity
         for reference in found
     ]
-    return _rank_references(tuple(combined))
+    return _dedupe_reference_sites(tuple(combined))
 
 
 def _compiled_wildcard_references(
@@ -1130,7 +1277,7 @@ def _rank_references(references: tuple[CodeReference, ...]) -> tuple[CodeReferen
             key=lambda reference: (
                 -reference.confidence,
                 -role_score.get(reference.role, 0),
-                -sum(bool(values) for values in reference.runtime_argument_values),
+                -_resolved_runtime_value_count(reference),
                 not bool(reference.runtime_arguments),
                 reference.path.as_posix().casefold(),
                 reference.line,
@@ -1138,6 +1285,83 @@ def _rank_references(references: tuple[CodeReference, ...]) -> tuple[CodeReferen
             ),
         )
     )
+
+
+def _dedupe_reference_sites(references: tuple[CodeReference, ...]) -> tuple[CodeReference, ...]:
+    """Drop only lower-information variants from one physical call argument."""
+    grouped: dict[tuple[object, ...], list[CodeReference]] = {}
+    for reference in _rank_references(references):
+        key = (
+            reference.path,
+            reference.line,
+            reference.column,
+            reference.call_name,
+            reference.argument_index,
+            reference.arguments,
+            reference.role,
+        )
+        values = grouped.setdefault(key, [])
+        if any(_reference_dominates(value, reference) for value in values):
+            continue
+        values[:] = [value for value in values if not _reference_dominates(reference, value)]
+        values.append(reference)
+    return _rank_references(
+        tuple(reference for values in grouped.values() for reference in values)
+    )
+
+
+def _reference_dominates(left: CodeReference, right: CodeReference) -> bool:
+    if left.confidence < right.confidence:
+        return False
+    left_values = _concrete_runtime_values(left)
+    right_values = _concrete_runtime_values(right)
+    size = max(len(left_values), len(right_values))
+    left_values += (frozenset(),) * (size - len(left_values))
+    right_values += (frozenset(),) * (size - len(right_values))
+    if any(not right_value.issubset(left_value) for left_value, right_value in zip(left_values, right_values)):
+        return False
+    return (
+        left.confidence > right.confidence
+        or left_values != right_values
+        or _resolved_runtime_value_count(left) > _resolved_runtime_value_count(right)
+    )
+
+
+def _concrete_runtime_values(reference: CodeReference) -> tuple[frozenset[str], ...]:
+    values: list[frozenset[str]] = []
+    for index, candidates in enumerate(reference.runtime_argument_values):
+        kinds = (
+            reference.runtime_argument_kinds[index]
+            if index < len(reference.runtime_argument_kinds)
+            else ()
+        )
+        values.append(
+            frozenset(
+                value
+                for candidate_index, value in enumerate(candidates)
+                if value
+                and (
+                    candidate_index >= len(kinds)
+                    or kinds[candidate_index] != SEMANTIC_EXPRESSION
+                )
+            )
+        )
+    return tuple(values)
+
+
+def _resolved_runtime_value_count(reference: CodeReference) -> int:
+    count = 0
+    for index, values in enumerate(reference.runtime_argument_values):
+        if not values:
+            continue
+        kinds = (
+            reference.runtime_argument_kinds[index]
+            if index < len(reference.runtime_argument_kinds)
+            else ()
+        )
+        if not kinds or any(kind != SEMANTIC_EXPRESSION for kind in kinds):
+            count += 1
+    return count
 
 
 def _family_base(label: str) -> str:

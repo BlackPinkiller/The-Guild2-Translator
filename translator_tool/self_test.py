@@ -26,7 +26,7 @@ from .ai import (
     TranslationProviderError,
     build_llm_contexts,
 )
-from .cache import cache_path, confirmed_uids, need_work_uids, source_review_uids
+from .cache import cache_path, confirmed_uids, format_confirmations, need_work_uids, source_review_uids
 from .code_index import CodeReference, CodeReferenceIndex, build_code_reference_index
 from .code_window_context import (
     DARK_PANEL_TEXT,
@@ -51,7 +51,7 @@ from .self_tests.diagnostics import assert_diagnostics_are_bounded_and_content_f
 from .self_tests.performance import AI_CONTEXT_BUILD_LIMIT_SECONDS, assert_within_budget
 from .i18n import set_language, status_text, translate
 from .format_io import load_dbt, load_plain_text, matching_source_field, row_key
-from .gui_semantics import gui_node_geometry, gui_resource_info
+from .gui_semantics import GuiNodeGeometry, GuiResourceInfo, gui_node_geometry, gui_resource_info
 from .preview import GLYPH_MARK, PreviewAtom, PreviewDocument, PreviewService, _load_tga_image
 from .recovery import apply_recovery_draft, clear_recovery_draft, load_recovery_draft, recovery_path, save_recovery_draft
 from .project import (
@@ -88,11 +88,13 @@ from .self_tests.code_semantics import (
     assert_code_semantics_resolve_local_function_returns,
     assert_placeholder_values_avoid_ambiguous_random_branches,
     assert_placeholder_reference_selection_is_coherent,
+    assert_preview_variable_source_cache_reuses_script_text,
     assert_variadic_runtime_arguments_map_to_placeholder_positions,
 )
 from .self_tests.code_index_lazy import (
     assert_code_index_requests_selected_and_visible_rows_without_moving_viewport,
     assert_lazy_code_index_loads_cached_value_providers,
+    assert_lazy_code_index_loads_effective_item_id_ranges,
     assert_lazy_code_index_links_cached_cross_file_facts,
     assert_lazy_code_index_prioritizes_requested_labels_and_invalidates_cache,
     assert_lazy_code_index_survives_unwritable_cache,
@@ -103,6 +105,7 @@ from .self_tests.performance import (
     assert_within_budget,
 )
 from .self_tests.preview_context_selection import (
+    assert_cross_entry_labels_preserve_literal_suffixes,
     assert_game_preview_parts_use_the_selected_call_site,
     assert_preview_context_selection_keeps_arguments_and_style_coherent,
     assert_preview_context_selection_keeps_the_current_dynamic_branch,
@@ -220,6 +223,8 @@ def assert_table_model_preserves_full_display_text() -> None:
         current_text=translation,
         display_status=lambda: STATUS_TRANSLATED,
         issues=lambda: [],
+        active_issues=lambda: [],
+        format_differences_confirmed=lambda _issues=None: False,
     )
     model = UnitTableModel()
     model.units = [unit]
@@ -234,6 +239,18 @@ def assert_table_model_preserves_full_display_text() -> None:
             raise AssertionError(
                 f"table model clipped column {column} before the delegate could use its actual width"
             )
+
+    action_issues = lambda: [ValidationIssue("warning", "missing", "format-missing")]
+    review_issues = lambda: [ValidationIssue("warning", "extra", "format-extra")]
+    action_unit = SimpleNamespace(uid="action", issues=action_issues, active_issues=action_issues)
+    review_unit = SimpleNamespace(uid="review", issues=review_issues, active_issues=review_issues)
+    model.units = [review_unit, action_unit]
+    if model.has_format_warning(0):
+        raise AssertionError("review-only formatting was included in the needs-action filter")
+    if not model.has_format_warning(1):
+        raise AssertionError("an actionable format issue was excluded from the needs-action filter")
+    if model.format_concern_rank(1) >= model.format_concern_rank(0):
+        raise AssertionError("format sorting did not place actionable issues before review-only differences")
 
 
 def copy_project_subset(src_root: Path, dst_root: Path) -> None:
@@ -572,6 +589,13 @@ def assert_code_window_context_extracts_window_labels_and_buttons() -> None:
                     '    "BeginCouncilMeeting", 17, 6, "@L_COUNCIL_SCHEDULE_+0")',
                     'InitData("@P@B[1,@L_BONUS_SMALL_+0,@L_BONUS_SMALL_TIP_+0,Hud/Buttons/btn_Money_Small.tga]",',
                     '    0, "@L_BONUS_HEAD_+0", "@L_BONUS_OBSOLETE_BODY_+0", Cost)',
+                    'MsgBox("", "", "@P@B[M,@L_INTERFACE_BUTTONS_ENDGAME]"..',
+                    '    "@B[S,@L_INTERFACE_BUTTONS_STATISTICS]"..',
+                    '    "@B[0,@LJa_+0]".."@B[1,@L%1t]".."@B[2,Cancel]",',
+                    '    "@L_BUTTON_CAPTION_HEAD_+0", "@L_BUTTON_CAPTION_BODY_+0", Cost)',
+                    'InitData("@P@B[0,0,@L_TAX_TIP_+0,Hud/Buttons/btn_Money_Small.tga]"..',
+                    '    "@B[1,10,@L_TAX_TIP_+1,Hud/Buttons/btn_Money_Large.tga]",',
+                    '    0, "@L_TAX_HEAD_+0", "@L_TAX_BODY_+0", Cost)',
                     'InitData("SayPanel", 0, "@L_PANEL_HEAD_+0", "@L_PANEL_BODY_+0", Cost)',
                     'this:AddSheetToTabGroup("Diary", "CustomSheet", "@L_CUSTOM_TAB_+0")',
                     'InitAlias("Destination", MEASUREINIT_SELECTION, "", "@L_SELECT_TARGET_+0", 0)',
@@ -607,6 +631,48 @@ def assert_code_window_context_extracts_window_labels_and_buttons() -> None:
             raise AssertionError(f"MsgQuick should use its transparent HUD overlay profile: {short_context!r}")
         if short_context.default_color != DARK_PANEL_TEXT:
             raise AssertionError(f"dark panel default text color should be white: {short_context!r}")
+        caption_context = best_window_context(
+            index.references_for("BUTTON_CAPTION_HEAD_+0").project,
+            "BUTTON_CAPTION_HEAD_+0",
+        )
+        if caption_context is None or tuple(
+            (button.identifier, button.label, button.text)
+            for button in caption_context.buttons
+        ) != (
+            ("M", "interface_buttons_endgame", ""),
+            ("S", "interface_buttons_statistics", ""),
+            ("0", "ja_+0", ""),
+            ("1", "", "%1t"),
+            ("2", "", "Cancel"),
+        ):
+            raise AssertionError(
+                "@B captions were confused with their return values or compact/inline caption forms: "
+                f"{caption_context!r}"
+            )
+        tax_context = best_window_context(
+            index.references_for("TAX_HEAD_+0").project,
+            "TAX_HEAD_+0",
+        )
+        if tax_context is None or tuple(
+            (button.identifier, button.label, button.text, button.icon_asset)
+            for button in tax_context.buttons
+        ) != (
+            ("0", "", "0", "Hud/Buttons/btn_Money_Small.tga"),
+            ("1", "", "10", "Hud/Buttons/btn_Money_Large.tga"),
+        ):
+            raise AssertionError(
+                "InitData's numeric captions were replaced by tooltip labels or return identifiers: "
+                f"{tax_context!r}"
+            )
+        tax_tooltip_context = best_window_context(
+            index.references_for("TAX_TIP_+0").project,
+            "TAX_TIP_+0",
+        )
+        if tax_tooltip_context is not None:
+            raise AssertionError(
+                "an @B tooltip label was treated as visible button text: "
+                f"{tax_tooltip_context!r}"
+            )
         variable_button_refs = index.references_for("MEASURE_WUERDENTRAGEREMPFANGEN_BODY_+0").project
         variable_button_context = best_window_context(variable_button_refs, "_MEASURE_WUERDENTRAGEREMPFANGEN_BODY_+0")
         if variable_button_context is None:
@@ -957,7 +1023,7 @@ def assert_game_preview_draws_all_buttons() -> None:
     service = PreviewService()
     buttons = tuple(
         PreviewDocument.from_atoms(f"Button {index}", [PreviewAtom(f"Button {index}", 0, 8)])
-        for index in range(5)
+        for index in range(7)
     )
     drawn: list[str] = []
 
@@ -967,19 +1033,108 @@ def assert_game_preview_draws_all_buttons() -> None:
         return int(top) + 1 if isinstance(top, int) else 1
 
     service._draw_game_document = fake_draw_document  # type: ignore[method-assign]
-    button_rects: list[tuple[int, int]] = []
+    button_rects: list[QRect] = []
 
     def capture_button_rect(_painter: object, rect: QRect) -> bool:
-        button_rects.append((rect.width(), rect.height()))
+        button_rects.append(QRect(rect))
         return True
 
     service._draw_game_button_background = capture_button_rect  # type: ignore[method-assign]
-    service.game_window_image(None, None, target=False, buttons=buttons)
+    vertical = service.game_window_image(None, None, target=False, buttons=buttons)
     if drawn != [button.display_text for button in buttons]:
         raise AssertionError(f"game preview should draw every button without truncation: {drawn!r}")
-    if len(set(button_rects)) != 1 or button_rects[0][1] != 36:
+    if (
+        len({(rect.width(), rect.height()) for rect in button_rects}) != 1
+        or button_rects[0].height() != 36
+    ):
         raise AssertionError(
             f"game preview buttons should retain one fixed material size: {button_rects!r}"
+        )
+    if (
+        button_rects[0].top() < 0
+        or button_rects[-1].bottom() >= vertical.height()
+        or any(left.bottom() >= right.top() for left, right in zip(button_rects, button_rects[1:]))
+    ):
+        raise AssertionError(
+            "a real seven-button vertical stack exceeded or overlapped its preview panel: "
+            f"{vertical.size()!r}, {button_rects!r}"
+        )
+    gui_service = PreviewService(Path("."))
+    gui_info = GuiResourceInfo(
+        Path("panel_messagebox.gui"),
+        "panel_messagebox",
+        (),
+        (481, 376),
+        (66, 50, 358, 236),
+        (
+            GuiNodeGeometry("LHeader", 66, 20, 358, 24, None),
+            GuiNodeGeometry("Entrys", 66, 50, 358, 236, None),
+        ),
+    )
+    gui_service._game_window_gui_info = lambda _context: gui_info  # type: ignore[method-assign]
+    gui_button_rects: list[QRect] = []
+    gui_service._draw_game_button_background = (  # type: ignore[method-assign]
+        lambda _painter, rect: gui_button_rects.append(QRect(rect)) or True
+    )
+    gui_service._draw_game_document = fake_draw_document  # type: ignore[method-assign]
+    gui_vertical = gui_service.game_window_image(
+        PreviewDocument.from_atoms("Headline", [PreviewAtom("Headline", 0, 8)]),
+        PreviewDocument.from_atoms("Body", [PreviewAtom("Body", 0, 4)]),
+        target=False,
+        buttons=buttons,
+        context=PreviewWindowContext(
+            "message",
+            "parchment",
+            PARCHMENT_TEXT,
+            layout="parchment",
+            gui_resource="GUI/Hud/panel_messagebox.gui",
+        ),
+    )
+    if (
+        len(gui_button_rects) != 7
+        or gui_button_rects[0].top() < 0
+        or gui_button_rects[-1].bottom() >= gui_vertical.height()
+        or any(rect.left() < 0 or rect.right() >= gui_vertical.width() for rect in gui_button_rects)
+        or any(
+            left.bottom() >= right.top()
+            for left, right in zip(gui_button_rects, gui_button_rects[1:])
+        )
+    ):
+        raise AssertionError(
+            "GUI-backed vertical buttons did not receive a contained panel extension: "
+            f"{gui_vertical.size()!r}, {gui_button_rects!r}"
+        )
+    long_button_service = PreviewService()
+    long_button_scales: list[float] = []
+
+    def capture_long_button(
+        _painter: object,
+        _document: PreviewDocument,
+        **kwargs: object,
+    ) -> int:
+        long_button_scales.append(float(kwargs.get("scale", 0.0)))
+        return int(kwargs.get("top", 0)) + 1
+
+    long_button_service._draw_game_document = capture_long_button  # type: ignore[method-assign]
+    long_button_service._draw_game_button_background = (  # type: ignore[method-assign]
+        lambda _painter, _rect: True
+    )
+    long_caption = "Debtors: 12 Person and Total Money: 1,000"
+    long_button_service.game_window_image(
+        None,
+        None,
+        target=False,
+        buttons=(
+            PreviewDocument.from_atoms(
+                long_caption,
+                [PreviewAtom(long_caption, 0, len(long_caption))],
+            ),
+        ),
+    )
+    if len(long_button_scales) != 1 or not 0.42 <= long_button_scales[0] < 0.72:
+        raise AssertionError(
+            "a long vertical-button caption was clipped instead of using an adaptive text scale: "
+            f"{long_button_scales!r}"
         )
     layout_service = PreviewService()
     layout_service._draw_game_document = fake_draw_document  # type: ignore[method-assign]
@@ -1173,7 +1328,7 @@ def assert_game_preview_draws_all_buttons() -> None:
             f"Choice {index}",
             [PreviewAtom(f"Choice {index}", 0, len(f"Choice {index}"))],
         )
-        for index in range(3)
+        for index in range(6)
     )
     measure_choice = multi_service.game_window_image(
         PreviewDocument.from_atoms("Choose", [PreviewAtom("Choose", 0, 6)]),
@@ -1192,17 +1347,22 @@ def assert_game_preview_draws_all_buttons() -> None:
         ),
     )
     if (
-        measure_choice.width() * 115 != measure_choice.height() * 255
+        measure_choice.width() * 115 != measure_choice.height() * 414
         or [position[0] for position in multi_positions]
-        != ["Choose", "Choice 0", "Choice 1", "Choice 2"]
+        != ["Choose", *(f"Choice {index}" for index in range(6))]
         or not (
             multi_positions[1][1]
             < multi_positions[2][1]
             < multi_positions[3][1]
+            < multi_positions[4][1]
+            < multi_positions[5][1]
+            < multi_positions[6][1]
         )
+        or multi_positions[1][1] <= 0
+        or multi_positions[6][2] >= measure_choice.width()
     ):
         raise AssertionError(
-            "InitData preview should follow the three-slot game panel and omit its obsolete BodyLabel: "
+            "InitData preview should repeat the centered GUI slots for every button and omit its obsolete BodyLabel: "
             f"{measure_choice.size()!r}, {multi_positions!r}"
         )
     multi_positions.clear()
@@ -2126,6 +2286,71 @@ def assert_workflow_cache_updates_once(root: Path) -> None:
         safe_rmtree(temp)
 
 
+def assert_format_difference_confirmation_is_content_bound() -> None:
+    temp = Path(tempfile.gettempdir()) / f"translator_tool_smoke_format_confirmation_{uuid.uuid4().hex[:8]}"
+    temp.mkdir(parents=True, exist_ok=True)
+    original_atomic_write = cache_module.atomic_write
+    writes = 0
+    try:
+        unit = TranslationUnit(
+            uid="Text.dbt|1|FORMAT_CONFIRM_+0|Text",
+            file_rel="Text.dbt",
+            record_id="1",
+            label="FORMAT_CONFIRM_+0",
+            field_name="Text",
+            source_text="Name: %1SN",
+            translate_text="姓名",
+            status=STATUS_TRANSLATED,
+            ref=UnitRef(kind="dbt", target_doc=SimpleNamespace(path=temp / "Text.dbt")),
+        )
+        project = Project(
+            root=temp,
+            languages_root=temp / "languages",
+            language="#chinese",
+            codec=None,
+            source_docs={},
+            source_text_docs={},
+            target_dbt_docs={},
+            target_text_docs={},
+            units=[unit],
+            source_order={},
+            unit_index={unit.uid: unit},
+            insertion_anchors={},
+        )
+        if not any(issue.acknowledgeable and issue.needs_action for issue in unit.active_issues()):
+            raise AssertionError("format-confirmation fixture did not start with an actionable placeholder difference")
+
+        def count_atomic_write(path: Path, data: bytes) -> None:
+            nonlocal writes
+            writes += 1
+            original_atomic_write(path, data)
+
+        cache_module.atomic_write = count_atomic_write
+        changed = project.set_units_format_confirmed((unit,), True)
+        if changed != (unit,) or writes != 1:
+            raise AssertionError("format confirmation was not persisted in one atomic cache update")
+        if unit.active_issues() or not unit.format_differences_confirmed():
+            raise AssertionError("confirmed intentional placeholder differences still appeared as active concerns")
+        if format_confirmations(temp, "#chinese").get(unit.uid) != unit.format_confirmation:
+            raise AssertionError("format confirmation fingerprint was not persisted")
+
+        project.apply_unit_edits(((unit, "姓名：%2SN", None),))
+        if unit.format_differences_confirmed() or not unit.active_issues():
+            raise AssertionError("editing confirmed text did not automatically reactivate format concerns")
+        project.apply_unit_edits(((unit, "姓名", None),))
+        if not unit.format_differences_confirmed() or unit.active_issues():
+            raise AssertionError("undoing to the exact confirmed text did not restore its content-bound confirmation")
+
+        project.set_units_format_confirmed((unit,), False)
+        if unit.format_confirmation or unit.uid in format_confirmations(temp, "#chinese"):
+            raise AssertionError("clearing format confirmation left persisted workflow metadata")
+        if not unit.active_issues():
+            raise AssertionError("clearing format confirmation did not restore the placeholder concern")
+    finally:
+        cache_module.atomic_write = original_atomic_write
+        safe_rmtree(temp)
+
+
 def assert_startup_prefers_local_sources_over_game_root() -> None:
     from . import app as app_module
     from .app import TranslatorWindow
@@ -2831,6 +3056,24 @@ def assert_editor_undo_stays_local(root: Path) -> None:
             raise AssertionError("background Git initialization did not finish successfully")
 
         unit = next(item for item in win.model.units if item.ref.kind == "dbt" and item.source_text)
+        table_menu, table_actions = win._build_table_menu([unit])
+        top_level_actions = [action for action in table_menu.actions() if not action.isSeparator()]
+        expected_top_level = {
+            translate("menu.copy_selected_translation", suffix=""),
+            translate("menu.ai_service"),
+            translate("menu.entry_status"),
+            translate("menu.format_check"),
+            translate("menu.translation_edit"),
+            translate("menu.entry_history"),
+        }
+        if len(top_level_actions) != 6 or {action.text() for action in top_level_actions} != expected_top_level:
+            raise AssertionError("table context menu did not keep a compact six-item top level")
+        if any(
+            table_actions[key] in table_menu.actions()
+            for key in ("confirm_translated", "restore", "clear", "delete_mark", "format_confirmed")
+        ):
+            raise AssertionError("low-frequency table actions leaked back into the context-menu top level")
+        table_menu.deleteLater()
         original = unit.current_text
         original_dirty_count = win.project.dirty_count()
         win.project.set_units_confirmed((unit,), True)
@@ -3978,15 +4221,13 @@ def assert_guild2_format_grammar() -> None:
     if any("$T" in issue.message for issue in false_tab):
         raise AssertionError("embedded $T in plain text was misread as a layout token")
     source_fix = validate_translation("%1NAE", "%1NAME", dbt_field=True)
-    if any(issue.code in {"argument-index", "format-extra", "unknown-format"} for issue in source_fix):
-        raise AssertionError("repairing a malformed source placeholder still produced a false-positive warning")
-    if not any(issue.code == "source-format-suspect" for issue in source_fix):
-        raise AssertionError("repairing a malformed source placeholder should leave a lightweight source-format marker")
+    if not any(issue.code == "argument-index" for issue in source_fix):
+        raise AssertionError("adding a valid placeholder beside an ignored invalid percent form was not detected")
+    if any(issue.code in {"unknown-format", "source-format-suspect"} for issue in source_fix):
+        raise AssertionError("invalid percent forms should not produce their own diagnostics")
     source_drop = validate_translation("Rate %A", "Rate", dbt_field=True)
-    if any(issue.code == "unknown-format" for issue in source_drop):
-        raise AssertionError("dropping an invalid source-only marker should not create an unknown-format warning")
-    if not any(issue.code == "source-format-suspect" for issue in source_drop):
-        raise AssertionError("dropping an invalid source-only marker should leave a lightweight source-format marker")
+    if source_drop:
+        raise AssertionError("invalid source-only percent forms should be ignored completely")
     color_spacing = normalize_color_token_spacing(
         "$C[1,2,3]开头甲$C[4,5,6]乙，$C[7,8,9]丙#E[NT_NEUTRAL]$C[10,11,12]丁测试$N$N$C[13,14,15]戊"
     )
@@ -4000,15 +4241,30 @@ def assert_guild2_format_grammar() -> None:
     compatible = validate_translation("Name: %1SN", "姓名：%1SV", dbt_field=True)
     if any(issue.blocks_save for issue in compatible) or not any(issue.code == "argument-variant" for issue in compatible):
         raise AssertionError("SN/SV compatible character-name variant was not accepted")
+    if any(issue.needs_action for issue in compatible) or not all(
+        issue.concern_level == "review" for issue in compatible
+    ):
+        raise AssertionError("an intentional grammatical argument variant was classified as required work")
     wrong_index = validate_translation("Name: %1SN", "姓名：%2SN", dbt_field=True)
     if any(issue.blocks_save for issue in wrong_index) or not any(issue.code == "argument-index" for issue in wrong_index):
         raise AssertionError("invalid argument index was not retained as a non-blocking warning")
+    if not any(issue.needs_action and issue.concern_level == "action" for issue in wrong_index):
+        raise AssertionError("an invalid argument index was not classified as needing action")
     wrong_type = validate_translation("Name: %1SN", "数值：%1n", dbt_field=True)
     if any(issue.blocks_save for issue in wrong_type) or not any(issue.code == "argument-type" for issue in wrong_type):
         raise AssertionError("incompatible argument type was not retained as a non-blocking warning")
-    unknown = validate_translation("Plain text", "未知 %A", dbt_field=True)
+    unknown_percent = validate_translation("Plain text", "未知 %A %broken %% %", dbt_field=True)
+    if unknown_percent:
+        raise AssertionError("standalone and invalid percent forms should be ignored completely")
+    unknown = validate_translation("Plain text", "未知 @Broken", dbt_field=True)
     if any(issue.blocks_save for issue in unknown) or not any(issue.code == "unknown-format" for issue in unknown):
-        raise AssertionError("unknown format token was not reduced to a non-blocking warning")
+        raise AssertionError("unknown non-percent format token was not retained as a non-blocking warning")
+    extra_style = validate_translation("Plain text", "Plain %>text%<", dbt_field=True)
+    if extra_style:
+        raise AssertionError("percent quote styling should be ignored completely")
+    color_only = validate_translation("$C[1,2,3]Text", "文字", dbt_field=True)
+    if not color_only or any(issue.concern_level != "info" for issue in color_only):
+        raise AssertionError("color-only differences were not kept at the lowest information level")
 
 
 def assert_format_dialects_are_isolated() -> None:
@@ -4079,6 +4335,7 @@ def assert_preview_i18n_and_symbol_mapping() -> None:
             '17 "_CHARACTERS_3_TITLES_NAME_+9" "Citizen" |\n'
             '18 "SubstSimFullDescOffice_+0" "%1ST %1SV %1SD, %1SA in %2NAME" |\n'
             '19 "SubstSimFullDescNoOffice_+0" "%1ST %1SV %1SD" |\n'
+            '20 "_INTERFACE_BUTTONS_ENDGAME_+0" "End game" |\n'
         )
         rows_target = (
             '1 "_NAMES_ENGLISH_MALE_+0" "杰克" |\n'
@@ -4849,6 +5106,89 @@ def assert_preview_i18n_and_symbol_mapping() -> None:
         )
         if "crash" not in guide_crash.display_text.casefold() or "Crash risk" in guide_crash.display_text:
             raise AssertionError("Guide preview should be blocked by plain double quotes")
+
+        if service.localization.resolve_label("_PREVIEW_LABEL", False) != "Preview label":
+            raise AssertionError("an explicit unsuffixed @L label did not fall back to its _+0 record")
+        if service.localization.resolve_label("_preview_label_+0", False) != "Preview label":
+            raise AssertionError("a proven label key failed case-insensitive DB lookup")
+        if service.localization.resolve_label("interface_buttons_endgame", False) != "End game":
+            raise AssertionError(
+                "a normalized button caption did not resolve its leading-underscore +0 game label"
+            )
+        if service.localization.resolve_label("interface_buttons_endgame", True) != "End game":
+            raise AssertionError(
+                "a missing target button caption did not fall back to the base-game source label"
+            )
+        if (
+            service.localization.resolve_label("scenario_war_*_+0", False)
+            != "The German Empire"
+        ):
+            raise AssertionError(
+                "a dynamic button-label family did not resolve to a real localized sample"
+            )
+        if (
+            service.localization.sample_label(
+                "_CHARACTERS_2_PROFESSIONS_",
+                "_NAME_+*",
+                "multi-wildcard",
+                1,
+                False,
+            )
+            != "Baker"
+        ):
+            raise AssertionError("a label pattern containing multiple wildcards was not sampled")
+
+        missing_pattern = service.localization.sample_label(
+            "_CACHE_INVALIDATION_",
+            "_+0",
+            "cache-invalidation",
+            1,
+            False,
+        )
+        if missing_pattern:
+            raise AssertionError("the cache-invalidation fixture unexpectedly matched a label")
+        def fail_full_label_reindex() -> None:
+            raise AssertionError("a single edited label rebuilt the full localization index")
+
+        service.localization._rebuild_label_indexes = fail_full_label_reindex
+        service.update_project_localization(
+            "_CACHE_INVALIDATION_NEW_+0",
+            "New cached label",
+            "",
+        )
+        if (
+            service.localization.sample_label(
+                "_CACHE_INVALIDATION_",
+                "_+0",
+                "cache-invalidation",
+                1,
+                False,
+            )
+            != "New cached label"
+        ):
+            raise AssertionError("the label-pattern cache was not invalidated with localization data")
+        for index in range(service.localization.MAX_LABEL_PATTERN_CACHE + 1):
+            service.localization.sample_label(
+                f"_MISSING_CACHE_{index}_",
+                "_+0",
+                "cache-bound",
+                1,
+                False,
+            )
+        if len(service.localization._label_pattern_cache) > service.localization.MAX_LABEL_PATTERN_CACHE:
+            raise AssertionError("the repeated label-pattern cache exceeded its size bound")
+
+        service._render_cache.clear()
+        for index in range(service.MAX_RENDER_CACHE + 1):
+            service.render(
+                f'<text>"Blocked {index}"</text>',
+                unit_key=f"blocked-guide:{index}",
+                file_rel="Guides/Controls.txt",
+                kind="text",
+                target=False,
+            )
+        if len(service._render_cache) > service.MAX_RENDER_CACHE:
+            raise AssertionError("blocked Guide previews bypassed the render-cache size bound")
     finally:
         safe_rmtree(temp)
 
@@ -5531,6 +5871,7 @@ def main() -> int:
     assert_code_semantics_follow_fields_panels_and_initdata()
     assert_feedback_message_contracts_do_not_depend_on_label_names()
     assert_dynamic_table_and_engine_label_semantics_are_preserved()
+    assert_preview_variable_source_cache_reuses_script_text()
     assert_cross_file_return_labels_flow_only_to_real_callers()
     assert_cross_file_function_summaries_bind_arguments_and_expand_returns()
     assert_cross_file_function_summaries_follow_nested_dependencies()
@@ -5542,6 +5883,7 @@ def main() -> int:
     assert_preview_context_selection_keeps_the_current_dynamic_branch()
     assert_preview_context_selection_prefers_displayed_runtime_labels()
     assert_preview_context_selection_understands_returned_label_roles()
+    assert_cross_entry_labels_preserve_literal_suffixes()
     assert_project_localization_updates_invalidate_placeholder_previews()
     assert_editor_changes_reach_preview_localization()
     assert_bundled_preview_assets_are_complete()
@@ -5549,6 +5891,7 @@ def main() -> int:
     assert_preview_format_layout_controls_are_semantic()
     assert_game_preview_parts_use_the_selected_call_site()
     assert_lazy_code_index_prioritizes_requested_labels_and_invalidates_cache()
+    assert_lazy_code_index_loads_effective_item_id_ranges()
     assert_lazy_code_index_links_cached_cross_file_facts()
     assert_lazy_code_index_loads_cached_value_providers()
     assert_lazy_code_index_survives_unwritable_cache()
@@ -5605,6 +5948,7 @@ def main() -> int:
     assert_ignore_cache(root)
     assert_source_review_cache(root)
     assert_workflow_cache_updates_once(root)
+    assert_format_difference_confirmation_is_content_bound()
     assert_manual_status_cache()
     assert_operation_history()
     assert_ai_token_protection()

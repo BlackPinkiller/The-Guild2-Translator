@@ -6,8 +6,10 @@ from typing import Iterable
 
 from .cache import (
     confirmed_uids,
+    format_confirmations,
     ignored_uids,
     need_work_uids,
+    update_format_confirmations,
     update_language_uid_sets,
     source_review_uids,
 )
@@ -27,7 +29,13 @@ from .format_io import (
     translatable_fields,
 )
 from .i18n import translate
-from .validation import ValidationIssue, format_dialect, issue_summary, validate_translation
+from .validation import (
+    ValidationIssue,
+    format_confirmation_fingerprint,
+    format_dialect,
+    issue_summary,
+    validate_translation,
+)
 from .validation import normalize_color_token_spacing
 
 
@@ -111,8 +119,11 @@ class TranslationUnit:
     edited_text: str | None = None
     ignored: bool = False
     confirmed: bool = False
+    format_confirmation: str = ""
     review_reason: str = TODO_REASON_NONE
     pending_delete: bool = False
+    _issue_cache_key: tuple[object, ...] | None = field(default=None, init=False, repr=False)
+    _issue_cache_value: tuple[ValidationIssue, ...] = field(default=(), init=False, repr=False)
 
     @property
     def current_text(self) -> str:
@@ -181,18 +192,52 @@ class TranslationUnit:
         return STATUS_TRANSLATED
 
     def issues(self) -> list[ValidationIssue]:
-        if self.pending_delete:
-            return self.initial_issues
-        if self.is_ignored and not self.is_dirty:
-            return self.initial_issues
-        dbt_field = self.ref.kind == "dbt"
-        return self.initial_issues + validate_translation(
+        # One bounded entry per loaded unit avoids repeating the same regex and
+        # codec checks in table paint, filtering, tooltips, and context menus.
+        cache_key = (
             self.source_text,
             self.current_text,
-            dbt_field=dbt_field,
-            font_codec=self.font_codec if ENABLE_FONT_GLYPH_VALIDATION else None,
+            self.pending_delete,
+            self.is_ignored,
+            self.is_dirty,
+            ENABLE_FONT_GLYPH_VALIDATION,
+        )
+        if cache_key == self._issue_cache_key:
+            return list(self._issue_cache_value)
+        if self.pending_delete or (self.is_ignored and not self.is_dirty):
+            issues = list(self.initial_issues)
+        else:
+            dbt_field = self.ref.kind == "dbt"
+            issues = self.initial_issues + validate_translation(
+                self.source_text,
+                self.current_text,
+                dbt_field=dbt_field,
+                font_codec=self.font_codec if ENABLE_FONT_GLYPH_VALIDATION else None,
+                dialect=format_dialect(self.file_rel, self.ref.kind),
+            )
+        self._issue_cache_key = cache_key
+        self._issue_cache_value = tuple(issues)
+        return list(issues)
+
+    def current_format_fingerprint(self) -> str:
+        return format_confirmation_fingerprint(
+            self.source_text,
+            self.current_text,
+            dbt_field=self.ref.kind == "dbt",
             dialect=format_dialect(self.file_rel, self.ref.kind),
         )
+
+    def format_differences_confirmed(self, issues: Iterable[ValidationIssue] | None = None) -> bool:
+        if not self.format_confirmation or self.format_confirmation != self.current_format_fingerprint():
+            return False
+        current = tuple(self.issues() if issues is None else issues)
+        return any(issue.acknowledgeable for issue in current)
+
+    def active_issues(self) -> list[ValidationIssue]:
+        issues = self.issues()
+        if not self.format_differences_confirmed(issues):
+            return issues
+        return [issue for issue in issues if not issue.acknowledgeable]
 
     def issue_text(self) -> str:
         return issue_summary(self.issues())
@@ -435,6 +480,24 @@ class Project:
             if confirmed:
                 changes.update({"ignored": (uids, False), "need_work": (uids, False), "source_review": (uids, False)})
             update_language_uid_sets(self.root, self.language, changes)
+
+    def set_units_format_confirmed(self, units: Iterable[TranslationUnit], confirmed: bool) -> tuple[TranslationUnit, ...]:
+        selected = tuple(units)
+        updates: dict[str, str | None] = {}
+        changed: list[TranslationUnit] = []
+        for unit in selected:
+            issues = unit.issues()
+            if confirmed and not any(issue.acknowledgeable for issue in issues):
+                continue
+            fingerprint = unit.current_format_fingerprint() if confirmed else ""
+            if unit.format_confirmation == fingerprint:
+                continue
+            unit.format_confirmation = fingerprint
+            updates[unit.uid] = fingerprint or None
+            changed.append(unit)
+        if updates:
+            update_format_confirmations(self.root, self.language, updates)
+        return tuple(changed)
 
     def apply_unit_edits(
         self,
@@ -751,9 +814,11 @@ def _apply_workflow_metadata(units: Iterable[TranslationUnit], root: Path, langu
     confirmed = confirmed_uids(root, language)
     need_work = need_work_uids(root, language)
     source_review = source_review_uids(root, language)
+    acknowledged_formats = format_confirmations(root, language)
     for unit in units:
         unit.ignored = unit.uid in ignored
         unit.confirmed = unit.uid in confirmed
+        unit.format_confirmation = acknowledged_formats.get(unit.uid, "")
         if unit.uid in source_review:
             unit.review_reason = TODO_REASON_SOURCE_CHANGED
         elif unit.uid in need_work:

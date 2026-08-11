@@ -72,7 +72,7 @@ class ProtectedText:
     tokens: tuple[tuple[str, str], ...]
 
 
-@dataclass(frozen=True)
+@dataclass(frozen=True, slots=True)
 class LlmNeighborContext:
     relation: str
     label: str
@@ -80,7 +80,7 @@ class LlmNeighborContext:
     record_id: str = ""
 
 
-@dataclass(frozen=True)
+@dataclass(frozen=True, slots=True)
 class LlmSuggestionContext:
     file_rel: str
     record_id: str
@@ -102,7 +102,9 @@ def build_llm_contexts(
     units: Iterable[TranslationContextUnit], target_uids: Iterable[str]
 ) -> dict[str, LlmSuggestionContext]:
     """Build bounded same-file context for selected units in linear time."""
-    targets = set(target_uids)
+    # Preserve the caller's order so bulk context creation walks each file
+    # sequentially instead of following hash-set order under memory pressure.
+    targets = dict.fromkeys(target_uids)
     if not targets:
         return {}
     by_file: dict[str, list[TranslationContextUnit]] = {}
@@ -111,7 +113,8 @@ def build_llm_contexts(
         if not unit.source_text:
             continue
         file_units = by_file.setdefault(unit.file_rel, [])
-        positions[unit.uid] = (file_units, len(file_units))
+        if unit.uid in targets:
+            positions[unit.uid] = (file_units, len(file_units))
         file_units.append(unit)
 
     contexts: dict[str, LlmSuggestionContext] = {}

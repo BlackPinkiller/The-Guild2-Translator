@@ -82,6 +82,10 @@ class PreviewWindowContext:
 BUTTON_RE = re.compile(r"@B\[(?P<body>[^\]]*)\]", re.IGNORECASE | re.DOTALL)
 STRING_LITERAL_RE = re.compile(r"""(?:"([^"\\]*(?:\\.[^"\\]*)*)"|'([^'\\]*(?:\\.[^'\\]*)*)')""")
 RESOLVED_LABEL_RE = re.compile(r"@L_[A-Za-z0-9_+*]+", re.IGNORECASE)
+COMPACT_BUTTON_LABEL_RE = re.compile(
+    r"@L(?P<label>[A-Za-z_][A-Za-z0-9_]*(?:_\+[A-Za-z0-9]+)?)",
+    re.IGNORECASE,
+)
 BUTTON_ASSET_RE = re.compile(r"[A-Za-z0-9_./\\-]+\.tga", re.IGNORECASE)
 
 
@@ -109,21 +113,31 @@ def window_context_for_reference(reference: CodeReference, current_label: str = 
         argument_expressions,
         contract.speaker_argument if contract else None,
     )
-    buttons = _buttons_from_arguments(argument_expressions)
-    labels_by_arg = _labels_by_argument(argument_expressions)
+    buttons = _buttons_from_arguments(
+        argument_expressions,
+        current_label if reference.role == "button" else "",
+    )
+    labels_by_arg = _labels_by_argument(argument_expressions, arguments, current_label)
     button_label_set = {button.label for button in buttons if button.label}
-    header_label, body_label = _header_body_labels(call_name, labels_by_arg, button_label_set, current_label)
+    header_label, body_label = _header_body_labels(
+        call_name,
+        labels_by_arg,
+        button_label_set,
+        current_label,
+        reference.role,
+    )
     related_references = related_window_references(reference)
     if surface == "questbook":
         for related in related_references:
             related_arguments = tuple(str(argument) for argument in related.arguments)
             related_expressions = _argument_expressions(related, related_arguments)
-            related_labels = _labels_by_argument(related_expressions)
+            related_labels = _labels_by_argument(related_expressions, related_arguments, "")
             related_header, related_body = _header_body_labels(
                 (related.call_name or "").casefold(),
                 related_labels,
                 set(),
                 "",
+                related.role,
             )
             if related_header and not header_label:
                 header_label = related_header
@@ -145,8 +159,36 @@ def window_context_for_reference(reference: CodeReference, current_label: str = 
         elif reference.role == "button" and not any(
             _equivalent_label(button.label, referenced_label) for button in buttons
         ):
-            buttons = (*buttons, PreviewWindowButton(identifier="", label=referenced_label))
-    argument_labels = _runtime_argument_labels(labels_by_arg, (header_label, body_label), button_label_set)
+            # The code index sees every @L inside @B as a button reference,
+            # including the third-field tooltip.  Only synthesize a visible
+            # caption when the parsed branch still has an unresolved slot.
+            unresolved_index = next(
+                (
+                    index
+                    for index, button in enumerate(buttons)
+                    if not button.label and not button.text
+                ),
+                None,
+            )
+            if unresolved_index is not None:
+                unresolved = buttons[unresolved_index]
+                buttons = (
+                    *buttons[:unresolved_index],
+                    PreviewWindowButton(
+                        unresolved.identifier,
+                        referenced_label,
+                        icon_asset=unresolved.icon_asset,
+                    ),
+                    *buttons[unresolved_index + 1 :],
+                )
+            elif not buttons:
+                buttons = (*buttons, PreviewWindowButton(identifier="", label=referenced_label))
+    argument_labels = _runtime_argument_labels(
+        labels_by_arg,
+        (header_label, body_label),
+        button_label_set,
+        minimum_argument_index=(contract.runtime_start if contract is not None else None),
+    )
     if (
         referenced_label
         and reference.role == "runtime_label"
@@ -699,11 +741,22 @@ def _contract_argument_hint(
 
 def _labels_by_argument(
     arguments: tuple[tuple[str, ...], ...],
+    raw_arguments: tuple[str, ...] = (),
+    current_label: str = "",
 ) -> list[tuple[int, tuple[str, ...]]]:
     labels: list[tuple[int, tuple[str, ...]]] = []
     for index, expressions in enumerate(arguments):
         found: list[str] = []
-        for argument in expressions:
+        raw_argument = raw_arguments[index] if index < len(raw_arguments) else ""
+        raw_labels = tuple(
+            normalize_label(match.group(0)) for match in LABEL_RE.finditer(raw_argument)
+        )
+        candidates_to_scan = (
+            (raw_argument,)
+            if raw_labels and ".." not in raw_argument and _numeric_suffix(current_label) != "_+0"
+            else expressions
+        )
+        for argument in candidates_to_scan:
             dynamic = dynamic_label_patterns(argument)
             candidates = dynamic or tuple(
                 normalize_label(match.group(0)) for match in LABEL_RE.finditer(argument)
@@ -728,13 +781,47 @@ def context_has_label(context: PreviewWindowContext, label: str) -> bool:
     return _context_has_label(context, _context_label(label))
 
 
+def context_displays_label(context: PreviewWindowContext, label: str) -> bool:
+    """Return whether the label itself occupies a visible slot in this window."""
+    normalized = _context_label(label)
+    visible = [context.header_label]
+    if not (context.call_name == "initdata" and context.surface == "measure_choice"):
+        visible.append(context.body_label)
+    visible.extend(button.label for button in context.buttons)
+    return any(_equivalent_label(candidate, normalized) for candidate in visible)
+
+
 def _buttons_from_arguments(
     arguments: tuple[tuple[str, ...], ...],
+    current_button_label: str = "",
 ) -> tuple[PreviewWindowButton, ...]:
     buttons: list[PreviewWindowButton] = []
     for expressions in arguments:
-        for argument in expressions:
-            buttons.extend(_buttons_from_expression(argument))
+        candidates = tuple(
+            candidate
+            for argument in expressions
+            if (candidate := _buttons_from_expression(argument))
+        )
+        if not candidates:
+            continue
+        normalized_current = _context_label(current_button_label)
+
+        def candidate_score(candidate: tuple[PreviewWindowButton, ...]) -> tuple[int, int, int]:
+            contains_current = int(
+                bool(normalized_current)
+                and any(
+                    _equivalent_label(button.label, normalized_current)
+                    for button in candidate
+                )
+            )
+            resolved_captions = sum(bool(button.label or button.text) for button in candidate)
+            return contains_current, len(candidate), resolved_captions
+
+        # Resolved arguments are alternative runtime values.  Picking one
+        # complete branch avoids combining mutually exclusive buttons from
+        # every possible value while retaining all buttons concatenated in
+        # that branch.
+        buttons.extend(max(candidates, key=candidate_score))
     unique: list[PreviewWindowButton] = []
     seen: set[tuple[str, str, str, str]] = set()
     for button in buttons:
@@ -746,34 +833,21 @@ def _buttons_from_arguments(
 
 
 def _buttons_from_expression(expression: str) -> tuple[PreviewWindowButton, ...]:
-    buttons: list[PreviewWindowButton] = []
-    for part in _concat_parts(expression):
-        buttons.extend(_direct_buttons_from_text(part))
-    return tuple(buttons)
+    return _direct_buttons_from_text(expression)
 
 
 def _direct_buttons_from_text(text: str) -> tuple[PreviewWindowButton, ...]:
     buttons: list[PreviewWindowButton] = []
     for match in BUTTON_RE.finditer(text):
         body = match.group("body")
-        if ".." in body:
-            continue
         parts = _split_button_parts(body)
         identifier = parts[0].strip() if parts else ""
-        label = ""
-        text_value = ""
+        label, text_value = _button_caption(parts[1] if len(parts) > 1 else "")
         icon_asset = ""
-        for part in parts[1:]:
+        for part in parts[2:]:
             asset_match = BUTTON_ASSET_RE.search(part)
             if asset_match is not None:
                 icon_asset = asset_match.group(0).replace("\\", "/")
-            label_match = RESOLVED_LABEL_RE.search(part) or LABEL_RE.search(part)
-            if label_match is not None:
-                label = normalize_label(label_match.group(0))
-                continue
-            literal = _literal_text(part)
-            if literal and not icon_asset:
-                text_value = literal
         buttons.append(
             PreviewWindowButton(
                 identifier=identifier,
@@ -785,9 +859,32 @@ def _direct_buttons_from_text(text: str) -> tuple[PreviewWindowButton, ...]:
     return tuple(buttons)
 
 
-def _concat_parts(expression: str) -> tuple[str, ...]:
-    return tuple(part.strip() for part in expression.split("..") if part.strip())
+def _button_caption(value: str) -> tuple[str, str]:
+    """Return the visible second field of @B, never its return identifier or tooltip."""
+    raw = value.strip()
+    literal_match = STRING_LITERAL_RE.fullmatch(raw)
+    if literal_match is not None:
+        raw = (literal_match.group(1) or literal_match.group(2) or "").strip()
+    if not raw or raw == "*" or ".." in raw:
+        return "", ""
 
+    label_match = RESOLVED_LABEL_RE.fullmatch(raw) or LABEL_RE.fullmatch(raw)
+    if label_match is not None:
+        return normalize_label(label_match.group(0)), ""
+
+    compact_match = COMPACT_BUTTON_LABEL_RE.fullmatch(raw)
+    if compact_match is not None:
+        return compact_match.group("label").casefold(), ""
+
+    if raw.casefold().startswith("@l"):
+        inline_text = raw[2:].strip()
+        if not inline_text or inline_text == "*" or '"' in inline_text or "'" in inline_text:
+            return "", ""
+        return "", inline_text
+
+    if '"' in raw or "'" in raw:
+        return "", ""
+    return "", raw
 
 def _split_button_parts(value: str) -> list[str]:
     parts: list[str] = []
@@ -832,6 +929,7 @@ def _header_body_labels(
     labels_by_arg: list[tuple[int, tuple[str, ...]]],
     button_labels: set[str],
     current_label: str,
+    current_role: str = "",
 ) -> tuple[str, str]:
     candidates: list[tuple[int, str]] = []
     for argument_index, labels in labels_by_arg:
@@ -840,6 +938,7 @@ def _header_body_labels(
                 candidates.append((argument_index, label))
     if not candidates:
         return "", ""
+    specialize_companions = current_role in {"header", "body", "template"}
     contract = call_contract(call_name)
     if contract is not None:
         role_by_index = dict(contract.label_roles)
@@ -854,12 +953,22 @@ def _header_body_labels(
             if role_by_index.get(index) == "body"
         ]
         header_values = (
-            _specialize_candidates(header_candidates, current_label, minimum_argument_index=0)
+            _specialize_candidates(
+                header_candidates,
+                current_label,
+                minimum_argument_index=0,
+                specialize_companions=specialize_companions,
+            )
             if header_candidates
             else []
         )
         body_values = (
-            _specialize_candidates(body_candidates, current_label, minimum_argument_index=0)
+            _specialize_candidates(
+                body_candidates,
+                current_label,
+                minimum_argument_index=0,
+                specialize_companions=specialize_companions,
+            )
             if body_candidates
             else []
         )
@@ -868,16 +977,59 @@ def _header_body_labels(
             body = _nearest_or_first_label(body_values, current_label) if body_values else ""
             return header, body
     if call_name.startswith("feedback_message"):
-        return _labels_from_first_two(_specialize_candidates(candidates, current_label, minimum_argument_index=1))
+        return _labels_from_first_two(
+            _specialize_candidates(
+                candidates,
+                current_label,
+                minimum_argument_index=1,
+                specialize_companions=specialize_companions,
+            )
+        )
     if call_name == "msgsayinteraction":
-        return _labels_from_first_two(_specialize_candidates(candidates, current_label, minimum_argument_index=4))
+        return _labels_from_first_two(
+            _specialize_candidates(
+                candidates,
+                current_label,
+                minimum_argument_index=4,
+                specialize_companions=specialize_companions,
+            )
+        )
     if call_name in {"msgquick", "msgsay", "msgsaynowait", "msgmeasure"}:
-        return "", _nearest_or_first_label(_specialize_candidates(candidates, current_label, minimum_argument_index=0), current_label)
+        return "", _nearest_or_first_label(
+            _specialize_candidates(
+                candidates,
+                current_label,
+                minimum_argument_index=0,
+                specialize_companions=specialize_companions,
+            ),
+            current_label,
+        )
     if call_name in {"msgnews", "msgnewsnowait"}:
-        return _labels_from_first_two(_specialize_candidates(candidates, current_label, minimum_argument_index=5))
+        return _labels_from_first_two(
+            _specialize_candidates(
+                candidates,
+                current_label,
+                minimum_argument_index=5,
+                specialize_companions=specialize_companions,
+            )
+        )
     if call_name in {"msgbox", "msgboxnowait", "msgquest", "showtutorialboxnowait"}:
-        return _labels_from_first_two(_specialize_candidates(candidates, current_label, minimum_argument_index=2))
-    return _labels_from_first_two(_specialize_candidates(candidates, current_label, minimum_argument_index=0))
+        return _labels_from_first_two(
+            _specialize_candidates(
+                candidates,
+                current_label,
+                minimum_argument_index=2,
+                specialize_companions=specialize_companions,
+            )
+        )
+    return _labels_from_first_two(
+        _specialize_candidates(
+            candidates,
+            current_label,
+            minimum_argument_index=0,
+            specialize_companions=specialize_companions,
+        )
+    )
 
 
 def _labels_from_first_two(candidates: list[tuple[int, str]]) -> tuple[str, str]:
@@ -903,13 +1055,22 @@ def _specialize_candidates(
     current_label: str,
     *,
     minimum_argument_index: int,
+    specialize_companions: bool = False,
 ) -> list[tuple[int, str]]:
     suffix = _numeric_suffix(current_label)
     narrowed: list[tuple[int, str]] = []
     for argument_index, label in candidates:
         if argument_index < minimum_argument_index:
             continue
-        if suffix and label.endswith("_+*"):
+        if (
+            suffix
+            and label.endswith("_+*")
+            and (
+                specialize_companions
+                or suffix == "_+0"
+                or _equivalent_label(label, current_label)
+            )
+        ):
             label = f"{label[:-3]}{suffix}"
         narrowed.append((argument_index, label))
     return narrowed or candidates
@@ -919,6 +1080,8 @@ def _runtime_argument_labels(
     labels_by_arg: list[tuple[int, tuple[str, ...]]],
     window_labels: tuple[str, str],
     button_labels: set[str],
+    *,
+    minimum_argument_index: int | None = None,
 ) -> tuple[str, ...]:
     last_window_label_index = -1
     for argument_index, labels in labels_by_arg:
@@ -929,6 +1092,8 @@ def _runtime_argument_labels(
         return ()
     values: list[str] = []
     for argument_index, labels in labels_by_arg:
+        if minimum_argument_index is not None and argument_index < minimum_argument_index:
+            continue
         if argument_index <= last_window_label_index:
             continue
         for label in labels:

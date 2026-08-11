@@ -21,6 +21,9 @@ from ..preview_placeholders import (
     PlaceholderLabelRecord,
     PlaceholderValueBuilder,
     _placeholder_expression,
+    _preview_code_text,
+    _variable_label_sources,
+    _variable_label_sources_cached,
     placeholder_arguments,
 )
 from ..script_semantics import (
@@ -183,11 +186,16 @@ def assert_code_semantics_are_scope_and_role_aware() -> None:
     if office_body.argument_index != 3 or office_body.runtime_arguments != (
         'GetID("")',
         'GetSettlementID("")',
+        "PrivilegeList()",
     ):
         raise AssertionError(
             "semantic call analysis used a fixed feedback-message layout"
         )
-    if office_body.runtime_argument_kinds != ((), ("settlement",)):
+    if office_body.runtime_argument_kinds != (
+        (),
+        ("settlement",),
+        ("label",),
+    ):
         raise AssertionError(
             "shifted feedback-message parameters lost their runtime types"
         )
@@ -270,6 +278,16 @@ def assert_code_semantics_resolve_local_function_returns() -> None:
             '    MsgQuick("", "@L_BODY_UNKNOWN_ALIAS_+0", GetID("TemporaryAlias"))',
             '    SimGetGender("AnyOfficer")',
             '    MsgQuick("", "@L_BODY_INPUT_CHARACTER_+0", GetID("AnyOfficer"))',
+            '    GetInsideBuilding("Visitor", "VisitBuilding")',
+            '    MsgQuick("", "@L_BODY_INSIDE_CHARACTER_+0", GetID("Visitor"))',
+            '    SimGetClass("GuildMaster")',
+            '    MsgQuick("", "@L_BODY_CLASS_CHARACTER_+0", GetID("GuildMaster"))',
+            '    PlayAnimationNoWait("Prisoner", "idle")',
+            '    MsgQuick("", "@L_BODY_ANIMATED_CHARACTER_+0", GetID("Prisoner"))',
+            '    MsgQuick("", "@L_BODY_CONDEMNED_CHARACTER_+0", GetID("Condemned"))',
+            '    Kill("Condemned")',
+            '    BuildingGetOwner("Shop", "ShopOwner")',
+            '    MsgQuick("", "@L_BODY_OWNER_CHARACTER_+0", GetID("ShopOwner"), GetID("Shop"))',
             '    CityGetRandomBuilding(TravelAlias, -1, -1, -1, -1, 0, "Market")',
             '    MsgQuick("", "@L_BODY_INPUT_SETTLEMENT_+0", GetID(TravelAlias))',
             '    if IsType(TargetAlias, "Building") then',
@@ -398,6 +416,21 @@ def assert_code_semantics_resolve_local_function_returns() -> None:
         raise AssertionError(
             "GetID did not consume character evidence from an engine API input"
         )
+    for label in (
+        "body_inside_character_+0",
+        "body_class_character_+0",
+        "body_animated_character_+0",
+        "body_condemned_character_+0",
+    ):
+        if by_label[label].runtime_argument_kinds != (("character",),):
+            raise AssertionError(
+                f"documented character input semantics did not reach GetID: {label}"
+            )
+    owner = by_label["body_owner_character_+0"]
+    if owner.runtime_argument_kinds != (("character",), ("building",)):
+        raise AssertionError(
+            "BuildingGetOwner did not type both its owner output and building input"
+        )
     if by_label["body_input_settlement_+0"].runtime_argument_kinds != (
         ("settlement",),
     ):
@@ -512,6 +545,9 @@ def assert_feedback_message_contracts_do_not_depend_on_label_names() -> None:
     uses = analyze_script(
         "\n".join(
             (
+                "function GetPrivilegeList()",
+                '    return "CanTrade", "CommandMonitor"',
+                "end",
                 'feedback_MessagePolitics("Patron", "@L_GUILDMASTER_HEAD",',
                 '    "@L_GUILDMASTER_PLAYER_FEMALE", GetID("City"), PatronID,',
                 '    GetYear(), "@L_GUILDMASTER_TITLE_FEMALE")',
@@ -556,9 +592,19 @@ def assert_feedback_message_contracts_do_not_depend_on_label_names() -> None:
             f"Mission feedback used label spelling to locate its body: {mission!r}"
         )
     office = by_label["office_gain_description"]
-    if office.role != "body" or office.runtime_arguments != ('GetID("")',):
+    if office.role != "body" or office.runtime_arguments != (
+        'GetID("")',
+        "GetPrivilegeList()",
+    ):
         raise AssertionError(
             f"Office feedback ignored its extra privilege-list parameter: {office!r}"
+        )
+    if office.runtime_argument_values[1] != (
+        "_MEASURE_CanTrade_NAME_+0",
+        "_MEASURE_CommandMonitor_NAME_+0",
+    ):
+        raise AssertionError(
+            f"Office feedback did not expose its generated privilege list: {office!r}"
         )
 
 
@@ -581,13 +627,61 @@ def assert_dynamic_table_and_engine_label_semantics_are_preserved() -> None:
                 "    local Labels = {Take = getLabel(1)}",
                 '    MsgQuick("", "@L_MESSAGES_BODY_+0", Labels.Take)',
                 '    MsgQuick("", "@L_PROFESSION_BODY_+0", ProfessionGetLabel(Profession, Gender))',
+                "    local BadgeID = DynastyGetFlagNumber(\"dynasty\") + 29",
+                '    local Badge = "@L$S[20"..BadgeID.."]"',
+                '    MsgQuick("", "@L_BADGE_LITERAL_BODY_+0", Badge)',
+                '    local StatusLabel = "@LHostility"',
+                '    local CurrentLabel = "@LNeutral"',
+                '    MsgQuick("", "@LDIPLOMATIC_STATE_CHANGED", StatusLabel, CurrentLabel)',
                 '    MsgQuick("", "@L_ROUNDED_BODY_+0", math.floor(Amount * Factor))',
                 '    MsgQuick("", "@L_VEHICLE_BODY_+0", GetID("Destination"))',
                 '    local VehicleType = CartGetType("Destination")',
+                '    local OfficeNameLabel = OfficeGetTextLabel("office", Gender)',
+                '    local GenderText = "_+0"',
+                '    local OfficeName = "@L"..string.sub(OfficeNameLabel, 0, -4)..GenderText',
+                '    MsgQuick("", "@L_OFFICE_SESSION_BODY_+0", OfficeName)',
+                '    local WinnerId = GetProperty("", "BestDicePlayer")',
+                '    ScenarioGetObjectByName("cl_Sim", WinnerId, "Winner")',
+                '    MsgQuick("", "@L_CHAMPION_BODY_+0", WinnerId)',
+                '    SimGetGender("NamedWinner")',
+                '    MsgQuick("", "@L_NAMED_CHARACTER_BODY_+0", GetName("NamedWinner"))',
+                "    local ItemID = InventoryGetSlotInfo()",
+                "    if Ready and (ItemID == 241 or ItemID == 242 or ItemID == 243) then",
+                '        MsgQuick("", "@L_ITEM_RANGE_BODY_+0", ItemGetLabel(ItemID, true))',
+                "    end",
+                "    if ItemID == 241 or OtherCondition then",
+                '        MsgQuick("", "@L_MIXED_RANGE_BODY_+0", ItemGetLabel(ItemID, true))',
+                "    end",
+                "    if ItemID >= 241 and ItemID <= 243 then",
+                '        MsgQuick("", "@L_ITEM_INTERVAL_BODY_+0", ItemGetLabel(ItemID, true))',
+                "    end",
+                "    local RandomItem = Rand(3) + 241",
+                '    MsgQuick("", "@L_ITEM_RANDOM_RANGE_BODY_+0", ItemGetLabel(RandomItem, true))',
+                "    local TradeItems = {241, 242, 243}",
+                '    MsgQuick("", "@L_ITEM_TABLE_BODY_+0", ItemGetLabel(TradeItems[Rand(3)], true))',
+                "    for Choice = 7, 9, 2 do",
+                '        MsgQuick("", "@L_ITEM_LOOP_BODY_+0", ItemGetLabel(Choice, false))',
+                "    end",
+                "end",
+                "function Callback(Source, Destination, Label)",
+                '    MsgQuick("", "@L_CALLBACK_BODY_+0", Label)',
+                "end",
+                "function Dispatch()",
+                "    local Handler = Callback",
+                "    local Label = ItemGetLabel(ItemID, true)",
+                '    Handler("", "", Label)',
                 "end",
             )
         ),
         Path("RuntimeCollections.lua"),
+        label_catalog=frozenset({"diplomatic_state_changed"}),
+        item_names_by_id=(
+            (7, "Sheep"),
+            (9, "Cattle"),
+            (241, "Iron"),
+            (242, "Silver"),
+            (243, "Gold"),
+        ),
     )
     by_label = {
         use.label: use
@@ -638,6 +732,66 @@ def assert_dynamic_table_and_engine_label_semantics_are_preserved() -> None:
         raise AssertionError(
             f"ProfessionGetLabel lost its documented label family: {profession!r}"
         )
+    item_range = by_label["item_range_body_+0"]
+    if item_range.runtime_argument_values != (
+        (
+            "_ITEM_Iron_NAME_+0",
+            "_ITEM_Silver_NAME_+0",
+            "_ITEM_Gold_NAME_+0",
+        ),
+    ):
+        raise AssertionError(
+            f"an explicit conditional item range was not propagated: {item_range!r}"
+        )
+    mixed_range = by_label["mixed_range_body_+0"]
+    if mixed_range.runtime_argument_values != (("_ITEM_*_NAME_+0",),):
+        raise AssertionError(
+            f"a mixed disjunction was unsafely narrowed to one item: {mixed_range!r}"
+        )
+    for range_label in ("item_interval_body_+0", "item_random_range_body_+0"):
+        item_interval = by_label[range_label]
+        if item_interval.runtime_argument_values != (
+            (
+                "_ITEM_Iron_NAME_+0",
+                "_ITEM_Silver_NAME_+0",
+                "_ITEM_Gold_NAME_+0",
+            ),
+        ):
+            raise AssertionError(
+                f"a bounded numeric item range was not propagated: {item_interval!r}"
+            )
+    item_table = by_label["item_table_body_+0"]
+    if item_table.runtime_argument_values != (
+        (
+            "_ITEM_Iron_NAME_+0",
+            "_ITEM_Silver_NAME_+0",
+            "_ITEM_Gold_NAME_+0",
+        ),
+    ):
+        raise AssertionError(
+            f"a numeric item table did not use the engine item catalog: {item_table!r}"
+        )
+    item_loop = by_label["item_loop_body_+0"]
+    if item_loop.runtime_argument_values != (
+        ("_ITEM_Sheep_NAME_+1", "_ITEM_Cattle_NAME_+1"),
+    ):
+        raise AssertionError(
+            f"a small literal for-range was not propagated: {item_loop!r}"
+        )
+    badge = by_label["badge_literal_body_+0"]
+    if badge.runtime_argument_kinds != (("dynasty_crest",),):
+        raise AssertionError(
+            f"a concatenated dynasty crest was treated as localization text: {badge!r}"
+        )
+    compact = by_label["diplomatic_state_changed"]
+    if compact.runtime_arguments != ("StatusLabel", "CurrentLabel"):
+        raise AssertionError(
+            f"a catalog-backed compact @L label lost its runtime arguments: {compact!r}"
+        )
+    if compact.runtime_argument_kinds != (("label",), ("label",)):
+        raise AssertionError(
+            f"compact runtime localization values were treated as plain text: {compact!r}"
+        )
     rounded = by_label["rounded_body_+0"]
     if rounded.runtime_argument_kinds != (("number",),):
         raise AssertionError(
@@ -648,6 +802,112 @@ def assert_dynamic_table_and_engine_label_semantics_are_preserved() -> None:
         raise AssertionError(
             f"a stable alias ignored later engine type evidence: {vehicle!r}"
         )
+    office_session = by_label["office_session_body_+0"]
+    if office_session.runtime_argument_values != (
+        ("@L_CHARACTERS_3_OFFICES_NAME_*_+0",),
+    ) or office_session.runtime_argument_kinds != (("label",),):
+        raise AssertionError(
+            "string.sub did not preserve the bounded office-label family: "
+            f"{office_session!r}"
+        )
+    champion = by_label["champion_body_+0"]
+    if champion.runtime_argument_values != (("",),) or champion.runtime_argument_kinds != (
+        ("character",),
+    ):
+        raise AssertionError(
+            "ScenarioGetObjectByName did not prove the champion-name type: "
+            f"{champion!r}"
+        )
+
+    class CharacterLocalization:
+        @staticmethod
+        def character_name(seed: str, number: int, target: bool) -> str:
+            del seed, number, target
+            return "Ada Lovelace"
+
+    champion_preview = PlaceholderValueBuilder(CharacterLocalization()).argument_value(
+        1,
+        "l",
+        PlaceholderContext(
+            label="_CHAMPION_BODY_+0",
+            file_rel="Text.dbt",
+            target=False,
+            locale="en",
+            references=(champion,),
+            argument_suffixes=((1, ("l",)),),
+        ),
+    )
+    if champion_preview.text != "Ada Lovelace":
+        raise AssertionError(
+            f"a type-only character value rendered as blank text: {champion_preview!r}"
+        )
+    named_character = by_label["named_character_body_+0"]
+    if named_character.runtime_argument_values != (("",),) or named_character.runtime_argument_kinds != (
+        ("character",),
+    ):
+        raise AssertionError(f"GetName lost its proven object type: {named_character!r}")
+    named_preview = PlaceholderValueBuilder(CharacterLocalization()).argument_value(
+        1,
+        "l",
+        PlaceholderContext(
+            label="_NAMED_CHARACTER_BODY_+0",
+            file_rel="Text.dbt",
+            target=False,
+            locale="en",
+            references=(named_character,),
+            argument_suffixes=((1, ("l",)),),
+        ),
+    )
+    if named_preview.text != "Ada Lovelace":
+        raise AssertionError(f"a proven GetName result rendered generically: {named_preview!r}")
+    callback = by_label["callback_body_+0"]
+    if callback.runtime_argument_values != (("_ITEM_*_NAME_+0",),) or callback.runtime_argument_kinds != (
+        ("label",),
+    ):
+        raise AssertionError(
+            f"a function-valued callback lost its bound label argument: {callback!r}"
+        )
+
+
+def assert_preview_variable_source_cache_reuses_script_text() -> None:
+    temp = Path(tempfile.mkdtemp(prefix="translator_tool_preview_source_cache_"))
+    script = temp / "Cached.lua"
+    _preview_code_text.cache_clear()
+    _variable_label_sources_cached.cache_clear()
+    try:
+        script.write_text(
+            '\n'.join((
+                'local First = "@L_FIRST_LABEL_+0"',
+                'local Second = "@L_SECOND_LABEL_+0"',
+                'MsgQuick("", First, Second)',
+            )),
+            encoding="utf-8",
+        )
+        first = _variable_label_sources(str(script), 3, "First")
+        second = _variable_label_sources(str(script), 3, "Second")
+        if first[0] != ("_FIRST_LABEL_+0",) or second[0] != ("_SECOND_LABEL_+0",):
+            raise AssertionError(f"cached script label sources were incorrect: {first!r}, {second!r}")
+        cache_info = _preview_code_text.cache_info()
+        if cache_info.misses != 1 or cache_info.hits < 1:
+            raise AssertionError(f"one script was reread for separate variables: {cache_info!r}")
+
+        script.write_text(
+            '\n'.join((
+                'local First = "@L_CHANGED_LABEL_LONGER_+0"',
+                'local Second = "@L_SECOND_LABEL_+0"',
+                'MsgQuick("", First, Second)',
+            )),
+            encoding="utf-8",
+        )
+        changed = _variable_label_sources(str(script), 3, "First")
+        if changed[0] != ("_CHANGED_LABEL_LONGER_+0",):
+            raise AssertionError(f"a changed script reused stale preview text: {changed!r}")
+        if _preview_code_text.cache_info().misses != 2:
+            raise AssertionError("a changed script fingerprint did not invalidate cached text")
+    finally:
+        _preview_code_text.cache_clear()
+        _variable_label_sources_cached.cache_clear()
+        shutil.rmtree(temp, ignore_errors=True)
 
 
 def assert_code_index_handles_families_and_binary_gui() -> None:
@@ -682,6 +942,38 @@ def assert_code_index_handles_families_and_binary_gui() -> None:
         fixed = index.references_for("FIXED_+3").project
         if len(fixed) != 1:
             raise AssertionError("the exact fixed label stopped matching itself")
+        weak = CodeReference(
+            "duplicate_body_+0",
+            temp / "Duplicate.lua",
+            8,
+            4,
+            "MsgQuick",
+            1,
+            ('""', '"@L_DUPLICATE_BODY_+0"', "Value"),
+            role="body",
+            runtime_arguments=("Value",),
+            runtime_argument_values=(("Value",),),
+            runtime_argument_kinds=(("expression",),),
+            confidence=80,
+        )
+        rich = CodeReference(
+            "duplicate_body_+0",
+            temp / "Duplicate.lua",
+            8,
+            4,
+            "MsgQuick",
+            1,
+            ('""', '"@L_DUPLICATE_BODY_+0"', "Value"),
+            role="body",
+            runtime_arguments=("Value",),
+            runtime_argument_values=(("42",),),
+            runtime_argument_kinds=(("number",),),
+            confidence=95,
+        )
+        duplicate_index = CodeReferenceIndex({"duplicate_body_+0": (weak, rich)})
+        active = duplicate_index.references_for("DUPLICATE_BODY_+0").project
+        if active != (rich,):
+            raise AssertionError(f"one physical call exposed duplicate semantic variants: {active!r}")
         gui = index.references_for("GUI_RESOURCE_+0").project
         if len(gui) != 1 or not gui[0].binary or gui[0].call_name is not None or gui[0].role != "gui_resource":
             raise AssertionError(f"binary GUI data produced a script call context: {gui!r}")
@@ -781,6 +1073,45 @@ def assert_code_index_handles_families_and_binary_gui() -> None:
         ):
             raise AssertionError(
                 f"preview quality evidence was misclassified: {quality_coverage!r}"
+            )
+        unresolved_expression_index = CodeReferenceIndex(
+            {
+                "expression_body_+0": (
+                    CodeReference(
+                        "expression_body_+0",
+                        temp / "Expression.lua",
+                        1,
+                        1,
+                        "MsgQuick",
+                        1,
+                        runtime_arguments=("LocalLabel",),
+                        runtime_argument_values=(("helper_MakeLabel()",),),
+                        runtime_argument_kinds=(("expression",),),
+                        role="body",
+                    ),
+                )
+            }
+        )
+        expression_reference_coverage = preview_reference_coverage(unresolved_expression_index)
+        if (
+            expression_reference_coverage.resolved_runtime_positions != 0
+            or expression_reference_coverage.unresolved_runtime_positions != 1
+        ):
+            raise AssertionError(
+                "an unresolved function expression was counted as a concrete runtime value: "
+                f"{expression_reference_coverage!r}"
+            )
+        expression_placeholder_coverage = preview_placeholder_coverage(
+            unresolved_expression_index,
+            (("EXPRESSION_BODY_+0", "%1l"),),
+        )
+        if (
+            expression_placeholder_coverage.concrete_positions != 0
+            or expression_placeholder_coverage.expression_only_positions != 1
+        ):
+            raise AssertionError(
+                "an unresolved function expression inflated concrete placeholder coverage: "
+                f"{expression_placeholder_coverage!r}"
             )
         parsed = placeholder_arguments("%2it | %1Sn | %2.1f/d")
         if parsed != ((2, "i"), (1, "Sn")):
@@ -971,8 +1302,8 @@ def assert_placeholder_values_avoid_ambiguous_random_branches() -> None:
         "MsgQuick",
         1,
         runtime_arguments=("Badge",),
-        runtime_argument_values=(("",),),
-        runtime_argument_kinds=(("dynasty_crest",),),
+        runtime_argument_values=(("", "@L$S[20*]"),),
+        runtime_argument_kinds=(("structure", "dynasty_crest"),),
         role="body",
     )
     crest = builder.argument_value(
@@ -987,10 +1318,12 @@ def assert_placeholder_values_avoid_ambiguous_random_branches() -> None:
         ),
     )
     if crest.text != GLYPH_MARK or crest.glyph_id is None:
-        raise AssertionError("a proven dynasty crest did not render as a game glyph")
+        raise AssertionError("an optional proven dynasty crest did not render as a game glyph")
     value = builder.argument_value(1, "l", context).text
-    if value in {"Beggar", "Emperor"}:
-        raise AssertionError(f"an unresolved runtime branch was presented as a certain value: {value!r}")
+    if value != "Beggar / Emperor":
+        raise AssertionError(
+            f"an unresolved runtime branch did not present its bounded alternatives: {value!r}"
+        )
 
     optional_label = CodeReference(
         "birth_body_daughter_+0",
@@ -1116,6 +1449,28 @@ def assert_placeholder_values_avoid_ambiguous_random_branches() -> None:
     plain_name = builder.argument_value(1, "NAME", ambiguous_context).text
     if plain_name != "Object 1":
         raise AssertionError(f"an ambiguous NAME branch was forced to one object type: {plain_name!r}")
+
+    direct_settlement = CodeReference(
+        "direct_settlement_+0",
+        Path("Settlement.lua"),
+        31,
+        1,
+        "MsgQuick",
+        1,
+        runtime_arguments=("settlement",),
+        runtime_argument_values=(("0",),),
+        runtime_argument_kinds=(("number",),),
+        role="body",
+    )
+    direct_settlement_context = PlaceholderContext(
+        "DIRECT_SETTLEMENT_+0",
+        "Text.dbt",
+        False,
+        "en",
+        (direct_settlement,),
+    )
+    if builder.argument_value(1, "NAME", direct_settlement_context).text == "Object 1":
+        raise AssertionError("a directly named settlement argument fell back to a generic object")
 
     typed_settlement = CodeReference(
         "settlement_name_+0",
@@ -1587,6 +1942,9 @@ def assert_cross_file_function_summaries_bind_arguments_and_expand_returns() -> 
                     "function MakeText(name)",
                     '    return "Office "..name',
                     "end",
+                    "function MakeDynamic()",
+                    '    return "@L_REALM_"..GetDatabaseValue("Realm").."_+0"',
+                    "end",
                 )
             ),
             encoding="utf-8",
@@ -1596,7 +1954,10 @@ def assert_cross_file_function_summaries_bind_arguments_and_expand_returns() -> 
                 (
                     "function Main()",
                     '    MsgQuick("", "@L_REMOTE_VALUES_BODY_+0", helper_MakeValues("BREAD"))',
+                    '    local LocalLabel = helper_MakeValues("WINE")',
+                    '    MsgQuick("", "@L_REMOTE_LOCAL_BODY_+0", LocalLabel)',
                     '    MsgQuick("", "@L_REMOTE_TEXT_BODY_+0", helper_MakeText("Bailiff"))',
+                    '    MsgQuick("", "@L_REMOTE_DYNAMIC_BODY_+0", helper_MakeDynamic())',
                     '    MsgQuick("", "@L_CITY_LEVEL_BODY_+0", CityLevel2Label(2))',
                     '    MsgQuick("", "@L_TITLE_LABEL_BODY_+0", GetNobilityTitleLabel(7))',
                     "end",
@@ -1653,6 +2014,24 @@ def assert_cross_file_function_summaries_bind_arguments_and_expand_returns() -> 
             raise AssertionError(
                 f"cross-file label types did not reach the caller: {resolved!r}"
             )
+        local_references = index.references_for("REMOTE_LOCAL_BODY_+0").project
+        local_reference = next(
+            (
+                item
+                for item in local_references
+                if item.runtime_argument_values == (("@L_ITEM_WINE_NAME_+0",),)
+            ),
+            None,
+        )
+        if local_reference is None:
+            raise AssertionError(
+                "a cross-file label-producing call was lost when assigned to a local variable: "
+                f"{local_references!r}"
+            )
+        if local_reference.runtime_argument_kinds != (("label",),):
+            raise AssertionError(
+                f"a local cross-file value lost its label type: {local_reference!r}"
+            )
         text_reference = index.references_for("REMOTE_TEXT_BODY_+0").project[0]
         if text_reference.runtime_argument_values != (("Office Bailiff",),):
             raise AssertionError(
@@ -1661,6 +2040,16 @@ def assert_cross_file_function_summaries_bind_arguments_and_expand_returns() -> 
         if text_reference.runtime_argument_kinds != (("text",),):
             raise AssertionError(
                 f"cross-file text type did not reach the caller: {text_reference!r}"
+            )
+        dynamic_reference = index.references_for("REMOTE_DYNAMIC_BODY_+0").project[0]
+        if dynamic_reference.runtime_argument_values != (("@L_REALM_*_+0",),):
+            raise AssertionError(
+                "an unresolved call inside a dynamic label was not preserved as a wildcard: "
+                f"{dynamic_reference!r}"
+            )
+        if dynamic_reference.runtime_argument_kinds != (("label",),):
+            raise AssertionError(
+                f"a wildcard dynamic label lost its label type: {dynamic_reference!r}"
             )
         if ("project", "helper_makevalues") in linker.unresolved_value_aliases():
             raise AssertionError("a loaded function summary remained marked as unresolved")

@@ -23,13 +23,14 @@ from .code_index import (
     normalize_label,
 )
 from .file_utils import atomic_write
+from .game_items import game_item_names_by_id
 from .script_semantics import SemanticValue, analyze_script as _semantic_analyze_script
 from .settings import settings_dir
 
 
 CACHE_FORMAT_VERSION = 1
 LEXICAL_SCHEMA_VERSION = 3
-ANALYZER_REVISION = "script-semantics-2026-07-22-1"
+ANALYZER_REVISION = "script-semantics-2026-08-10-1"
 MAX_CACHE_MANIFESTS = 8
 MAX_CACHE_BYTES = 128 * 1024 * 1024
 MAX_CACHED_FILES = 8192
@@ -260,6 +261,7 @@ class LazyCodeIndexBuilder:
         self.cache_path = cache_path or default_cache_path(game_root, project_root)
         self.files: tuple[CodeFileSpec, ...] = ()
         self.label_catalog = frozenset()
+        self.item_names_by_id: tuple[tuple[int, str], ...] = ()
         self.catalog_digest = ""
         self.cache: CodeFactsCache | None = None
         self._search_blobs: dict[str, bytes] = {}
@@ -286,7 +288,17 @@ class LazyCodeIndexBuilder:
             self.project_root,
             vanilla_project_name=self.vanilla_project_name,
         )
-        self.catalog_digest = _catalog_digest(self.label_catalog)
+        mod_name = (
+            ""
+            if self.project_root.name.casefold() == self.vanilla_project_name.casefold()
+            else self.project_root.name
+        )
+        self.item_names_by_id = game_item_names_by_id(self.game_root, mod_name)
+        self.catalog_digest = _catalog_digest(
+            self.label_catalog,
+            self.item_names_by_id,
+        )
+        self._linker = CrossFileSemanticLinker(self.item_names_by_id)
         self.cache = CodeFactsCache(self.cache_path)
         self._prepared = True
 
@@ -421,7 +433,12 @@ class LazyCodeIndexBuilder:
         if cached is not None:
             self._remember_return_aliases(cached)
             return self._linker.add(cached)
-        analysis = analyze_code_file(spec, label_catalog=self.label_catalog, raw=raw)
+        analysis = analyze_code_file(
+            spec,
+            label_catalog=self.label_catalog,
+            item_names_by_id=self.item_names_by_id,
+            raw=raw,
+        )
         self.cache.record_analysis(spec, raw, lexical, self.catalog_digest, analysis)
         self._remember_return_aliases(analysis)
         return self._linker.add(analysis)
@@ -767,10 +784,18 @@ def _flow_from_json(
     )
 
 
-def _catalog_digest(catalog: frozenset[str]) -> str:
+def _catalog_digest(
+    catalog: frozenset[str],
+    item_names_by_id: tuple[tuple[int, str], ...] = (),
+) -> str:
     digest = hashlib.sha256()
     for label in sorted(catalog):
         digest.update(label.encode("utf-8"))
+        digest.update(b"\0")
+    for item_id, name in item_names_by_id:
+        digest.update(str(item_id).encode("ascii"))
+        digest.update(b"=")
+        digest.update(name.encode("utf-8"))
         digest.update(b"\0")
     return digest.hexdigest()
 

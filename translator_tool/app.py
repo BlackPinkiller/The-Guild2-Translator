@@ -81,10 +81,11 @@ from .ai import (
     llm_provider_from_settings,
     provider_from_settings,
 )
-from .code_index import CodeReference, CodeReferenceIndex, CodeReferenceSet, label_group_key, normalize_label
+from .code_index import CodeReference, CodeReferenceIndex, CodeReferenceSet, normalize_label
 from .file_tree import FileTreeNode, build_file_tree
 from .code_index_lazy import LazyCodeIndexBuilder, LazyIndexProgress
 from .code_window_context import (
+    PreviewWindowButton,
     PreviewWindowContext,
     engine_window_context,
     engine_pair_preview_surface,
@@ -233,9 +234,12 @@ class UnitTableModel(QAbstractTableModel):
         self.units: list[TranslationUnit] = list(project.units) if project else []
         self._row_by_uid: dict[str, int] = {}
         self._units_by_file: dict[str, tuple[TranslationUnit, ...]] = {}
+        self._units_by_exact_label: dict[str, tuple[TranslationUnit, ...]] = {}
+        self._units_by_normalized_label: dict[str, tuple[TranslationUnit, ...]] = {}
         self._search: dict[str, str] = {}
         self._search_case_sensitive: dict[str, str] = {}
         self._format_warning: dict[str, bool] = {}
+        self._format_rank: dict[str, int] = {}
         self._glyph_warning: dict[str, bool] = {}
         self._recently_translated: set[str] = set()
         self._rebuild_indexes()
@@ -245,6 +249,7 @@ class UnitTableModel(QAbstractTableModel):
         self.project = project
         self.units = list(project.units)
         self._format_warning.clear()
+        self._format_rank.clear()
         self._glyph_warning.clear()
         self._recently_translated.clear()
         self._rebuild_indexes()
@@ -258,7 +263,10 @@ class UnitTableModel(QAbstractTableModel):
         self._search_case_sensitive.clear()
         self._row_by_uid.clear()
         self._units_by_file.clear()
+        self._units_by_exact_label.clear()
+        self._units_by_normalized_label.clear()
         self._format_warning.clear()
+        self._format_rank.clear()
         self._glyph_warning.clear()
         self._recently_translated.clear()
         self.endResetModel()
@@ -368,6 +376,7 @@ class UnitTableModel(QAbstractTableModel):
         self._search_case_sensitive[unit.uid] = raw_search
         self._search[unit.uid] = raw_search.casefold()
         self._format_warning.pop(unit.uid, None)
+        self._format_rank.pop(unit.uid, None)
         self._glyph_warning.pop(unit.uid, None)
         self.dataChanged.emit(self.index(row, 0), self.index(row, self.columnCount() - 1))
 
@@ -381,6 +390,7 @@ class UnitTableModel(QAbstractTableModel):
             self._search_case_sensitive[unit.uid] = raw_search
             self._search[unit.uid] = raw_search.casefold()
             self._format_warning.pop(unit.uid, None)
+            self._format_rank.pop(unit.uid, None)
             self._glyph_warning.pop(unit.uid, None)
             rows.append(row)
         if rows:
@@ -413,8 +423,20 @@ class UnitTableModel(QAbstractTableModel):
         if unit is None:
             return False
         if unit.uid not in self._format_warning:
-            self._format_warning[unit.uid] = bool(unit.issues())
+            self._format_warning[unit.uid] = any(issue.needs_action for issue in unit.active_issues())
         return self._format_warning[unit.uid]
+
+    def format_concern_rank(self, row: int) -> int:
+        unit = self.unit_at(row)
+        if unit is None:
+            return 4
+        if unit.uid not in self._format_rank:
+            levels = {issue.concern_level for issue in unit.active_issues()}
+            self._format_rank[unit.uid] = next(
+                (rank for rank, level in enumerate(("blocking", "action", "review", "info")) if level in levels),
+                4,
+            )
+        return self._format_rank[unit.uid]
 
     def has_glyph_warning(self, row: int) -> bool:
         unit = self.unit_at(row)
@@ -430,14 +452,31 @@ class UnitTableModel(QAbstractTableModel):
     def units_for_file(self, file_rel: str) -> tuple[TranslationUnit, ...]:
         return self._units_by_file.get(file_rel, ())
 
+    def units_for_exact_label(self, label: str) -> tuple[TranslationUnit, ...]:
+        return self._units_by_exact_label.get(label, ())
+
+    def units_for_normalized_label(self, label: str) -> tuple[TranslationUnit, ...]:
+        return self._units_by_normalized_label.get(normalize_label(label), ())
+
     def _rebuild_indexes(self) -> None:
         self._row_by_uid = {unit.uid: index for index, unit in enumerate(self.units)}
         self._search_case_sensitive = {unit.uid: _search_blob(unit) for unit in self.units}
         self._search = {uid: text.casefold() for uid, text in self._search_case_sensitive.items()}
         units_by_file: dict[str, list[TranslationUnit]] = {}
+        units_by_exact_label: dict[str, list[TranslationUnit]] = {}
+        units_by_normalized_label: dict[str, list[TranslationUnit]] = {}
         for unit in self.units:
             units_by_file.setdefault(unit.file_rel, []).append(unit)
+            if unit.label:
+                units_by_exact_label.setdefault(unit.label, []).append(unit)
+                units_by_normalized_label.setdefault(normalize_label(unit.label), []).append(unit)
         self._units_by_file = {file_rel: tuple(units) for file_rel, units in units_by_file.items()}
+        self._units_by_exact_label = {
+            label: tuple(units) for label, units in units_by_exact_label.items()
+        }
+        self._units_by_normalized_label = {
+            label: tuple(units) for label, units in units_by_normalized_label.items()
+        }
 
     def retranslate(self) -> None:
         if self.columnCount() > 0:
@@ -533,7 +572,7 @@ class UnitFilterProxyModel(QSortFilterProxyModel):
             status = unit.display_status()
             key = (status_rank.get(status, 99), status.casefold(), *text_tie)
         elif column == UnitTableModel.FORMAT:
-            key = (0 if source.has_format_warning(source_row) else 1, *text_tie)
+            key = (source.format_concern_rank(source_row), *text_tie)
         elif column == UnitTableModel.AI:
             can_translate = bool(
                 unit.source_text
@@ -4691,9 +4730,28 @@ class TranslatorWindow(QMainWindow):
         if cached is not None:
             return cached
 
-        def render(candidate: TranslationUnit | str | None) -> PreviewDocument | None:
+        def render(candidate: TranslationUnit | PreviewWindowButton | str | None) -> PreviewDocument | None:
             if candidate is None:
                 return None
+            if isinstance(candidate, PreviewWindowButton):
+                text = candidate.text
+                if candidate.label:
+                    text = (
+                        self.preview_service.localization.resolve_label(candidate.label, target)
+                        or candidate.label
+                    )
+                return self.preview_service.render(
+                    text,
+                    unit_key=(
+                        f"{unit.uid}:button:{candidate.label or candidate.identifier or candidate.icon_asset}"
+                    ),
+                    label=candidate.label or unit.label,
+                    file_rel=unit.file_rel,
+                    kind=unit.ref.kind,
+                    target=target,
+                    references=context_references or self._code_references_for_unit(unit),
+                    selected_label=unit.label,
+                )
             if isinstance(candidate, str):
                 return self.preview_service.render(
                     candidate,
@@ -4703,6 +4761,7 @@ class TranslatorWindow(QMainWindow):
                     kind=unit.ref.kind,
                     target=target,
                     references=context_references or self._code_references_for_unit(unit),
+                    selected_label=unit.label,
                 )
             text = candidate.current_text if target else candidate.source_text
             if target and not text:
@@ -4715,6 +4774,7 @@ class TranslatorWindow(QMainWindow):
                 kind=candidate.ref.kind,
                 target=target,
                 references=context_references or self._code_references_for_unit(candidate),
+                selected_label=unit.label,
             )
 
         image = self.preview_service.game_window_image(
@@ -4742,7 +4802,7 @@ class TranslatorWindow(QMainWindow):
         PreviewWindowContext | None,
         TranslationUnit | None,
         TranslationUnit | None,
-        tuple[TranslationUnit | str, ...],
+        tuple[TranslationUnit | PreviewWindowButton | str, ...],
         tuple[CodeReference, ...],
     ]:
         selection = select_preview_context(
@@ -4768,6 +4828,12 @@ class TranslatorWindow(QMainWindow):
                         else context.body_label
                     ),
                 )
+            elif TranslatorWindow._is_tooltip_record_pair(header_unit, body_unit):
+                context = surface_window_context(
+                    "tooltip",
+                    header_label=normalize_label(header_unit.label) if header_unit is not None else "",
+                    body_label=normalize_label(body_unit.label) if body_unit is not None else "",
+                )
             elif TranslatorWindow._is_name_tooltip_pair(header_unit, body_unit):
                 context = surface_window_context(
                     engine_pair_preview_surface(unit.label),
@@ -4777,15 +4843,16 @@ class TranslatorWindow(QMainWindow):
             return context, header_unit, body_unit, (), selection.references
         header_unit = self._unit_for_context_label(unit, context.header_label)
         body_unit = self._unit_for_context_label(unit, context.body_label)
-        button_units: list[TranslationUnit | str] = []
+        button_units: list[TranslationUnit | PreviewWindowButton | str] = []
         for button in context.buttons:
             candidate = self._unit_for_context_label(unit, button.label)
             if candidate is not None:
                 button_units.append(candidate)
-            elif button.text:
-                button_units.append(button.text)
-            elif button.identifier:
-                button_units.append(button.identifier)
+            else:
+                # Keep the whole descriptor so the renderer can resolve a
+                # base-game label per language.  identifier is a return value
+                # (for example M/S/0), never visible button text.
+                button_units.append(button)
         if header_unit is None and body_unit is None and not button_units:
             header_unit, body_unit = self._paired_preview_units(unit)
         if header_unit is None and body_unit is None:
@@ -4810,44 +4877,84 @@ class TranslatorWindow(QMainWindow):
     def _unit_for_normalized_label(self, file_rel: str, label: str) -> TranslationUnit | None:
         if not label:
             return None
-        labels = [label]
-        if label.startswith("_"):
-            labels.append(label[1:])
-        else:
-            labels.append("_" + label)
+        raw_label = label.strip()
+        if raw_label.startswith("@L_"):
+            raw_label = raw_label[3:]
+        exact_labels = [raw_label]
+        if "*" not in raw_label and re.search(r"_[+][A-Za-z0-9]+$", raw_label) is None:
+            exact_labels.append(raw_label + "_+0")
+        exact_labels.extend(
+            candidate[1:] if candidate.startswith("_") else "_" + candidate
+            for candidate in tuple(exact_labels)
+        )
+        exact_keys = set(exact_labels)
+        file_units = tuple(TranslatorWindow._preview_units_for_file(self, file_rel))
+        for candidate in file_units:
+            if candidate.label in exact_keys:
+                return candidate
+        exact_lookup = getattr(self.model, "units_for_exact_label", None)
+        if callable(exact_lookup):
+            for exact_label in exact_labels:
+                found = exact_lookup(exact_label)
+                if found:
+                    return found[0]
+
+        normalized_label = normalize_label(label)
+        canonical_labels = [normalized_label]
+        if "*" not in normalized_label and re.search(r"_[+][a-z0-9]+$", normalized_label) is None:
+            canonical_labels.append(normalized_label + "_+0")
+        alternate_labels = [
+            candidate[1:] if candidate.startswith("_") else "_" + candidate
+            for candidate in canonical_labels
+        ]
+        labels = list(dict.fromkeys((*canonical_labels, *alternate_labels)))
         wildcard_patterns = [
             re.compile("^" + re.escape(candidate).replace("\\*", "[a-z0-9_]+") + "$")
             for candidate in labels
             if "*" in candidate
         ]
-        label_groups = {group for candidate in labels if (group := label_group_key(candidate)) is not None}
-        fallback: TranslationUnit | None = None
-        for candidate in TranslatorWindow._preview_units_for_file(self, file_rel):
+        file_matches: list[TranslationUnit] = []
+        for candidate in file_units:
             normalized = normalize_label(candidate.label)
             if normalized in labels:
-                return candidate
+                file_matches.append(candidate)
             if any(pattern.match(normalized) for pattern in wildcard_patterns):
                 return candidate
-            if fallback is None and label_group_key(normalized) in label_groups:
-                fallback = candidate
-        if fallback is not None:
-            return fallback
+        if file_matches:
+            return file_matches[0] if len({candidate.label for candidate in file_matches}) == 1 else None
+
+        normalized_lookup = getattr(self.model, "units_for_normalized_label", None)
+        if callable(normalized_lookup) and not wildcard_patterns:
+            matches = [candidate for key in labels for candidate in normalized_lookup(key)]
+            if matches:
+                return matches[0] if len({candidate.label for candidate in matches}) == 1 else None
         for candidate in self.model.units:
             normalized = normalize_label(candidate.label)
             if normalized in labels:
-                return candidate
+                file_matches.append(candidate)
             if any(pattern.match(normalized) for pattern in wildcard_patterns):
                 return candidate
-            if fallback is None and label_group_key(normalized) in label_groups:
-                fallback = candidate
-        if fallback is not None:
-            return fallback
-        return None
+        return file_matches[0] if len({candidate.label for candidate in file_matches}) == 1 else None
 
     def _paired_preview_units(
         self,
         unit: TranslationUnit,
     ) -> tuple[TranslationUnit | None, TranslationUnit | None]:
+        if (
+            Path(unit.file_rel).name.casefold() == "tooltips.dbt"
+            and unit.ref.source_field in {"title", "description"}
+        ):
+            row_key = unit.ref.row_key
+            paired: dict[str, TranslationUnit | None] = {"title": None, "description": None}
+            for candidate in TranslatorWindow._preview_units_for_file(self, unit.file_rel):
+                if (
+                    candidate.label == unit.label
+                    and candidate.ref.row_key == row_key
+                    and candidate.ref.source_field in paired
+                ):
+                    paired[candidate.ref.source_field] = candidate
+            paired[unit.ref.source_field] = unit
+            return paired["title"], paired["description"]
         onscreen = re.match(r"^(.*?)(NAME|DESCRIPTION|TOOLTIP)(_[+]\d+)?$", unit.label, re.IGNORECASE)
         if onscreen is not None and "ONSCREENHELP" in unit.label.upper():
             prefix, kind, suffix = onscreen.groups()
@@ -4924,11 +5031,18 @@ class TranslatorWindow(QMainWindow):
         file_rel: str,
         labels: tuple[str, ...],
     ) -> TranslationUnit | None:
-        keys = {TranslatorWindow._preview_label_key(label) for label in labels if label}
-        for candidate in units:
-            if candidate.file_rel == file_rel and TranslatorWindow._preview_label_key(candidate.label) in keys:
+        candidates = tuple(candidate for candidate in units if candidate.file_rel == file_rel)
+        exact_labels = {label for label in labels if label}
+        for candidate in candidates:
+            if candidate.label in exact_labels:
                 return candidate
-        return None
+        keys = {TranslatorWindow._preview_label_key(label) for label in labels if label}
+        matches = [
+            candidate
+            for candidate in candidates
+            if TranslatorWindow._preview_label_key(candidate.label) in keys
+        ]
+        return matches[0] if len({candidate.label for candidate in matches}) == 1 else None
 
     @staticmethod
     def _preview_unit_for_role(
@@ -4937,18 +5051,25 @@ class TranslatorWindow(QMainWindow):
         prefix: str,
         role: str,
     ) -> TranslationUnit | None:
-        prefix_key = TranslatorWindow._preview_label_key(prefix)
+        candidates = tuple(candidate for candidate in units if candidate.file_rel == file_rel)
         role_value = role.casefold()
-        for candidate in units:
-            if candidate.file_rel != file_rel:
+        for candidate in candidates:
+            match = re.match(r"^(.*?)(NAME|TOOLTIP)(_[+]\d+)?$", candidate.label, re.IGNORECASE)
+            if match is None:
                 continue
+            candidate_prefix, candidate_role, _ = match.groups()
+            if candidate_role.casefold() == role_value and candidate_prefix == prefix:
+                return candidate
+        prefix_key = TranslatorWindow._preview_label_key(prefix)
+        matches: list[TranslationUnit] = []
+        for candidate in candidates:
             match = re.match(r"^(.*?)(NAME|TOOLTIP)(_[+]\d+)?$", candidate.label, re.IGNORECASE)
             if match is None:
                 continue
             candidate_prefix, candidate_role, _ = match.groups()
             if candidate_role.casefold() == role_value and TranslatorWindow._preview_label_key(candidate_prefix) == prefix_key:
-                return candidate
-        return None
+                matches.append(candidate)
+        return matches[0] if len({candidate.label for candidate in matches}) == 1 else None
 
     @staticmethod
     def _preview_label_key(label: str) -> str:
@@ -4961,6 +5082,19 @@ class TranslatorWindow(QMainWindow):
         return bool(
             re.match(r"^.*NAME(_[+]\d+)?$", header_unit.label, re.IGNORECASE)
             and re.match(r"^.*TOOLTIP(_[+]\d+)?$", body_unit.label, re.IGNORECASE)
+        )
+
+    @staticmethod
+    def _is_tooltip_record_pair(header_unit: TranslationUnit | None, body_unit: TranslationUnit | None) -> bool:
+        if header_unit is None or body_unit is None:
+            return False
+        return bool(
+            Path(header_unit.file_rel).name.casefold() == "tooltips.dbt"
+            and header_unit.file_rel == body_unit.file_rel
+            and header_unit.label == body_unit.label
+            and header_unit.ref.row_key == body_unit.ref.row_key
+            and header_unit.ref.source_field == "title"
+            and body_unit.ref.source_field == "description"
         )
 
     def _refresh_preview_presentations(self) -> None:
@@ -5331,17 +5465,15 @@ class TranslatorWindow(QMainWindow):
         self.current_uid = ""
         self._filter_anchor_uid = ""
         self.model.set_project(self.project)
-        self.preview_service.set_project_localization(
-            {
-                unit.label: unit.source_text
-                for unit in project.units
-                if unit.label
-            },
-            {
-                unit.label: unit.current_text
-                for unit in project.units
-                if unit.label
-            },
+        self.preview_service.set_project_localization_entries(
+            (
+                unit.uid,
+                unit.label,
+                unit.source_text,
+                unit.current_text,
+            )
+            for unit in project.units
+            if unit.label
         )
         self.translation_highlighter.set_glyph_codec(self.project.codec if ENABLE_FONT_GLYPH_VALIDATION else None)
         self._start_code_reference_index()
@@ -6118,6 +6250,7 @@ class TranslatorWindow(QMainWindow):
                     unit.label,
                     unit.source_text,
                     unit.current_text,
+                    unit_key=unit.uid,
                 )
         self._game_preview_cache.clear()
 
@@ -6204,6 +6337,48 @@ class TranslatorWindow(QMainWindow):
             self._show_ai_provider_menu(global_point)
             return
         units = self._selected_units()
+        menu, actions = self._build_table_menu(units)
+        action = menu.exec(global_point)
+        if action == actions["entry_history"]:
+            self.show_entry_history(unit)
+        elif action == actions["confirm_translated"]:
+            self._set_units_confirmed(units)
+        elif action == actions["need_work"]:
+            self._set_units_need_work(units, not bool(actions["need_work"].property("all_marked")))
+        elif action == actions["ignored"]:
+            self._set_units_ignored(units, not bool(actions["ignored"].property("all_marked")))
+        elif action == actions["format_confirmed"]:
+            self._set_units_format_confirmed(
+                units,
+                not bool(actions["format_confirmed"].property("all_marked")),
+            )
+        elif action == actions["copy_translation"]:
+            self._copy_unit_entries(units)
+        elif action == actions["restore"]:
+            self._replace_units_state(
+                units,
+                {item.uid: item.translate_text for item in units},
+                False,
+                translate("operation.restore_loaded"),
+            )
+        elif action == actions["source"]:
+            self._replace_units_state(units, {item.uid: item.source_text for item in units}, False, translate("operation.restore_source"))
+        elif action == actions["clear"]:
+            self._replace_units_state(units, {item.uid: "" for item in units}, False, translate("operation.clear_translation"))
+        elif action == actions["ai_translate"]:
+            self.translate_selected_units(units)
+        elif action == actions["llm_suggestion"]:
+            self.request_llm_suggestion(unit.uid)
+        elif action == actions["delete_mark"]:
+            self._set_units_pending_delete(
+                units,
+                not bool(actions["delete_mark"].property("all_marked")),
+            )
+
+    def _build_table_menu(
+        self,
+        units: list[TranslationUnit],
+    ) -> tuple[QMenu, dict[str, QAction]]:
         count = len(units)
         suffix = translate("menu.selection_suffix", count=count) if count > 1 else ""
         can_delete_all = bool(units) and all(item.can_delete_translation() for item in units)
@@ -6213,68 +6388,72 @@ class TranslatorWindow(QMainWindow):
         all_ignored = bool(units) and all(item.ignored for item in units)
         can_mark_review = bool(units) and all(not item.is_extra for item in units)
         can_confirm = can_mark_review and all(item.current_text for item in units)
+        format_candidates = tuple(
+            item for item in units if any(issue.acknowledgeable for issue in item.issues())
+        )
+        all_format_confirmed = bool(format_candidates) and all(
+            item.format_differences_confirmed() for item in format_candidates
+        )
         menu = QMenu(self)
-        menu.addSection(translate("menu.entry_status"))
-        confirm_translated = menu.addAction(translate("menu.confirm_translated", suffix=suffix))
+        actions: dict[str, QAction] = {}
+
+        actions["copy_translation"] = menu.addAction(translate("menu.copy_selected_translation", suffix=suffix))
+
+        ai_menu = menu.addMenu(translate("menu.ai_service"))
+        actions["ai_translate"] = ai_menu.addAction(translate("menu.ai_translate_selected", suffix=suffix))
+        actions["llm_suggestion"] = ai_menu.addAction(translate("menu.llm_suggestion"))
+        actions["llm_suggestion"].setEnabled(count == 1)
+
+        status_menu = menu.addMenu(translate("menu.entry_status"))
+        confirm_translated = status_menu.addAction(translate("menu.confirm_translated", suffix=suffix))
+        actions["confirm_translated"] = confirm_translated
         confirm_translated.setEnabled(can_confirm)
-        need_work = menu.addAction(
+        need_work = status_menu.addAction(
             translate("menu.unmark_need_work", suffix=suffix)
             if all_need_work
             else translate("menu.mark_need_work", suffix=suffix)
         )
+        actions["need_work"] = need_work
+        need_work.setProperty("all_marked", all_need_work)
         need_work.setEnabled(can_mark_review)
-        ignored = menu.addAction(
+        ignored = status_menu.addAction(
             translate("menu.unmark_ignored", suffix=suffix)
             if all_ignored
             else translate("menu.mark_ignored", suffix=suffix)
         )
+        actions["ignored"] = ignored
+        ignored.setProperty("all_marked", all_ignored)
         ignored.setEnabled(can_mark_review)
-        menu.addSection(translate("menu.translation_edit"))
-        entry_history = menu.addAction(translate("menu.entry_history"))
-        entry_history.setEnabled(count == 1 and self.git is not None and self.git_ready)
-        copy_translation = menu.addAction(translate("menu.copy_selected_translation", suffix=suffix))
-        restore = menu.addAction(translate("menu.restore_loaded", suffix=suffix))
-        source = menu.addAction(translate("menu.restore_source", suffix=suffix))
-        clear = menu.addAction(translate("menu.clear_translation", suffix=suffix))
-        menu.addSection(translate("menu.ai_service"))
-        ai_translate = menu.addAction(translate("menu.ai_translate_selected", suffix=suffix))
-        llm_suggestion = menu.addAction(translate("menu.llm_suggestion"))
-        llm_suggestion.setEnabled(count == 1)
-        menu.addSection(translate("menu.delete_cleanup"))
-        delete_mark = menu.addAction(
+
+        format_menu = menu.addMenu(translate("menu.format_check"))
+        format_confirmed = format_menu.addAction(
+            translate("menu.unconfirm_format_differences", suffix=suffix)
+            if all_format_confirmed
+            else translate("menu.confirm_format_differences", suffix=suffix)
+        )
+        actions["format_confirmed"] = format_confirmed
+        format_confirmed.setProperty("all_marked", all_format_confirmed)
+        format_confirmed.setEnabled(bool(format_candidates))
+
+        edit_menu = menu.addMenu(translate("menu.translation_edit"))
+        actions["restore"] = edit_menu.addAction(translate("menu.restore_loaded", suffix=suffix))
+        actions["source"] = edit_menu.addAction(translate("menu.restore_source", suffix=suffix))
+        actions["clear"] = edit_menu.addAction(translate("menu.clear_translation", suffix=suffix))
+        edit_menu.addSeparator()
+        delete_mark = edit_menu.addAction(
             translate("menu.unmark_delete", suffix=suffix)
             if all_pending_delete
             else translate("menu.mark_delete", suffix=suffix)
         )
+        actions["delete_mark"] = delete_mark
+        delete_mark.setProperty("all_marked", all_pending_delete)
         delete_mark.setEnabled(can_toggle_delete)
-        action = menu.exec(global_point)
-        if action == entry_history:
-            self.show_entry_history(unit)
-        elif action == confirm_translated:
-            self._set_units_confirmed(units)
-        elif action == need_work:
-            self._set_units_need_work(units, not all_need_work)
-        elif action == ignored:
-            self._set_units_ignored(units, not all_ignored)
-        elif action == copy_translation:
-            self._copy_unit_entries(units)
-        elif action == restore:
-            self._replace_units_state(
-                units,
-                {item.uid: item.translate_text for item in units},
-                False,
-                translate("operation.restore_loaded"),
-            )
-        elif action == source:
-            self._replace_units_state(units, {item.uid: item.source_text for item in units}, False, translate("operation.restore_source"))
-        elif action == clear:
-            self._replace_units_state(units, {item.uid: "" for item in units}, False, translate("operation.clear_translation"))
-        elif action == ai_translate:
-            self.translate_selected_units(units)
-        elif action == llm_suggestion:
-            self.request_llm_suggestion(unit.uid)
-        elif action == delete_mark:
-            self._set_units_pending_delete(units, not all_pending_delete)
+
+        menu.addSeparator()
+        entry_history = menu.addAction(translate("menu.entry_history"))
+        actions["entry_history"] = entry_history
+        entry_history.setEnabled(count == 1 and self.git is not None and self.git_ready)
+        return menu, actions
 
     def _select_context_row(self, index: QModelIndex) -> None:
         """Keep an existing multi-selection intact when opening its context menu."""
@@ -6379,6 +6558,21 @@ class TranslatorWindow(QMainWindow):
         self.project.set_units_confirmed(selected, True)
         self._refresh_unit_metadata(selected)
         self.statusBar().showMessage(translate("status.confirmed_translated", count=len(selected)), 3000)
+
+    def _set_units_format_confirmed(self, units: Iterable[TranslationUnit], confirmed: bool) -> None:
+        if self.project is None:
+            return
+        changed = self.project.set_units_format_confirmed(tuple(units), confirmed)
+        if not changed:
+            return
+        self._refresh_unit_metadata(changed)
+        self.statusBar().showMessage(
+            translate(
+                "status.format_differences_confirmed" if confirmed else "status.format_differences_unconfirmed",
+                count=len(changed),
+            ),
+            3000,
+        )
 
     def _set_units_need_work(self, units: Iterable[TranslationUnit], need_work: bool) -> None:
         if self.project is None:
@@ -6746,8 +6940,8 @@ class TranslatorWindow(QMainWindow):
         format_warning_count = sum(
             1
             for unit in result.saved_units
-            for issue in unit.issues()
-            if not issue.blocks_save
+            for issue in unit.active_issues()
+            if issue.needs_action
         )
         if not result.changed_files:
             if result.deleted_units:
@@ -7048,21 +7242,31 @@ class TranslatorWindow(QMainWindow):
         if unit.pending_delete:
             self.issue_label.setText(translate("issue.pending_delete"))
             return
-        issues = unit.issues()
+        raw_issues = unit.issues()
+        format_confirmed = unit.format_differences_confirmed(raw_issues)
+        issues = unit.active_issues()
         errors = [issue.message for issue in issues if issue.blocks_save]
-        warnings = [issue.message for issue in issues if not issue.blocks_save]
+        actions = [issue.message for issue in issues if issue.concern_level == "action"]
+        reviews = [issue.message for issue in issues if issue.concern_level == "review"]
+        information = [issue.message for issue in issues if issue.concern_level == "info"]
         parts = []
         if unit.ref.kind == "text" and issues:
             parts.append(translate("issue.document_scope"))
         summary = _format_diff_text(unit)
         if summary != translate("issue.format_ok"):
             parts.append(translate("issue.summary_prefix", text=summary))
+        if format_confirmed and issues:
+            parts.append(translate("issue.format_confirmed"))
         if unit.filter_status() == STATUS_TODO and unit.todo_reason:
             parts.append(translate("issue.todo_reason_prefix", text=todo_reason_text(unit.todo_reason)))
         if errors:
             parts.append(translate("issue.error_prefix", text=_localized_detail_join(errors)))
-        if warnings:
-            parts.append(translate("issue.warning_prefix", text=_localized_detail_join(warnings)))
+        if actions:
+            parts.append(translate("issue.action_prefix", text=_localized_detail_join(actions)))
+        if reviews:
+            parts.append(translate("issue.review_prefix", text=_localized_detail_join(reviews)))
+        if information:
+            parts.append(translate("issue.info_prefix", text=_localized_detail_join(information)))
         if unit.is_dirty:
             parts.append(translate("issue.unsaved"))
         self.issue_label.setText("   ·   ".join(parts) if parts else translate("issue.format_ok"))
@@ -7496,7 +7700,7 @@ def _render_history_html(commits_oldest_first: tuple[GitCommit, ...], entries: l
 
 
 def _issue_badge(unit: TranslationUnit) -> str:
-    issues = unit.issues()
+    issues = unit.active_issues()
     errors = sum(issue.blocks_save for issue in issues)
     warnings = len(issues) - errors
     if errors:
@@ -7534,26 +7738,21 @@ def _counter_tokens(counter: Counter[str]) -> list[str]:
     return values
 
 
-FORMAT_INFO_CODES = {"source-format-suspect", "format-fallback"}
-FORMAT_ERROR_CODES = {"unknown-format", "dbt-quote"}
-
-
 def _format_indicator(unit: TranslationUnit) -> tuple[str, str]:
-    issues = unit.issues()
+    raw_issues = unit.issues()
+    issues = unit.active_issues()
+    if unit.format_differences_confirmed(raw_issues) and not issues:
+        return "✓", translate("format.summary.confirmed")
     if not issues:
         return "✓", translate("format.summary.ok")
-    if any(issue.blocks_save for issue in issues):
+    levels = {issue.concern_level for issue in issues}
+    if "blocking" in levels:
         return "!", translate("format.summary.blocking")
-
-    codes = {issue.code for issue in issues}
-    if (
-        any(code in FORMAT_ERROR_CODES or code.startswith("argument-") for code in codes)
-        or any(issue.code == "font-glyph" for issue in issues)
-    ):
-        return "!", translate("format.summary.high")
-    if codes and codes.issubset(FORMAT_INFO_CODES):
-        return "~", translate("format.summary.source_suspect")
-    return "?", translate("format.summary.warning")
+    if "action" in levels:
+        return "!", translate("format.summary.action")
+    if "review" in levels:
+        return "?", translate("format.summary.review")
+    return "~", translate("format.summary.info")
 
 
 def _format_diff_text(unit: TranslationUnit) -> str:
@@ -7578,7 +7777,7 @@ def _format_diff_tooltip(unit: TranslationUnit) -> str:
         lines.append(translate("format.tooltip.diff", text=difference))
     issue_lines = [
         issue.message
-        for issue in unit.issues()
+        for issue in unit.active_issues()
         if issue.code not in {"format-missing", "format-extra", "format-color-missing", "format-color-extra"}
     ]
     if issue_lines:
@@ -7590,6 +7789,8 @@ def _format_tokens_for_diff(text: str, dialect: str = FORMAT_GUILD2) -> Counter[
     tokens = format_tokens(text, dialect=dialect)
     if dialect == FORMAT_GUILD2:
         tokens.pop("$N", None)
+        for token in ("%", "%%", "%>", "%<"):
+            tokens.pop(token, None)
         for token in [value for value in tokens if value.startswith("$[")]:
             del tokens[token]
     return tokens

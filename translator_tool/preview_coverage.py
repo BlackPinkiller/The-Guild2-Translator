@@ -10,7 +10,7 @@ from .preview_placeholders import (
     placeholder_reference_complete,
     placeholder_reference_score,
 )
-from .script_semantics import call_contract
+from .script_semantics import SEMANTIC_EXPRESSION, call_contract
 
 
 @dataclass(frozen=True)
@@ -120,8 +120,7 @@ def preview_reference_coverage(index: CodeReferenceIndex) -> PreviewReferenceCov
             resolved_runtime_positions += sum(
                 1
                 for position in range(len(reference.runtime_arguments))
-                if position < len(reference.runtime_argument_values)
-                and bool(reference.runtime_argument_values[position])
+                if _position_has_resolved_runtime_value(reference, position)
             )
     return PreviewReferenceCoverage(
         indexed_labels=len(labels),
@@ -245,11 +244,38 @@ def _runtime_evidence(
     kinds: list[str] = []
     position = number - 1
     for reference in references:
-        if position < len(reference.runtime_argument_values):
-            values.extend(str(value) for value in reference.runtime_argument_values[position])
-        if position < len(reference.runtime_argument_kinds):
-            kinds.extend(str(kind) for kind in reference.runtime_argument_kinds[position])
+        position_values = (
+            reference.runtime_argument_values[position]
+            if position < len(reference.runtime_argument_values)
+            else ()
+        )
+        position_kinds = (
+            reference.runtime_argument_kinds[position]
+            if position < len(reference.runtime_argument_kinds)
+            else ()
+        )
+        for index, value in enumerate(position_values):
+            kind = str(position_kinds[index]) if index < len(position_kinds) else ""
+            if kind != SEMANTIC_EXPRESSION:
+                values.append(str(value))
+                if kind:
+                    kinds.append(kind)
     return tuple(dict.fromkeys(values)), tuple(dict.fromkeys(kinds))
+
+
+def _position_has_resolved_runtime_value(reference: CodeReference, position: int) -> bool:
+    if position >= len(reference.runtime_argument_values):
+        return False
+    values = reference.runtime_argument_values[position]
+    kinds = (
+        reference.runtime_argument_kinds[position]
+        if position < len(reference.runtime_argument_kinds)
+        else ()
+    )
+    return any(
+        index >= len(kinds) or kinds[index] != SEMANTIC_EXPRESSION
+        for index, _value in enumerate(values)
+    )
 
 
 def _is_display_reference(reference: CodeReference) -> bool:

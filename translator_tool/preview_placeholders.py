@@ -3,10 +3,11 @@ from __future__ import annotations
 from dataclasses import dataclass
 from decimal import Decimal, InvalidOperation
 from functools import lru_cache
+from pathlib import Path
 import re
 from typing import Protocol
 
-from .code_index import dynamic_label_patterns, normalize_label
+from .code_index import dynamic_label_patterns, normalize_label, runtime_label_argument_number
 from .engine_semantics import (
     ENGINE_BUILDING,
     ENGINE_CHARACTER,
@@ -186,6 +187,7 @@ class PlaceholderContext:
     locale: str
     references: tuple[object, ...] = ()
     argument_suffixes: tuple[tuple[int, tuple[str, ...]], ...] = ()
+    selected_label: str = ""
 
     @property
     def seed_key(self) -> str:
@@ -389,8 +391,10 @@ class PlaceholderValueBuilder:
         if suffix in {"", "l", "s"}:
             if (
                 suffix == "l"
-                and _runtime_argument_kinds(number, context)
-                == {SEMANTIC_DYNASTY_CREST}
+                and (
+                    _runtime_argument_kinds(number, context)
+                    - {SEMANTIC_STRUCTURE}
+                ) == {SEMANTIC_DYNASTY_CREST}
             ):
                 dynasty = self.entities.dynasty(number, context)
                 return PlaceholderValue(GLYPH_MARK, dynasty.crest_glyph_id)
@@ -547,6 +551,22 @@ def _stable_index(seed: str, size: int) -> int:
 
 
 def _semantic_kind(number: int, context: PlaceholderContext) -> str:
+    runtime_kind_names = {
+        SEMANTIC_BUILDING: "building",
+        SEMANTIC_CHARACTER: "character",
+        SEMANTIC_DYNASTY: "dynasty",
+        SEMANTIC_SETTLEMENT: "city",
+        SEMANTIC_VEHICLE: "vehicle",
+    }
+    runtime_kinds = {
+        runtime_kind_names[kind]
+        for kind in _runtime_argument_kinds(number, context)
+        if kind in runtime_kind_names
+    }
+    if len(runtime_kinds) == 1:
+        return next(iter(runtime_kinds))
+    if len(runtime_kinds) > 1:
+        return ""
     kinds: set[str] = set()
     for reference in context.references:
         for expression in _placeholder_expressions(reference, number):
@@ -664,6 +684,17 @@ def _plain_name_expression_kind(expression: str) -> str:
     object is a sim, building, or settlement.
     """
     lowered = expression.casefold()
+    identifier = re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", expression.strip())
+    if identifier is not None:
+        direct_name = identifier.group(0).casefold()
+        if direct_name in {"settlement", "settlementid", "city", "cityid"}:
+            return "city"
+        if direct_name in {"building", "buildingid", "workbuilding", "workbuildingid"}:
+            return "building"
+        if direct_name in {"dynasty", "dynastyid"}:
+            return "dynasty"
+        if direct_name in {"sim", "simid", "character", "characterid", "person", "personid"}:
+            return "character"
     if "getsettlement" in lowered or "citylabel" in lowered:
         return "city"
     if "workbuilding" in lowered or "getbuilding" in lowered:
@@ -735,7 +766,7 @@ def _parse_scalar_literal(expression: str, suffix: str) -> tuple[object, str] | 
     stripped = expression.strip()
     if suffix == "s":
         value = _quoted_scalar_text(stripped)
-        if value is None or value.startswith("@L_"):
+        if value is None or _compact_or_standard_label(value):
             return None
         return ("string", value), value
 
@@ -868,9 +899,11 @@ def _literal_localization_label(expression: str) -> str:
     if ".." in stripped:
         return ""
     value = stripped.strip('"').strip("'")
-    if not value.startswith("@L_"):
-        return ""
-    return value[3:].lstrip("_")
+    if value.startswith("@L_"):
+        return value[3:].lstrip("_")
+    if _compact_or_standard_label(value):
+        return value[2:].lstrip("_")
+    return ""
 
 
 def _is_button_argument(expression: str) -> bool:
@@ -906,6 +939,14 @@ def _localized_argument_value(
     context: PlaceholderContext,
 ) -> str:
     for reference in context.references:
+        value = _selected_runtime_label_value(
+            localization,
+            reference,
+            number,
+            context,
+        )
+        if value:
+            return value
         expression = _placeholder_expression(reference, number)
         value = _localized_expression_value(localization, expression, number, context)
         if not value:
@@ -920,6 +961,21 @@ def _localized_argument_value(
         if value:
             return value
     return ""
+
+
+def _selected_runtime_label_value(
+    localization: PlaceholderLocalization,
+    reference: object,
+    number: int,
+    context: PlaceholderContext,
+) -> str:
+    """Bind a cross-entry preview's selected label to its proven argument slot."""
+    selected_label = context.selected_label
+    if not selected_label or getattr(reference, "role", "") != "runtime_label":
+        return ""
+    if runtime_label_argument_number(reference, selected_label) != number:
+        return ""
+    return _resolved_label_value(localization, selected_label, context.target)
 
 
 def _plain_string_argument_value(
@@ -988,7 +1044,17 @@ def _localized_runtime_argument_value(
             else ""
         )
         if str(candidate) == "":
-            values.append((kind, "\u200b"))
+            if not kind or kind == SEMANTIC_STRUCTURE:
+                values.append((kind, "\u200b"))
+            else:
+                sample = _semantic_runtime_sample(
+                    localization,
+                    kind,
+                    number,
+                    context,
+                )
+                if sample:
+                    values.append((kind, sample))
             continue
         if str(candidate) == "$N":
             values.append((kind, " "))
@@ -1001,12 +1067,16 @@ def _localized_runtime_argument_value(
         )
         if (
             not value
-            and re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", str(candidate))
+            and re.fullmatch(
+                r"[A-Za-z_][A-Za-z0-9_]*(?:(?:_\+|\+)[A-Za-z0-9]+)?",
+                str(candidate),
+            )
         ):
-            label = str(candidate)
-            localized = localization.localized(label, context.target)
-            if localized and localized != label:
-                value = localized
+            value = _resolved_label_value(
+                localization,
+                str(candidate),
+                context.target,
+            )
         if not value:
             return ""
         values.append((kind, value))
@@ -1019,8 +1089,29 @@ def _localized_runtime_argument_value(
     )
     if len(meaningful_values) == 1:
         return meaningful_values[0]
+    if len(meaningful_values) > 1:
+        return _alternative_preview(meaningful_values)
     unique_values = tuple(dict.fromkeys(value for _kind, value in values))
     return unique_values[0] if len(unique_values) == 1 else ""
+
+
+def _semantic_runtime_sample(
+    localization: PlaceholderLocalization,
+    kind: str,
+    number: int,
+    context: PlaceholderContext,
+) -> str:
+    if kind == SEMANTIC_CHARACTER:
+        return localization.character_name(context.seed_key, number, context.target)
+    if kind == SEMANTIC_BUILDING:
+        return PlaceholderEntityResolver(localization).building(number, context).proper_name
+    if kind == SEMANTIC_SETTLEMENT:
+        return _city_value(localization, number, context)
+    if kind == SEMANTIC_DYNASTY:
+        return PlaceholderEntityResolver(localization).dynasty(number, context).name
+    if kind == SEMANTIC_VEHICLE:
+        return translate("preview.value.vehicle", locale=context.locale)
+    return ""
 
 
 def _localized_expression_value(
@@ -1031,16 +1122,16 @@ def _localized_expression_value(
 ) -> str:
     contextual = _contextual_dynamic_label(expression, context.label)
     if contextual:
-        value = localization.localized(contextual, context.target)
-        if value and value != contextual:
+        value = _resolved_label_value(localization, contextual, context.target)
+        if value:
             return value
     labels = _literal_label_candidates(expression)
     if labels:
         contextual_label = _matching_context_label(labels, context.label)
         if len(labels) == 1 or contextual_label:
             label = contextual_label or labels[0]
-            value = localization.localized(label, context.target)
-            if value and value != label:
+            value = _resolved_label_value(localization, label, context.target)
+            if value:
                 return value
             sample = _wildcard_label_sample(
                 localization,
@@ -1075,6 +1166,33 @@ def _wildcard_label_sample(
     )
 
 
+def _resolved_label_value(
+    localization: PlaceholderLocalization,
+    label: str,
+    target: bool,
+) -> str:
+    resolver = getattr(localization, "resolve_label", None)
+    if callable(resolver):
+        resolved = str(resolver(label, target) or "")
+        if resolved:
+            return resolved
+    value = localization.localized(label, target)
+    if value and value != label:
+        return value
+    if "*" not in label and re.search(r"_\+[A-Za-z0-9]+$", label) is None:
+        suffixed = label + "_+0"
+        value = localization.localized(suffixed, target)
+        if value and value != suffixed:
+            return value
+    return ""
+
+
+def _alternative_preview(values: tuple[str, ...], limit: int = 2) -> str:
+    visible = values[:limit]
+    result = " / ".join(visible)
+    return result + " / ..." if len(values) > limit else result
+
+
 def _localized_variable_value(
     localization: PlaceholderLocalization,
     reference: object,
@@ -1103,7 +1221,7 @@ def _localized_variable_value(
     if len(resolved_values) == 1:
         return resolved_values[0]
     if len(resolved_values) > 1:
-        return ""
+        return _alternative_preview(tuple(resolved_values))
     path = getattr(reference, "path", None)
     line = getattr(reference, "line", None)
     if path is None or not isinstance(line, int):
@@ -1111,17 +1229,17 @@ def _localized_variable_value(
     labels, dynamic_samples = _variable_label_sources(str(path), line, variable)
     values: list[str] = []
     for label in labels:
-        value = localization.localized(label, context.target)
-        if value and value != label:
+        value = _resolved_label_value(localization, label, context.target)
+        if value:
             values.append(value)
     for prefix, suffix in dynamic_samples:
         value = localization.sample_label(prefix, suffix, context.seed_key, number, context.target)
         if value:
             values.append(value)
     values = list(dict.fromkeys(values))
-    if len(values) != 1:
-        return ""
-    return values[0]
+    if len(values) == 1:
+        return values[0]
+    return _alternative_preview(tuple(values)) if values else ""
 
 
 def _contextual_dynamic_label(expression: str, context_label: str) -> str:
@@ -1147,11 +1265,30 @@ def _wildcard_label_matches(pattern: str, label: str) -> bool:
     return re.match(regex, label, re.IGNORECASE) is not None
 
 
-@lru_cache(maxsize=2048)
 def _variable_label_sources(path: str, line: int, variable: str) -> tuple[tuple[str, ...], tuple[tuple[str, str], ...]]:
     try:
-        text = open(path, "r", encoding="utf-8", errors="ignore").read()
+        stat = Path(path).stat()
     except OSError:
+        return (), ()
+    return _variable_label_sources_cached(
+        path,
+        stat.st_mtime_ns,
+        stat.st_size,
+        line,
+        variable,
+    )
+
+
+@lru_cache(maxsize=2048)
+def _variable_label_sources_cached(
+    path: str,
+    mtime_ns: int,
+    size: int,
+    line: int,
+    variable: str,
+) -> tuple[tuple[str, ...], tuple[tuple[str, str], ...]]:
+    text = _preview_code_text(path, mtime_ns, size)
+    if text is None:
         return (), ()
     prefix = "\n".join(text.splitlines()[: max(0, line - 1)])
     assignment_re = re.compile(
@@ -1169,6 +1306,16 @@ def _variable_label_sources(path: str, line: int, variable: str) -> tuple[tuple[
             if sample not in dynamic_samples:
                 dynamic_samples.append(sample)
     return tuple(labels), tuple(dynamic_samples)
+
+
+@lru_cache(maxsize=256)
+def _preview_code_text(path: str, mtime_ns: int, size: int) -> str | None:
+    """Read each script fingerprint once across all placeholder lookups."""
+    del mtime_ns, size
+    try:
+        return Path(path).read_text(encoding="utf-8", errors="ignore")
+    except OSError:
+        return None
 
 
 def _dynamic_sample_candidates(expression: str) -> tuple[tuple[str, str], ...]:
@@ -1190,11 +1337,13 @@ def _dynamic_sample_candidates(expression: str) -> tuple[tuple[str, str], ...]:
 def _literal_label_candidates(expression: str) -> tuple[str, ...]:
     labels: list[str] = []
     for match in _LABEL_LITERAL_RE.finditer(expression):
-        label = match.group(1) or match.group(2)
+        label = match.group(1) or match.group(2) or match.group(3)
         if not label:
             continue
         if label.startswith("@L_"):
             label = "_" + label[3:].lstrip("_")
+        elif label.startswith("@L"):
+            label = "_" + label[2:].lstrip("_")
         elif not label.startswith("_"):
             label = "_" + label
         if label not in labels:
@@ -1203,9 +1352,20 @@ def _literal_label_candidates(expression: str) -> tuple[str, ...]:
 
 
 _LABEL_LITERAL_RE = re.compile(
-    r"(@L_[A-Za-z0-9_*]+_\+[A-Za-z0-9*]+)|"
+    r"(@L_[A-Za-z0-9_*]+_\+[A-Za-z0-9*]+|@L_[A-Za-z0-9_*]+)|"
+    r"(@L[A-Za-z][A-Za-z0-9_]*(?:(?:_\+|\+)[A-Za-z0-9]+)?)|"
     r"(?<![A-Za-z0-9])(_[A-Za-z0-9_*]+_\+[A-Za-z0-9*]+)"
 )
+
+
+def _compact_or_standard_label(value: str) -> bool:
+    return bool(
+        value.startswith("@L_")
+        or re.fullmatch(
+            r"@L[A-Za-z][A-Za-z0-9_]*(?:(?:_\+|\+)[A-Za-z0-9]+)?",
+            value,
+        )
+    )
 
 
 def _related_office_value(

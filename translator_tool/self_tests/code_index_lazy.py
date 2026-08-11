@@ -9,6 +9,64 @@ from .. import code_index_lazy as lazy_module
 from ..code_index_lazy import LazyCodeIndexBuilder
 
 
+def assert_lazy_code_index_loads_effective_item_id_ranges() -> None:
+    temp = Path(tempfile.mkdtemp(prefix="translator_tool_item_ranges_"))
+    try:
+        game = temp / "game"
+        project = temp / "sources" / "Reforged"
+        scripts = game / "mods" / "Reforged" / "Scripts"
+        scripts.mkdir(parents=True)
+        project.mkdir(parents=True)
+        base_items = game / "DB" / "Items.dbt"
+        mod_items = game / "mods" / "Reforged" / "DB" / "Items.dbt"
+        base_items.parent.mkdir(parents=True)
+        mod_items.parent.mkdir(parents=True)
+        base_items.write_text(
+            'Table Description:\n"id" INT -1 |"name" STRING 0 |\nData:\n'
+            '241 "Iron" |\n242 "Silver" |\n',
+            encoding="utf-8",
+        )
+        mod_items.write_text(
+            'Table Description:\n"id" INT -1 |"name" STRING 0 |\nData:\n'
+            '241 "TemperedIron" |\n242 "~" |\n243 "Gold" |\n',
+            encoding="utf-8",
+        )
+        script = scripts / "ItemRange.lua"
+        script.write_text(
+            "\n".join(
+                (
+                    "function Run()",
+                    "  local ItemID = RuntimeItem()",
+                    "  if ItemID == 241 or ItemID == 242 or ItemID == 243 then",
+                    '    MsgQuick("", "@L_ITEM_RANGE_BODY_+0", ItemGetLabel(ItemID, true))',
+                    "  end",
+                    "end",
+                )
+            ),
+            encoding="utf-8",
+        )
+        builder = LazyCodeIndexBuilder(
+            game,
+            project,
+            cache_path=temp / "cache.json",
+        )
+        index = builder.analyze_labels(("ITEM_RANGE_BODY_+0",))
+        builder.close()
+        references = index.references_for("ITEM_RANGE_BODY_+0").project
+        if len(references) != 1 or references[0].runtime_argument_values != (
+            (
+                "_ITEM_TemperedIron_NAME_+0",
+                "_ITEM_Silver_NAME_+0",
+                "_ITEM_Gold_NAME_+0",
+            ),
+        ):
+            raise AssertionError(
+                f"the lazy index did not load the effective mod item ID range: {references!r}"
+            )
+    finally:
+        shutil.rmtree(temp, ignore_errors=True)
+
+
 def assert_lazy_code_index_prioritizes_requested_labels_and_invalidates_cache() -> None:
     temp = Path(tempfile.mkdtemp(prefix="translator_tool_lazy_code_index_"))
     original_revision = lazy_module.ANALYZER_REVISION
@@ -246,7 +304,15 @@ def assert_lazy_code_index_loads_cached_value_providers() -> None:
             encoding="utf-8",
         )
         (scripts / "caller.lua").write_text(
-            'function Main() MsgQuick("", "@L_LAZY_VALUE_BODY_+0", helper_MakeValues("BREAD")) end',
+            "\n".join(
+                (
+                    "function Main()",
+                    '    MsgQuick("", "@L_LAZY_VALUE_BODY_+0", helper_MakeValues("BREAD"))',
+                    '    local LocalLabel = helper_MakeValues("WINE")',
+                    '    MsgQuick("", "@L_LAZY_LOCAL_VALUE_BODY_+0", LocalLabel)',
+                    "end",
+                )
+            ),
             encoding="utf-8",
         )
         (scripts / "unrelated.lua").write_text(
@@ -255,7 +321,7 @@ def assert_lazy_code_index_loads_cached_value_providers() -> None:
         )
         cache_path = temp / "cache.json"
         cold = LazyCodeIndexBuilder(game, project, cache_path=cache_path)
-        index = cold.analyze_labels(("LAZY_VALUE_BODY_+0",))
+        index = cold.analyze_labels(("LAZY_VALUE_BODY_+0", "LAZY_LOCAL_VALUE_BODY_+0"))
         resolved = next(
             (
                 item
@@ -271,6 +337,12 @@ def assert_lazy_code_index_loads_cached_value_providers() -> None:
             raise AssertionError(
                 f"targeted lazy analysis lost semantic value types: {resolved!r}"
             )
+        if not any(
+            item.runtime_argument_values == (("@L_ITEM_WINE_NAME_+0",),)
+            and item.runtime_argument_kinds == (("label",),)
+            for item in index.references_for("LAZY_LOCAL_VALUE_BODY_+0").project
+        ):
+            raise AssertionError("targeted lazy analysis lost a provider hidden by a local variable")
         if cold.progress.analyzed != 2:
             raise AssertionError(
                 f"value-provider analysis scanned unrelated files: {cold.progress!r}"
@@ -282,7 +354,7 @@ def assert_lazy_code_index_loads_cached_value_providers() -> None:
 
         lazy_module.analyze_code_file = fail_if_reparsed
         warm = LazyCodeIndexBuilder(game, project, cache_path=cache_path)
-        cached = warm.analyze_labels(("LAZY_VALUE_BODY_+0",))
+        cached = warm.analyze_labels(("LAZY_VALUE_BODY_+0", "LAZY_LOCAL_VALUE_BODY_+0"))
         if not any(
             item.runtime_argument_values
             == (("@L_ITEM_BREAD_NAME_+0",), ("Tail",))
@@ -290,6 +362,12 @@ def assert_lazy_code_index_loads_cached_value_providers() -> None:
             for item in cached.references_for("LAZY_VALUE_BODY_+0").project
         ):
             raise AssertionError("warm cache did not restore and link function value summaries")
+        if not any(
+            item.runtime_argument_values == (("@L_ITEM_WINE_NAME_+0",),)
+            and item.runtime_argument_kinds == (("label",),)
+            for item in cached.references_for("LAZY_LOCAL_VALUE_BODY_+0").project
+        ):
+            raise AssertionError("warm cache did not relink a locally assigned provider value")
         warm.close()
     finally:
         lazy_module.analyze_code_file = original_analyze_code_file

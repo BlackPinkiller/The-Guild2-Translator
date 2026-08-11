@@ -54,6 +54,19 @@ def confirmed_uids(root: Path, language: str) -> set[str]:
     return _uid_set(root, language, "confirmed")
 
 
+def format_confirmations(root: Path, language: str) -> dict[str, str]:
+    cache = load_cache(root)
+    language_data = cache.get("languages", {}).get(language, {})
+    values = language_data.get("format_confirmations", {}) if isinstance(language_data, dict) else {}
+    if not isinstance(values, dict):
+        return {}
+    return {
+        str(uid): fingerprint
+        for uid, fingerprint in values.items()
+        if isinstance(fingerprint, str) and fingerprint
+    }
+
+
 def _uid_set(root: Path, language: str, key: str) -> set[str]:
     cache = load_cache(root)
     language_data = cache.get("languages", {}).get(language, {})
@@ -85,6 +98,43 @@ def set_need_work_many(root: Path, language: str, uids: list[str] | tuple[str, .
 
 def set_confirmed_many(root: Path, language: str, uids: list[str] | tuple[str, ...], confirmed: bool) -> None:
     _set_uid_set_many(root, language, "confirmed", uids, confirmed)
+
+
+def update_format_confirmations(
+    root: Path,
+    language: str,
+    updates: Mapping[str, str | None],
+) -> None:
+    """Persist a batch of content-bound format acknowledgements atomically."""
+    if not updates:
+        return
+    cache = load_cache(root)
+    languages = cache.setdefault("languages", {})
+    language_data = languages.setdefault(language, {})
+    if not isinstance(language_data, dict):
+        language_data = {}
+        languages[language] = language_data
+    raw = language_data.get("format_confirmations", {})
+    current = (
+        {
+            str(uid): fingerprint
+            for uid, fingerprint in raw.items()
+            if isinstance(fingerprint, str) and fingerprint
+        }
+        if isinstance(raw, dict)
+        else {}
+    )
+    updated = dict(current)
+    for uid, fingerprint in updates.items():
+        key = str(uid)
+        if fingerprint:
+            updated[key] = fingerprint
+        else:
+            updated.pop(key, None)
+    if updated == current and raw == updated:
+        return
+    language_data["format_confirmations"] = dict(sorted(updated.items()))
+    save_cache(root, cache)
 
 
 def _set_uid_set_many(root: Path, language: str, key: str, uids: list[str] | tuple[str, ...], enabled: bool) -> None:

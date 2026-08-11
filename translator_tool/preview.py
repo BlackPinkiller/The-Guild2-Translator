@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from collections.abc import Iterable
 from dataclasses import dataclass
 import base64
 import hashlib
@@ -366,6 +367,42 @@ def _document_text(document: PreviewDocument | None) -> str:
     return document.display_text.replace(PREVIEW_MARK, "").replace(GLYPH_MARK, "##")
 
 
+def _measure_choice_root_and_slots(
+    info: GuiResourceInfo | None,
+    button_count: int,
+) -> tuple[tuple[int, int], tuple[int, ...]]:
+    """Expand the three-slot GUI template for every InitData button."""
+    root_width, root_height = (
+        info.root_size
+        if info is not None and info.root_size
+        else (255, 115)
+    )
+    slot_nodes = sorted(
+        (
+            node
+            for node in (info.nodes if info is not None else ())
+            if re.fullmatch(r"Slot\d+", node.name, re.IGNORECASE)
+            and node.x is not None
+        ),
+        key=lambda node: int(re.search(r"\d+", node.name).group(0)),
+    )
+    lefts = [int(node.x) for node in slot_nodes]
+    if not lefts:
+        lefts = [46, 99, 152]
+    positive_steps = [
+        right - left
+        for left, right in zip(lefts, lefts[1:])
+        if right > left
+    ]
+    spacing = positive_steps[0] if positive_steps else 53
+    while len(lefts) < max(0, button_count):
+        lefts.append(lefts[-1] + spacing)
+    template_slot_count = max(3, len(slot_nodes))
+    extra_slots = max(0, button_count - template_slot_count)
+    root_width += extra_slots * spacing
+    return (root_width, root_height), tuple(lefts[:button_count])
+
+
 def _line_visual_units(line: str) -> float:
     total = 0.0
     for char in line:
@@ -657,6 +694,8 @@ class GameUiAtlas:
 
 
 class GameLocalization:
+    MAX_LABEL_PATTERN_CACHE = 256
+
     def __init__(self, game_root: Path | None, target_language: str) -> None:
         self.game_root = game_root
         self.target_language = target_language
@@ -668,6 +707,8 @@ class GameLocalization:
         self.surname_keys: tuple[str, ...] = ()
         self.profession_keys_by_class: dict[str, tuple[str, ...]] = {}
         self.office_keys: tuple[str, ...] = ()
+        self._label_keys_by_casefold: dict[str, str] = {}
+        self._label_pattern_cache: dict[str, tuple[str, ...]] = {}
         self._label_record_cache: dict[
             tuple[str, tuple[str, ...]],
             tuple[tuple[str, tuple[str, ...]], ...],
@@ -708,6 +749,7 @@ class GameLocalization:
         self._game_target = self._read_labels(languages / folder / "Text.dbt") if folder else {}
         self.source = dict(self._game_source)
         self.target = dict(self._game_target)
+        self._rebuild_label_indexes()
         self._refresh_name_keys()
         self._load_character_metadata()
 
@@ -718,7 +760,7 @@ class GameLocalization:
     ) -> None:
         self.source = {**self._game_source, **source}
         self.target = {**self._game_target, **target}
-        self._label_record_cache.clear()
+        self._rebuild_label_indexes()
         self._refresh_name_keys()
         self._load_character_metadata()
 
@@ -730,9 +772,18 @@ class GameLocalization:
     ) -> None:
         self.source[label] = source
         self.target[label] = target
+        self._label_keys_by_casefold.setdefault(label.casefold(), label)
+        self._label_pattern_cache.clear()
         self._label_record_cache.clear()
         if label.startswith("_NAMES_"):
             self._refresh_name_keys()
+
+    def _rebuild_label_indexes(self) -> None:
+        self._label_keys_by_casefold = {}
+        for key in sorted({*self.source, *self.target}, key=lambda value: (value.casefold(), value)):
+            self._label_keys_by_casefold.setdefault(key.casefold(), key)
+        self._label_pattern_cache.clear()
+        self._label_record_cache.clear()
 
     def _refresh_name_keys(self) -> None:
         keys = tuple(sorted(key for key in self.source if key.startswith("_NAMES_")))
@@ -802,6 +853,41 @@ class GameLocalization:
             return self.target.get(label) or self.source.get(label) or label
         return self.source.get(label) or label
 
+    def resolve_label(self, label: str, target: bool) -> str:
+        """Resolve a proven label key, allowing only format-neutral key variants."""
+        raw_label = label.strip()
+        if raw_label.startswith("@L_"):
+            raw_label = raw_label[3:]
+        candidates = [raw_label]
+        if "*" not in raw_label and re.search(r"_\+[A-Za-z0-9]+$", raw_label) is None:
+            candidates.append(raw_label + "_+0")
+        candidates.extend(
+            candidate[1:] if candidate.startswith("_") else "_" + candidate
+            for candidate in tuple(candidates)
+        )
+        for candidate in dict.fromkeys(candidates):
+            if "*" in candidate:
+                prefix, suffix = candidate.split("*", 1)
+                sampled = self.sample_label(
+                    prefix,
+                    suffix,
+                    raw_label,
+                    0,
+                    target,
+                )
+                if sampled:
+                    return sampled
+                continue
+            key = candidate if candidate in self.source or candidate in self.target else ""
+            if not key:
+                key = self._label_keys_by_casefold.get(candidate.casefold(), "")
+            if not key:
+                continue
+            if target:
+                return self.target.get(key) or self.source.get(key) or key
+            return self.source.get(key) or key
+        return ""
+
     def character_name(self, unit_key: str, number: int, target: bool, *, forename_only: bool = False) -> str:
         first, surname, _ = self.character_name_parts(unit_key, number, target)
         if forename_only or not surname:
@@ -821,17 +907,26 @@ class GameLocalization:
         return first, surname, gender
 
     def sample_label(self, prefix: str, suffix: str, unit_key: str, number: int, target: bool) -> str:
-        keys = tuple(
-            sorted(
-                key
-                for key, value in self.source.items()
-                if key.startswith(prefix)
-                and key.endswith(suffix)
-                and value
-                and "_ATHMO_" not in key
-                and "_TEMPLATE_" not in key
+        pattern = prefix + "*" + suffix
+        keys = self._label_pattern_cache.get(pattern)
+        if keys is None:
+            regex = re.compile(
+                "^" + re.escape(pattern).replace(r"\*", ".*") + "$",
+                re.IGNORECASE,
             )
-        )
+            keys = tuple(
+                sorted(
+                    key
+                    for key, value in self.source.items()
+                    if regex.match(key)
+                    and value
+                    and "_ATHMO_" not in key
+                    and "_TEMPLATE_" not in key
+                )
+            )
+            if len(self._label_pattern_cache) >= self.MAX_LABEL_PATTERN_CACHE:
+                self._label_pattern_cache.clear()
+            self._label_pattern_cache[pattern] = keys
         key = self._pick(keys, f"{unit_key}:{number}:{prefix}:{suffix}")
         return self.localized(key, target) if key else ""
 
@@ -916,6 +1011,8 @@ class GameLocalization:
 
 
 class PreviewService:
+    MAX_RENDER_CACHE = 2048
+
     def __init__(
         self,
         game_root: Path | None = None,
@@ -930,10 +1027,14 @@ class PreviewService:
         self._localization: GameLocalization | None = None
         self._project_source_labels: dict[str, str] = {}
         self._project_target_labels: dict[str, str] = {}
+        self._project_label_owners: dict[str, str] = {}
         self._atlases: dict[bool, GameGlyphAtlas | None] = {}
         self._ui_atlas: GameUiAtlas | None = None
         self._ui_image_cache: dict[str, QImage | None] = {}
-        self._render_cache: dict[tuple[str, str, str, str, bool, tuple[object, ...], str], PreviewDocument] = {}
+        self._render_cache: dict[
+            tuple[str, str, str, str, bool, tuple[object, ...], str, str],
+            PreviewDocument,
+        ] = {}
         self._scaled_glyph_cache: dict[tuple[int, float, int], QImage] = {}
         self._system_glyph_cache: dict[tuple[str, float, int, str], QImage] = {}
         self._translation_font_ids: list[int] = []
@@ -941,6 +1042,16 @@ class PreviewService:
         self._translation_font_key = ""
         self._translation_font_checked = False
         self._translation_font_check_after = 0.0
+
+    def _store_render_document(
+        self,
+        key: tuple[str, str, str, str, bool, tuple[object, ...], str, str],
+        document: PreviewDocument,
+    ) -> PreviewDocument:
+        if len(self._render_cache) >= self.MAX_RENDER_CACHE and key not in self._render_cache:
+            self._render_cache.clear()
+        self._render_cache[key] = document
+        return document
 
     def configure(
         self,
@@ -992,6 +1103,7 @@ class PreviewService:
     ) -> None:
         self._project_source_labels = dict(source)
         self._project_target_labels = dict(target)
+        self._project_label_owners.clear()
         if self._localization is not None:
             self._localization.set_project_labels(
                 self._project_source_labels,
@@ -999,12 +1111,44 @@ class PreviewService:
             )
         self._render_cache.clear()
 
+    def set_project_localization_entries(
+        self,
+        entries: Iterable[tuple[str, str, str, str]],
+    ) -> None:
+        """Install one deterministic localization owner per exact label.
+
+        A Tooltips.dbt record exposes both ``title`` and ``description`` with
+        the same key.  Keeping the first project-order unit prevents the
+        placeholder dictionary from switching meaning when either field is
+        edited; the record preview still renders both fields directly.
+        """
+        source: dict[str, str] = {}
+        target: dict[str, str] = {}
+        owners: dict[str, str] = {}
+        for unit_key, label, source_text, target_text in entries:
+            if not label or label in owners:
+                continue
+            owners[label] = unit_key
+            source[label] = source_text
+            target[label] = target_text
+        self._project_source_labels = source
+        self._project_target_labels = target
+        self._project_label_owners = owners
+        if self._localization is not None:
+            self._localization.set_project_labels(source, target)
+        self._render_cache.clear()
+
     def update_project_localization(
         self,
         label: str,
         source: str,
         target: str,
+        *,
+        unit_key: str = "",
     ) -> None:
+        owner = self._project_label_owners.get(label)
+        if owner is not None and unit_key and owner != unit_key:
+            return
         self._project_source_labels[label] = source
         self._project_target_labels[label] = target
         if self._localization is not None:
@@ -1029,6 +1173,7 @@ class PreviewService:
         target: bool,
         references: tuple[object, ...] = (),
         argument_suffixes: tuple[tuple[int, tuple[str, ...]], ...] = (),
+        selected_label: str = "",
     ) -> tuple[str, int | None]:
         return self._placeholder_argument_value(
             unit_key,
@@ -1039,6 +1184,7 @@ class PreviewService:
             target,
             references,
             argument_suffixes,
+            selected_label,
         )
 
     def _named_value(
@@ -1059,6 +1205,7 @@ class PreviewService:
         target: bool,
         references: tuple[object, ...] = (),
         argument_suffixes: tuple[tuple[int, tuple[str, ...]], ...] = (),
+        selected_label: str = "",
     ) -> PlaceholderContext:
         return PlaceholderContext(
             label=label,
@@ -1067,6 +1214,7 @@ class PreviewService:
             locale=self.locale(target),
             references=references,
             argument_suffixes=argument_suffixes,
+            selected_label=selected_label,
         )
 
     def _placeholder_builder(self) -> PlaceholderValueBuilder:
@@ -1082,6 +1230,7 @@ class PreviewService:
         target: bool,
         references: tuple[object, ...] = (),
         argument_suffixes: tuple[tuple[int, tuple[str, ...]], ...] = (),
+        selected_label: str = "",
     ) -> tuple[str, int | None]:
         value = self._placeholder_builder().argument_value(
             number,
@@ -1092,6 +1241,7 @@ class PreviewService:
                 target,
                 references,
                 argument_suffixes,
+                selected_label,
             ),
         )
         return value.text, value.glyph_id
@@ -1125,10 +1275,12 @@ class PreviewService:
         kind: str,
         target: bool,
         references: tuple[object, ...] = (),
+        selected_label: str = "",
     ) -> PreviewDocument:
         self._refresh_standard_font()
         references = select_preview_context(text, references, label).references
-        key = (unit_key, label, file_rel, kind, target, references, text)
+        selected_label = selected_label or label
+        key = (unit_key, label, file_rel, kind, target, references, selected_label, text)
         cached = self._render_cache.get(key)
         if cached is not None:
             return cached
@@ -1149,14 +1301,20 @@ class PreviewService:
                 document.display_to_raw,
                 profile.line_height_percent,
             )
-            self._render_cache[key] = document
-            return document
-        compiler = _PreviewCompiler(self, unit_key, label, file_rel, target, dialect, references, profile)
+            return self._store_render_document(key, document)
+        compiler = _PreviewCompiler(
+            self,
+            unit_key,
+            label,
+            file_rel,
+            target,
+            dialect,
+            references,
+            profile,
+            selected_label,
+        )
         document = compiler.compile(text)
-        if len(self._render_cache) >= 2048:
-            self._render_cache.clear()
-        self._render_cache[key] = document
-        return document
+        return self._store_render_document(key, document)
 
     def _atlas(self, target: bool) -> GameGlyphAtlas | None:
         if target in self._atlases:
@@ -1396,9 +1554,22 @@ class PreviewService:
         painter.setRenderHint(QPainter.RenderHint.SmoothPixmapTransform, True)
         painter.scale(output_scale, output_scale)
         logical_rect = QRect(0, 0, logical_width, logical_height)
+        gui_button_height = (
+            _estimated_buttons_height(buttons, logical_width)
+            if buttons
+            and context is not None
+            and context.kind != "measure_choice"
+            and _gui_document_node_names(context) is not None
+            else 0
+        )
+        gui_document_rect = (
+            QRect(0, 0, logical_width, max(1, logical_height - gui_button_height - 12))
+            if gui_button_height
+            else logical_rect
+        )
         self._draw_game_window_frame(painter, context, logical_rect)
         if not layout.preset_id:
-            self._draw_game_window_decoration(painter, context, logical_rect)
+            self._draw_game_window_decoration(painter, context, gui_document_rect)
         default_color = context.default_color if context is not None else DARK_PANEL_TEXT
         if layout.preset_id:
             self._draw_game_preset_documents(
@@ -1480,7 +1651,7 @@ class PreviewService:
             header,
             body,
             target=target,
-            rect=logical_rect,
+            rect=gui_document_rect,
             default_color=default_color,
         ):
             if buttons:
@@ -2438,14 +2609,15 @@ class PreviewService:
         rect: QRect,
         default_color: tuple[int, int, int, int],
     ) -> None:
-        """Draw InitData's real header and three measure slots.
+        """Draw InitData's real header and its repeated measure slots.
 
         ScriptDocumentation.html marks InitData's BodyLabel as obsolete, and
         panel_measurechoice.gui contains no body label, so body text is
         intentionally absent here.
         """
         info = self._game_window_gui_info(context)
-        root_size = info.root_size if info is not None and info.root_size else (255, 115)
+        root_size, slot_lefts = _measure_choice_root_and_slots(info, len(buttons))
+        base_root_size = info.root_size if info is not None and info.root_size else (255, 115)
         header_node = (
             gui_node_geometry(info, "LHeader")
             if info is not None
@@ -2453,6 +2625,9 @@ class PreviewService:
         )
         if header is not None and header_node is not None:
             header_rect = _scaled_gui_node_rect(header_node, root_size, rect)
+            if root_size[0] > base_root_size[0]:
+                header_rect.setLeft(rect.left())
+                header_rect.setRight(rect.right())
             self._draw_game_document(
                 painter,
                 header,
@@ -2482,15 +2657,10 @@ class PreviewService:
             if label is not None:
                 label_top = label.y
                 label_height = label.height
-        slot_lefts = (
-            0,
-            max(0, (root_width - slot_width) // 2),
-            max(0, root_width - slot_width),
-        )
         scale_x = rect.width() / max(1, root_width)
         scale_y = rect.height() / max(1, root_height)
         slot_asset = self.ui_image("Hud/nocompression/measurebutton.tga")
-        for index, button in enumerate(buttons[:3]):
+        for index, button in enumerate(buttons):
             x = slot_lefts[index]
             slot_rect = QRect(
                 rect.left() + round(x * scale_x),
@@ -2822,7 +2992,20 @@ class PreviewService:
         elif context is not None and context.kind == "pamphlet":
             candidates = ((504, 496), (620, 610))
         elif context is not None and context.kind == "measure_choice":
-            candidates = ((255, 115), (382, 172), (510, 230))
+            (root_width, root_height), _slot_lefts = _measure_choice_root_and_slots(
+                gui_info,
+                len(buttons),
+            )
+            scales = (1.0, 1.5, min(2.0, 720 / max(1, root_width)))
+            candidates = tuple(
+                dict.fromkeys(
+                    (
+                        max(1, round(root_width * scale)),
+                        max(1, round(root_height * scale)),
+                    )
+                    for scale in scales
+                )
+            )
         elif context is not None and context.kind == "tooltip":
             candidates = ((310, 30),)
         elif gui_driven and gui_geometry is not None:
@@ -2886,6 +3069,18 @@ class PreviewService:
             right_margin = 26 if dark_panel else 34
             body_scale = 0.78 if dark_panel else 0.85
         button_gap = 6
+
+        if buttons and gui_driven and context is not None and context.kind != "measure_choice":
+            width, content_height = candidates[-1]
+            button_height = _estimated_buttons_height(buttons, width)
+            return GameWindowLayout(
+                width,
+                min(720, content_height + button_height + 12),
+                top,
+                left_margin,
+                right_margin,
+                body_scale,
+            )
 
         standard_family = self._standard_font_family(target)
 
@@ -2990,6 +3185,17 @@ class PreviewService:
             result = candidate_layout(index, width, height)
             if result is not None:
                 return result
+
+        if buttons and (context is None or context.kind != "measure_choice"):
+            width, height = candidates[-1]
+            for expanded_height in range(height + 42, 721, 42):
+                result = candidate_layout(
+                    len(candidates) - 1,
+                    width,
+                    expanded_height,
+                )
+                if result is not None:
+                    return result
 
         width, height = candidates[-1]
         for adaptive_scale in (0.78, 0.72, 0.66, 0.60, 0.54, 0.50):
@@ -3529,6 +3735,17 @@ class PreviewService:
                 painter.fillRect(x, y, button_width, button_height, QColor(44, 72, 28, 230))
                 painter.setPen(QColor(180, 160, 80, 230))
                 painter.drawRect(x, y, button_width, button_height)
+            text_width = max(1, button_width - 20)
+            natural_text_width = self._estimated_preset_document_width(
+                button,
+                0.72,
+                target=target,
+            )
+            text_scale = (
+                0.72
+                if natural_text_width <= text_width
+                else max(0.42, 0.72 * text_width / max(1, natural_text_width))
+            )
             self._draw_game_document(
                 painter,
                 button,
@@ -3536,7 +3753,7 @@ class PreviewService:
                 top=y + 10,
                 left=x + 10,
                 right=x + button_width - 10,
-                scale=0.72,
+                scale=text_scale,
                 centered=True,
                 default_color=default_color,
                 single_line=True,
@@ -3673,6 +3890,7 @@ class _PreviewCompiler:
         dialect: str,
         references: tuple[object, ...] = (),
         profile: PreviewProfile | None = None,
+        selected_label: str = "",
     ) -> None:
         self.service = service
         self.unit_key = unit_key
@@ -3682,6 +3900,7 @@ class _PreviewCompiler:
         self.dialect = dialect
         self.references = references
         self.profile = profile or preview_profile(dialect)
+        self.selected_label = selected_label or label
         self.atoms: list[PreviewAtom] = []
         self.color: tuple[int, int, int, int] | None = None
         self.guide_rgb = {"r": 60, "g": 60, "b": 60}
@@ -3798,6 +4017,7 @@ class _PreviewCompiler:
                     self.dialect,
                     self.references,
                     self.profile,
+                    self.selected_label,
                 )
                 nested.color = self.color
                 nested_document = nested.compile(token[1:-1])
@@ -3828,6 +4048,7 @@ class _PreviewCompiler:
                 FORMAT_GUILD2,
                 self.references,
                 preview_profile(FORMAT_GUILD2),
+                self.selected_label,
             )
             nested.color = self.color
             nested_document = nested.compile(inner)
@@ -3913,6 +4134,7 @@ class _PreviewCompiler:
                     self.target,
                     self.references,
                     self.argument_suffixes,
+                    self.selected_label,
                 )
                 self._emit(
                     value,
@@ -3931,6 +4153,7 @@ class _PreviewCompiler:
                 self.target,
                 self.references,
                 self.argument_suffixes,
+                self.selected_label,
             )
             self._emit(
                 self._embedded_argument_text(value),
@@ -3969,6 +4192,7 @@ class _PreviewCompiler:
                     self.target,
                     self.references,
                     self.argument_suffixes,
+                    self.selected_label,
                 )
                 self._emit(value, start, split, replacement=True)
                 self._emit(GLYPH_MARK, split, end, replacement=True, glyph_id=2002)
@@ -3982,6 +4206,7 @@ class _PreviewCompiler:
                 self.target,
                 self.references,
                 self.argument_suffixes,
+                self.selected_label,
             )
             self._emit(value, start, end, replacement=True, glyph_id=glyph_id)
             return
