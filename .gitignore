@@ -26,6 +26,7 @@ AGENTS.md
 **/AGENTS.md
 
 # Python runtime files.
+.venv/
 __pycache__/
 *.py[cod]
 *.tmp

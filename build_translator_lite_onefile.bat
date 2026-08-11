@@ -1,51 +1,37 @@
 @echo off
-setlocal EnableExtensions
+setlocal EnableExtensions EnableDelayedExpansion
 cd /d "%~dp0"
 
 set "REBUILD_CHOICE="
 set /p "REBUILD_CHOICE=Rebuild? [Y/n]: "
 if /I "%REBUILD_CHOICE%"=="n" goto :build_skipped
+ver >nul
 
-set "PYTHON_CMD="
-py -3.12 -c "import sys; raise SystemExit(sys.version_info[:2] != (3, 12))" >nul 2>nul
-if not errorlevel 1 set "PYTHON_CMD=py -3.12"
-if defined PYTHON_CMD goto :python_found
-
-python -c "import sys; raise SystemExit(sys.version_info[:2] != (3, 12))" >nul 2>nul
-if not errorlevel 1 set "PYTHON_CMD=python"
-if defined PYTHON_CMD goto :python_found
-
-if exist "%LOCALAPPDATA%\Programs\Python\Python312\python.exe" (
-  set "PYTHON_CMD="%LOCALAPPDATA%\Programs\Python\Python312\python.exe""
-  goto :python_found
+if not exist ".venv\Scripts\python.exe" (
+  set "BOOTSTRAP_PYTHON=py -3.12"
+  if exist "%USERPROFILE%\.cache\codex-runtimes\codex-primary-runtime\dependencies\python\python.exe" set "BOOTSTRAP_PYTHON="%USERPROFILE%\.cache\codex-runtimes\codex-primary-runtime\dependencies\python\python.exe""
+  !BOOTSTRAP_PYTHON! -m venv .venv
+  if errorlevel 1 goto :failed
 )
 
-echo Python 3.12 was not found.
-goto :failed
+set "VENV_IS_PYTHON_312="
+".venv\Scripts\python.exe" -c "import sys; raise SystemExit(not sys.version_info[:2] == (3, 12))" >nul 2>nul && set "VENV_IS_PYTHON_312=1"
+if not defined VENV_IS_PYTHON_312 (
+  echo The local virtual environment must use Python 3.12.
+  goto :failed
+)
 
-:python_found
-if exist .build-venv rmdir /s /q .build-venv
-
-%PYTHON_CMD% -m venv .build-venv
+".venv\Scripts\python.exe" -m pip install -r requirements-build.txt
 if errorlevel 1 goto :failed
 
-call .build-venv\Scripts\activate.bat
-if errorlevel 1 goto :failed
-
-python -m pip install --upgrade pip
-if errorlevel 1 goto :failed
-
-python -m pip install --no-cache-dir "PyInstaller>=6.0" PySide6-Essentials
-if errorlevel 1 goto :failed
-
-python -m pip show PySide6-Essentials shiboken6
+".venv\Scripts\python.exe" -m pip show PyInstaller PySide6-Essentials shiboken6
 
 if exist build\dist rmdir /s /q build\dist
 if exist build\work rmdir /s /q build\work
 if exist build\spec rmdir /s /q build\spec
 if exist build\release rmdir /s /q build\release
 
-python -m PyInstaller ^
+".venv\Scripts\python.exe" -m PyInstaller ^
   --noconfirm ^
   --clean ^
   --windowed ^
