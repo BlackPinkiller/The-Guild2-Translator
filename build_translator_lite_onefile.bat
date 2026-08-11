@@ -2,9 +2,31 @@
 setlocal EnableExtensions
 cd /d "%~dp0"
 
+set "REBUILD_CHOICE="
+set /p "REBUILD_CHOICE=Rebuild? [Y/n]: "
+if /I "%REBUILD_CHOICE%"=="n" goto :build_skipped
+
+set "PYTHON_CMD="
+py -3.12 -c "import sys; raise SystemExit(sys.version_info[:2] != (3, 12))" >nul 2>nul
+if not errorlevel 1 set "PYTHON_CMD=py -3.12"
+if defined PYTHON_CMD goto :python_found
+
+python -c "import sys; raise SystemExit(sys.version_info[:2] != (3, 12))" >nul 2>nul
+if not errorlevel 1 set "PYTHON_CMD=python"
+if defined PYTHON_CMD goto :python_found
+
+if exist "%LOCALAPPDATA%\Programs\Python\Python312\python.exe" (
+  set "PYTHON_CMD="%LOCALAPPDATA%\Programs\Python\Python312\python.exe""
+  goto :python_found
+)
+
+echo Python 3.12 was not found.
+goto :failed
+
+:python_found
 if exist .build-venv rmdir /s /q .build-venv
 
-py -3.12 -m venv .build-venv
+%PYTHON_CMD% -m venv .build-venv
 if errorlevel 1 goto :failed
 
 call .build-venv\Scripts\activate.bat
@@ -61,7 +83,7 @@ if errorlevel 1 goto :failed
 
 mkdir build\release
 copy /Y build\dist\TheGuild2Translator.exe build\release\TheGuild2Translator.exe
-if errorlevel 8 goto :failed
+if errorlevel 1 goto :failed
 
 if exist build\TheGuild2Translator.zip del /f /q build\TheGuild2Translator.zip
 
@@ -72,6 +94,64 @@ echo.
 echo Build complete:
 echo   build\release\TheGuild2Translator.exe
 echo   build\TheGuild2Translator.zip
+goto :publish_prompt
+
+:build_skipped
+if not exist build\TheGuild2Translator.zip (
+  echo Existing build\TheGuild2Translator.zip was not found.
+  goto :failed
+)
+
+echo.
+echo Build skipped:
+echo   build\TheGuild2Translator.zip
+
+:publish_prompt
+echo.
+set "PUBLISH_CHOICE="
+set /p "PUBLISH_CHOICE=Publish to GitHub? [y/N]: "
+if /I not "%PUBLISH_CHOICE%"=="y" exit /b 0
+
+set "GH_CLI=gh"
+where gh >nul 2>nul
+if errorlevel 1 (
+  if exist "C:\Program Files\GitHub CLI\gh.exe" (
+    set "GH_CLI=C:\Program Files\GitHub CLI\gh.exe"
+  ) else (
+    echo GitHub CLI was not found.
+    goto :failed
+  )
+)
+
+for /f %%I in ('git rev-parse HEAD') do set "COMMIT_SHA=%%I"
+if not defined COMMIT_SHA goto :failed
+
+for /f %%I in ('git rev-parse --short HEAD') do set "SHORT_SHA=%%I"
+if not defined SHORT_SHA goto :failed
+
+for /f "delims=" %%I in ('"%GH_CLI%" repo view --json url --jq .url') do set "REPO_URL=%%I"
+if not defined REPO_URL goto :failed
+
+git push origin HEAD
+if errorlevel 1 goto :failed
+
+"%GH_CLI%" release view "build-%SHORT_SHA%" >nul 2>nul
+if errorlevel 1 (
+  "%GH_CLI%" release create "build-%SHORT_SHA%" ^
+    "build\TheGuild2Translator.zip#TheGuild2Translator.zip" ^
+    --target "%COMMIT_SHA%" ^
+    --title "TheGuild2Translator %SHORT_SHA%" ^
+    --notes "%REPO_URL%/commit/%COMMIT_SHA%"
+) else (
+  "%GH_CLI%" release upload "build-%SHORT_SHA%" ^
+    "build\TheGuild2Translator.zip#TheGuild2Translator.zip" ^
+    --clobber
+)
+if errorlevel 1 goto :failed
+
+echo.
+echo Published:
+"%GH_CLI%" release view "build-%SHORT_SHA%" --json url --jq .url
 exit /b 0
 
 :failed

@@ -4,6 +4,121 @@ from pathlib import Path
 
 from ..code_index import CodeReference
 from ..preview import GameLocalization, PreviewService
+from ..script_semantics import SEMANTIC_LABEL, SEMANTIC_LABEL_DOMAIN
+
+
+def assert_wildcard_runtime_slots_keep_distinct_identity() -> None:
+    service = PreviewService(None, "#chinese")
+    service.set_project_localization(
+        {
+            "_SCENARIO_WAR_ALPHA_+0": "Alpha Realm",
+            "_SCENARIO_WAR_BETA_+0": "Beta Realm",
+            "_SCENARIO_WAR_ALPHA_+2": "Alpha",
+            "_SCENARIO_WAR_BETA_+2": "Beta",
+            "_KR_KONTOR_NOCROWN_+0": "Unclaimed",
+        },
+        {
+            "_SCENARIO_WAR_ALPHA_+0": "阿尔法王国",
+            "_SCENARIO_WAR_BETA_+0": "贝塔王国",
+            "_SCENARIO_WAR_ALPHA_+2": "阿尔法",
+            "_SCENARIO_WAR_BETA_+2": "贝塔",
+            "_KR_KONTOR_NOCROWN_+0": "无归属",
+        },
+    )
+    reference = CodeReference(
+        "kr_visit_bribe_body_+0",
+        Path("statevisit.lua"),
+        295,
+        1,
+        "MsgBoxNoWait",
+        3,
+        runtime_arguments=(
+            "trade_RealmDisplayFull(rival)",
+            "bribe",
+            "trade_RealmDisplayFull(Slot)",
+        ),
+        runtime_argument_values=(
+            (
+                "@L_KR_KONTOR_NOCROWN_+0",
+                "@L_SCENARIO_WAR_*_+0",
+                "@L_SCENARIO_WAR_*_+2",
+            ),
+            (),
+            (
+                "@L_KR_KONTOR_NOCROWN_+0",
+                "@L_SCENARIO_WAR_*_+0",
+                "@L_SCENARIO_WAR_*_+2",
+            ),
+        ),
+        runtime_argument_kinds=(
+            ("label", "label", "label"),
+            ("number",),
+            ("label", "label", "label"),
+        ),
+        role="body",
+    )
+    rendered = service.render(
+        "%1l / %3l",
+        unit_key="kr-visit-bribe-body",
+        label="_KR_VISIT_BRIBE_BODY_+0",
+        file_rel="Kontor.dbt",
+        kind="dbt",
+        target=True,
+        references=(reference,),
+    ).display_text
+    realms = tuple(part.strip() for part in rendered.split("/"))
+    if len(realms) != 2 or not all(realms) or realms[0] == realms[1]:
+        raise AssertionError(
+            "different runtime slots from one label family collapsed to one preview object: "
+            f"{rendered!r}"
+        )
+
+
+def assert_database_label_domains_precede_guard_fallbacks() -> None:
+    service = PreviewService(None, "#chinese")
+    service.set_project_localization(
+        {
+            "_KR_KONTOR_NOCROWN_+0": "Unclaimed",
+            "_SCENARIO_WAR_spain_+2": "Castile",
+            "_SCENARIO_WAR_france_+2": "France",
+            "_SCENARIO_WAR_RANDOMTALK_+2": "It's cold, I want to go home...",
+        },
+        {},
+    )
+    reference = CodeReference(
+        "kr_permit_have_+0",
+        Path("Permit.lua"),
+        10,
+        1,
+        "MsgQuick",
+        1,
+        runtime_arguments=("trade_RealmDisplay(Realm)",),
+        runtime_argument_values=(
+            (
+                "@L_KR_KONTOR_NOCROWN_+0",
+                "@L_SCENARIO_WAR_spain_+2",
+                "@L_SCENARIO_WAR_france_+2",
+            ),
+        ),
+        runtime_argument_kinds=(
+            (SEMANTIC_LABEL, SEMANTIC_LABEL_DOMAIN, SEMANTIC_LABEL_DOMAIN),
+        ),
+        role="body",
+    )
+    rendered = service.render(
+        "Licence with %1l.",
+        unit_key="database-domain-preview",
+        label="_KR_PERMIT_HAVE_+0",
+        file_rel="Kontor.dbt",
+        kind="dbt",
+        target=False,
+        references=(reference,),
+    ).display_text
+    if rendered != "Licence with Castile.":
+        raise AssertionError(
+            "a proven database label domain did not precede its invalid-input fallback: "
+            f"{rendered!r}"
+        )
 
 
 def assert_preview_localization_fallback_keeps_selection_nonblocking() -> None:

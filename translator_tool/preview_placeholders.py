@@ -13,6 +13,8 @@ from .engine_semantics import (
     ENGINE_CHARACTER,
     ENGINE_DYNASTY,
     ENGINE_SETTLEMENT,
+    engine_format_argument_alias,
+    engine_format_argument_labels,
     engine_format_argument_kind,
 )
 from .i18n import translate
@@ -21,6 +23,8 @@ from .script_semantics import (
     SEMANTIC_CHARACTER,
     SEMANTIC_DYNASTY_CREST,
     SEMANTIC_DYNASTY,
+    SEMANTIC_LABEL,
+    SEMANTIC_LABEL_DOMAIN,
     SEMANTIC_SETTLEMENT,
     SEMANTIC_STRUCTURE,
     SEMANTIC_TEXT,
@@ -381,6 +385,9 @@ class PlaceholderValueBuilder:
         context: PlaceholderContext,
         _depth: int = 0,
     ) -> PlaceholderValue:
+        engine_alias = engine_format_argument_alias(context.label, number)
+        if engine_alias is not None and engine_alias != number:
+            return self.argument_value(engine_alias, suffix, context, _depth)
         if suffix.upper() in _CHARACTER_SUFFIXES:
             return PlaceholderValue(self.entities.character(number, context).project(suffix))
         if suffix == "DS":
@@ -400,6 +407,11 @@ class PlaceholderValueBuilder:
                 return PlaceholderValue(GLYPH_MARK, dynasty.crest_glyph_id)
             rendered = (
                 _plain_string_argument_value(number, context)
+                or _localized_engine_argument_value(
+                    self.localization,
+                    number,
+                    context,
+                )
                 if suffix == "s"
                 else _localized_argument_value(self.localization, number, context)
             )
@@ -960,6 +972,23 @@ def _localized_argument_value(
             value = _localized_variable_value(localization, reference, expression, number, context)
         if value:
             return value
+    return _localized_engine_argument_value(localization, number, context)
+
+
+def _localized_engine_argument_value(
+    localization: PlaceholderLocalization,
+    number: int,
+    context: PlaceholderContext,
+) -> str:
+    for label in engine_format_argument_labels(context.label, number):
+        value = _localized_expression_value(
+            localization,
+            label,
+            number,
+            context,
+        )
+        if value:
+            return value
     return ""
 
 
@@ -1037,7 +1066,8 @@ def _localized_runtime_argument_value(
         else ()
     )
     values: list[tuple[str, str]] = []
-    for index, candidate in enumerate(candidates):
+    for index in _runtime_candidate_preview_order(candidates, kinds):
+        candidate = candidates[index]
         kind = (
             str(kinds[index])
             if isinstance(kinds, tuple) and index < len(kinds)
@@ -1064,6 +1094,11 @@ def _localized_runtime_argument_value(
             str(candidate),
             number,
             context,
+            sample_number=_runtime_family_sample_number(
+                reference,
+                str(candidate),
+                number,
+            ),
         )
         if (
             not value
@@ -1119,7 +1154,10 @@ def _localized_expression_value(
     expression: str,
     number: int,
     context: PlaceholderContext,
+    *,
+    sample_number: int | None = None,
 ) -> str:
+    selection_number = number if sample_number is None else sample_number
     contextual = _contextual_dynamic_label(expression, context.label)
     if contextual:
         value = _resolved_label_value(localization, contextual, context.target)
@@ -1130,22 +1168,73 @@ def _localized_expression_value(
         contextual_label = _matching_context_label(labels, context.label)
         if len(labels) == 1 or contextual_label:
             label = contextual_label or labels[0]
-            value = _resolved_label_value(localization, label, context.target)
-            if value:
-                return value
-            sample = _wildcard_label_sample(
-                localization,
-                label,
-                number,
-                context,
-            )
-            if sample:
-                return sample
+            if "*" in label:
+                sample = _wildcard_label_sample(
+                    localization,
+                    label,
+                    selection_number,
+                    context,
+                )
+                if sample:
+                    return sample
+            else:
+                value = _resolved_label_value(localization, label, context.target)
+                if value:
+                    return value
     for prefix, suffix in _dynamic_sample_candidates(expression):
-        value = localization.sample_label(prefix, suffix, context.seed_key, number, context.target)
+        value = localization.sample_label(
+            prefix,
+            suffix,
+            context.seed_key,
+            selection_number,
+            context.target,
+        )
         if value:
             return value
     return ""
+
+
+def _runtime_family_sample_number(
+    reference: object,
+    expression: str,
+    number: int,
+) -> int:
+    """Return this slot's ordinal among arguments sharing one label family.
+
+    Runtime arguments such as ``RealmDisplayFull(rival)`` and
+    ``RealmDisplayFull(owner)`` resolve to the same wildcard label family but
+    still represent different objects.  Sampling by their family ordinal lets
+    the preview keep that caller-level identity whenever the catalog has enough
+    distinct labels.
+    """
+
+    identities = _wildcard_label_identities(expression)
+    if len(identities) != 1:
+        return number
+    identity = next(iter(identities))
+    runtime_values = getattr(reference, "runtime_argument_values", ())
+    if not isinstance(runtime_values, tuple):
+        return number
+    family_slots = tuple(
+        index
+        for index, candidates in enumerate(runtime_values, start=1)
+        if isinstance(candidates, tuple)
+        and any(
+            identity in _wildcard_label_identities(str(candidate))
+            for candidate in candidates
+        )
+    )
+    if len(family_slots) <= 1 or number not in family_slots:
+        return number
+    return family_slots.index(number) + 1
+
+
+def _wildcard_label_identities(expression: str) -> frozenset[str]:
+    return frozenset(
+        label.casefold()
+        for label in _literal_label_candidates(expression)
+        if "*" in label
+    )
 
 
 def _wildcard_label_sample(
@@ -1192,6 +1281,35 @@ def _representative_preview(values: tuple[str, ...]) -> str:
     return values[0] if values else ""
 
 
+def _runtime_candidate_preview_order(
+    candidates: tuple[object, ...],
+    kinds: tuple[object, ...],
+) -> tuple[int, ...]:
+    """Prefer a proven runtime label domain over a fixed fallback label.
+
+    Cross-file helpers commonly return one dynamic domain label plus a literal
+    sentinel for invalid input. The semantic index retains both; exact labels
+    expanded from a finite game-DB column and unresolved wildcard families
+    should precede the guard branch regardless of source order.
+    """
+
+    proven_domains: list[int] = []
+    preferred: list[int] = []
+    fallbacks: list[int] = []
+    for index, candidate in enumerate(candidates):
+        value = str(candidate)
+        kind = str(kinds[index]) if index < len(kinds) else ""
+        if kind == SEMANTIC_LABEL_DOMAIN:
+            proven_domains.append(index)
+            continue
+        is_label_family = "*" in value and (
+            kind == SEMANTIC_LABEL
+            or value.startswith(("@L_", "_"))
+        )
+        (preferred if is_label_family else fallbacks).append(index)
+    return tuple(proven_domains + preferred + fallbacks)
+
+
 def _localized_variable_value(
     localization: PlaceholderLocalization,
     reference: object,
@@ -1207,12 +1325,24 @@ def _localized_variable_value(
     if isinstance(runtime_values, tuple) and 0 < number <= len(runtime_values):
         candidates = runtime_values[number - 1]
         if isinstance(candidates, tuple):
-            for candidate in candidates:
+            kinds = getattr(reference, "runtime_argument_kinds", ())
+            position_kinds = (
+                kinds[number - 1]
+                if isinstance(kinds, tuple) and number <= len(kinds)
+                else ()
+            )
+            for index in _runtime_candidate_preview_order(candidates, position_kinds):
+                candidate = candidates[index]
                 value = _localized_expression_value(
                     localization,
                     str(candidate),
                     number,
                     context,
+                    sample_number=_runtime_family_sample_number(
+                        reference,
+                        str(candidate),
+                        number,
+                    ),
                 )
                 if value:
                     resolved_values.append(value)

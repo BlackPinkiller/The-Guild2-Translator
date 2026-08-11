@@ -14,6 +14,7 @@ from ..code_index import (
     scan_scripts_root,
 )
 from ..code_window_context import best_window_context
+from ..engine_semantics import engine_format_argument_labels
 from ..preview_context_selection import select_preview_context
 from ..preview_coverage import preview_placeholder_coverage, preview_reference_coverage
 from ..preview_placeholders import (
@@ -1051,11 +1052,13 @@ def assert_code_index_handles_families_and_binary_gui() -> None:
             (
                 ("FAMILY_BASE_+0", "%1NAME"),
                 ("EXACT_BASE", "%1l"),
+                ("_ONSCREENHELP_4_UPGRADES_IMPACT_PRODUCT_+0", "%1l"),
             ),
         )
         if (
-            placeholder_coverage.labels_with_placeholders != 2
-            or placeholder_coverage.placeholder_positions != 2
+            placeholder_coverage.labels_with_placeholders != 3
+            or placeholder_coverage.placeholder_positions != 3
+            or placeholder_coverage.engine_label_positions != 1
             or placeholder_coverage.expression_only_positions != 1
             or placeholder_coverage.missing_positions != 1
         ):
@@ -1257,6 +1260,10 @@ def assert_placeholder_values_avoid_ambiguous_random_branches() -> None:
                 return "Citizen"
             if prefix == "_CHARACTERS_2_PROFESSIONS_":
                 return "Blacksmith"
+            if prefix == "_ITEM_":
+                return "Honeycomb"
+            if prefix == "_CHARACTERS_1_CLASSES_":
+                return "Patron"
             if prefix == "_PRIVILEGE_":
                 return "May trade goods"
             return "Supreme Commander"
@@ -1305,8 +1312,12 @@ def assert_placeholder_values_avoid_ambiguous_random_branches() -> None:
                 "_CHARACTERS_3_OFFICES_NAME_Bischof_+0": "Bishop",
                 "_CHARACTERS_3_OFFICES_NAME_Buergermeister_+0": "City Mayor",
                 "_CHARACTERS_3_TITLES_NAME_+9": "Citizen",
+                "_CHARACTERS_3_TITLES_NAME_+7": "Lesser Citizen",
+                "_Hostility": "Feud",
+                "_Neutral": "Neutral",
                 "_BIRTH_PROMPT_DAUGHTER_+0": "What do you want to name your daughter?",
                 "SubstSimFullDescOffice_+0": "%1ST %1SV %1SD, %1SA in %2NAME",
+                "_KR_KONTOR_NOCROWN_+0": "Unclaimed",
             }.get(label, label)
 
     ambiguous = CodeReference(
@@ -1323,6 +1334,104 @@ def assert_placeholder_values_avoid_ambiguous_random_branches() -> None:
     )
     context = PlaceholderContext("BRANCH_BODY_+0", "Text.dbt", False, "en", (ambiguous,))
     builder = PlaceholderValueBuilder(Localization())
+    product = builder.argument_value(
+        1,
+        "l",
+        PlaceholderContext(
+            "_ONSCREENHELP_4_UPGRADES_IMPACT_PRODUCT_+0",
+            "Text.dbt",
+            False,
+            "en",
+        ),
+    ).text
+    if product != "Honeycomb":
+        raise AssertionError(
+            f"an engine-owned item-label argument remained generic: {product!r}"
+        )
+    if engine_format_argument_labels("_GENERAL_MEASURES_FAILURES_+20", 3) != (
+        "_MEASURE_*_NAME_+0",
+    ):
+        raise AssertionError("an engine format variant lost its measure-label contract")
+    missed_class = builder.argument_value(
+        2,
+        "l",
+        PlaceholderContext(
+            "_FAMILY_150_ATTENDAPPRENTICESHIP_MISSED_BODY_+0",
+            "Text.dbt",
+            False,
+            "en",
+        ),
+    ).text
+    if missed_class != "Patron":
+        raise AssertionError(
+            f"an engine-owned class label remained generic: {missed_class!r}"
+        )
+    office_template = builder.argument_value(
+        1,
+        "s",
+        PlaceholderContext(
+            "_CHARACTERS_3_OFFICES_TEMPLATE_+1",
+            "Text.dbt",
+            False,
+            "en",
+        ),
+    ).text
+    if office_template != "Supreme Commander":
+        raise AssertionError(
+            f"an engine-owned string label remained generic: {office_template!r}"
+        )
+    old_title = builder.argument_value(
+        1,
+        "l",
+        PlaceholderContext(
+            "_CHARACTERS_3_TITLES_AQUIRE_MESSAGES_LOOSE_TITLE_BODY_+0",
+            "Text.dbt",
+            False,
+            "en",
+        ),
+    ).text
+    new_title = builder.argument_value(
+        2,
+        "l",
+        PlaceholderContext(
+            "_CHARACTERS_3_TITLES_AQUIRE_MESSAGES_LOOSE_TITLE_BODY_+0",
+            "Text.dbt",
+            False,
+            "en",
+        ),
+    ).text
+    if (old_title, new_title) != ("Citizen", "Lesser Citizen"):
+        raise AssertionError(
+            "a title-loss preview did not keep its old/new title boundary: "
+            f"{old_title!r}, {new_title!r}"
+        )
+    malformed_diplomacy = CodeReference(
+        "measure_administrate_diplomacy_request_enemies_body_+0",
+        Path("ms_047_AdministrateDiplomacy.lua"),
+        656,
+        1,
+        "MsgBox",
+        4,
+        runtime_arguments=('GetID("Destination")', "ReqMoney", "TargetBadge"),
+        runtime_argument_values=(("",), ("2500",), ("@L$S[2045]",)),
+        runtime_argument_kinds=(("dynasty",), ("number",), ("dynasty_crest",)),
+        role="body",
+    )
+    recovered_crest = builder.argument_value(
+        2,
+        "l",
+        PlaceholderContext(
+            "_MEASURE_ADMINISTRATE_DIPLOMACY_REQUEST_ENEMIES_BODY_+0",
+            "Text.dbt",
+            False,
+            "en",
+            (malformed_diplomacy,),
+        ),
+    )
+    if recovered_crest.text != GLYPH_MARK or recovered_crest.glyph_id is None:
+        raise AssertionError(
+            "the shipped diplomacy %2l/%3 crest mismatch was not recovered visually"
+        )
     crest_reference = CodeReference(
         "badge_body_+0",
         Path("Badge.lua"),
@@ -1352,6 +1461,40 @@ def assert_placeholder_values_avoid_ambiguous_random_branches() -> None:
     if value != "Beggar":
         raise AssertionError(
             f"an unresolved runtime branch did not use one representative value: {value!r}"
+        )
+
+    realm_reference = CodeReference(
+        "kr_charter_sealed_+0",
+        Path("ms_CallCharter.lua"),
+        93,
+        1,
+        "MsgQuick",
+        1,
+        runtime_arguments=("trade_RealmDisplayFull(winner)",),
+        runtime_argument_values=(
+            (
+                "@L_KR_KONTOR_NOCROWN_+0",
+                "@L_SCENARIO_WAR_*_+0",
+                "@L_SCENARIO_WAR_*_+2",
+            ),
+        ),
+        runtime_argument_kinds=(("label", "label", "label"),),
+        role="body",
+    )
+    realm = builder.argument_value(
+        1,
+        "l",
+        PlaceholderContext(
+            "KR_CHARTER_SEALED_+0",
+            "Kontor.dbt",
+            False,
+            "en",
+            (realm_reference,),
+        ),
+    ).text
+    if realm != "Supreme Commander":
+        raise AssertionError(
+            f"a valid realm interaction preview preferred its fallback label: {realm!r}"
         )
 
     optional_label = CodeReference(

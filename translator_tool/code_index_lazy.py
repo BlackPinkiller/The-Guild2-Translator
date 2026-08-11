@@ -25,6 +25,7 @@ from .code_index import (
     normalize_label,
 )
 from .file_utils import atomic_write
+from .game_database import DatabaseValueDomains, game_database_value_domains
 from .game_items import game_item_names_by_id
 from .script_semantics import SemanticValue, analyze_script as _semantic_analyze_script
 from .settings import settings_dir
@@ -265,6 +266,7 @@ class LazyCodeIndexBuilder:
         self.files: tuple[CodeFileSpec, ...] = ()
         self.label_catalog = frozenset()
         self.item_names_by_id: tuple[tuple[int, str], ...] = ()
+        self.database_value_domains: DatabaseValueDomains = ()
         self.catalog_digest = ""
         self.cache: CodeFactsCache | None = None
         self._search_blobs: dict[str, bytes] = {}
@@ -298,11 +300,19 @@ class LazyCodeIndexBuilder:
             else self.project_root.name
         )
         self.item_names_by_id = game_item_names_by_id(self.game_root, mod_name)
+        self.database_value_domains = game_database_value_domains(
+            self.game_root,
+            mod_name,
+        )
         self.catalog_digest = _catalog_digest(
             self.label_catalog,
             self.item_names_by_id,
+            self.database_value_domains,
         )
-        self._linker = CrossFileSemanticLinker(self.item_names_by_id)
+        self._linker = CrossFileSemanticLinker(
+            self.item_names_by_id,
+            self.database_value_domains,
+        )
         self.cache = CodeFactsCache(self.cache_path)
         self._prepared = True
 
@@ -446,6 +456,7 @@ class LazyCodeIndexBuilder:
             spec,
             label_catalog=self.label_catalog,
             item_names_by_id=self.item_names_by_id,
+            database_value_domains=self.database_value_domains,
             raw=raw,
         )
         self.cache.record_analysis(spec, raw, lexical, self.catalog_digest, analysis)
@@ -810,6 +821,7 @@ def _flow_from_json(
 def _catalog_digest(
     catalog: frozenset[str],
     item_names_by_id: tuple[tuple[int, str], ...] = (),
+    database_value_domains: DatabaseValueDomains = (),
 ) -> str:
     digest = hashlib.sha256()
     for label in sorted(catalog):
@@ -820,6 +832,14 @@ def _catalog_digest(
         digest.update(b"=")
         digest.update(name.encode("utf-8"))
         digest.update(b"\0")
+    for table, field, values in database_value_domains:
+        digest.update(table.encode("utf-8"))
+        digest.update(b".")
+        digest.update(field.encode("utf-8"))
+        digest.update(b"=")
+        for value in values:
+            digest.update(value.encode("utf-8"))
+            digest.update(b"\0")
     return digest.hexdigest()
 
 
@@ -830,6 +850,7 @@ def _analyzer_revision() -> str:
         paths = {
             Path(__file__),
             Path(analyze_code_file.__code__.co_filename),
+            Path(game_database_value_domains.__code__.co_filename),
             Path(_semantic_analyze_script.__code__.co_filename),
         }
         for path in sorted(paths, key=lambda item: str(item).casefold()):

@@ -4,7 +4,9 @@ from collections import Counter
 from dataclasses import replace
 import html
 import math
+import multiprocessing
 from pathlib import Path
+from queue import Empty
 import re
 import sys
 import threading
@@ -59,6 +61,7 @@ from PySide6.QtWidgets import (
     QPushButton,
     QScrollArea,
     QSplitter,
+    QStackedWidget,
     QStyledItemDelegate,
     QStyle,
     QStyleOptionViewItem,
@@ -83,7 +86,8 @@ from .ai import (
 )
 from .code_index import CodeReference, CodeReferenceIndex, CodeReferenceSet, normalize_label
 from .file_tree import FileTreeNode, build_file_tree
-from .code_index_lazy import LazyCodeIndexBuilder, LazyIndexProgress
+from .code_index_lazy import LazyIndexProgress
+from .code_index_worker import code_index_process_main
 from .code_window_context import (
     PreviewWindowButton,
     PreviewWindowContext,
@@ -97,6 +101,8 @@ from .diagnostics import configure_diagnostics, log_exception, log_failure, log_
 from .entry_clipboard import ENTRY_CLIPBOARD_MIME, decode_translations, encode_entries
 from .git_history import GitCommit, GitError, LanguageGit, TranslationLogEntry
 from .game_theme import GameAssetSet, GameHeaderFrame, GamePanelFrame, install_game_theme_style
+from .guide_model import guide_page_id, parse_guide_toc
+from .guide_widget import GuidePreviewPane
 from .history import OperationHistory, TranslationOperation, UnitChange
 from .history_index import (
     MAX_INDEXED_COMMITS,
@@ -177,6 +183,7 @@ from .text_import import (
 )
 from .validation import (
     COLOR_TOKEN_RE,
+    FORMAT_GUIDE,
     FORMAT_GUILD2,
     format_counter_items,
     format_dialect,
@@ -298,21 +305,26 @@ class UnitTableModel(QAbstractTableModel):
     def data(self, index: QModelIndex, role: int = Qt.ItemDataRole.DisplayRole):  # noqa: N802
         if not index.isValid() or index.row() >= len(self.units):
             return None
-        unit = self.units[index.row()]
+        return self.data_for_row(index.row(), index.column(), role)
+
+    def data_for_row(self, row: int, column: int, role: int):
+        if not (0 <= row < len(self.units)):
+            return None
+        unit = self.units[row]
         if role == Qt.ItemDataRole.UserRole:
             return unit.uid
         if role == Qt.ItemDataRole.ToolTipRole:
-            if index.column() == self.FORMAT:
+            if column == self.FORMAT:
                 return _format_diff_tooltip(unit)
-            if index.column() == self.SOURCE:
+            if column == self.SOURCE:
                 return unit.source_text
-            if index.column() == self.TRANSLATION:
+            if column == self.TRANSLATION:
                 return unit.current_text
-            if index.column() == self.AI:
+            if column == self.AI:
                 if unit.pending_delete:
                     return translate("table.ai_tooltip.delete")
                 return translate("table.ai_tooltip")
-            if index.column() == self.STATUS:
+            if column == self.STATUS:
                 suffix = translate("table.status.recent_suffix") if unit.uid in self._recently_translated else ""
                 detail = ""
                 if unit.filter_status() == STATUS_TODO and unit.todo_reason:
@@ -324,7 +336,7 @@ class UnitTableModel(QAbstractTableModel):
                 return QColor(_theme_row_tint("delete", "#f2d6d3"))
             if unit.requires_manual_review:
                 return QColor(_theme_row_tint("review", "#f4b66f"))
-            if self.has_glyph_warning(index.row()):
+            if self.has_glyph_warning(row):
                 return QColor(_theme_row_tint("glyph", "#f3d9a4"))
             return QColor(_theme_row_tint("recent", "#dce5b5")) if unit.uid in self._recently_translated else None
         if role == Qt.ItemDataRole.ForegroundRole and unit.pending_delete:
@@ -335,18 +347,23 @@ class UnitTableModel(QAbstractTableModel):
             return font
         if role != Qt.ItemDataRole.DisplayRole:
             return None
-        column = index.column()
-        values = {
-            self.FILE: unit.file_rel,
-            self.ID: unit.record_id,
-            self.LABEL: _single_line_table_text(unit.label),
-            self.SOURCE: _single_line_table_text(unit.source_text),
-            self.TRANSLATION: _single_line_table_text(unit.current_text),
-            self.STATUS: unit.display_status(),
-            self.FORMAT: _format_diff_text(unit),
-            self.AI: translate("table.ai_action"),
-        }
-        return values.get(column, "")
+        if column == self.FILE:
+            return unit.file_rel
+        if column == self.ID:
+            return unit.record_id
+        if column == self.LABEL:
+            return _single_line_table_text(unit.label)
+        if column == self.SOURCE:
+            return _single_line_table_text(unit.source_text)
+        if column == self.TRANSLATION:
+            return _single_line_table_text(unit.current_text)
+        if column == self.STATUS:
+            return unit.display_status()
+        if column == self.FORMAT:
+            return _format_diff_text(unit)
+        if column == self.AI:
+            return translate("table.ai_action")
+        return ""
 
     def unit_at(self, row: int) -> TranslationUnit | None:
         return self.units[row] if 0 <= row < len(self.units) else None
@@ -558,14 +575,23 @@ class UnitFilterProxyModel(QAbstractTableModel):
         return 0 if parent.isValid() or source is None else source.columnCount()
 
     def data(self, index: QModelIndex, role: int = Qt.ItemDataRole.DisplayRole):  # noqa: N802
-        source_index = self.mapToSource(index)
         source = self._source_model
-        return source.data(source_index, role) if source is not None and source_index.isValid() else None
+        if (
+            source is None
+            or not index.isValid()
+            or not (0 <= index.row() < len(self._source_rows))
+        ):
+            return None
+        return source.data_for_row(
+            self._source_rows[index.row()],
+            index.column(),
+            role,
+        )
 
     def flags(self, index: QModelIndex) -> Qt.ItemFlag:
-        source_index = self.mapToSource(index)
-        source = self._source_model
-        return source.flags(source_index) if source is not None and source_index.isValid() else Qt.ItemFlag.NoItemFlags
+        if not index.isValid() or not (0 <= index.row() < len(self._source_rows)):
+            return Qt.ItemFlag.NoItemFlags
+        return Qt.ItemFlag.ItemIsEnabled | Qt.ItemFlag.ItemIsSelectable
 
     def headerData(
         self,
@@ -591,6 +617,12 @@ class UnitFilterProxyModel(QAbstractTableModel):
             return QModelIndex()
         proxy_row = self._proxy_row_by_source.get(source_index.row())
         return self.index(proxy_row, source_index.column()) if proxy_row is not None else QModelIndex()
+
+    def unit_at(self, proxy_row: int) -> TranslationUnit | None:
+        source = self._source_model
+        if source is None or not (0 <= proxy_row < len(self._source_rows)):
+            return None
+        return source.unit_at(self._source_rows[proxy_row])
 
     def sortColumn(self) -> int:  # noqa: N802
         return self._sort_column
@@ -1137,8 +1169,11 @@ class PreviewTextDelegate(RowTintDelegate):
         self.glyph_image = glyph_image
 
     def paint(self, painter: QPainter, option: QStyleOptionViewItem, index: QModelIndex) -> None:
+        if not self.enabled():
+            super().paint(painter, option, index)
+            return
         unit = _unit_from_model_index(index)
-        if not self.enabled() or not isinstance(unit, TranslationUnit):
+        if not isinstance(unit, TranslationUnit):
             super().paint(painter, option, index)
             return
 
@@ -1577,9 +1612,7 @@ def _paint_review_background(painter: QPainter, option: QStyleOptionViewItem, in
 def _unit_from_model_index(index: QModelIndex) -> TranslationUnit | None:
     model = index.model()
     if isinstance(model, UnitFilterProxyModel):
-        source_index = model.mapToSource(index)
-        source_model = model.sourceModel()
-        return source_model.unit_at(source_index.row()) if isinstance(source_model, UnitTableModel) else None
+        return model.unit_at(index.row())
     if isinstance(model, UnitTableModel):
         return model.unit_at(index.row())
     return None
@@ -1918,6 +1951,7 @@ class PreviewPlainTextEdit(QTextEdit):
     """Editable raw text with a reversible, localized preview presentation."""
 
     previewRendered = Signal()
+    contentEdited = Signal(int, int)
 
     def __init__(self, parent: QWidget | None = None) -> None:
         super().__init__(parent)
@@ -1932,6 +1966,11 @@ class PreviewPlainTextEdit(QTextEdit):
         self._game_font_enabled = False
         self._preview_document = PreviewDocument.from_atoms("", [])
         self._base_zoom_point_size: float | None = None
+        self._zoom_factor = 1.0
+        self._native_mutation_depth = 0
+        self._ime_raw_selection: tuple[int, int] | None = None
+        self._preview_surface = ""
+        self._normal_document_margin = self.document().documentMargin()
 
     @property
     def preview_enabled(self) -> bool:
@@ -1961,6 +2000,23 @@ class PreviewPlainTextEdit(QTextEdit):
         if self._preview_enabled:
             self.refresh_preview()
 
+    def set_preview_surface(self, surface: str) -> None:
+        normalized = surface.casefold()
+        if normalized == self._preview_surface:
+            return
+        self._preview_surface = normalized
+        self.refresh_preview_surface()
+
+    def refresh_preview_surface(self) -> None:
+        self._sync_preview_surface()
+
+    def _sync_preview_surface(self) -> None:
+        if self._preview_enabled and self._preview_surface == "guide":
+            self.document().setDocumentMargin(18.0)
+        else:
+            self.document().setDocumentMargin(self._normal_document_margin)
+        self.viewport().update()
+
     def set_game_font_builder(
         self,
         enabled: bool,
@@ -1976,31 +2032,33 @@ class PreviewPlainTextEdit(QTextEdit):
     def set_preview_enabled(self, enabled: bool) -> None:
         if enabled == self._preview_enabled:
             return
-        if self._editing_raw:
-            self._finish_raw_edit()
-        if enabled:
-            self._raw_text = QTextEdit.toPlainText(self)
-            raw_position = self.textCursor().position()
-            self._preview_enabled = True
-            self._sync_native_undo()
-            self._render_preview(raw_position)
-        else:
-            raw_position = self._preview_document.raw_position(self.textCursor().position())
-            self._preview_enabled = False
-            blocker = QSignalBlocker(self)
-            self._set_unformatted_plain_text(self._raw_text)
-            cursor = self.textCursor()
-            cursor.setPosition(min(raw_position, len(self._raw_text)))
-            self.setTextCursor(cursor)
+        blocker = QSignalBlocker(self)
+        try:
+            if enabled:
+                self._raw_text = QTextEdit.toPlainText(self)
+                raw_position = self.textCursor().position()
+                self._preview_enabled = True
+                self._sync_preview_surface()
+                self._sync_native_undo()
+                self._render_preview(raw_position)
+            else:
+                raw_position = self._preview_document.raw_position(self.textCursor().position())
+                self._preview_enabled = False
+                self._set_unformatted_plain_text(self._raw_text)
+                cursor = self.textCursor()
+                cursor.setPosition(min(raw_position, len(self._raw_text)))
+                self.setTextCursor(cursor)
+                self._sync_preview_surface()
+                self._sync_native_undo()
+        finally:
             del blocker
-            self._sync_native_undo()
         self.previewRendered.emit()
 
     def refresh_preview(self) -> None:
         if not self._preview_enabled or self._editing_raw:
             return
         raw_position = self._preview_document.raw_position(self.textCursor().position())
-        self._render_preview(raw_position)
+        self._render_preview(raw_position, preserve_scroll=True)
         self.previewRendered.emit()
 
     def setPlainText(self, text: str) -> None:  # noqa: N802
@@ -2020,7 +2078,28 @@ class PreviewPlainTextEdit(QTextEdit):
             return start, end
         return self._preview_document.display_range(start, end)
 
+    def raw_cursor_position(self) -> int:
+        cursor = self.textCursor()
+        if self._preview_enabled and not self._editing_raw:
+            return self._preview_document.raw_position(cursor.position())
+        return cursor.position()
+
+    def set_raw_cursor_position(self, position: int, anchor: int | None = None) -> None:
+        raw_position = max(0, min(position, len(self._raw_text)))
+        raw_anchor = max(0, min(anchor if anchor is not None else position, len(self._raw_text)))
+        if self._preview_enabled and not self._editing_raw:
+            display_anchor = self._preview_document.display_position(raw_anchor)
+            display_position = self._preview_document.display_position(raw_position)
+        else:
+            display_anchor = raw_anchor
+            display_position = raw_position
+        cursor = self.textCursor()
+        cursor.setPosition(display_anchor)
+        cursor.setPosition(display_position, QTextCursor.MoveMode.KeepAnchor)
+        self.setTextCursor(cursor)
+
     def set_zoom_factor(self, factor: float) -> None:
+        self._zoom_factor = max(0.2, factor)
         if self._base_zoom_point_size is None:
             font = self.font()
             if font.pointSizeF() > 0:
@@ -2028,14 +2107,22 @@ class PreviewPlainTextEdit(QTextEdit):
             else:
                 self._base_zoom_point_size = font.pixelSize() * 72.0 / max(1, self.logicalDpiY())
         font = QFont(self.font())
-        font.setPointSizeF(max(1.0, self._base_zoom_point_size * factor))
+        font.setPointSizeF(max(1.0, self._base_zoom_point_size * self._zoom_factor))
         self.document().setDefaultFont(font)
+        if self._preview_enabled and not self._editing_raw:
+            self._render_preview(self.raw_cursor_position(), preserve_scroll=True)
+            self.previewRendered.emit()
+            return
         cursor = QTextCursor(self.document())
         cursor.select(QTextCursor.SelectionType.Document)
         char_format = QTextCharFormat()
         char_format.setFont(font)
         cursor.mergeCharFormat(char_format)
         self.setCurrentCharFormat(char_format)
+
+    def refresh_theme_font(self) -> None:
+        self._base_zoom_point_size = None
+        self.set_zoom_factor(self._zoom_factor)
 
     @staticmethod
     def _is_edit_key(event: QKeyEvent) -> bool:
@@ -2053,142 +2140,218 @@ class PreviewPlainTextEdit(QTextEdit):
             event.modifiers() & Qt.KeyboardModifier.ControlModifier and not event.modifiers() & Qt.KeyboardModifier.AltModifier
         )
 
-    def _begin_raw_edit(self) -> None:
-        if not self._preview_enabled or self._editing_raw:
-            return
-        display_cursor = self.textCursor()
-        raw_anchor = self._preview_document.raw_position(display_cursor.anchor())
-        raw_position = self._preview_document.raw_position(display_cursor.position())
-        self._editing_raw = True
-        blocker = QSignalBlocker(self)
-        self._set_unformatted_plain_text(self._raw_text)
-        raw_cursor = self.textCursor()
-        raw_cursor.setPosition(raw_anchor)
-        raw_cursor.setPosition(raw_position, QTextCursor.MoveMode.KeepAnchor)
-        self.setTextCursor(raw_cursor)
-        del blocker
+    def _raw_selection(self) -> tuple[int, int, int]:
+        cursor = self.textCursor()
+        raw_anchor = self._preview_document.raw_position(cursor.anchor())
+        raw_position = self._preview_document.raw_position(cursor.position())
+        return min(raw_anchor, raw_position), max(raw_anchor, raw_position), raw_position
 
-    def _finish_raw_edit(self) -> None:
-        if not self._editing_raw:
+    def _replace_preview_raw(self, start: int, end: int, replacement: str, before_cursor: int) -> None:
+        if self.isReadOnly():
             return
-        raw_cursor = self.textCursor()
-        raw_anchor = raw_cursor.anchor()
-        raw_position = raw_cursor.position()
-        self._raw_text = QTextEdit.toPlainText(self)
-        self._editing_raw = False
-        self._render_preview(raw_position, raw_anchor)
+        start = max(0, min(start, len(self._raw_text)))
+        end = max(start, min(end, len(self._raw_text)))
+        updated = self._raw_text[:start] + replacement + self._raw_text[end:]
+        if updated == self._raw_text:
+            return
+        self._raw_text = updated
+        after_cursor = start + len(replacement)
+        self._render_preview(after_cursor)
+        self.textChanged.emit()
+        self.contentEdited.emit(before_cursor, after_cursor)
         self.previewRendered.emit()
 
-    def _render_preview(self, raw_position: int, raw_anchor: int | None = None) -> None:
-        builder = self._preview_builder
-        document = builder(self._raw_text) if builder is not None else PreviewDocument.from_atoms(
-            self._raw_text,
-            [PreviewAtom(self._raw_text, 0, len(self._raw_text))] if self._raw_text else [],
-        )
-        self._preview_document = document
-        blocker = QSignalBlocker(self)
-        self._set_unformatted_plain_text(document.display_text)
-        self._apply_preview_line_height(document.line_height_percent)
-        text_font_family = (
-            self._text_font_family_provider()
-            if self._game_font_enabled and self._text_font_family_provider is not None
-            else ""
-        )
-        for span in document.spans:
-            atom = span.atom
-            if (
-                self._game_font_enabled
-                and self._text_glyph_provider is not None
-                and not text_font_family
-                and atom.glyph_id is None
-            ):
-                for offset, char in enumerate(atom.text):
-                    if char in {"\n", "\r", "\t", PREVIEW_MARK}:
-                        continue
-                    image = self._text_glyph_provider(
-                        char,
-                        atom.color or _theme_rgba("text", (55, 38, 24, 255)),
-                    )
-                    if image is None or not hasattr(image, "isNull") or image.isNull():
-                        continue
-                    glyph_cursor = QTextCursor(self.document())
-                    glyph_cursor.setPosition(span.display_start + offset)
-                    glyph_cursor.movePosition(
-                        QTextCursor.MoveOperation.NextCharacter,
-                        QTextCursor.MoveMode.KeepAnchor,
-                    )
-                    height = max(8, QFontMetrics(self.document().defaultFont()).height() - 2)
-                    width = max(1.0, image.width() * height / max(image.height(), 1))
-                    resource_url = QUrl(
-                        f"preview-font-{ord(char)}-{span.display_start + offset}-{height}.png"
-                    )
-                    self.document().addResource(
-                        QTextDocument.ResourceType.ImageResource,
-                        resource_url,
-                        image,
-                    )
-                    image_format = QTextImageFormat()
-                    image_format.setName(resource_url.toString())
-                    image_format.setWidth(width)
-                    image_format.setHeight(height)
-                    image_format.setVerticalAlignment(
-                        QTextCharFormat.VerticalAlignment.AlignMiddle
-                    )
-                    glyph_cursor.insertImage(image_format)
-                continue
-            cursor = QTextCursor(self.document())
-            cursor.setPosition(span.display_start)
-            cursor.setPosition(span.display_end, QTextCursor.MoveMode.KeepAnchor)
-            char_format = QTextCharFormat()
-            if text_font_family and atom.glyph_id is None:
-                font = QFont(self.document().defaultFont())
-                font.setFamily(text_font_family)
-                char_format.setFont(font)
-            has_visible_replacement = atom.replacement and atom.text not in {"\n", "\t", PREVIEW_MARK}
-            if atom.final_style and atom.color is not None:
-                char_format.setForeground(QColor(*atom.color))
-            elif atom.color is not None:
-                char_format.setUnderlineColor(QColor(*atom.color))
-                char_format.setUnderlineStyle(
-                    QTextCharFormat.UnderlineStyle.DashUnderline
-                    if has_visible_replacement
-                    else QTextCharFormat.UnderlineStyle.SingleUnderline
+    def _preview_key_replacement(self, event: QKeyEvent) -> bool:
+        start, end, before_cursor = self._raw_selection()
+        replacement: str | None = None
+        if event.matches(QKeySequence.StandardKey.Paste):
+            replacement = QApplication.clipboard().text()
+        elif event.matches(QKeySequence.StandardKey.Cut):
+            if start == end:
+                return True
+            QApplication.clipboard().setText(self._raw_text[start:end])
+            replacement = ""
+        elif event.key() == Qt.Key.Key_Backspace:
+            if start == end and start > 0:
+                start -= 1
+            replacement = ""
+        elif event.key() == Qt.Key.Key_Delete:
+            if start == end and end < len(self._raw_text):
+                end += 1
+            replacement = ""
+        elif event.key() in {Qt.Key.Key_Return, Qt.Key.Key_Enter}:
+            replacement = "\n"
+        elif event.key() == Qt.Key.Key_Tab:
+            replacement = "\t"
+        elif event.text() and not (
+            event.modifiers() & Qt.KeyboardModifier.ControlModifier
+            and not event.modifiers() & Qt.KeyboardModifier.AltModifier
+        ):
+            replacement = event.text()
+        if replacement is None:
+            return False
+        self._replace_preview_raw(start, end, replacement, before_cursor)
+        return True
+
+    def _native_edit(self, mutation: Callable[[], None]) -> None:
+        if self._native_mutation_depth:
+            mutation()
+            return
+        before_text = QTextEdit.toPlainText(self)
+        before_cursor = self.textCursor().position()
+        self._native_mutation_depth += 1
+        try:
+            mutation()
+        finally:
+            self._native_mutation_depth -= 1
+        after_text = QTextEdit.toPlainText(self)
+        if after_text != before_text:
+            self._raw_text = after_text
+            self.contentEdited.emit(before_cursor, self.textCursor().position())
+
+    def _render_preview(
+        self,
+        raw_position: int,
+        raw_anchor: int | None = None,
+        *,
+        preserve_scroll: bool = False,
+    ) -> None:
+        vertical = self.verticalScrollBar()
+        horizontal = self.horizontalScrollBar()
+        vertical_ratio = vertical.value() / vertical.maximum() if vertical.maximum() > 0 else 0.0
+        horizontal_value = horizontal.value()
+        updates_enabled = self.updatesEnabled()
+        if updates_enabled:
+            self.setUpdatesEnabled(False)
+        try:
+            builder = self._preview_builder
+            document = builder(self._raw_text) if builder is not None else PreviewDocument.from_atoms(
+                self._raw_text,
+                [PreviewAtom(self._raw_text, 0, len(self._raw_text))] if self._raw_text else [],
+            )
+            self._preview_document = document
+            blocker = QSignalBlocker(self)
+            try:
+                self._set_unformatted_plain_text(document.display_text)
+                self._apply_preview_line_height(document.line_height_percent)
+                text_font_family = (
+                    self._text_font_family_provider()
+                    if self._game_font_enabled and self._text_font_family_provider is not None
+                    else ""
                 )
-            elif has_visible_replacement and not atom.final_style:
-                char_format.setUnderlineStyle(QTextCharFormat.UnderlineStyle.DashUnderline)
-                char_format.setUnderlineColor(QColor(_theme_color("markup_token", "#79740e")))
-            if atom.replacement and atom.text not in {"\n", "\t", PREVIEW_MARK}:
-                char_format.setFontWeight(QFont.Weight.Normal)
-            if atom.glyph_id is not None and self._glyph_provider is not None:
-                image = self._glyph_provider(atom.glyph_id)
-                if image is not None and hasattr(image, "isNull") and not image.isNull():
-                    height = max(8, QFontMetrics(self.document().defaultFont()).height() - 2)
-                    width = max(1.0, image.width() * height / max(image.height(), 1))
-                    resource_url = QUrl(
-                        f"preview-glyph-{atom.glyph_id}-{span.display_start}-{height}.png"
-                    )
-                    self.document().addResource(
-                        QTextDocument.ResourceType.ImageResource,
-                        resource_url,
-                        image,
-                    )
-                    glyph_format = QTextImageFormat()
-                    glyph_format.setName(resource_url.toString())
-                    glyph_format.setWidth(width)
-                    glyph_format.setHeight(height)
-                    glyph_format.setVerticalAlignment(
-                        QTextCharFormat.VerticalAlignment.AlignMiddle
-                    )
-                    cursor.insertImage(glyph_format)
-                    continue
-            cursor.mergeCharFormat(char_format)
-        display_anchor = document.display_position(raw_anchor if raw_anchor is not None else raw_position)
-        display_position = document.display_position(raw_position)
-        cursor = self.textCursor()
-        cursor.setPosition(display_anchor)
-        cursor.setPosition(display_position, QTextCursor.MoveMode.KeepAnchor)
-        self.setTextCursor(cursor)
-        del blocker
+                for span in document.spans:
+                    atom = span.atom
+                    if (
+                        self._game_font_enabled
+                        and self._text_glyph_provider is not None
+                        and not text_font_family
+                        and atom.glyph_id is None
+                        and atom.layout != "guide_rule"
+                    ):
+                        for offset, char in enumerate(atom.text):
+                            if char in {"\n", "\r", "\t", PREVIEW_MARK}:
+                                continue
+                            image = self._text_glyph_provider(
+                                char,
+                                atom.color or _theme_rgba("text", (55, 38, 24, 255)),
+                            )
+                            if image is None or not hasattr(image, "isNull") or image.isNull():
+                                continue
+                            glyph_cursor = QTextCursor(self.document())
+                            glyph_cursor.setPosition(span.display_start + offset)
+                            glyph_cursor.movePosition(
+                                QTextCursor.MoveOperation.NextCharacter,
+                                QTextCursor.MoveMode.KeepAnchor,
+                            )
+                            height = max(8, QFontMetrics(self.document().defaultFont()).height() - 2)
+                            width = max(1.0, image.width() * height / max(image.height(), 1))
+                            resource_url = QUrl(
+                                f"preview-font-{ord(char)}-{span.display_start + offset}-{height}.png"
+                            )
+                            self.document().addResource(
+                                QTextDocument.ResourceType.ImageResource,
+                                resource_url,
+                                image,
+                            )
+                            image_format = QTextImageFormat()
+                            image_format.setName(resource_url.toString())
+                            image_format.setWidth(width)
+                            image_format.setHeight(height)
+                            image_format.setVerticalAlignment(
+                                QTextCharFormat.VerticalAlignment.AlignMiddle
+                            )
+                            glyph_cursor.insertImage(image_format)
+                        continue
+
+                    cursor = QTextCursor(self.document())
+                    cursor.setPosition(span.display_start)
+                    cursor.setPosition(span.display_end, QTextCursor.MoveMode.KeepAnchor)
+                    char_format = QTextCharFormat()
+                    if text_font_family and atom.glyph_id is None:
+                        font = QFont(self.document().defaultFont())
+                        font.setFamily(text_font_family)
+                        char_format.setFont(font)
+                    if atom.layout in {"guide_header", "guide_rule"}:
+                        font = QFont(self.document().defaultFont())
+                        if text_font_family:
+                            font.setFamily(text_font_family)
+                        if atom.layout == "guide_header":
+                            font.setWeight(QFont.Weight.DemiBold)
+                        elif font.pointSizeF() > 0:
+                            font.setPointSizeF(max(6.0, font.pointSizeF() * 0.72))
+                        char_format.setFont(font)
+                    has_visible_replacement = atom.replacement and atom.text not in {"\n", "\t", PREVIEW_MARK}
+                    if atom.final_style and atom.color is not None:
+                        char_format.setForeground(QColor(*atom.color))
+                    elif atom.color is not None:
+                        char_format.setUnderlineColor(QColor(*atom.color))
+                        char_format.setUnderlineStyle(
+                            QTextCharFormat.UnderlineStyle.DashUnderline
+                            if has_visible_replacement
+                            else QTextCharFormat.UnderlineStyle.SingleUnderline
+                        )
+                    elif has_visible_replacement and not atom.final_style:
+                        char_format.setUnderlineStyle(QTextCharFormat.UnderlineStyle.DashUnderline)
+                        char_format.setUnderlineColor(QColor(_theme_color("markup_token", "#79740e")))
+                    if atom.replacement and atom.text not in {"\n", "\t", PREVIEW_MARK}:
+                        char_format.setFontWeight(QFont.Weight.Normal)
+                    if atom.glyph_id is not None and self._glyph_provider is not None:
+                        image = self._glyph_provider(atom.glyph_id)
+                        if image is not None and hasattr(image, "isNull") and not image.isNull():
+                            height = max(8, QFontMetrics(self.document().defaultFont()).height() - 2)
+                            width = max(1.0, image.width() * height / max(image.height(), 1))
+                            resource_url = QUrl(
+                                f"preview-glyph-{atom.glyph_id}-{span.display_start}-{height}.png"
+                            )
+                            self.document().addResource(
+                                QTextDocument.ResourceType.ImageResource,
+                                resource_url,
+                                image,
+                            )
+                            glyph_format = QTextImageFormat()
+                            glyph_format.setName(resource_url.toString())
+                            glyph_format.setWidth(width)
+                            glyph_format.setHeight(height)
+                            glyph_format.setVerticalAlignment(
+                                QTextCharFormat.VerticalAlignment.AlignMiddle
+                            )
+                            cursor.insertImage(glyph_format)
+                            continue
+                    cursor.mergeCharFormat(char_format)
+                display_anchor = document.display_position(raw_anchor if raw_anchor is not None else raw_position)
+                display_position = document.display_position(raw_position)
+                cursor = self.textCursor()
+                cursor.setPosition(display_anchor)
+                cursor.setPosition(display_position, QTextCursor.MoveMode.KeepAnchor)
+                self.setTextCursor(cursor)
+                if preserve_scroll:
+                    vertical.setValue(round(vertical.maximum() * vertical_ratio))
+                    horizontal.setValue(min(horizontal_value, horizontal.maximum()))
+            finally:
+                del blocker
+        finally:
+            if updates_enabled:
+                self.setUpdatesEnabled(True)
         self.viewport().update()
 
     def _set_unformatted_plain_text(self, text: str) -> None:
@@ -2207,48 +2370,63 @@ class PreviewPlainTextEdit(QTextEdit):
 
     def keyPressEvent(self, event: QKeyEvent) -> None:  # noqa: N802
         if self._preview_enabled and self._is_edit_key(event):
-            self._begin_raw_edit()
+            if self._preview_key_replacement(event):
+                return
+        if self._is_edit_key(event):
+            self._native_edit(lambda: QTextEdit.keyPressEvent(self, event))
+        else:
             QTextEdit.keyPressEvent(self, event)
-            self._finish_raw_edit()
-            return
-        QTextEdit.keyPressEvent(self, event)
 
     def inputMethodEvent(self, event) -> None:  # noqa: N802
         if self._preview_enabled:
-            self._begin_raw_edit()
-            QTextEdit.inputMethodEvent(self, event)
-            if not event.preeditString():
-                self._finish_raw_edit()
+            if self._ime_raw_selection is None:
+                start, end, _position = self._raw_selection()
+                self._ime_raw_selection = (start, end)
+            commit = event.commitString()
+            if commit:
+                start, end = self._ime_raw_selection
+                before_cursor = end
+                self._ime_raw_selection = None
+                self._replace_preview_raw(start, end, commit, before_cursor)
+            elif event.preeditString():
+                blocker = QSignalBlocker(self)
+                QTextEdit.inputMethodEvent(self, event)
+                del blocker
+            else:
+                start, end = self._ime_raw_selection
+                self._ime_raw_selection = None
+                self._render_preview(end, start)
             return
-        QTextEdit.inputMethodEvent(self, event)
+        self._native_edit(lambda: QTextEdit.inputMethodEvent(self, event))
 
     def insertPlainText(self, text: str) -> None:  # noqa: N802
         if self._preview_enabled and not self._editing_raw:
-            self._begin_raw_edit()
-            QTextEdit.insertPlainText(self, text)
-            self._finish_raw_edit()
+            start, end, before_cursor = self._raw_selection()
+            self._replace_preview_raw(start, end, text, before_cursor)
             return
-        QTextEdit.insertPlainText(self, text)
+        self._native_edit(lambda: QTextEdit.insertPlainText(self, text))
 
     def insertFromMimeData(self, source) -> None:  # noqa: N802
         if self._preview_enabled and not self._editing_raw:
-            self._begin_raw_edit()
-            QTextEdit.insertFromMimeData(self, source)
-            self._finish_raw_edit()
+            start, end, before_cursor = self._raw_selection()
+            self._replace_preview_raw(start, end, source.text(), before_cursor)
             return
-        QTextEdit.insertFromMimeData(self, source)
+        self._native_edit(lambda: QTextEdit.insertFromMimeData(self, source))
 
     def cut(self) -> None:
         if self._preview_enabled and not self._editing_raw:
-            self._begin_raw_edit()
-            QTextEdit.cut(self)
-            self._finish_raw_edit()
+            start, end, before_cursor = self._raw_selection()
+            if start != end:
+                QApplication.clipboard().setText(self._raw_text[start:end])
+                self._replace_preview_raw(start, end, "", before_cursor)
             return
-        QTextEdit.cut(self)
+        self._native_edit(lambda: QTextEdit.cut(self))
 
     def focusOutEvent(self, event) -> None:  # noqa: N802
-        if self._editing_raw:
-            self._finish_raw_edit()
+        if self._ime_raw_selection is not None:
+            start, end = self._ime_raw_selection
+            self._ime_raw_selection = None
+            self._render_preview(end, start)
         super().focusOutEvent(event)
 
 
@@ -2375,6 +2553,9 @@ class CodeIndexWorker(QRunnable):
         self._request_lock = threading.Lock()
         self._requested: dict[str, tuple[int, int]] = {}
         self._request_generation = 0
+        self._background_enabled = False
+        self._background_generation = 0
+        self._sent_background_generation = -1
 
     def request_labels(self, labels: Iterable[str], priority: int) -> None:
         with self._request_lock:
@@ -2400,6 +2581,13 @@ class CodeIndexWorker(QRunnable):
 
     def cancel(self) -> None:
         self.cancel_event.set()
+
+    def set_background_enabled(self, enabled: bool) -> None:
+        with self._request_lock:
+            if self._background_enabled == enabled:
+                return
+            self._background_enabled = enabled
+            self._background_generation += 1
 
     def _take_requested(self) -> tuple[int, int, tuple[str, ...]] | None:
         with self._request_lock:
@@ -2434,40 +2622,83 @@ class CodeIndexWorker(QRunnable):
                 for requested_priority, _requested_generation in self._requested.values()
             )
 
+    def _take_background_state(self) -> bool | None:
+        with self._request_lock:
+            if self._sent_background_generation == self._background_generation:
+                return None
+            self._sent_background_generation = self._background_generation
+            return self._background_enabled
+
+    @staticmethod
+    def _close_process_queue(process_queue) -> None:
+        try:
+            process_queue.close()
+            process_queue.cancel_join_thread()
+        except (AttributeError, OSError, ValueError):
+            pass
+
     def run(self) -> None:
         if self.game_root is None or self.project_root is None:
             self.signals.finished.emit(self.token)
             return
-        builder = LazyCodeIndexBuilder(
-            self.game_root,
-            self.project_root,
-            vanilla_project_name=VANILLA_PROJECT_NAME,
+        context = multiprocessing.get_context("spawn")
+        command_queue = context.Queue()
+        result_queue = context.Queue(maxsize=8)
+        stop_event = context.Event()
+        process = context.Process(
+            target=code_index_process_main,
+            args=(
+                str(self.game_root),
+                str(self.project_root),
+                VANILLA_PROJECT_NAME,
+                command_queue,
+                result_queue,
+                stop_event,
+            ),
+            name=f"Guild2CodeIndex-{self.token}",
         )
         try:
+            process.start()
             while not self.cancel_event.is_set():
                 request = self._take_requested()
-                labels_ready: tuple[str, ...] = ()
                 if request is not None:
-                    priority, _generation, labels = request
-                    index = builder.analyze_labels(
-                        labels,
-                        cancelled=lambda: self.cancel_event.is_set()
-                        or self._has_higher_priority_request(priority),
+                    priority, generation, labels = request
+                    command_queue.put(
+                        ("request", priority, generation, labels),
+                        timeout=0.05,
                     )
-                    if not self._has_higher_priority_request(priority):
-                        labels_ready = labels
-                else:
-                    index = builder.analyze_next_batch(
-                        12,
-                        cancelled=lambda: self.cancel_event.is_set() or self._has_requested(),
+                background_enabled = self._take_background_state()
+                if background_enabled is not None:
+                    command_queue.put(
+                        ("background", background_enabled),
+                        timeout=0.05,
                     )
-                progress = builder.progress
-                if not index.is_empty:
-                    self.signals.partial.emit(self.token, index, progress)
-                if labels_ready:
-                    self.signals.labels_ready.emit(self.token, labels_ready)
-                if progress.complete:
+
+                try:
+                    result = result_queue.get(timeout=0.05)
+                except Empty:
+                    if not process.is_alive():
+                        if process.exitcode not in {0, None}:
+                            self.signals.failed.emit(
+                                self.token,
+                                f"worker process exited with code {process.exitcode}",
+                            )
+                            return
+                        break
+                    continue
+                if not isinstance(result, tuple) or not result:
+                    continue
+                kind = result[0]
+                if kind == "partial" and len(result) == 3:
+                    self.signals.partial.emit(self.token, result[1], result[2])
+                elif kind == "labels_ready" and len(result) == 2:
+                    self.signals.labels_ready.emit(self.token, result[1])
+                elif kind == "finished":
                     break
+                elif kind == "failed":
+                    message = str(result[2] if len(result) >= 3 else result[1])
+                    self.signals.failed.emit(self.token, message)
+                    return
         except Exception as exc:
             try:
                 self.signals.failed.emit(self.token, str(exc))
@@ -2475,7 +2706,18 @@ class CodeIndexWorker(QRunnable):
                 pass
             return
         finally:
-            builder.close()
+            stop_event.set()
+            try:
+                command_queue.put_nowait(("cancel",))
+            except (OSError, ValueError):
+                pass
+            if process.pid is not None:
+                process.join(timeout=0.8)
+                if process.is_alive():
+                    process.terminate()
+                    process.join(timeout=0.8)
+            self._close_process_queue(command_queue)
+            self._close_process_queue(result_queue)
         if self.cancel_event.is_set():
             return
         try:
@@ -4493,7 +4735,13 @@ class TranslatorWindow(QMainWindow):
         self.typing_uid = ""
         self.typing_before = ""
         self.typing_before_deleted = False
+        self.typing_before_cursor: int | None = None
+        self.typing_after_cursor: int | None = None
         self.editor_zoom_steps = self.settings.editor_zoom_steps
+        self._guide_preview_target = False
+        self._guide_preview_restore_splitter_sizes: tuple[int, int] | None = None
+        self._guide_preview_restore_splitter_ratio = 0.0
+        self._guide_preview_restore_table_scroll: tuple[int, int] | None = None
         self.typing_timer = QTimer(self)
         self.typing_timer.setSingleShot(True)
         self.typing_timer.setInterval(TYPING_GROUP_DELAY_MS)
@@ -4710,6 +4958,7 @@ class TranslatorWindow(QMainWindow):
         self.table.selectionModel().currentRowChanged.connect(self._on_row_selected)
         self.table.verticalHeader().setVisible(False)
         self.table.verticalHeader().setDefaultSectionSize(30)
+        self.table.verticalHeader().setSectionResizeMode(QHeaderView.ResizeMode.Fixed)
         self.table.horizontalHeader().setStretchLastSection(False)
         for column, width in enumerate(UnitTableModel.WIDTHS):
             self.table.setColumnWidth(column, width)
@@ -4772,14 +5021,16 @@ class TranslatorWindow(QMainWindow):
         self.code_index_visible_timer.setSingleShot(True)
         self.code_index_visible_timer.setInterval(90)
         self.code_index_visible_timer.timeout.connect(self._request_visible_code_contexts)
+        self.code_index_idle_timer = QTimer(self)
+        self.code_index_idle_timer.setSingleShot(True)
+        self.code_index_idle_timer.setInterval(700)
+        self.code_index_idle_timer.timeout.connect(self._resume_background_code_index)
         self.code_context_preview_uid = ""
         self.code_context_preview_timer = QTimer(self)
         self.code_context_preview_timer.setSingleShot(True)
         self.code_context_preview_timer.setInterval(CODE_CONTEXT_PREVIEW_DELAY_MS)
         self.code_context_preview_timer.timeout.connect(self._refresh_current_code_context_preview)
-        self.table.verticalScrollBar().valueChanged.connect(
-            lambda _value: self.code_index_visible_timer.start()
-        )
+        self.table.verticalScrollBar().valueChanged.connect(self._on_table_scrolled)
         self.source_preview_button.toggled.connect(
             lambda checked: self._on_editor_preview_toggled(False, checked)
         )
@@ -4820,7 +5071,7 @@ class TranslatorWindow(QMainWindow):
         self.source_edit.viewport().installEventFilter(self)
         self.translation_edit.installEventFilter(self)
         self.translation_edit.viewport().installEventFilter(self)
-        self.translation_edit.textChanged.connect(self._on_editor_changed)
+        self.translation_edit.contentEdited.connect(self._on_editor_changed)
         self.source_edit.previewRendered.connect(self._refresh_editor_highlights)
         self.translation_edit.previewRendered.connect(self._refresh_editor_highlights)
         self.source_highlighter = TokenHighlighter(self.source_edit.document())
@@ -4828,7 +5079,25 @@ class TranslatorWindow(QMainWindow):
         self.editors_splitter.addWidget(self.source_box)
         self.editors_splitter.addWidget(self.translation_box)
         self.editors_splitter.setSizes([620, 620])
-        self.main_splitter.addWidget(self.editors_splitter)
+        self.guide_preview = GuidePreviewPane()
+        self.guide_preview.closeRequested.connect(self._close_guide_preview)
+        self.guide_preview.pageRequested.connect(self._open_guide_preview_page)
+        self.guide_preview.targetRequested.connect(self._switch_guide_preview_target)
+        self.guide_preview.set_resolvers(
+            tip=self._resolve_guide_tip,
+            dynamic=self._resolve_guide_dynamic,
+        )
+        self.guide_preview.set_font_providers(
+            text_glyph=lambda char, target, color: self.preview_service.text_glyph_image(
+                char, target, color
+            ),
+            text_family=lambda target: self.preview_service.text_font_family(target),
+        )
+        self.editor_stack = QStackedWidget()
+        self.editor_stack.addWidget(self.editors_splitter)
+        self.editor_stack.addWidget(self.guide_preview)
+        self.editor_stack.setCurrentWidget(self.editors_splitter)
+        self.main_splitter.addWidget(self.editor_stack)
         self.main_splitter.setSizes([560, 270])
         self._table_visible_splitter_sizes = [560, 270]
         self._apply_editor_zoom()
@@ -4857,6 +5126,12 @@ class TranslatorWindow(QMainWindow):
             self.addAction(action)
 
     def eventFilter(self, watched: QObject, event: QEvent) -> bool:  # noqa: N802
+        if event.type() in {
+            QEvent.Type.KeyPress,
+            QEvent.Type.MouseButtonPress,
+            QEvent.Type.Wheel,
+        }:
+            self._defer_background_code_index()
         if watched is getattr(self, "source_code_button", None):
             return self._handle_code_button_event(event)
         code_popup = getattr(self, "code_reference_popup", None)
@@ -4970,6 +5245,9 @@ class TranslatorWindow(QMainWindow):
         for editor in self._editor_widgets():
             editor.set_zoom_factor(factor)
             editor.setProperty("zoomSteps", self.editor_zoom_steps)
+        guide_preview = getattr(self, "guide_preview", None)
+        if isinstance(guide_preview, GuidePreviewPane):
+            guide_preview.set_zoom_factor(factor)
 
     def _change_editor_zoom(self, delta: int) -> None:
         new_steps = max(-8, min(24, self.editor_zoom_steps + delta))
@@ -4996,6 +5274,8 @@ class TranslatorWindow(QMainWindow):
         self.typing_uid = ""
         self.typing_before = ""
         self.typing_before_deleted = False
+        self.typing_before_cursor = None
+        self.typing_after_cursor = None
 
     def _editor_group(self, read_only: bool) -> tuple[QGroupBox, PreviewPlainTextEdit, QToolButton]:
         box = EditorGroupBox()
@@ -5036,6 +5316,7 @@ class TranslatorWindow(QMainWindow):
             self._request_code_context_for_unit(unit)
         self.thread_pool.start(worker)
         self.code_index_visible_timer.start()
+        self.code_index_idle_timer.start()
 
     def _start_preview_localization(self) -> None:
         for stale_worker in self.preview_localization_workers:
@@ -5130,6 +5411,8 @@ class TranslatorWindow(QMainWindow):
         self._game_preview_cache.clear()
         self.source_edit.refresh_preview()
         self.translation_edit.refresh_preview()
+        if TranslatorWindow._guide_preview_is_active(self):
+            self._refresh_guide_preview()
         self._update_preview_tooltips()
 
     def _code_reference_index_finished(self, token: int) -> None:
@@ -5185,6 +5468,21 @@ class TranslatorWindow(QMainWindow):
         if normalize_label(unit.label) in self.code_reference_labels_ready:
             return
         self.code_reference_workers[-1].request_labels((unit.label,), 0)
+
+    def _defer_background_code_index(self) -> None:
+        for worker in getattr(self, "code_reference_workers", ()):
+            worker.set_background_enabled(False)
+        idle_timer = getattr(self, "code_index_idle_timer", None)
+        if isinstance(idle_timer, QTimer):
+            idle_timer.start()
+
+    def _resume_background_code_index(self) -> None:
+        for worker in self.code_reference_workers:
+            worker.set_background_enabled(True)
+
+    def _on_table_scrolled(self, _value: int) -> None:
+        self._defer_background_code_index()
+        self.code_index_visible_timer.start()
 
     def _request_visible_code_contexts(self) -> None:
         if (
@@ -5438,6 +5736,13 @@ class TranslatorWindow(QMainWindow):
         )
 
     def _on_editor_preview_toggled(self, target: bool, checked: bool) -> None:
+        unit = self._current_unit()
+        if unit is not None and format_dialect(unit.file_rel, unit.ref.kind) == FORMAT_GUIDE:
+            if checked:
+                self._show_guide_preview(target)
+            elif self._guide_preview_is_active() and self._guide_preview_target == target:
+                self._close_guide_preview()
+            return
         if target:
             self._commit_typing_operation()
             editor = self.translation_edit
@@ -5446,6 +5751,196 @@ class TranslatorWindow(QMainWindow):
         editor.set_preview_enabled(checked)
         self._update_preview_tooltips()
         self._refresh_editor_highlights()
+
+    def _guide_preview_is_active(self) -> bool:
+        return (
+            hasattr(self, "editor_stack")
+            and hasattr(self, "guide_preview")
+            and self.editor_stack.currentWidget() is self.guide_preview
+        )
+
+    def _expand_guide_preview_from_table(self) -> None:
+        if self._guide_preview_restore_splitter_sizes is not None:
+            return
+        sizes = self.main_splitter.sizes()
+        if not self.table_frame.isVisible() or len(sizes) != 2 or sizes[0] <= 0:
+            return
+        total = sum(sizes)
+        if total <= 0:
+            return
+        self._guide_preview_restore_splitter_sizes = (sizes[0], sizes[1])
+        self._guide_preview_restore_splitter_ratio = sizes[0] / total
+        self._guide_preview_restore_table_scroll = (
+            self.table.verticalScrollBar().value(),
+            self.table.horizontalScrollBar().value(),
+        )
+        self._table_visible_splitter_sizes = list(sizes)
+        self.table_frame.setVisible(False)
+        self.main_splitter.setSizes([0, total])
+
+    def _restore_guide_preview_table(self) -> None:
+        restore_sizes = self._guide_preview_restore_splitter_sizes
+        restore_ratio = self._guide_preview_restore_splitter_ratio
+        restore_scroll = self._guide_preview_restore_table_scroll
+        self._guide_preview_restore_splitter_sizes = None
+        self._guide_preview_restore_splitter_ratio = 0.0
+        self._guide_preview_restore_table_scroll = None
+        if restore_sizes is None:
+            return
+        if self._is_document_file_selected():
+            self.main_splitter.setSizes([0, max(sum(restore_sizes), 1)])
+            return
+        self.table_frame.setVisible(True)
+        total = sum(self.main_splitter.sizes())
+        if total <= 0:
+            restored = list(restore_sizes)
+        else:
+            table_size = max(1, min(total - 1, round(total * restore_ratio)))
+            restored = [table_size, max(1, total - table_size)]
+        self._table_visible_splitter_sizes = restored
+        self.main_splitter.setSizes(restored)
+        if restore_scroll is not None:
+            vertical_scroll, horizontal_scroll = restore_scroll
+            self.table.verticalScrollBar().setValue(vertical_scroll)
+            self.table.horizontalScrollBar().setValue(horizontal_scroll)
+
+    def _show_guide_preview(self, target: bool) -> None:
+        unit = self._current_unit()
+        if unit is None or format_dialect(unit.file_rel, unit.ref.kind) != FORMAT_GUIDE:
+            return
+        preview_was_active = self._guide_preview_is_active()
+        self._commit_typing_operation()
+        self._guide_preview_target = target
+        source_blocker = QSignalBlocker(self.source_preview_button)
+        target_blocker = QSignalBlocker(self.translation_preview_button)
+        self.source_preview_button.setChecked(not target)
+        self.translation_preview_button.setChecked(target)
+        del source_blocker, target_blocker
+        if not preview_was_active:
+            self._expand_guide_preview_from_table()
+        self._refresh_guide_preview()
+        self.editor_stack.setCurrentWidget(self.guide_preview)
+        self.guide_preview.setFocus(Qt.FocusReason.OtherFocusReason)
+        self._update_preview_tooltips()
+
+    def _close_guide_preview(self) -> None:
+        if not hasattr(self, "editor_stack"):
+            return
+        was_target = self._guide_preview_target
+        self.editor_stack.setCurrentWidget(self.editors_splitter)
+        self._restore_guide_preview_table()
+        source_blocker = QSignalBlocker(self.source_preview_button)
+        target_blocker = QSignalBlocker(self.translation_preview_button)
+        self.source_preview_button.setChecked(False)
+        self.translation_preview_button.setChecked(False)
+        del source_blocker, target_blocker
+        (self.translation_edit if was_target else self.source_edit).setFocus(
+            Qt.FocusReason.OtherFocusReason
+        )
+        self._update_preview_tooltips()
+
+    def _guide_units(self) -> tuple[TranslationUnit, ...]:
+        return tuple(
+            unit
+            for unit in self.model.units
+            if format_dialect(unit.file_rel, unit.ref.kind) == FORMAT_GUIDE
+        )
+
+    def _guide_unit_for_page(self, page_id: str) -> TranslationUnit | None:
+        wanted = page_id.strip().casefold()
+        return next(
+            (unit for unit in self._guide_units() if guide_page_id(unit.file_rel).casefold() == wanted),
+            None,
+        )
+
+    def _guide_toc_text(self, target: bool) -> str:
+        toc = self._guide_unit_for_page("TableOfContents")
+        if toc is None:
+            return ""
+        return (toc.current_text or toc.source_text) if target else toc.source_text
+
+    def _refresh_guide_preview(self) -> None:
+        unit = self._current_unit()
+        if unit is None or format_dialect(unit.file_rel, unit.ref.kind) != FORMAT_GUIDE:
+            if self._guide_preview_is_active():
+                self._close_guide_preview()
+            return
+        toc_text = self._guide_toc_text(self._guide_preview_target)
+        display_unit = unit
+        if guide_page_id(unit.file_rel).casefold() == "tableofcontents":
+            first_page = next(
+                (entry.page_id for entry in parse_guide_toc(toc_text) if entry.page_id),
+                "",
+            )
+            display_unit = self._guide_unit_for_page(first_page) or unit
+        text = (
+            (display_unit.current_text or display_unit.source_text)
+            if self._guide_preview_target
+            else display_unit.source_text
+        )
+        self.guide_preview.set_guide(
+            toc_text,
+            guide_page_id(display_unit.file_rel),
+            text,
+            target=self._guide_preview_target,
+        )
+
+    def _open_guide_preview_page(self, page_id: str) -> None:
+        unit = self._guide_unit_for_page(page_id)
+        if unit is None:
+            return
+        if self._guide_preview_restore_splitter_sizes is not None:
+            restore_scroll = self._guide_preview_restore_table_scroll
+            source_row = self.model.row_for_uid(unit.uid)
+            proxy_index = (
+                self.proxy.mapFromSource(self.model.index(source_row, 0))
+                if source_row is not None
+                else QModelIndex()
+            )
+            if proxy_index.isValid():
+                selection_blocker = QSignalBlocker(self.table.selectionModel())
+                self.table.setCurrentIndex(proxy_index)
+                self.table.selectRow(proxy_index.row())
+                del selection_blocker
+                self._filter_anchor_uid = unit.uid
+            self.current_uid = unit.uid
+            self._set_editor_unit(unit)
+            self._update_window_title()
+            self._refresh_guide_preview()
+            if restore_scroll is not None:
+                vertical_scroll, horizontal_scroll = restore_scroll
+                self.table.verticalScrollBar().setValue(vertical_scroll)
+                self.table.horizontalScrollBar().setValue(horizontal_scroll)
+            return
+        index = self.file_combo.findData(unit.file_rel)
+        if index >= 0 and index != self.file_combo.currentIndex():
+            self.file_combo.setCurrentIndex(index)
+        else:
+            self.current_uid = unit.uid
+            self._set_editor_unit(unit)
+        self._refresh_guide_preview()
+
+    def _switch_guide_preview_target(self, target: bool) -> None:
+        if not self._guide_preview_is_active():
+            return
+        self._guide_preview_target = target
+        source_blocker = QSignalBlocker(self.source_preview_button)
+        target_blocker = QSignalBlocker(self.translation_preview_button)
+        self.source_preview_button.setChecked(not target)
+        self.translation_preview_button.setChecked(target)
+        del source_blocker, target_blocker
+        self._refresh_guide_preview()
+
+    def _resolve_guide_tip(self, tip_id: str, target: bool) -> str:
+        value = self.preview_service.localization.resolve_label(tip_id, target)
+        return value if value and value.casefold() != tip_id.casefold() else tip_id
+
+    @staticmethod
+    def _resolve_guide_dynamic(_directive: str, _target: bool) -> tuple[str, ...]:
+        # The browser accepts any directive through one resolver boundary.  A
+        # missing data provider stays visibly unresolved instead of fabricating
+        # a value for one known placeholder family.
+        return ()
 
     def _update_preview_tooltips(self) -> None:
         unit = self._current_unit()
@@ -5564,6 +6059,13 @@ class TranslatorWindow(QMainWindow):
         tuple[TranslationUnit | PreviewWindowButton | str, ...],
         tuple[CodeReference, ...],
     ]:
+        unit_kind = str(getattr(getattr(unit, "ref", None), "kind", "dbt"))
+        if format_dialect(unit.file_rel, unit_kind) == FORMAT_GUIDE:
+            context = surface_window_context(
+                "guide",
+                body_label=normalize_label(unit.label),
+            )
+            return context, None, unit, (), ()
         selection = select_preview_context(
             str(getattr(unit, "source_text", "") or ""),
             self._code_references_for_unit(unit),
@@ -5858,8 +6360,12 @@ class TranslatorWindow(QMainWindow):
 
     def _refresh_preview_presentations(self) -> None:
         self._game_preview_cache.clear()
+        self.source_edit.refresh_preview_surface()
+        self.translation_edit.refresh_preview_surface()
         self.source_edit.refresh_preview()
         self.translation_edit.refresh_preview()
+        if self._guide_preview_is_active():
+            self._refresh_guide_preview()
         self._update_preview_tooltips()
         self.table.viewport().update()
 
@@ -6599,6 +7105,8 @@ class TranslatorWindow(QMainWindow):
         self.source_code_button.setText(translate("editor.code_button"))
         self.source_preview_button.setText(translate("editor.preview_toggle"))
         self.translation_preview_button.setText(translate("editor.preview_toggle"))
+        if hasattr(self, "guide_preview"):
+            self.guide_preview.retranslate_ui()
         self._update_code_reference_display()
         if isinstance(self.source_box, EditorGroupBox):
             self.source_box.position_preview_button()
@@ -6694,12 +7202,17 @@ class TranslatorWindow(QMainWindow):
             self._set_editor_unit(unit)
             self._update_window_title()
             return True
+        if self._guide_preview_is_active() and self._guide_preview_restore_splitter_sizes is None:
+            self._close_guide_preview()
+        if self._guide_preview_restore_splitter_sizes is not None and self._guide_preview_is_active():
+            return False
         if not self.table_frame.isVisible():
             self.table_frame.setVisible(True)
             self.main_splitter.setSizes(self._table_visible_splitter_sizes)
         return False
 
     def _apply_filters(self) -> None:
+        self._defer_background_code_index()
         query = self.search_edit.text()
         previous_document_mode = not self.table_frame.isVisible()
         selected_uid = self._filter_anchor_uid or self.current_uid
@@ -6771,6 +7284,7 @@ class TranslatorWindow(QMainWindow):
         # Ctrl+A selection can briefly emit "" before the first new character;
         # restoring the table selection at that point steals focus from search.
         self._refresh_editor_highlights()
+        self._defer_background_code_index()
         self.search_debounce.start()
 
     def _on_search_case_toggled(self, _checked: bool) -> None:
@@ -6875,6 +7389,7 @@ class TranslatorWindow(QMainWindow):
     def _on_row_selected(self, current: QModelIndex, _previous: QModelIndex) -> None:
         if self._is_document_file_selected():
             return
+        self._defer_background_code_index()
         self._commit_typing_operation()
         self.code_context_preview_timer.stop()
         self.code_context_preview_uid = ""
@@ -6890,8 +7405,24 @@ class TranslatorWindow(QMainWindow):
     def _set_editor_unit(self, unit: TranslationUnit | None) -> None:
         self.loading_editor = True
         dialect = format_dialect(unit.file_rel, unit.ref.kind) if unit is not None else FORMAT_GUILD2
+        guide_mode = dialect == FORMAT_GUIDE
+        if not guide_mode and self._guide_preview_is_active():
+            self._close_guide_preview()
+        if guide_mode and not self._guide_preview_is_active():
+            source_blocker = QSignalBlocker(self.source_preview_button)
+            target_blocker = QSignalBlocker(self.translation_preview_button)
+            if self.source_edit.preview_enabled:
+                self.source_edit.set_preview_enabled(False)
+            if self.translation_edit.preview_enabled:
+                self.translation_edit.set_preview_enabled(False)
+            self.source_preview_button.setChecked(False)
+            self.translation_preview_button.setChecked(False)
+            del source_blocker, target_blocker
         self.source_highlighter.set_dialect(dialect)
         self.translation_highlighter.set_dialect(dialect)
+        preview_surface = "guide" if guide_mode else ""
+        self.source_edit.set_preview_surface(preview_surface)
+        self.translation_edit.set_preview_surface(preview_surface)
         source_blocker = QSignalBlocker(self.source_edit)
         translation_blocker = QSignalBlocker(self.translation_edit)
         self.source_edit.setPlainText(unit.source_text if unit else "")
@@ -6904,6 +7435,8 @@ class TranslatorWindow(QMainWindow):
         self._update_preview_tooltips()
         self._refresh_editor_highlights()
         self._update_code_reference_display()
+        if guide_mode and self._guide_preview_is_active():
+            self._refresh_guide_preview()
 
     def _search_ranges(self, text: str, field: str) -> list[tuple[int, int]]:
         case_sensitive = self.search_edit.case_button.isChecked()
@@ -6974,22 +7507,30 @@ class TranslatorWindow(QMainWindow):
         self.source_edit.setExtraSelections(source_selections)
         self.translation_edit.setExtraSelections(translation_selections)
 
-    def _on_editor_changed(self) -> None:
+    def _on_editor_changed(self, before_cursor: int = -1, after_cursor: int = -1) -> None:
         if self.loading_editor:
             return
         unit = self._current_unit()
         if unit is None:
             return
         text = self.translation_edit.toPlainText()
+        if after_cursor < 0:
+            cursor_reader = getattr(self.translation_edit, "raw_cursor_position", None)
+            after_cursor = cursor_reader() if callable(cursor_reader) else len(text)
+        if before_cursor < 0:
+            before_cursor = after_cursor
         if not self.typing_uid:
             self.typing_uid = unit.uid
             self.typing_before = unit.current_text
             self.typing_before_deleted = unit.pending_delete
+            self.typing_before_cursor = before_cursor
         elif self.typing_uid != unit.uid:
             self._commit_typing_operation()
             self.typing_uid = unit.uid
             self.typing_before = unit.current_text
             self.typing_before_deleted = unit.pending_delete
+            self.typing_before_cursor = before_cursor
+        self.typing_after_cursor = after_cursor
         before_status = unit.filter_status()
         before_dirty = unit.is_dirty
         self._set_unit_text(unit, text)
@@ -7012,11 +7553,23 @@ class TranslatorWindow(QMainWindow):
         before, self.typing_uid = self.typing_before, ""
         self.typing_before = ""
         before_deleted, self.typing_before_deleted = self.typing_before_deleted, False
+        before_cursor, self.typing_before_cursor = self.typing_before_cursor, None
+        after_cursor, self.typing_after_cursor = self.typing_after_cursor, None
         if unit is not None and (unit.current_text != before or unit.pending_delete != before_deleted):
             self.history.push(
                 TranslationOperation(
                     translate("operation.continuous_edit"),
-                    (UnitChange(unit.uid, before, unit.current_text, before_deleted, unit.pending_delete),),
+                    (
+                        UnitChange(
+                            unit.uid,
+                            before,
+                            unit.current_text,
+                            before_deleted,
+                            unit.pending_delete,
+                            before_cursor,
+                            after_cursor,
+                        ),
+                    ),
                 )
             )
 
@@ -7067,10 +7620,9 @@ class TranslatorWindow(QMainWindow):
         self._schedule_recovery_snapshot()
 
     def _apply_operation_changes(self, changes: tuple[UnitChange, ...], *, use_after: bool) -> None:
-        cursor = self.translation_edit.textCursor()
-        cursor_position = cursor.position()
-        old_display_length = max(0, self.translation_edit.document().characterCount() - 1)
-        cursor_was_at_end = cursor_position >= old_display_length
+        cursor_position = self.translation_edit.raw_cursor_position()
+        current_before = self.model.unit_for_uid(self.current_uid) if self.current_uid else None
+        current_before_text = current_before.current_text if current_before is not None else ""
         changed: list[tuple[TranslationUnit, str, bool]] = []
         edit_states: list[tuple[TranslationUnit, str, bool | None]] = []
         changed_uids: set[str] = set()
@@ -7107,16 +7659,55 @@ class TranslatorWindow(QMainWindow):
             self._restore_selected_row(selected_uid)
         current = self.model.unit_for_uid(self.current_uid) if self.current_uid else None
         if current is not None and current.uid in changed_uids:
-            self._set_editor_unit(current)
-            new_display_length = max(0, self.translation_edit.document().characterCount() - 1)
-            restored_cursor = self.translation_edit.textCursor()
-            restored_cursor.setPosition(
-                new_display_length if cursor_was_at_end else min(cursor_position, new_display_length)
+            current_change = next(change for change in changes if change.uid == current.uid)
+            desired_cursor = (
+                current_change.after_cursor if use_after else current_change.before_cursor
             )
-            self.translation_edit.setTextCursor(restored_cursor)
+            if desired_cursor is None:
+                desired_cursor = self._map_cursor_between_texts(
+                    current_before_text,
+                    current.current_text,
+                    cursor_position,
+                )
+            self.loading_editor = True
+            translation_blocker = QSignalBlocker(self.translation_edit)
+            self.translation_edit.setPlainText(current.current_text)
+            self.translation_edit.document().clearUndoRedoStacks()
+            self.translation_edit.set_raw_cursor_position(desired_cursor)
+            del translation_blocker
+            self.loading_editor = False
+            self._update_issue_detail(current)
+            self._refresh_editor_highlights()
+            if self._guide_preview_is_active():
+                self._refresh_guide_preview()
         self._update_counts()
         self._update_window_title()
         self._schedule_recovery_snapshot()
+
+    @staticmethod
+    def _map_cursor_between_texts(before: str, after: str, position: int) -> int:
+        """Keep a caret attached to the unchanged prefix or suffix across undo/redo."""
+
+        old_position = max(0, min(position, len(before)))
+        prefix = 0
+        prefix_limit = min(len(before), len(after))
+        while prefix < prefix_limit and before[prefix] == after[prefix]:
+            prefix += 1
+        suffix = 0
+        suffix_limit = min(len(before) - prefix, len(after) - prefix)
+        while (
+            suffix < suffix_limit
+            and before[len(before) - suffix - 1] == after[len(after) - suffix - 1]
+        ):
+            suffix += 1
+        if old_position == len(before):
+            return len(after)
+        if old_position <= prefix:
+            return old_position
+        old_suffix_start = len(before) - suffix
+        if old_position >= old_suffix_start:
+            return max(prefix, len(after) - (len(before) - old_position))
+        return min(len(after), prefix)
 
     def _set_unit_text(self, unit: TranslationUnit, text: str) -> None:
         if self.project is None:
@@ -8111,6 +8702,10 @@ class TranslatorWindow(QMainWindow):
                 self.source_highlighter.refresh_theme()
             if hasattr(self, "translation_highlighter"):
                 self.translation_highlighter.refresh_theme()
+            for editor in self._editor_widgets():
+                editor.refresh_theme_font()
+            if hasattr(self, "guide_preview"):
+                self.guide_preview.refresh_theme()
             self._apply_theme_layout()
         finally:
             self.setUpdatesEnabled(True)
@@ -8122,8 +8717,7 @@ class TranslatorWindow(QMainWindow):
     def _unit_from_proxy_index(self, index: QModelIndex) -> TranslationUnit | None:
         if not index.isValid():
             return None
-        source_index = self.proxy.mapToSource(index)
-        return self.model.unit_at(source_index.row())
+        return self.proxy.unit_at(index.row())
 
     def _update_issue_detail(self, unit: TranslationUnit | None) -> None:
         if unit is None:
@@ -8207,6 +8801,7 @@ class TranslatorWindow(QMainWindow):
         self.ai_filter_refresh_timer.stop()
         self.code_button_hold_timer.stop()
         self.code_index_visible_timer.stop()
+        self.code_index_idle_timer.stop()
         self.code_context_preview_timer.stop()
         self.code_context_preview_uid = ""
         self.source_preview_tooltip_filter.cancel()
@@ -9057,6 +9652,7 @@ def apply_theme(app: QApplication | None, theme: str) -> None:
 
 
 def main() -> None:
+    multiprocessing.freeze_support()
     configure_diagnostics()
     startup_started = time.perf_counter()
     try:

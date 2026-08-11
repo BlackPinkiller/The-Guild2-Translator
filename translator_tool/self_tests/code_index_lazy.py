@@ -171,6 +171,93 @@ def assert_lazy_code_index_loads_effective_item_id_ranges() -> None:
         shutil.rmtree(temp, ignore_errors=True)
 
 
+def assert_lazy_code_index_resolves_database_backed_label_domains() -> None:
+    temp = Path(tempfile.mkdtemp(prefix="translator_tool_database_domains_"))
+    try:
+        game = temp / "game"
+        project = temp / "sources" / "Reforged"
+        scripts = game / "mods" / "Reforged" / "Scripts"
+        scripts.mkdir(parents=True)
+        project.mkdir(parents=True)
+        base_database = game / "DB" / "Lordship.dbt"
+        mod_database = game / "mods" / "Reforged" / "DB" / "Lordship.dbt"
+        base_database.parent.mkdir(parents=True)
+        mod_database.parent.mkdir(parents=True)
+        header = (
+            'Table Description:\n"id" INT -1 |"name" STRING 0 |'
+            '"enemy1" STRING 0 |"enemy2" STRING 0 |\nData:\n'
+        )
+        base_database.write_text(
+            header
+            + '1 "base" "spain" "france" |\n'
+            + '2 "north" "hansa" "england" |\n',
+            encoding="utf-8",
+        )
+        mod_database.write_text(
+            header + '1 "modded" "italy" "austria" |\n',
+            encoding="utf-8",
+        )
+        (scripts / "trade.lua").write_text(
+            "\n".join(
+                (
+                    "function GetRealmName(Slot)",
+                    '  return GetDatabaseValue("Lordship", 1, "enemy"..Slot)',
+                    "end",
+                    "function RealmDisplay(Slot)",
+                    '  if Slot == nil then return "@L_KR_KONTOR_NOCROWN_+0" end',
+                    '  return "@L_SCENARIO_WAR_"..trade_GetRealmName(Slot).."_+2"',
+                    "end",
+                )
+            ),
+            encoding="utf-8",
+        )
+        (scripts / "Permit.lua").write_text(
+            "\n".join(
+                (
+                    "function Run()",
+                    "  local lordName = trade_RealmDisplay(Realm)",
+                    '  MsgQuick("", "@L_KR_PERMIT_HAVE_+0", lordName)',
+                    "end",
+                )
+            ),
+            encoding="utf-8",
+        )
+        builder = LazyCodeIndexBuilder(
+            game,
+            project,
+            cache_path=temp / "cache.json",
+        )
+        index = builder.analyze_labels(("KR_PERMIT_HAVE_+0",))
+        builder.close()
+        references = index.references_for("KR_PERMIT_HAVE_+0").project
+        if len(references) != 1:
+            raise AssertionError(f"database-backed caller was not indexed once: {references!r}")
+        values = references[0].runtime_argument_values
+        expected = {
+            "@L_KR_KONTOR_NOCROWN_+0",
+            "@L_SCENARIO_WAR_italy_+2",
+            "@L_SCENARIO_WAR_austria_+2",
+            "@L_SCENARIO_WAR_hansa_+2",
+            "@L_SCENARIO_WAR_england_+2",
+        }
+        if len(values) != 1 or set(values[0]) != expected:
+            raise AssertionError(
+                "a finite database label domain degraded into an unrelated wildcard: "
+                f"{values!r}"
+            )
+        if any("*" in value or "RANDOMTALK" in value for value in values[0]):
+            raise AssertionError(f"database label candidates escaped their runtime column: {values!r}")
+        kinds = dict(zip(values[0], references[0].runtime_argument_kinds[0]))
+        if kinds.get("@L_KR_KONTOR_NOCROWN_+0") != "label" or any(
+            kinds.get(value) != "label_domain"
+            for value in expected
+            if value != "@L_KR_KONTOR_NOCROWN_+0"
+        ):
+            raise AssertionError(f"database label provenance was not preserved: {kinds!r}")
+    finally:
+        shutil.rmtree(temp, ignore_errors=True)
+
+
 def assert_lazy_code_index_prioritizes_requested_labels_and_invalidates_cache() -> None:
     temp = Path(tempfile.mkdtemp(prefix="translator_tool_lazy_code_index_"))
     original_revision = lazy_module.ANALYZER_REVISION
@@ -253,8 +340,9 @@ def assert_lazy_code_index_prioritizes_requested_labels_and_invalidates_cache() 
 
 
 def assert_code_index_requests_selected_and_visible_rows_without_moving_viewport() -> None:
-    from .. import app as app_module
     from ..app import CodeIndexWorker, TranslatorWindow
+    from ..code_index_worker import run_code_index_loop
+    from queue import Empty, Queue
 
     worker = CodeIndexWorker(1, None, None)
     worker.request_labels(("visible",), 1)
@@ -270,13 +358,13 @@ def assert_code_index_requests_selected_and_visible_rows_without_moving_viewport
     if worker._take_requested() != (0, 4, ("new-selected",)):
         raise AssertionError("a stale selected-row request delayed the current selection")
 
-    original_builder = app_module.LazyCodeIndexBuilder
-    runtime_worker = CodeIndexWorker(2, Path("game"), Path("project"))
     calls: list[tuple[str, ...]] = []
     ready: list[str] = []
+    command_queue: Queue[object] = Queue()
+    result_queue: Queue[object] = Queue()
 
     class FakeBuilder:
-        def __init__(self, *_args, **_kwargs) -> None:
+        def __init__(self) -> None:
             self.complete = False
 
         @property
@@ -286,14 +374,14 @@ def assert_code_index_requests_selected_and_visible_rows_without_moving_viewport
         def analyze_labels(self, labels, *, cancelled):
             calls.append(tuple(labels))
             if labels == ("visible-old",):
-                runtime_worker.request_labels(("selected-now",), 0)
+                command_queue.put(("request", 0, 2, ("selected-now",)))
                 if not cancelled():
                     raise AssertionError("selected request did not preempt visible-row analysis")
             elif labels == ("selected-now",):
-                runtime_worker.request_labels(("selected-new",), 0)
-                runtime_worker.request_labels(("visible-new",), 1)
-                if cancelled():
-                    raise AssertionError("a new selection restarted active selected-row analysis")
+                command_queue.put(("request", 0, 3, ("selected-new",)))
+                command_queue.put(("request", 1, 4, ("visible-new",)))
+                if not cancelled():
+                    raise AssertionError("a stale active selection blocked the new selected row")
             elif labels == ("selected-new",):
                 pass
             elif labels == ("visible-new",):
@@ -303,18 +391,15 @@ def assert_code_index_requests_selected_and_visible_rows_without_moving_viewport
         def analyze_next_batch(self, *_args, **_kwargs):
             raise AssertionError("worker ignored queued priority requests")
 
-        def close(self) -> None:
-            pass
-
-    try:
-        app_module.LazyCodeIndexBuilder = FakeBuilder
-        runtime_worker.signals.labels_ready.connect(
-            lambda _token, labels: ready.extend(labels)
-        )
-        runtime_worker.request_labels(("visible-old",), 1)
-        runtime_worker.run()
-    finally:
-        app_module.LazyCodeIndexBuilder = original_builder
+    command_queue.put(("request", 1, 1, ("visible-old",)))
+    run_code_index_loop(FakeBuilder(), command_queue, result_queue, lambda: False)  # type: ignore[arg-type]
+    while True:
+        try:
+            result = result_queue.get_nowait()
+        except Empty:
+            break
+        if isinstance(result, tuple) and result and result[0] == "labels_ready":
+            ready.extend(result[1])
     if calls != [
         ("visible-old",),
         ("selected-now",),
@@ -322,8 +407,48 @@ def assert_code_index_requests_selected_and_visible_rows_without_moving_viewport
         ("visible-new",),
     ]:
         raise AssertionError(f"priority requests ran in the wrong order: {calls!r}")
-    if ready != ["selected-now", "selected-new", "visible-new"]:
+    if ready != ["selected-new", "visible-new"]:
         raise AssertionError(f"interrupted or empty priority results reported wrong readiness: {ready!r}")
+
+    temp = Path(tempfile.mkdtemp(prefix="translator_tool_code_index_process_"))
+    try:
+        game = temp / "game"
+        project = temp / "sources" / "Vanilla"
+        scripts = game / "Scripts"
+        scripts.mkdir(parents=True)
+        project.mkdir(parents=True)
+        script = scripts / "Selected.lua"
+        script.write_text(
+            'MsgQuick("", "@L_SELECTED_PROCESS_BODY_+0", Value)',
+            encoding="utf-8",
+        )
+        process_worker = CodeIndexWorker(2, game, project)
+        partials: list[CodeReferenceIndex] = []
+        process_ready: list[str] = []
+        failures: list[str] = []
+        process_worker.signals.partial.connect(
+            lambda _token, index, _progress: partials.append(index)
+        )
+        process_worker.signals.labels_ready.connect(
+            lambda _token, labels: process_ready.extend(labels)
+        )
+        process_worker.signals.failed.connect(
+            lambda _token, message: failures.append(message)
+        )
+        process_worker.request_labels(("SELECTED_PROCESS_BODY_+0",), 0)
+        process_worker.run()
+        if failures:
+            raise AssertionError(f"isolated code-index process failed: {failures!r}")
+        if process_ready != ["selected_process_body_+0"]:
+            raise AssertionError(f"isolated selected request was not reported ready: {process_ready!r}")
+        merged = CodeReferenceIndex()
+        for partial in partials:
+            merged.merge(partial)
+        references = merged.references_for("SELECTED_PROCESS_BODY_+0").project
+        if len(references) != 1 or references[0].path != script:
+            raise AssertionError(f"isolated process returned the wrong code reference: {references!r}")
+    finally:
+        shutil.rmtree(temp, ignore_errors=True)
 
     units = tuple(
         SimpleNamespace(

@@ -545,6 +545,13 @@ def _presentation_for_surface(
             "Hud/NoCompression/header_red.tga",
         )
     profiles = {
+        "guide": PreviewSurfacePresentation(
+            "guide",
+            "parchment",
+            "guide",
+            "GUI/Hud/panel_guide.gui",
+            "Hud/background_scroll.tga",
+        ),
         "messagebox": PreviewSurfacePresentation(
             "message",
             "parchment",

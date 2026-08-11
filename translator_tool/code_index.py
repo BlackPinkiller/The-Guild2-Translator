@@ -8,12 +8,14 @@ from pathlib import Path
 import re
 
 from .game_items import game_item_names_by_id
+from .game_database import DatabaseValueDomains, game_database_value_domains
 from .script_semantics import (
     ExternalCallFlow,
     FunctionValueSummary,
     FunctionReturnLabel,
     SUMMARY_PARAMETER_PREFIX,
     SEMANTIC_EXPRESSION,
+    SEMANTIC_DATABASE_VALUE,
     SEMANTIC_LABEL,
     SemanticValue,
     ScriptSemanticFacts,
@@ -218,6 +220,7 @@ class CrossFileSemanticLinker:
     def __init__(
         self,
         item_names_by_id: tuple[tuple[int, str], ...] = (),
+        database_value_domains: DatabaseValueDomains = (),
     ) -> None:
         self._returns: dict[tuple[str, str, Path | None], list[CodeReturnLabel]] = {}
         self._flows: dict[tuple[str, str, Path | None], list[CodeExternalFlow]] = {}
@@ -230,6 +233,10 @@ class CrossFileSemanticLinker:
         self._seen_value_references: set[tuple[object, ...]] = set()
         self._emitted_values: set[tuple[object, ...]] = set()
         self._item_names_by_id = dict(item_names_by_id)
+        self._database_value_domains = {
+            (table.casefold(), field.casefold()): values
+            for table, field, values in database_value_domains
+        }
 
     def add(self, analysis: CodeFileAnalysis) -> CodeReferenceIndex:
         result = CodeReferenceIndex()
@@ -509,6 +516,7 @@ class CrossFileSemanticLinker:
             alias,
             tuple(argument_values),
             item_names_by_id=self._item_names_by_id,
+            database_value_domains=self._database_value_domains,
         )
         if native is not None:
             return native
@@ -654,7 +662,12 @@ def _semantic_text_candidates(
 def _semantic_kind_candidates(
     values: tuple[SemanticValue, ...],
 ) -> tuple[str, ...]:
-    return tuple(value.kind for value in values)
+    return tuple(
+        semantic_literal(value.text).kind
+        if value.kind == SEMANTIC_DATABASE_VALUE
+        else value.kind
+        for value in values
+    )
 
 
 def _semantic_specificity(values: tuple[SemanticValue, ...]) -> int:
@@ -725,7 +738,8 @@ def build_code_reference_index(
         else project_root.name
     )
     item_names = game_item_names_by_id(game_root, mod_name)
-    linker = CrossFileSemanticLinker(item_names)
+    database_domains = game_database_value_domains(game_root, mod_name)
+    linker = CrossFileSemanticLinker(item_names, database_domains)
     result = CodeReferenceIndex()
     for spec in files:
         partial = linker.add(
@@ -733,6 +747,7 @@ def build_code_reference_index(
                 spec,
                 label_catalog=label_catalog,
                 item_names_by_id=item_names,
+                database_value_domains=database_domains,
             )
         )
         result.merge(partial)
@@ -773,12 +788,14 @@ def index_code_file(
     *,
     label_catalog: frozenset[str] = frozenset(),
     item_names_by_id: tuple[tuple[int, str], ...] = (),
+    database_value_domains: DatabaseValueDomains = (),
     raw: bytes | None = None,
 ) -> CodeReferenceIndex:
     return analyze_code_file(
         spec,
         label_catalog=label_catalog,
         item_names_by_id=item_names_by_id,
+        database_value_domains=database_value_domains,
         raw=raw,
     ).index
 
@@ -788,6 +805,7 @@ def analyze_code_file(
     *,
     label_catalog: frozenset[str] = frozenset(),
     item_names_by_id: tuple[tuple[int, str], ...] = (),
+    database_value_domains: DatabaseValueDomains = (),
     raw: bytes | None = None,
 ) -> CodeFileAnalysis:
     if raw is None:
@@ -800,6 +818,7 @@ def analyze_code_file(
         source=spec.source,
         label_catalog=label_catalog,
         item_names_by_id=item_names_by_id,
+        database_value_domains=database_value_domains,
         raw=raw,
     )
     index = (
@@ -824,6 +843,7 @@ def scan_code_roots(
     source: str = "project",
     label_catalog: frozenset[str] = frozenset(),
     item_names_by_id: tuple[tuple[int, str], ...] = (),
+    database_value_domains: DatabaseValueDomains = (),
 ) -> dict[str, tuple[CodeReference, ...]]:
     merged: dict[str, list[CodeReference]] = {}
     for root in roots:
@@ -832,6 +852,7 @@ def scan_code_roots(
             source=source,
             label_catalog=label_catalog,
             item_names_by_id=item_names_by_id,
+            database_value_domains=database_value_domains,
         ).items():
             merged.setdefault(label, []).extend(references)
     return {label: _dedupe_references(items) for label, items in merged.items()}
@@ -843,6 +864,7 @@ def scan_scripts_root(
     source: str = "project",
     label_catalog: frozenset[str] = frozenset(),
     item_names_by_id: tuple[tuple[int, str], ...] = (),
+    database_value_domains: DatabaseValueDomains = (),
 ) -> dict[str, tuple[CodeReference, ...]]:
     root = root.expanduser()
     if not root.is_dir():
@@ -854,6 +876,7 @@ def scan_scripts_root(
             source=source,
             label_catalog=label_catalog,
             item_names_by_id=item_names_by_id,
+            database_value_domains=database_value_domains,
         ).items():
             grouped.setdefault(label, []).extend(references)
     return {label: _dedupe_references(items) for label, items in grouped.items()}
@@ -865,6 +888,7 @@ def scan_code_file(
     source: str = "project",
     label_catalog: frozenset[str] = frozenset(),
     item_names_by_id: tuple[tuple[int, str], ...] = (),
+    database_value_domains: DatabaseValueDomains = (),
     raw: bytes | None = None,
 ) -> dict[str, tuple[CodeReference, ...]]:
     references, _facts = _scan_code_file(
@@ -872,6 +896,7 @@ def scan_code_file(
         source=source,
         label_catalog=label_catalog,
         item_names_by_id=item_names_by_id,
+        database_value_domains=database_value_domains,
         raw=raw,
     )
     return references
@@ -883,6 +908,7 @@ def _scan_code_file(
     source: str,
     label_catalog: frozenset[str],
     item_names_by_id: tuple[tuple[int, str], ...],
+    database_value_domains: DatabaseValueDomains,
     raw: bytes | None,
 ) -> tuple[dict[str, tuple[CodeReference, ...]], ScriptSemanticFacts | None]:
     if raw is None:
@@ -915,6 +941,7 @@ def _scan_code_file(
         path,
         label_catalog=label_catalog,
         item_names_by_id=item_names_by_id,
+        database_value_domains=database_value_domains,
     )
     for use in facts.uses:
         line_number, column = _line_column(line_starts, use.position)
@@ -1090,11 +1117,11 @@ def _dynamic_label_from_expression(expression: str, *, normalized: bool) -> str:
     if not has_wildcard:
         return ""
     label = "".join(fragments)
-    if label.endswith("_+"):
+    if label.endswith("+"):
         label += "*"
     if not (label.startswith("@L_") or label.startswith("_")):
         return ""
-    if "_+" not in label:
+    if re.search(r"(?:_\+|\+)[A-Za-z0-9*]+$", label) is None:
         return ""
     return normalize_label(label) if normalized else label
 
@@ -1115,7 +1142,7 @@ def normalize_label(label: str) -> str:
     value = label.strip()
     if value.startswith("@L_"):
         value = value[3:]
-    if value.endswith("_+"):
+    if value.endswith("+"):
         value += "*"
     return value.casefold()
 
@@ -1169,10 +1196,10 @@ def runtime_label_argument_number(reference: CodeReference, label: str) -> int |
 
 def label_group_key(label: str) -> str | None:
     normalized = normalize_label(label)
-    match = re.match(r"^(.*_\+)[A-Za-z0-9]+$", normalized)
+    match = re.match(r"^(.*?)(?P<separator>_\+|\+)[A-Za-z0-9]+$", normalized)
     if match is not None:
-        return match.group(1) + "*"
-    if normalized.endswith("_+*"):
+        return match.group(1) + match.group("separator") + "*"
+    if normalized.endswith(("_+*", "+*")):
         return normalized
     return None
 
@@ -1209,19 +1236,23 @@ def lookup_labels(label: str) -> tuple[str, ...]:
 
 def dynamic_label_keys(label: str) -> tuple[str, ...]:
     normalized = normalize_label(label)
-    match = re.match(r"^(?P<body>.+)_\+(?P<suffix>[A-Za-z0-9*]+)$", normalized)
+    match = re.match(
+        r"^(?P<body>.+?)(?P<separator>_\+|\+)(?P<suffix>[A-Za-z0-9*]+)$",
+        normalized,
+    )
     if match is None:
         return ()
     parts = match.group("body").split("_")
     if len(parts) < 2:
         return ()
     suffix = match.group("suffix")
+    separator = match.group("separator")
     keys: list[str] = []
     for index in range(1, len(parts)):
         candidate_parts = list(parts)
         candidate_parts[index] = "*"
-        keys.append("_".join(candidate_parts) + "_+" + suffix)
-        keys.append("_".join(candidate_parts) + "_+*")
+        keys.append("_".join(candidate_parts) + separator + suffix)
+        keys.append("_".join(candidate_parts) + separator + "*")
     return tuple(keys)
 
 
@@ -1410,7 +1441,10 @@ def _resolved_runtime_value_count(reference: CodeReference) -> int:
 
 
 def _family_base(label: str) -> str:
-    match = re.match(r"^(.*)_\+[A-Za-z0-9]+$", normalize_label(label))
+    match = re.match(
+        r"^(.*?)(?:_\+|\+)[A-Za-z0-9]+$",
+        normalize_label(label),
+    )
     return match.group(1) if match is not None else ""
 
 

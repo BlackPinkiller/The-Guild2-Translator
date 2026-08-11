@@ -4,7 +4,7 @@ from dataclasses import asdict, dataclass
 from typing import Iterable
 
 from .code_index import CodeReference, CodeReferenceIndex
-from .engine_semantics import engine_format_argument_kind
+from .engine_semantics import engine_format_argument_kind, engine_format_argument_labels
 from .preview_placeholders import (
     placeholder_arguments,
     placeholder_reference_complete,
@@ -33,6 +33,7 @@ class PlaceholderPreviewCoverage:
     labels_with_placeholders: int = 0
     placeholder_positions: int = 0
     concrete_positions: int = 0
+    engine_label_positions: int = 0
     semantic_type_positions: int = 0
     suffix_format_positions: int = 0
     structural_positions: int = 0
@@ -145,6 +146,7 @@ def preview_placeholder_coverage(
     labels_with_placeholders = 0
     placeholder_positions = 0
     concrete_positions = 0
+    engine_label_positions = 0
     semantic_type_positions = 0
     suffix_format_positions = 0
     structural_positions = 0
@@ -170,7 +172,9 @@ def preview_placeholder_coverage(
                 if placeholder_reference_complete(token, reference)
             )
             if not aligned:
-                if engine_format_argument_kind(label, number):
+                if engine_format_argument_labels(label, number):
+                    engine_label_positions += 1
+                elif engine_format_argument_kind(label, number):
                     semantic_type_positions += 1
                 elif _suffix_has_intrinsic_format(suffix):
                     suffix_format_positions += 1
@@ -180,6 +184,8 @@ def preview_placeholder_coverage(
             values, kinds = _runtime_evidence(aligned, number)
             if any(value not in {"", "$N"} for value in values):
                 concrete_positions += 1
+            elif engine_format_argument_labels(label, number):
+                engine_label_positions += 1
             elif kinds and all(kind == "structure" for kind in kinds):
                 structural_positions += 1
             elif not _placeholder_kinds_compatible(suffix, kinds):
@@ -194,6 +200,7 @@ def preview_placeholder_coverage(
         labels_with_placeholders=labels_with_placeholders,
         placeholder_positions=placeholder_positions,
         concrete_positions=concrete_positions,
+        engine_label_positions=engine_label_positions,
         semantic_type_positions=semantic_type_positions,
         suffix_format_positions=suffix_format_positions,
         structural_positions=structural_positions,

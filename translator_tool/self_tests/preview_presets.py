@@ -10,8 +10,8 @@ from ..preview_presets import (
 
 def assert_preview_presets_are_complete_and_unambiguous() -> None:
     presets = preview_presets()
-    if len(presets) != 7:
-        raise AssertionError(f"expected seven focused preview styles, got {len(presets)}")
+    if len(presets) != 8:
+        raise AssertionError(f"expected eight focused preview styles, got {len(presets)}")
     owners: dict[str, str] = {}
     for preset in presets:
         for surface in preset.surfaces:
@@ -30,6 +30,7 @@ def assert_preview_presets_are_complete_and_unambiguous() -> None:
         "measure_choice": "choice_panel",
         "questbook": "split_book",
         "pamphlet": "document_page",
+        "guide": "guide_page",
     }
     for surface, preset_id in expected.items():
         preset = preview_preset(surface)

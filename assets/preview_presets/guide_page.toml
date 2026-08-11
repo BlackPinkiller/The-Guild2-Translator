@@ -1,0 +1,23 @@
+[preset]
+id = "guide_page"
+surfaces = ["guide"]
+kinds = ["guide"]
+flow = "column"
+min_width = 420
+preferred_width = 540
+max_width = 580
+min_height = 220
+max_height = 460
+padding = [34, 38, 34, 38]
+gap = 0
+background = "guide_background"
+body_scale = 0.64
+renderer = "flow"
+
+[[region]]
+id = "body"
+parent = "root"
+slot = "body"
+flow = "stack"
+grow = 1.0
+min_size = 150

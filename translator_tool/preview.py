@@ -19,6 +19,7 @@ from PySide6.QtGui import (
     QFontMetrics,
     QImage,
     QPainter,
+    QPen,
     qRgba,
 )
 
@@ -66,6 +67,10 @@ PRINTF_PREVIEW_RE = re.compile(PRINTF_TOKEN)
 SYMBOL_PREVIEW_RE = re.compile(r"\$S\[\s*(\d+)\s*\]")
 COLOR_VALUE_RE = re.compile(r"\d+")
 GUIDE_VALUE_RE = re.compile(r"\[([rgb])=(\d{1,3})\]")
+GUIDE_BODY_TEXT = (55, 38, 24, 255)
+GUIDE_HEADER_TEXT = (145, 48, 39, 255)
+GUIDE_RULE_TEXT = (117, 82, 49, 255)
+GUIDE_RULE_LINE = "─" * 40
 
 
 def _gui_document_node_names(
@@ -243,6 +248,12 @@ class _NativeTextRun:
 @dataclass(frozen=True)
 class _LayoutSpacer:
     width: int
+
+
+@dataclass(frozen=True)
+class _LayoutRule:
+    width: int
+    color: QColor
 
 
 def _aligned_line_left(
@@ -581,10 +592,11 @@ class GameGlyphAtlas:
                 self.keys_by_codepoint.setdefault(codepoint, []).append(key)
 
     def glyph(self, codepoint: int, font: str = "BookAntiqua_large") -> QImage | None:
-        key = (font.casefold(), codepoint)
-        if key in self.images:
-            return self.images[key]
-        record = self.records.get(key)
+        requested_key = (font.casefold(), codepoint)
+        if requested_key in self.images:
+            return self.images[requested_key]
+        key = requested_key
+        record = self.records.get(requested_key)
         if record is None:
             candidates = self.keys_by_codepoint.get(codepoint, ())
             if not candidates:
@@ -602,6 +614,7 @@ class GameGlyphAtlas:
         except (OSError, ValueError, struct.error):
             return None
         self.images[key] = image
+        self.images[requested_key] = image
         return image
 
 
@@ -943,7 +956,16 @@ class GameLocalization:
             if len(self._label_pattern_cache) >= self.MAX_LABEL_PATTERN_CACHE:
                 self._label_pattern_cache.clear()
             self._label_pattern_cache[pattern] = keys
-        key = self._pick(keys, f"{unit_key}:{number}:{prefix}:{suffix}")
+        if number > 0 and keys:
+            # Keep slot 1's established deterministic sample, then walk the
+            # same family without replacement while enough labels exist.
+            first_index = self._index(
+                f"{unit_key}:1:{prefix}:{suffix}",
+                len(keys),
+            )
+            key = keys[(first_index + number - 1) % len(keys)]
+        else:
+            key = self._pick(keys, f"{unit_key}:{number}:{prefix}:{suffix}")
         return self.localized(key, target) if key else ""
 
     def sample_label_record(
@@ -3589,7 +3611,7 @@ class PreviewService:
             if native_font is not None
             else None
         )
-        lines: list[list[QImage | _NativeTextRun | _LayoutSpacer]] = [[]]
+        lines: list[list[QImage | _NativeTextRun | _LayoutSpacer | _LayoutRule]] = [[]]
         widths = [0]
         current_alignment = "center" if centered else "left"
         alignments = [current_alignment]
@@ -3645,6 +3667,15 @@ class PreviewService:
             return True
 
         for atom in document.atoms:
+            if atom.layout == "guide_rule":
+                if lines[-1] and not next_line():
+                    break
+                rule_width = max(1, right - left)
+                lines[-1].append(
+                    _LayoutRule(rule_width, QColor(*(atom.color or GUIDE_RULE_TEXT)))
+                )
+                widths[-1] = rule_width
+                continue
             if atom.layout in {"left", "right", "center"}:
                 current_alignment = atom.layout
                 alignments[-1] = current_alignment
@@ -3730,6 +3761,12 @@ class PreviewService:
             x = _aligned_line_left(alignment, left, right, width)
             for item in items:
                 if isinstance(item, _LayoutSpacer):
+                    x += item.width
+                    continue
+                if isinstance(item, _LayoutRule):
+                    painter.setPen(QPen(item.color, 1))
+                    line_y = y + max(1, line_height // 2)
+                    painter.drawLine(x, line_y, x + item.width, line_y)
                     x += item.width
                     continue
                 if isinstance(item, _NativeTextRun) and native_metrics is not None:
@@ -3848,12 +3885,13 @@ class PreviewService:
         )
         result = scaled
         if color is not None:
-            result = QImage(width, height, QImage.Format.Format_ARGB32)
+            result = QImage(width, height, QImage.Format.Format_ARGB32_Premultiplied)
             result.fill(Qt.GlobalColor.transparent)
-            for y in range(height):
-                for x in range(width):
-                    alpha = scaled.pixelColor(x, y).alpha() * color.alpha() // 255
-                    result.setPixel(x, y, qRgba(color.red(), color.green(), color.blue(), alpha))
+            painter = QPainter(result)
+            painter.fillRect(result.rect(), color)
+            painter.setCompositionMode(QPainter.CompositionMode.CompositionMode_DestinationIn)
+            painter.drawImage(0, 0, scaled)
+            painter.end()
         if len(self._scaled_glyph_cache) >= 4096:
             self._scaled_glyph_cache.clear()
         self._scaled_glyph_cache[cache_key] = result
@@ -3962,8 +4000,15 @@ class _PreviewCompiler:
         self.profile = profile or preview_profile(dialect)
         self.selected_label = selected_label or label
         self.atoms: list[PreviewAtom] = []
-        self.color: tuple[int, int, int, int] | None = None
-        self.guide_rgb = {"r": 60, "g": 60, "b": 60}
+        self.color: tuple[int, int, int, int] | None = (
+            GUIDE_BODY_TEXT if dialect == FORMAT_GUIDE else None
+        )
+        self.guide_rgb = {
+            "r": GUIDE_BODY_TEXT[0],
+            "g": GUIDE_BODY_TEXT[1],
+            "b": GUIDE_BODY_TEXT[2],
+        }
+        self.guide_in_header = False
         self.quote_re = re.compile(QUOTE_STYLE_TOKEN)
         self.argument_suffixes: tuple[tuple[int, tuple[str, ...]], ...] = ()
 
@@ -3981,6 +4026,7 @@ class _PreviewCompiler:
         )
         if self.dialect == FORMAT_GUIDE:
             self._compile_matches(text, GUIDE_TOKEN_RE, self._guide_token)
+            self.atoms = self._compact_guide_atoms(self.atoms)
         elif self.dialect == FORMAT_TOOLTIP:
             self._compile_matches(text, TOOLTIP_TOKEN_RE, self._tooltip_token)
         else:
@@ -4006,6 +4052,13 @@ class _PreviewCompiler:
         final_style: bool | None = None,
         layout: str = "",
     ) -> None:
+        if (
+            not layout
+            and self.dialect == FORMAT_GUIDE
+            and self.guide_in_header
+            and text.replace(PREVIEW_MARK, "").strip()
+        ):
+            layout = "guide_header"
         self.atoms.append(
             PreviewAtom(
                 text,
@@ -4018,6 +4071,59 @@ class _PreviewCompiler:
                 layout,
             )
         )
+
+    @staticmethod
+    def _compact_guide_atoms(atoms: list[PreviewAtom]) -> list[PreviewAtom]:
+        """Collapse source formatting whitespace without changing stored Guide text."""
+
+        compacted: list[PreviewAtom] = []
+        line_state = "start"
+
+        def append_piece(atom: PreviewAtom, text: str, start: int, end: int) -> None:
+            compacted.append(
+                PreviewAtom(
+                    text,
+                    start,
+                    end,
+                    atom.replacement,
+                    atom.glyph_id,
+                    atom.color,
+                    atom.final_style,
+                    atom.layout,
+                )
+            )
+
+        for atom in atoms:
+            source_text = atom.text or PREVIEW_MARK
+            if atom.layout == "guide_rule":
+                append_piece(atom, source_text, atom.raw_start, atom.raw_end)
+                line_state = "rule"
+                continue
+            text_length = len(source_text)
+            raw_length = max(0, atom.raw_end - atom.raw_start)
+            for match in re.finditer(r"\r\n|[\r\n]|[ \t]+|\u200b+|[^\r\n \t\u200b]+", source_text):
+                piece = match.group(0)
+                raw_start = atom.raw_start + round(raw_length * match.start() / text_length)
+                raw_end = atom.raw_start + round(raw_length * match.end() / text_length)
+                if piece in {"\r", "\n", "\r\n"}:
+                    if line_state in {"content", "rule"}:
+                        append_piece(atom, "\n", raw_start, raw_end)
+                        line_state = "newline"
+                    else:
+                        append_piece(atom, PREVIEW_MARK, raw_start, raw_end)
+                    continue
+                if piece.isspace():
+                    if line_state in {"start", "newline"}:
+                        append_piece(atom, PREVIEW_MARK, raw_start, raw_end)
+                    else:
+                        append_piece(atom, piece, raw_start, raw_end)
+                    continue
+                if piece == PREVIEW_MARK * len(piece):
+                    append_piece(atom, piece, raw_start, raw_end)
+                    continue
+                append_piece(atom, piece, raw_start, raw_end)
+                line_state = "content"
+        return compacted
 
     def _compile_matches(self, text: str, pattern: re.Pattern[str], handler) -> None:
         position = 0
@@ -4038,11 +4144,17 @@ class _PreviewCompiler:
                     raw_start + position,
                     raw_start + match.start(),
                 )
+            literal = match.group(0)
+            replacement = (
+                literal
+                if self.dialect == FORMAT_GUIDE
+                else ("『" if literal == ">" else "』")
+            )
             self._emit(
-                "『" if match.group(0) == ">" else "』",
+                replacement,
                 raw_start + match.start(),
                 raw_start + match.end(),
-                replacement=True,
+                replacement=self.dialect != FORMAT_GUIDE,
             )
             position = match.end()
         if position < len(text):
@@ -4291,29 +4403,29 @@ class _PreviewCompiler:
     def _guide_token(self, token: str, start: int, end: int) -> None:
         lowered = token.casefold()
         if token.startswith("<"):
+            if lowered.startswith("<header"):
+                self.guide_in_header = True
+                self.color = GUIDE_HEADER_TEXT
+                self._emit(PREVIEW_MARK, start, end, replacement=False)
+                return
+            if lowered == "</header>":
+                self._emit("\n", start, end, replacement=False, layout="guide_header_end")
+                self.guide_in_header = False
+                self.color = GUIDE_RULE_TEXT
+                self._emit(GUIDE_RULE_LINE, start, end, replacement=False, layout="guide_rule")
+                self.color = GUIDE_BODY_TEXT
+                self._emit("\n", start, end, replacement=False)
+                return
+            if lowered.startswith("<separator"):
+                previous_color = self.color
+                self._emit("\n", start, end, replacement=False)
+                self.color = GUIDE_RULE_TEXT
+                self._emit(GUIDE_RULE_LINE, start, end, replacement=False, layout="guide_rule")
+                self.color = previous_color or GUIDE_BODY_TEXT
+                self._emit("\n", start, end, replacement=False)
+                return
             value = self.profile.guide_token_text(token)
             self._emit(value if value is not None else PREVIEW_MARK, start, end, replacement=False)
-            return
-        if token.startswith("<"):
-            if lowered.startswith("<separator"):
-                value = "\n────────\n"
-            elif lowered == "</header>":
-                value = "  "
-            elif lowered == "</text>":
-                value = "\n"
-            elif lowered in {"</list>", "</table>"}:
-                value = PREVIEW_MARK
-            elif lowered == "</row>":
-                value = "\n"
-            elif lowered == "</cell>":
-                value = " "
-            elif lowered == "<item>":
-                value = "• "
-            elif lowered == "</item>":
-                value = " "
-            else:
-                value = PREVIEW_MARK
-            self._emit(value, start, end, replacement=False)
             return
         guide_value = GUIDE_VALUE_RE.fullmatch(token)
         if guide_value is not None:

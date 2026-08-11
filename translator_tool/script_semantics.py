@@ -374,6 +374,7 @@ class _Analysis:
     ]
     lexical_value_constraints: dict[int, dict[str, tuple[str, ...]]]
     item_names_by_id: dict[int, str]
+    database_value_domains: dict[tuple[str, str], tuple[str, ...]]
 
 
 LABEL_RE = re.compile(
@@ -400,12 +401,15 @@ _CALL_EXPRESSION_RE = re.compile(
 )
 SUMMARY_PARAMETER_PREFIX = "\x1f"
 _SEMANTIC_KIND_PREFIX = "\x1e"
+_DATABASE_VALUE_MARK = "\x1d"
 SEMANTIC_EXPRESSION = "expression"
 SEMANTIC_BUILDING = "building"
 SEMANTIC_CHARACTER = "character"
 SEMANTIC_DYNASTY_CREST = "dynasty_crest"
 SEMANTIC_DYNASTY = "dynasty"
 SEMANTIC_LABEL = "label"
+SEMANTIC_LABEL_DOMAIN = "label_domain"
+SEMANTIC_DATABASE_VALUE = "database_value"
 SEMANTIC_NUMBER = "number"
 SEMANTIC_SETTLEMENT = "settlement"
 SEMANTIC_STRUCTURE = "structure"
@@ -492,12 +496,14 @@ def analyze_script(
     *,
     label_catalog: frozenset[str] = frozenset(),
     item_names_by_id: tuple[tuple[int, str], ...] = (),
+    database_value_domains: tuple[tuple[str, str, tuple[str, ...]], ...] = (),
 ) -> tuple[SemanticLabelUse, ...]:
     return analyze_script_facts(
         text,
         path,
         label_catalog=label_catalog,
         item_names_by_id=item_names_by_id,
+        database_value_domains=database_value_domains,
     ).uses
 
 
@@ -513,6 +519,7 @@ def analyze_script_facts(
     *,
     label_catalog: frozenset[str] = frozenset(),
     item_names_by_id: tuple[tuple[int, str], ...] = (),
+    database_value_domains: tuple[tuple[str, str, tuple[str, ...]], ...] = (),
 ) -> ScriptSemanticFacts:
     tokens = tokenize_lua(text)
     functions = _functions(tokens, path)
@@ -581,6 +588,10 @@ def analyze_script_facts(
         _native_value_type_events(tokens, calls, token_starts),
         _lexical_value_constraints(tokens, branch_path_tokens, branch_paths),
         dict(item_names_by_id),
+        {
+            (table.casefold(), field.casefold()): values
+            for table, field, values in database_value_domains
+        },
     )
     has_localization_work = any(
         _literal_labels(token.value, label_catalog, allow_patterns=True)
@@ -1798,14 +1809,14 @@ def _best_label_candidates(
 
 
 def _literal_match_kind(label: str, catalog: frozenset[str]) -> str:
-    if "_+" in label:
+    if _label_family_base(label):
         return "exact"
     if not catalog:
         return "family"
     variants = {label, label.lstrip("_")}
     if variants & catalog:
         return "exact"
-    if variants & _catalog_family_bases(catalog):
+    if variants & _catalog_family_separators(catalog).keys():
         return "family"
     return "exact"
 
@@ -1815,23 +1826,57 @@ def _semantic_label_identity(
     kind: str,
     catalog: frozenset[str],
 ) -> str:
-    if kind != "family" or not catalog or "_+" in label:
+    role_alias = _catalog_backed_role_alias(label, catalog)
+    if role_alias:
+        label = role_alias
+    if kind != "family" or not catalog or _label_family_base(label):
         return label
     variants = {label, label.lstrip("_")}
-    if variants & _catalog_family_bases(catalog):
-        return label + "_+*"
+    family_separators = _catalog_family_separators(catalog)
+    if variants & family_separators.keys():
+        separator = next(
+            (
+                family_separators[variant]
+                for variant in (label, label.lstrip("_"))
+                if variant in family_separators
+            ),
+            "_+",
+        )
+        return label + separator + "*"
     return label
 
 
+def _catalog_backed_role_alias(label: str, catalog: frozenset[str]) -> str:
+    """Recover a unique catalog label when a script adds a stray BODY segment."""
+    if not catalog or {label, label.lstrip("_")} & catalog:
+        return ""
+    match = re.match(
+        r"^(?P<base>.+)_body(?P<suffix>(?:_\+|\+)[A-Za-z0-9*]+)$",
+        label,
+    )
+    if match is None:
+        return ""
+    candidate = match.group("base") + match.group("suffix")
+    return candidate if {candidate, candidate.lstrip("_")} & catalog else ""
+
+
 @lru_cache(maxsize=8)
-def _catalog_family_bases(catalog: frozenset[str]) -> frozenset[str]:
-    """Cache family bases by the complete immutable project-label catalog."""
-    bases: set[str] = set()
-    for label in catalog:
-        match = re.match(r"^(.*)_\+[A-Za-z0-9]+$", label)
+def _catalog_family_separators(catalog: frozenset[str]) -> Mapping[str, str]:
+    """Cache each catalog family and its actual suffix separator once."""
+    separators: dict[str, str] = {}
+    for label in sorted(catalog):
+        match = re.match(
+            r"^(?P<base>.*?)(?P<separator>_\+|\+)[A-Za-z0-9*]+$",
+            label,
+        )
         if match is not None:
-            bases.add(match.group(1))
-    return frozenset(bases)
+            separators.setdefault(match.group("base"), match.group("separator"))
+    return separators
+
+
+def _label_family_base(label: str) -> str:
+    match = re.match(r"^(.*?)(?:_\+|\+)[A-Za-z0-9*]+$", label)
+    return match.group(1) if match is not None else ""
 
 
 def _evaluate_tokens(
@@ -2114,6 +2159,7 @@ def _evaluate_local_function_call(
             call.name,
             semantic_arguments,
             item_names_by_id=analysis.item_names_by_id,
+            database_value_domains=analysis.database_value_domains,
         )
         if not resolved:
             return ()
@@ -2632,6 +2678,9 @@ def _function_value_summaries(
 
 
 def semantic_literal(value: str) -> SemanticValue:
+    database_backed = _DATABASE_VALUE_MARK in value
+    if database_backed:
+        value = value.replace(_DATABASE_VALUE_MARK, "")
     marker_kind = _semantic_marker_kind(value)
     if marker_kind:
         return SemanticValue(marker_kind, "")
@@ -2648,12 +2697,16 @@ def semantic_literal(value: str) -> SemanticValue:
         kind = SEMANTIC_EXPRESSION
     else:
         kind = SEMANTIC_TEXT
+    if database_backed and kind == SEMANTIC_LABEL:
+        kind = SEMANTIC_LABEL_DOMAIN
     return SemanticValue(kind, value)
 
 
 def _semantic_candidate(value: SemanticValue) -> str:
     if value.kind in _SEMANTIC_MARKER_KINDS and not value.text:
         return _SEMANTIC_KIND_PREFIX + value.kind
+    if value.kind == SEMANTIC_DATABASE_VALUE and value.text:
+        return f"{_DATABASE_VALUE_MARK}{value.text}{_DATABASE_VALUE_MARK}"
     return value.text
 
 
@@ -2671,6 +2724,7 @@ def native_semantic_function_name(alias: str) -> str | None:
     if name in {
         "citylevel2label",
         "generateprivilegelistlabels",
+        "getdatabasevalue",
         "getflaglabel",
         "getnobilitytitlelabel",
         "itemgetlabel",
@@ -2688,6 +2742,7 @@ def resolve_native_semantic_function(
     argument_values: tuple[tuple[SemanticValue, ...], ...],
     *,
     item_names_by_id: Mapping[int, str] | None = None,
+    database_value_domains: Mapping[tuple[str, str], tuple[str, ...]] | None = None,
 ) -> tuple[tuple[SemanticValue, ...], ...] | None:
     """Apply engine function contracts shared by local and cross-file evaluation."""
     name = native_semantic_function_name(alias)
@@ -2699,6 +2754,14 @@ def resolve_native_semantic_function(
         # dynasty/sim alias. Its exact glyph is runtime state, but its display
         # domain is fixed.
         return ((SemanticValue(SEMANTIC_DYNASTY_CREST, ""),),)
+    if name == "getdatabasevalue":
+        values = _database_value_candidates(
+            argument_values,
+            database_value_domains or {},
+        )
+        return (
+            tuple(SemanticValue(SEMANTIC_DATABASE_VALUE, value) for value in values),
+        ) if values else None
     if name == "itemgetlabel":
         item_values = argument_values[0] if argument_values else ()
         singular_values = argument_values[1] if len(argument_values) > 1 else ()
@@ -2821,6 +2884,50 @@ def resolve_native_semantic_function(
     while len(positions) < 21:
         positions.append((semantic_literal(""),))
     return tuple(positions[:21])
+
+
+def _database_value_candidates(
+    argument_values: tuple[tuple[SemanticValue, ...], ...],
+    domains: Mapping[tuple[str, str], tuple[str, ...]],
+) -> tuple[str, ...]:
+    """Resolve a finite GetDatabaseValue column without guessing its row."""
+    if len(argument_values) < 3 or not domains:
+        return ()
+    table_patterns = tuple(
+        pattern
+        for value in argument_values[0]
+        if (pattern := _database_lookup_pattern(value)) is not None
+    )
+    field_patterns = tuple(
+        pattern
+        for value in argument_values[2]
+        if (pattern := _database_lookup_pattern(value)) is not None
+    )
+    if not table_patterns or not field_patterns:
+        return ()
+    values: list[str] = []
+    for (table, field), candidates in domains.items():
+        if not any(pattern.fullmatch(table) for pattern in table_patterns):
+            continue
+        if not any(pattern.fullmatch(field) for pattern in field_patterns):
+            continue
+        for candidate in candidates:
+            if candidate in values:
+                continue
+            values.append(candidate)
+            if len(values) > 64:
+                return ()
+    return tuple(values)
+
+
+def _database_lookup_pattern(value: SemanticValue) -> re.Pattern[str] | None:
+    if not value.text or value.kind == SEMANTIC_EXPRESSION:
+        return None
+    marker = re.escape(SUMMARY_PARAMETER_PREFIX) + r"\d+" + re.escape(SUMMARY_PARAMETER_PREFIX)
+    escaped = re.escape(value.text.casefold())
+    escaped = re.sub(marker, ".*", escaped)
+    escaped = escaped.replace(r"\*", ".*")
+    return re.compile(escaped)
 
 
 def _semantic_integer_candidates(
@@ -3132,7 +3239,7 @@ def _literal_labels(
     if compact is not None and not stripped.startswith("@L_"):
         normalized = compact.group("label").casefold()
         catalog_values = {normalized, normalized.lstrip("_")}
-        if catalog_values & catalog or (not catalog and "_+" in normalized):
+        if catalog_values & catalog or (not catalog and _label_family_base(normalized)):
             return ((normalized, value.find(stripped)),)
     if allow_patterns and stripped.startswith("@L_") and "*" in stripped:
         label = _normalize_label(stripped)
@@ -3155,7 +3262,7 @@ def _literal_labels(
         catalog_values = {normalized, normalized.lstrip("_")}
         if (
             catalog_values & catalog
-            or (not catalog and "_+" in normalized)
+            or (not catalog and _label_family_base(normalized))
             or (allow_patterns and "*" in normalized)
         ):
             return ((normalized, value.find(stripped)),)
@@ -3168,7 +3275,7 @@ def _normalize_label(label: str) -> str:
         value = value[3:]
     elif value.startswith("@L"):
         value = value[2:]
-    if value.endswith("_+"):
+    if value.endswith("+"):
         value += "*"
     return value.casefold()
 

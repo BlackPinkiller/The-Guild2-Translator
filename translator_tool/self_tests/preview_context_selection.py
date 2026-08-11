@@ -568,6 +568,52 @@ def assert_cross_entry_labels_preserve_literal_suffixes() -> None:
         if context is None or context.header_label != "buy_cannon_ammu_amount_head+0":
             raise AssertionError(f"a literal +0 window label lost its suffix: {context!r}")
 
+        compact_default = Path(temp_dir) / "CompactDefault.lua"
+        compact_default.write_text(
+            "function Run()\n"
+            '  MsgQuick("", "@L_PRIVILEGES_109_SETSEVERITYOFTHELAW_MSG_BODY", '
+            'GetID("city"), OldSeverity, NewSeverity)\n'
+            "end\n",
+            encoding="utf-8",
+        )
+        compact_label = "PRIVILEGES_109_SETSEVERITYOFTHELAW_MSG_BODY+0"
+        compact_index = index_code_file(
+            CodeFileSpec(compact_default, "project"),
+            label_catalog=frozenset({compact_label.casefold()}),
+        )
+        compact_references = compact_index.references_for(compact_label).active
+        if (
+            len(compact_references) != 1
+            or compact_references[0].runtime_arguments
+            != ('GetID("city")', "OldSeverity", "NewSeverity")
+        ):
+            raise AssertionError(
+                "a suffix-free script call did not bind to its compact +0 DBT entry: "
+                f"{compact_references!r}"
+            )
+
+        stray_body = Path(temp_dir) / "StrayBody.lua"
+        stray_body.write_text(
+            'MsgQuick("", "@L_MEASURE_REQUEST_ATTACK_BUILDING_BODY_+0", '
+            'GetID("Actor"), GetID("Building"), EnemyBadge, MyBadge)\n',
+            encoding="utf-8",
+        )
+        catalog_label = "MEASURE_REQUEST_ATTACK_BUILDING_+0"
+        stray_body_index = index_code_file(
+            CodeFileSpec(stray_body, "project"),
+            label_catalog=frozenset({catalog_label.casefold()}),
+        )
+        stray_body_references = stray_body_index.references_for(catalog_label).active
+        if (
+            len(stray_body_references) != 1
+            or stray_body_references[0].runtime_arguments
+            != ('GetID("Actor")', 'GetID("Building")', "EnemyBadge", "MyBadge")
+        ):
+            raise AssertionError(
+                "a unique catalog label did not recover a stray script BODY segment: "
+                f"{stray_body_references!r}"
+            )
+
     reference = CodeReference(
         "document_new_+1",
         Path("Document.lua"),

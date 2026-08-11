@@ -11,6 +11,8 @@ class UnitChange:
     after: str
     before_deleted: bool = False
     after_deleted: bool = False
+    before_cursor: int | None = None
+    after_cursor: int | None = None
 
 
 @dataclass(frozen=True)

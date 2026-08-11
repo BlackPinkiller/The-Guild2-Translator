@@ -99,6 +99,7 @@ from .self_tests.code_index_lazy import (
     assert_hot_ui_updates_are_coalesced,
     assert_lazy_batches_advance_without_rescanning_prefix,
     assert_lazy_code_index_loads_cached_value_providers,
+    assert_lazy_code_index_resolves_database_backed_label_domains,
     assert_lazy_code_index_loads_effective_item_id_ranges,
     assert_lazy_code_index_links_cached_cross_file_facts,
     assert_lazy_code_index_prioritizes_requested_labels_and_invalidates_cache,
@@ -108,6 +109,8 @@ from .self_tests.performance import (
     LARGE_BATCH_MIN_ENTRIES,
     LARGE_BATCH_SAVE_LIMIT_SECONDS,
     assert_large_cached_search_filter_stays_interactive,
+    assert_large_label_catalog_family_lookup_is_cached,
+    assert_table_display_does_not_validate_unrelated_columns,
     assert_within_budget,
 )
 from .self_tests.preview_context_selection import (
@@ -119,11 +122,19 @@ from .self_tests.preview_context_selection import (
     assert_preview_context_selection_understands_returned_label_roles,
 )
 from .self_tests.preview_localization import (
+    assert_database_label_domains_precede_guard_fallbacks,
     assert_editor_changes_reach_preview_localization,
     assert_preview_localization_fallback_keeps_selection_nonblocking,
     assert_project_localization_updates_invalidate_placeholder_previews,
+    assert_wildcard_runtime_slots_keep_distinct_identity,
 )
 from .self_tests.preview_assets import assert_bundled_preview_assets_are_complete
+from .self_tests.guide_preview import (
+    assert_guide_browser_is_responsive_and_navigable,
+    assert_guide_editor_preview_keeps_a_scrollable_asset_free_surface,
+    assert_guide_preview_uses_compact_scroll_page_semantics,
+    assert_preview_edits_stay_atomic_and_restore_cursor_anchors,
+)
 from .self_tests.preview_presets import assert_preview_presets_are_complete_and_unambiguous
 from .self_tests.preview_format_layout import assert_preview_format_layout_controls_are_semantic
 from .source_sync import (
@@ -3071,7 +3082,25 @@ def assert_editor_undo_stays_local(root: Path) -> None:
     try:
         guide_source = temp / "languages" / "Guides" / "Intro.txt"
         guide_source.parent.mkdir(parents=True, exist_ok=True)
-        guide_source.write_bytes("Guide Title\r\nGuide Body\r\n".encode("utf-16"))
+        guide_source.write_bytes(
+            (
+                "<header>Guide Title</header>\r\n"
+                + "\r\n".join(
+                    f"<text>Guide body section {index}.</text>" for index in range(36)
+                )
+                + "\r\n"
+            ).encode("utf-16")
+        )
+        (guide_source.parent / "Second.txt").write_bytes(
+            "<header>Second page</header>\r\n<text>Second guide body.</text>\r\n".encode("utf-16")
+        )
+        (guide_source.parent / "TableOfContents.txt").write_bytes(
+            (
+                "[Category]Test\r\n"
+                "  [Page]Intro|Introduction\r\n"
+                "  [Page]Second|Second page\r\n"
+            ).encode("utf-16")
+        )
         os.environ["LOCALAPPDATA"] = str(settings_dir)
         app_module.MANAGED_PROJECT_ROOT = temp
         save_settings(AppSettings(last_project_root=str(temp)))
@@ -3260,6 +3289,120 @@ def assert_editor_undo_stays_local(root: Path) -> None:
             raise AssertionError("guide txt smoke test entry is missing from file filter")
         win.file_combo.setCurrentIndex(guides_index)
         app.processEvents()
+        if win.table_frame.isVisible():
+            raise AssertionError("selecting a Guide document did not hide the entry table")
+
+        source_cursor = win.source_edit.textCursor()
+        source_cursor.movePosition(QTextCursor.MoveOperation.End)
+        win.source_edit.setTextCursor(source_cursor)
+        source_raw_position = win.source_edit.raw_cursor_position()
+        win.source_preview_button.click()
+        app.processEvents()
+        if (
+            win.editor_stack.currentWidget() is not win.guide_preview
+            or win._guide_preview_target
+        ):
+            raise AssertionError("source Guide preview did not replace the complete dual-editor area")
+        if win.guide_preview.body.verticalScrollBar().maximum() <= 0:
+            raise AssertionError("merged Guide preview body did not remain scrollable")
+        win.guide_preview.close_button.click()
+        app.processEvents()
+        if win.editor_stack.currentWidget() is not win.editors_splitter:
+            raise AssertionError("closing Guide preview did not restore the dual editors")
+        if win.source_edit.raw_cursor_position() != source_raw_position:
+            raise AssertionError("closing Guide preview lost the source editor caret")
+        if win.table_frame.isVisible():
+            raise AssertionError("closing a document-mode Guide preview unexpectedly restored the entry table")
+
+        win.translation_preview_button.click()
+        app.processEvents()
+        if (
+            win.editor_stack.currentWidget() is not win.guide_preview
+            or not win._guide_preview_target
+        ):
+            raise AssertionError("translation Guide preview did not retain its entry side")
+        all_files_index = win.file_combo.findData(app_module.FILE_FILTER_ALL)
+        if all_files_index < 0:
+            raise AssertionError("all-files filter is missing before the expanded Guide preview smoke test")
+        win.file_combo.setCurrentIndex(all_files_index)
+        app.processEvents()
+        if (
+            win.editor_stack.currentWidget() is not win.editors_splitter
+            or not win.table_frame.isVisible()
+            or win.source_preview_button.isChecked()
+            or win.translation_preview_button.isChecked()
+        ):
+            raise AssertionError(
+                "returning to all files from document mode did not automatically close Guide preview"
+            )
+
+        guide_unit = next(item for item in win.model.units if item.file_rel == "Guides/Intro.txt")
+        if not win._restore_selected_row(guide_unit.uid):
+            raise AssertionError("all-files Guide preview smoke test could not select its Guide entry")
+        app.processEvents()
+        win.main_splitter.setSizes([420, 300])
+        app.processEvents()
+        visible_sizes = win.main_splitter.sizes()
+        visible_total = sum(visible_sizes)
+        visible_ratio = visible_sizes[0] / visible_total if visible_total else 0.0
+        table_scroll = win.table.verticalScrollBar().value()
+
+        win.source_preview_button.click()
+        app.processEvents()
+        expanded_sizes = win.main_splitter.sizes()
+        if (
+            win.editor_stack.currentWidget() is not win.guide_preview
+            or win.table_frame.isVisible()
+            or expanded_sizes[0] != 0
+            or win._guide_preview_restore_splitter_sizes is None
+        ):
+            raise AssertionError(
+                "Guide preview opened from the entry list did not expand across the complete content area"
+            )
+        win._open_guide_preview_page("Second")
+        app.processEvents()
+        second_guide_unit = next(item for item in win.model.units if item.file_rel == "Guides/Second.txt")
+        if (
+            win.file_combo.currentData() != app_module.FILE_FILTER_ALL
+            or win.current_uid != second_guide_unit.uid
+            or win.table_frame.isVisible()
+        ):
+            raise AssertionError(
+                "expanded Guide navigation changed the file filter or exposed the entry table"
+            )
+        win.resize(win.width(), win.height() + 80)
+        app.processEvents()
+        win.guide_preview.close_button.click()
+        app.processEvents()
+        restored_sizes = win.main_splitter.sizes()
+        restored_total = sum(restored_sizes)
+        restored_ratio = restored_sizes[0] / restored_total if restored_total else 0.0
+        if (
+            win.editor_stack.currentWidget() is not win.editors_splitter
+            or not win.table_frame.isVisible()
+            or win._guide_preview_restore_splitter_sizes is not None
+        ):
+            raise AssertionError("closing the expanded Guide preview did not restore the entry-list layout")
+        if abs(restored_ratio - visible_ratio) > 0.03:
+            raise AssertionError(
+                "closing the expanded Guide preview did not restore the prior splitter proportion: "
+                f"before={visible_ratio:.3f}, after={restored_ratio:.3f}"
+            )
+        expected_table_scroll = min(table_scroll, win.table.verticalScrollBar().maximum())
+        if win.table.verticalScrollBar().value() != expected_table_scroll:
+            raise AssertionError(
+                "expanded Guide preview changed the entry-list viewport: "
+                f"before={table_scroll}, after={win.table.verticalScrollBar().value()}, "
+                f"maximum={win.table.verticalScrollBar().maximum()}"
+            )
+        if (
+            win.current_uid != second_guide_unit.uid
+            or win.table.currentIndex().data(Qt.ItemDataRole.UserRole) != second_guide_unit.uid
+        ):
+            raise AssertionError("closing the expanded Guide preview lost its selected Guide entry")
+        if not win._restore_selected_row(second.uid):
+            raise AssertionError("expanded Guide preview smoke test could not restore its prior DBT entry")
+        app.processEvents()
 
         dbt_index = win.file_combo.findData(second.file_rel)
         if dbt_index < 0:
@@ -3287,6 +3430,35 @@ def assert_editor_undo_stays_local(root: Path) -> None:
         win._set_editor_unit(second)
         win.translation_edit.setFocus(Qt.FocusReason.OtherFocusReason)
         app.processEvents()
+        win.translation_preview_button.click()
+        app.processEvents()
+        win.translation_edit.selectAll()
+        win.translation_edit.insertPlainText("1234")
+        app.processEvents()
+        QTest.qWait(TYPING_GROUP_DELAY_MS + 120)
+        app.processEvents()
+        win.translation_edit.set_raw_cursor_position(4)
+        QTest.keyClick(win.translation_edit, Qt.Key.Key_Backspace)
+        QTest.keyClick(win.translation_edit, Qt.Key.Key_Backspace)
+        app.processEvents()
+        QTest.qWait(TYPING_GROUP_DELAY_MS + 120)
+        app.processEvents()
+        if win.translation_edit.toPlainText() != "12":
+            raise AssertionError("preview deletion did not update the raw translation")
+        QTest.keyClick(win.translation_edit, Qt.Key.Key_Z, Qt.KeyboardModifier.ControlModifier)
+        app.processEvents()
+        if (
+            win.translation_edit.toPlainText() != "1234"
+            or win.translation_edit.raw_cursor_position() != 4
+        ):
+            raise AssertionError(
+                "preview undo did not restore both text length and its caret anchor: "
+                f"text={win.translation_edit.toPlainText()!r}, "
+                f"cursor={win.translation_edit.raw_cursor_position()}"
+            )
+        win.translation_preview_button.click()
+        app.processEvents()
+        win.history.clear()
         cycle_baseline = second.current_text
         cycle_second = cycle_baseline + "2"
         cycle_third = cycle_baseline + "3"
@@ -5981,7 +6153,13 @@ def main() -> int:
     assert_project_localization_updates_invalidate_placeholder_previews()
     assert_editor_changes_reach_preview_localization()
     assert_preview_localization_fallback_keeps_selection_nonblocking()
+    assert_database_label_domains_precede_guard_fallbacks()
+    assert_wildcard_runtime_slots_keep_distinct_identity()
     assert_bundled_preview_assets_are_complete()
+    assert_guide_preview_uses_compact_scroll_page_semantics()
+    assert_guide_editor_preview_keeps_a_scrollable_asset_free_surface()
+    assert_guide_browser_is_responsive_and_navigable()
+    assert_preview_edits_stay_atomic_and_restore_cursor_anchors()
     assert_preview_presets_are_complete_and_unambiguous()
     assert_preview_format_layout_controls_are_semantic()
     assert_game_preview_parts_use_the_selected_call_site()
@@ -5990,12 +6168,15 @@ def main() -> int:
     assert_lazy_batches_advance_without_rescanning_prefix()
     assert_lazy_code_index_prioritizes_requested_labels_and_invalidates_cache()
     assert_lazy_code_index_loads_effective_item_id_ranges()
+    assert_lazy_code_index_resolves_database_backed_label_domains()
     assert_lazy_code_index_links_cached_cross_file_facts()
     assert_lazy_code_index_loads_cached_value_providers()
     assert_lazy_code_index_survives_unwritable_cache()
     assert_code_index_requests_selected_and_visible_rows_without_moving_viewport()
     assert_hot_ui_updates_are_coalesced()
     assert_large_cached_search_filter_stays_interactive()
+    assert_large_label_catalog_family_lookup_is_cached()
+    assert_table_display_does_not_validate_unrelated_columns()
     assert_stale_code_index_workers_are_released()
     assert_code_window_context_extracts_window_labels_and_buttons()
     assert_code_preview_unit_lookup_accepts_leading_underscore_labels()

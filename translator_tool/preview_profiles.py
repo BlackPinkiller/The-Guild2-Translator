@@ -25,14 +25,10 @@ class PreviewProfile:
         if self.dialect != FORMAT_GUIDE or not token.startswith("<"):
             return None
         lowered = token.casefold()
-        if lowered.startswith("<separator"):
-            return "\n────────\n"
-        if lowered == "</header>":
-            return "  "
         if lowered == "</text>":
             return "\n"
         if lowered in {"</list>", "</table>"}:
-            return ""
+            return "\n"
         if lowered == "</row>":
             return "\n"
         if lowered == "</cell>":
@@ -40,11 +36,11 @@ class PreviewProfile:
         if lowered == "<item>":
             return "• "
         if lowered == "</item>":
-            return " "
+            return "\n"
         return ""
 
 
 def preview_profile(dialect: str) -> PreviewProfile:
     if dialect == FORMAT_GUIDE:
-        return PreviewProfile(dialect=dialect, final_style=True, line_height_percent=72)
+        return PreviewProfile(dialect=dialect, final_style=True, line_height_percent=112)
     return PreviewProfile(dialect=dialect)
