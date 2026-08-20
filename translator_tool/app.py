@@ -9205,6 +9205,8 @@ def _issue_badge(unit: TranslationUnit) -> str:
 
 
 def _format_token_deltas(unit: TranslationUnit) -> tuple[Counter[str], Counter[str], Counter[str], Counter[str]]:
+    if unit.is_missing_translation:
+        return Counter(), Counter(), Counter(), Counter()
     dialect = format_dialect(unit.file_rel, unit.ref.kind)
     source_hard, source_color = split_soft_color_tokens(_format_tokens_for_diff(unit.source_text, dialect))
     target_hard, target_color = split_soft_color_tokens(_format_tokens_for_diff(unit.current_text, dialect))

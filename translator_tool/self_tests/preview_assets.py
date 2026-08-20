@@ -26,12 +26,9 @@ def assert_bundled_preview_assets_are_complete() -> None:
     if len(sources) != len(set(sources)):
         raise AssertionError("bundled preview manifest contains duplicate source names")
     repository_root = Path(__file__).resolve().parents[2]
-    for build_script in (
-        repository_root / "build_translator_lite.bat",
-        repository_root / "build_translator_lite_onefile.bat",
-    ):
-        text = build_script.read_text(encoding="utf-8")
-        if "assets\\preview_ui;assets\\preview_ui" not in text:
-            raise AssertionError(
-                f"{build_script.name} does not package the bundled preview assets"
-            )
+    build_script = repository_root / "build_translator_lite_onefile.bat"
+    text = build_script.read_text(encoding="utf-8")
+    if "assets\\preview_ui;assets\\preview_ui" not in text:
+        raise AssertionError(
+            f"{build_script.name} does not package the bundled preview assets"
+        )

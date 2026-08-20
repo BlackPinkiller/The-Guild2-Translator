@@ -46,6 +46,7 @@ from .self_tests.history_index import assert_history_index_is_persistent_and_bou
 from .self_tests.format_io import assert_guild2_encoding_detection
 from .self_tests.file_tree import assert_file_tree_groups_nested_paths
 from .self_tests.project_order import assert_missing_translations_follow_source_order
+from .self_tests.project_validation import assert_missing_rows_do_not_report_translation_format_errors
 from .self_tests.text_import import assert_text_import_planning_is_safe_and_lightweight
 from .self_tests.diagnostics import assert_diagnostics_are_bounded_and_content_free
 from .self_tests.performance import AI_CONTEXT_BUILD_LIMIT_SECONDS, assert_within_budget
@@ -6126,6 +6127,7 @@ def main() -> int:
     assert_statuses(root)
     assert_loaded_order_matches_file_lines(root)
     assert_missing_translations_follow_source_order()
+    assert_missing_rows_do_not_report_translation_format_errors()
     assert_table_model_preserves_full_display_text()
     assert_local_project_roots_detect_sources_projects()
     assert_discover_game_source_projects_detects_vanilla_and_mods()

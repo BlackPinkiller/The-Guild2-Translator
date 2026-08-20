@@ -165,11 +165,21 @@ class TranslationUnit:
         return self.review_reason in MANUAL_REVIEW_REASONS
 
     @property
+    def is_missing_translation(self) -> bool:
+        return (
+            self.ref.kind == "dbt"
+            and self.ref.target_row is None
+            and self.ref.suggested_row is None
+            and not self.translate_text
+            and not self.current_text
+        )
+
+    @property
     def todo_reason(self) -> str:
         if self.is_ignored or self.is_extra:
             return TODO_REASON_NONE
         if not self.current_text:
-            if self.ref.kind == "dbt" and self.ref.target_row is None and self.ref.suggested_row is None and not self.translate_text:
+            if self.is_missing_translation:
                 return TODO_REASON_MISSING_ROW
             return TODO_REASON_EMPTY
         if self.confirmed:
@@ -200,11 +210,16 @@ class TranslationUnit:
             self.pending_delete,
             self.is_ignored,
             self.is_dirty,
+            self.is_missing_translation,
             ENABLE_FONT_GLYPH_VALIDATION,
         )
         if cache_key == self._issue_cache_key:
             return list(self._issue_cache_value)
-        if self.pending_delete or (self.is_ignored and not self.is_dirty):
+        if (
+            self.pending_delete
+            or self.is_missing_translation
+            or (self.is_ignored and not self.is_dirty)
+        ):
             issues = list(self.initial_issues)
         else:
             dbt_field = self.ref.kind == "dbt"
