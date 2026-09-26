@@ -31,6 +31,9 @@ if exist build\work rmdir /s /q build\work
 if exist build\spec rmdir /s /q build\spec
 if exist build\release rmdir /s /q build\release
 
+rem Keep unrelated DLL directories on PATH out of PyInstaller's dependency scan.
+setlocal
+set "PATH=%CD%\.venv\Scripts;%SystemRoot%\System32;%SystemRoot%;%SystemRoot%\System32\Wbem"
 ".venv\Scripts\python.exe" -m PyInstaller ^
   --noconfirm ^
   --clean ^
@@ -66,7 +69,11 @@ if exist build\release rmdir /s /q build\release
   --exclude-module PySide6.QtWebEngineWidgets ^
   translator_tool_launcher.py
 
-if errorlevel 1 goto :failed
+if errorlevel 1 (
+  endlocal
+  goto :failed
+)
+endlocal
 
 mkdir build\release
 copy /Y build\dist\TheGuild2Translator.exe build\release\TheGuild2Translator.exe
