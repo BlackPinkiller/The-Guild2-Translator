@@ -5,6 +5,7 @@ import shutil
 import tempfile
 
 from ..git_history import LanguageGit
+from ..history_index import HistoryIndexStore
 from ..settings import AppSettings
 
 
@@ -31,13 +32,39 @@ def assert_history_uses_live_source_missing_from_old_commits() -> None:
         _assert_kontor_entry(entries)
 
         git._entry_cache.clear()
-        batched = dict(git.iter_entries_for_commits((commit.full_hash,)))
+        dependencies: dict[str, dict[str, str]] = {}
+        batched = dict(git.iter_entries_for_commits((commit.full_hash,), source_dependencies=dependencies))
         _assert_kontor_entry(batched.get(commit.full_hash, []))
+
+        store = HistoryIndexStore.for_repository(repo, "#chinese", codec_fingerprint=git.history_codec_fingerprint)
+        store.store_commit(commit.full_hash, batched[commit.full_hash], dependencies[commit.full_hash])
+        store.store_commit("committed-source", entries)
+        # Files never used as fallback must not invalidate either commit.
+        (repo / "Unrelated.dbt").write_bytes(_dbt_bytes("english", "Unrelated"))
+        store.invalidate_changed_sources(git.source_fingerprint)
+        hashes = (commit.full_hash, "committed-source")
+        if store.indexed_hashes(hashes) != set(hashes):
+            raise AssertionError("unrelated source edit discarded the persistent history index")
 
         first_fingerprint = git.history_cache_fingerprint
         source.write_bytes(_dbt_bytes("english", "Updated trade licence"))
         if git.history_cache_fingerprint == first_fingerprint:
             raise AssertionError("history cache did not invalidate when a live fallback source changed")
+        store.invalidate_changed_sources(git.source_fingerprint)
+        if store.indexed_hashes(hashes) != {"committed-source"}:
+            raise AssertionError("fallback source edit failed to invalidate only its dependent commits")
+        refreshed = git.entries_for_commit(commit.full_hash)
+        if refreshed[0].source_text != "Updated trade licence":
+            raise AssertionError("in-memory history cache retained stale live source text")
+        source.unlink()
+        missing = dict(git.iter_entries_for_commits((commit.full_hash,), source_dependencies=dependencies))
+        if missing[commit.full_hash]:
+            raise AssertionError("removed live source remained in the in-memory history cache")
+        store.store_commit(commit.full_hash, (), dependencies[commit.full_hash])
+        source.write_bytes(_dbt_bytes("english", "Restored source"))
+        store.invalidate_changed_sources(git.source_fingerprint)
+        if commit.full_hash in store.indexed_hashes(hashes):
+            raise AssertionError("previously missing source did not invalidate empty indexed history")
     finally:
         shutil.rmtree(root, ignore_errors=True)
 

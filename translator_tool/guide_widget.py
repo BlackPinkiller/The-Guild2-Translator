@@ -260,7 +260,7 @@ class GuidePreviewPane(QWidget):
     def __init__(self, parent: QWidget | None = None) -> None:
         super().__init__(parent)
         self.setObjectName("guidePreviewPane")
-        assets = Path(__file__).resolve().parents[1] / "assets" / "game_theme"
+        assets = Path(__file__).resolve().parents[1] / "assets" / "guide_preview"
         self._assets = assets
         self._surface_texture = QPixmap(str(assets / "guide_surface_hires.png"))
         self._target = False

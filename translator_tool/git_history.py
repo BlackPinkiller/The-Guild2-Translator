@@ -16,6 +16,7 @@ from typing import Iterable
 from .codec_adapter import CodecError, Guild2Codec, load_codec_for_language
 from .format_io import (
     DbtDocument,
+    DbtRow,
     load_dbt_bytes,
     load_plain_text_bytes,
     matching_source_field,
@@ -98,6 +99,20 @@ class TranslationLogEntry:
         )
 
 
+@dataclass
+class _HistoryDocument:
+    """Immutable parsed snapshot and row lookup, kept in the six-document LRU."""
+
+    document: DbtDocument
+    rows: list[tuple[tuple, DbtRow]]
+    row_index: dict[tuple, DbtRow]
+
+    @classmethod
+    def from_document(cls, document: DbtDocument) -> "_HistoryDocument":
+        rows = [(row_key(document.path.name, row), row) for row in document.rows]
+        return cls(document, rows, dict(rows))
+
+
 class LanguageGit:
     """A narrow Git facade: only the language repository is ever auto-committed."""
 
@@ -134,12 +149,43 @@ class LanguageGit:
         self._commit_list_cache: tuple[GitCommit, ...] | None = None
         self._all_commit_list_cache: tuple[GitCommit, ...] | None = None
         self._entry_cache: OrderedDict[str, tuple[TranslationLogEntry, ...]] = OrderedDict()
+        # Same lifetime/bound as _entry_cache; only live fallback files affect an entry.
+        self._entry_source_dependencies: dict[str, dict[str, str]] = {}
         self._combined_cache: OrderedDict[tuple[str, ...], tuple[TranslationLogEntry, ...]] = OrderedDict()
 
     @property
     def history_cache_fingerprint(self) -> str:
         """Include live sources used when older commits have no source blob."""
         return f"{self._codec_history_fingerprint}-{_working_source_fingerprint(self.repo)}"
+
+    @property
+    def history_codec_fingerprint(self) -> str:
+        return self._codec_history_fingerprint
+
+    def source_fingerprint(self, file_rel: str) -> str:
+        return _source_bytes_fingerprint(self._working_source_bytes(file_rel))
+
+    def _cached_entries(
+        self, commit: str, fingerprints: dict[str, str],
+    ) -> tuple[tuple[TranslationLogEntry, ...], dict[str, str]] | None:
+        with self._cache_lock:
+            cached = self._entry_cache.get(commit)
+            dependencies = dict(self._entry_source_dependencies.get(commit, {}))
+        for file_rel, fingerprint in dependencies.items():
+            if file_rel not in fingerprints:
+                fingerprints[file_rel] = self.source_fingerprint(file_rel)
+            if fingerprints[file_rel] != fingerprint:
+                return None
+        return (cached, dependencies) if cached is not None else None
+
+    def _cache_entries(self, commit: str, entries: tuple[TranslationLogEntry, ...], dependencies: dict[str, str]) -> None:
+        with self._cache_lock:
+            self._entry_cache[commit] = entries
+            self._entry_source_dependencies[commit] = dependencies
+            self._entry_cache.move_to_end(commit)
+            while len(self._entry_cache) > self.ENTRY_CACHE_LIMIT:
+                old_commit, _entries = self._entry_cache.popitem(last=False)
+                self._entry_source_dependencies.pop(old_commit, None)
 
     def ensure_repository(self, settings: AppSettings) -> bool:
         """Create the initial language baseline. Returns true when it was created."""
@@ -243,18 +289,16 @@ class LanguageGit:
         return commits
 
     def entries_for_commit(self, commit: str) -> list[TranslationLogEntry]:
-        with self._cache_lock:
-            cached = self._entry_cache.get(commit)
-            if cached is not None:
-                self._entry_cache.move_to_end(commit)
+        cached = self._cached_entries(commit, {})
         if cached is not None:
-            return list(cached)
+            return list(cached[0])
         parent = self._parent_of(commit)
         if parent is None:
             return []
         changed = self._run("diff-tree", "--no-commit-id", "--name-only", "-r", commit).stdout.splitlines()
         prefix = self._language_pathspec()
         entries: list[TranslationLogEntry] = []
+        dependencies: dict[str, str] = {}
         for target_rel in changed:
             if not target_rel.startswith(prefix):
                 continue
@@ -264,6 +308,7 @@ class LanguageGit:
             source = self._show_bytes(commit, file_rel)
             if source is None:
                 source = self._working_source_bytes(file_rel)
+                dependencies[file_rel] = _source_bytes_fingerprint(source)
             if source is None:
                 continue
             if target_rel.lower().endswith(".dbt"):
@@ -273,30 +318,26 @@ class LanguageGit:
             elif target_rel.lower().endswith(".txt"):
                 entries.extend(self._text_entries(file_rel, source, before, after))
         packed = tuple(entries)
-        with self._cache_lock:
-            self._entry_cache[commit] = packed
-            self._entry_cache.move_to_end(commit)
-            while len(self._entry_cache) > self.ENTRY_CACHE_LIMIT:
-                self._entry_cache.popitem(last=False)
-            cached = packed
-        return list(cached)
+        self._cache_entries(commit, packed, dependencies)
+        return list(packed)
 
     def entries_for_commits(self, commits_oldest_first: Iterable[str]) -> list[TranslationLogEntry]:
         """Return translation changes for the selected commits in commit order."""
         commit_list = tuple(commits_oldest_first)
         if not commit_list:
             return []
+        cache_key = (self.history_cache_fingerprint, *commit_list)
         with self._cache_lock:
-            cached = self._combined_cache.get(commit_list)
+            cached = self._combined_cache.get(cache_key)
             if cached is not None:
-                self._combined_cache.move_to_end(commit_list)
+                self._combined_cache.move_to_end(cache_key)
         if cached is not None:
             return list(cached)
         entry_groups = tuple(tuple(self.entries_for_commit(commit)) for commit in commit_list)
         combined = tuple(entry for group in entry_groups for entry in group)
         with self._cache_lock:
-            self._combined_cache[commit_list] = combined
-            self._combined_cache.move_to_end(commit_list)
+            self._combined_cache[cache_key] = combined
+            self._combined_cache.move_to_end(cache_key)
             while len(self._combined_cache) > self.COMBINED_CACHE_LIMIT:
                 self._combined_cache.popitem(last=False)
             cached = combined
@@ -306,23 +347,28 @@ class LanguageGit:
         self,
         commits_newest_first: Iterable[str],
         cancel_event: threading.Event | None = None,
+        *,
+        source_dependencies: dict[str, dict[str, str]] | None = None,
     ) -> Iterable[tuple[str, list[TranslationLogEntry]]]:
         """Read many commits with bounded Git batch calls and blob/document reuse."""
         requested = tuple(commits_newest_first)
         if not requested:
             return
         cached_entries: dict[str, tuple[TranslationLogEntry, ...]] = {}
-        with self._cache_lock:
-            for commit in requested:
-                cached = self._entry_cache.get(commit)
-                if cached is not None:
-                    cached_entries[commit] = cached
-                    self._entry_cache.move_to_end(commit)
+        fingerprints: dict[str, str] = {}
+        for commit in requested:
+            if cancel_event is not None and cancel_event.is_set():
+                return
+            cached = self._cached_entries(commit, fingerprints)
+            if cached is not None:
+                cached_entries[commit] = cached[0]
+                if source_dependencies is not None:
+                    source_dependencies[commit] = cached[1]
         missing_commits = set(requested) - cached_entries.keys()
         commit_specs = self._history_commit_specs(missing_commits) if missing_commits else {}
         blob_cache: OrderedDict[str, bytes] = OrderedDict()
         blob_cache_bytes = 0
-        document_cache: OrderedDict[tuple[str, str], DbtDocument] = OrderedDict()
+        document_cache: OrderedDict[tuple[str, str], _HistoryDocument] = OrderedDict()
 
         def cache_blob(oid: str, raw: bytes) -> None:
             nonlocal blob_cache_bytes
@@ -381,6 +427,7 @@ class LanguageGit:
                     yield commit, list(cached_entries[commit])
                     continue
                 entries: list[TranslationLogEntry] = []
+                dependencies: dict[str, str] = {}
                 for after_spec, before_spec, source_spec in paths_by_commit.get(commit, ()):
                     target_rel = after_spec.split(":", 1)[1]
                     file_rel = target_rel[len(self._language_pathspec()) :]
@@ -398,6 +445,7 @@ class LanguageGit:
                     )
                     if source is None:
                         source = self._working_source_bytes(file_rel)
+                        dependencies[file_rel] = _source_bytes_fingerprint(source)
                     if source is None:
                         continue
                     if target_rel.lower().endswith(".dbt"):
@@ -406,7 +454,7 @@ class LanguageGit:
                         source_doc = self._cached_dbt_document(document_cache, source_oid, file_rel, source)
                         after_doc = self._cached_dbt_document(document_cache, after_oid, file_rel, after)
                         before_doc = (
-                            self._cached_dbt_document(document_cache, before_oid, file_rel, before)
+                            self._cached_dbt_document(document_cache, before_oid, file_rel, before, previous=after_doc)
                             if before is not None
                             else None
                         )
@@ -414,11 +462,9 @@ class LanguageGit:
                     elif target_rel.lower().endswith(".txt"):
                         entries.extend(self._text_entries(file_rel, source, before, after))
                 packed = tuple(entries)
-                with self._cache_lock:
-                    self._entry_cache[commit] = packed
-                    self._entry_cache.move_to_end(commit)
-                    while len(self._entry_cache) > self.ENTRY_CACHE_LIMIT:
-                        self._entry_cache.popitem(last=False)
+                self._cache_entries(commit, packed, dependencies)
+                if source_dependencies is not None:
+                    source_dependencies[commit] = dependencies
                 yield commit, list(packed)
             for oid, raw in loaded_blobs.items():
                 cache_blob(oid, raw)
@@ -496,17 +542,22 @@ class LanguageGit:
 
     def _cached_dbt_document(
         self,
-        cache: OrderedDict[tuple[str, str], DbtDocument],
+        cache: OrderedDict[tuple[str, str], _HistoryDocument],
         oid: str | None,
         file_rel: str,
         raw: bytes,
-    ) -> DbtDocument:
-        key = (oid or "", Path(file_rel).name.casefold())
+        *,
+        previous: _HistoryDocument | None = None,
+    ) -> _HistoryDocument:
+        # Blob content plus the complete relative path determine parsing/row keys.
+        key = (oid or _source_bytes_fingerprint(raw), file_rel)
         document = cache.get(key)
         if document is not None:
             cache.move_to_end(key)
             return document
-        document = load_dbt_bytes(Path(file_rel), raw)
+        document = _HistoryDocument.from_document(load_dbt_bytes(
+            Path(file_rel), raw, previous=previous.document if previous is not None else None,
+        ))
         cache[key] = document
         cache.move_to_end(key)
         while len(cache) > self.HISTORY_DOCUMENT_CACHE_LIMIT:
@@ -520,31 +571,37 @@ class LanguageGit:
         source_doc = load_dbt_bytes(Path(file_name), source_raw)
         after_doc = load_dbt_bytes(Path(file_name), after_raw)
         before_doc = load_dbt_bytes(Path(file_name), before_raw) if before_raw is not None else None
-        return self._dbt_entries_from_documents(file_rel, source_doc, before_doc, after_doc)
+        return self._dbt_entries_from_documents(
+            file_rel, _HistoryDocument.from_document(source_doc),
+            _HistoryDocument.from_document(before_doc) if before_doc is not None else None,
+            _HistoryDocument.from_document(after_doc),
+        )
 
     def _dbt_entries_from_documents(
         self,
         file_rel: str,
-        source_doc: DbtDocument,
-        before_doc: DbtDocument | None,
-        after_doc: DbtDocument,
+        source_doc: _HistoryDocument,
+        before_doc: _HistoryDocument | None,
+        after_doc: _HistoryDocument,
     ) -> list[TranslationLogEntry]:
         file_name = Path(file_rel).name
         source_rows = source_doc.row_index
         after_rows = after_doc.row_index
         before_rows = before_doc.row_index if before_doc is not None else {}
-        fields = translatable_fields(file_name, after_doc.string_columns)
+        fields = translatable_fields(file_name, after_doc.document.string_columns)
+        source_fields = {field: matching_source_field(field, source_doc.document.string_columns) for field in fields}
         entries: list[TranslationLogEntry] = []
-        for row in after_doc.rows:
-            key = row_key(file_name, row)
+        for key, row in after_doc.rows:
             source_row = source_rows.get(key)
             before_row = before_rows.get(key)
+            if row is before_row:
+                continue
             for field_name in fields:
                 after_value = row.get(field_name)
                 before_value = before_row.get(field_name) if before_row is not None else None
                 if before_value == after_value:
                     continue
-                source_field = matching_source_field(field_name, source_doc.string_columns)
+                source_field = source_fields[field_name]
                 source_text = source_row.get(source_field) if source_row is not None else ""
                 previous_text = self._decode(before_value) if before_value is not None else None
                 kind = _history_kind(previous_text)
@@ -568,7 +625,7 @@ class LanguageGit:
                 before_value = before_row.get(field_name)
                 if before_value is None:
                     continue
-                source_field = matching_source_field(field_name, source_doc.string_columns)
+                source_field = source_fields[field_name]
                 source_text = source_row.get(source_field) if source_row is not None else ""
                 entries.append(
                     TranslationLogEntry(
@@ -798,6 +855,10 @@ def _codec_history_fingerprint(codec: Guild2Codec | None) -> str:
         digest.update(decoded.encode("utf-8"))
         digest.update(b"\0")
     return f"codec-{digest.hexdigest()[:16]}"
+
+
+def _source_bytes_fingerprint(raw: bytes | None) -> str:
+    return "missing" if raw is None else hashlib.sha256(raw).hexdigest()
 
 
 def _working_source_fingerprint(repo: Path) -> str:

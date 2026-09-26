@@ -34,6 +34,9 @@ def assert_saved_file_refresh(project_root: Path, codec_root: Path) -> None:
         if unit.ref.kind == "dbt" and unit.ref.target_row is not None and not unit.pending_delete
     )
     untouched = next(unit for unit in project.units if unit.file_rel != edited.file_rel)
+    same_file = next(unit for unit in project.units if unit.file_rel == edited.file_rel and unit.uid != edited.uid)
+    same_file.issues()
+    issue_cache = same_file._issue_cache_value
     project.apply_unit_edits(((edited, edited.current_text + "x", None),))
     result = project.save()
     started = time.perf_counter()
@@ -49,7 +52,21 @@ def assert_saved_file_refresh(project_root: Path, codec_root: Path) -> None:
         raise AssertionError("changed-file refresh did not accept the durable edited translation")
     if project.unit_by_uid(untouched.uid) is not untouched:
         raise AssertionError("changed-file refresh rebuilt an unrelated translation file")
+    if project.unit_by_uid(same_file.uid) is not same_file or same_file._issue_cache_value is not issue_cache:
+        raise AssertionError("saving one row discarded an unchanged row's identity or validation cache")
+    if same_file.ref.target_doc is not project.target_dbt_docs[same_file.file_rel]:
+        raise AssertionError("retained unit still referenced the old target document")
     _assert_matches_full_reload(project, codec_root)
+
+    previous_doc = same_file.ref.target_doc
+    try:
+        project.reload_saved_files((*result.changed_files, project.root / "outside.dbt"))
+    except ProjectError:
+        pass
+    else:
+        raise AssertionError("reload accepted a file outside the active language")
+    if project.target_dbt_docs[same_file.file_rel] is not previous_doc or same_file.ref.target_doc is not previous_doc:
+        raise AssertionError("failed multi-file refresh partially published new documents")
 
     project.apply_unit_edits(((refreshed, refreshed.current_text, True),))
     deleted_result = project.save()

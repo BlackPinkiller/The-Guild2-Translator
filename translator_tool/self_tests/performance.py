@@ -10,6 +10,123 @@ SAVED_FILE_REFRESH_LIMIT_SECONDS = 1.5
 AI_CONTEXT_BUILD_LIMIT_SECONDS = 0.5
 CACHED_SEARCH_FILTER_LIMIT_SECONDS = 0.25
 LABEL_CATALOG_FAMILY_LOOKUP_LIMIT_SECONDS = 1.0
+SINGLE_SAVE_REFRESH_LIMIT_SECONDS = 0.75
+FORMAT_SCAN_SLICE_LIMIT_SECONDS = 0.15
+HISTORY_LONG_DIFF_LIMIT_SECONDS = 0.2
+HISTORY_SEARCH_PREPARE_LIMIT_SECONDS = 1.5
+
+
+def assert_history_long_text_and_search_stay_bounded() -> None:
+    from datetime import datetime
+    import threading
+
+    from ..git_history import GitCommit, TranslationLogEntry
+    from ..history_render import inline_diff_html
+    from ..history_search import build_history_search_index, matches_terms, query_terms
+
+    text = "正文 repeated " * 3000
+    started = perf_counter()
+    rendered = inline_diff_html(text, text + "x")
+    assert_within_budget("36k-character appended history diff", perf_counter() - started, HISTORY_LONG_DIFF_LIMIT_SECONDS)
+    if not rendered.endswith('<span class="diff-add">x</span>'):
+        raise AssertionError("large appended history diff did not isolate the new character")
+    started = perf_counter()
+    inline_diff_html("AB" * 18_000, "BA" * 18_000)
+    assert_within_budget("36k-character repetitive replacement diff", perf_counter() - started, HISTORY_LONG_DIFF_LIMIT_SECONDS)
+    commit = GitCommit("a" * 40, "aaaaaaa", datetime(2026, 1, 1), "Save translations")
+    events = [(commit, TranslationLogEntry(
+        "更新", "Text.dbt", str(index), f"Label{index}", "Text", "Hello", f"新译文{index}", "旧译文",
+    )) for index in range(20_000)]
+    started = perf_counter()
+    index = build_history_search_index((commit,), events, threading.Event())
+    assert_within_budget("20k-change history search preparation", perf_counter() - started, HISTORY_SEARCH_PREPARE_LIMIT_SECONDS)
+    assert index is not None
+    terms = query_terms("hello 新译文19999")
+    started = perf_counter()
+    matches = [key for key in index.entry_keys if matches_terms(index.entry_blobs[key], terms)]
+    assert_within_budget("20k-entry history search", perf_counter() - started, CACHED_SEARCH_FILTER_LIMIT_SECONDS)
+    if matches != [events[-1][1].change_key]:
+        raise AssertionError("large history search returned the wrong entry")
+
+
+def assert_incremental_save_and_format_scan_stay_bounded() -> None:
+    from pathlib import Path
+    from tempfile import TemporaryDirectory
+    from unittest.mock import patch
+
+    from PySide6.QtWidgets import QApplication
+
+    from .. import app as app_module
+    from ..app import UnitTableModel
+    from ..project import Project
+
+    app = QApplication.instance() or QApplication([])
+    with TemporaryDirectory(prefix="translator_performance_") as directory:
+        root = Path(directory).resolve()
+        language = root / "languages" / "#english"
+        language.mkdir(parents=True)
+        header = '"id" INT |"label" STRING |"english" STRING |\nData:\n'
+        rows = ''.join(f'{index} "LABEL_{index}" "Text %1SN {index}" |\n' for index in range(20_000))
+        for path in (language.parent / "Text.dbt", language / "Text.dbt"):
+            if not path.resolve().is_relative_to(root):
+                raise AssertionError("performance fixture escaped its temporary directory")
+            path.write_text(header + rows, encoding="utf-8")
+        project = Project.load(root, "#english", enable_codec=False)
+        model = UnitTableModel(project)
+        try:
+            untouched = project.units[0]
+            model.has_format_warning(0)
+            cached_search = model.search_blob(0)
+            edited = project.units[-2]
+            project.apply_unit_edits(((edited, "Changed %1SN", None),))
+            model.refresh_unit(edited)
+            resets: list[None] = []
+            model.modelReset.connect(lambda: resets.append(None))
+            with patch.object(app_module, "_search_blob", wraps=app_module._search_blob) as search_calls:
+                started = perf_counter()
+                result = project.save()
+                project.reload_saved_files(result.changed_files)
+                model.refresh_project(project)
+                elapsed = perf_counter() - started
+            assert_within_budget("20k-row single save and model refresh", elapsed, SINGLE_SAVE_REFRESH_LIMIT_SECONDS)
+            if resets or search_calls.call_count != 1:
+                raise AssertionError("one saved row reset the model or rebuilt unrelated search entries")
+            if project.units[0] is not untouched or model.search_blob(0) is not cached_search:
+                raise AssertionError("save discarded an untouched row or its search cache")
+            refreshed = project.unit_by_uid(edited.uid)
+            if refreshed is None or refreshed.is_dirty or "Changed" not in model.search_blob(19_998, case_sensitive=True):
+                raise AssertionError("incremental model refresh exposed stale saved text")
+            if model.units_for_exact_label(refreshed.label) != (refreshed,):
+                raise AssertionError("label lookup retained a replaced saved unit")
+
+            model.cancel_format_scan()
+            started = perf_counter()
+            model._scan_format_warnings()
+            assert_within_budget("first format scan slice", perf_counter() - started, FORMAT_SCAN_SLICE_LIMIT_SECONDS)
+            if model.format_warnings_ready:
+                raise AssertionError("first format slice validated the entire 20k-row project")
+            # Editing an already scanned row must invalidate it exactly once.
+            project.apply_unit_edits(((untouched, "Missing argument", None),))
+            model.refresh_unit(untouched)
+            model.refresh_unit(untouched)
+            if model._format_changed_rows != {0}:
+                raise AssertionError("format scan did not coalesce edits to an already scanned row")
+            while not model.format_warnings_ready:
+                started = perf_counter()
+                model._scan_format_warnings()
+                assert_within_budget("format scan slice", perf_counter() - started, FORMAT_SCAN_SLICE_LIMIT_SECONDS)
+            if not model.has_format_warning(0):
+                raise AssertionError("format scan lost a changed row's warning")
+            project.apply_unit_edits(((untouched, untouched.source_text, None),))
+            model.refresh_unit(untouched)
+            model._scan_format_warnings()
+            if model.has_format_warning(0):
+                raise AssertionError("format scan retained a repaired warning")
+            model.clear()
+            if model._format_scan_timer.isActive() or model._format_changed_rows:
+                raise AssertionError("clearing the project left format work pending")
+        finally:
+            model.cancel_format_scan()
 
 
 def assert_within_budget(name: str, elapsed: float, limit: float, *, detail: str = "") -> None:

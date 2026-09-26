@@ -43,7 +43,19 @@ from .self_tests.project_refresh import assert_saved_file_refresh
 from .self_tests.git_commit import assert_tracked_git_commit_skips_redundant_add
 from .self_tests.git_history_source import assert_history_uses_live_source_missing_from_old_commits
 from .self_tests.history_index import assert_history_index_is_persistent_and_bounded
-from .self_tests.format_io import assert_guild2_encoding_detection
+from .self_tests.appearance import (
+    assert_theme_text_contrast_and_history_consistency,
+    assert_appearance_preserves_editor_state_and_file_bytes,
+    assert_interface_scale_settings,
+    assert_search_control_geometry_and_help,
+    assert_auxiliary_dialog_layout_and_state,
+    assert_supported_theme_settings_and_assets,
+)
+from .self_tests.history_search import (
+    assert_history_search_prepares_complete_cancellable_results,
+    assert_history_diff_preserves_text_and_escapes_markup,
+)
+from .self_tests.format_io import assert_guild2_encoding_detection, assert_incremental_dbt_parse_matches_full_parse
 from .self_tests.file_tree import assert_file_tree_groups_nested_paths
 from .self_tests.project_order import assert_missing_translations_follow_source_order
 from .self_tests.project_validation import assert_missing_rows_do_not_report_translation_format_errors
@@ -110,6 +122,8 @@ from .self_tests.performance import (
     LARGE_BATCH_MIN_ENTRIES,
     LARGE_BATCH_SAVE_LIMIT_SECONDS,
     assert_large_cached_search_filter_stays_interactive,
+    assert_incremental_save_and_format_scan_stay_bounded,
+    assert_history_long_text_and_search_stay_bounded,
     assert_large_label_catalog_family_lookup_is_cached,
     assert_table_display_does_not_validate_unrelated_columns,
     assert_within_budget,
@@ -2926,7 +2940,7 @@ def assert_project_history_settings(root: Path) -> None:
         save_settings(
             AppSettings(
                 ui_language="zh-CN",
-                ui_theme="guild2",
+                ui_theme="dark",
                 last_project_root=expected[0],
                 recent_project_roots=expected,
                 enable_chinese_codec=True,
@@ -2942,7 +2956,7 @@ def assert_project_history_settings(root: Path) -> None:
         if (
             loaded.ui_language != "zh-CN"
             or
-            loaded.ui_theme != "guild2"
+            loaded.ui_theme != "dark"
             or
             loaded.last_project_root != expected[0]
             or loaded.recent_project_roots != expected[:8]
@@ -3133,8 +3147,10 @@ def assert_editor_undo_stays_local(root: Path) -> None:
         if len(win.top_buttons) != 1 or win.top_buttons[0].property("text_key") != "button.save":
             raise AssertionError("low-frequency actions were still spread across the title bar")
         more_action_keys = tuple(action.property("text_key") for action in win.more_actions)
-        if more_action_keys != ("button.import_text", "button.history", "button.settings"):
-            raise AssertionError("the More menu did not contain the expected low-frequency actions")
+        if more_action_keys != ("project.button.manage", "button.import_text"):
+            raise AssertionError("the More menu did not contain project management and import")
+        if tuple(button.property("text_key") for button in win.navigation_buttons) != ("button.history", "button.settings"):
+            raise AssertionError("history and settings lost their direct navigation buttons")
         git_init_deadline = time.monotonic() + 10.0
         while not win.git_ready and not win._git_init_failed and time.monotonic() < git_init_deadline:
             QTest.qWait(20)
@@ -3851,8 +3867,12 @@ def assert_editor_undo_stays_local(root: Path) -> None:
         win._filter_anchor_uid = save_unit.uid
         if not win._restore_selected_row(save_unit.uid):
             raise AssertionError("save refresh fixture could not select a lower-table translation")
+        _assert_format_filter_yields_and_restores_selection(win, app, save_unit.uid)
         win._replace_unit_text(save_unit, save_after, "save refresh smoke test")
         load_calls = 0
+        model_resets: list[None] = []
+        record_reset = lambda: model_resets.append(None)
+        win.model.modelReset.connect(record_reset)
         original_load_project = win.load_project
 
         def tracked_load_project(discard_changes: bool = False) -> None:
@@ -3862,11 +3882,14 @@ def assert_editor_undo_stays_local(root: Path) -> None:
 
         win.load_project = tracked_load_project  # type: ignore[method-assign]
         win.save_all()
+        win.model.modelReset.disconnect(record_reset)
         win.load_project = original_load_project  # type: ignore[method-assign]
         app.processEvents()
         saved_unit = win.project.unit_by_uid(save_unit.uid)
         if load_calls:
             raise AssertionError("ordinary save fell back to a full-project reload")
+        if model_resets:
+            raise AssertionError("ordinary save reset the entire table model")
         if saved_unit is None or saved_unit.current_text != save_after or saved_unit.is_dirty:
             raise AssertionError("ordinary save did not refresh the durable translation in place")
         current_index = win.table.currentIndex()
@@ -3917,11 +3940,62 @@ def assert_ui_language_switching() -> None:
         set_language(previous)
 
 
+def _assert_format_filter_yields_and_restores_selection(win, app, selected_uid: str) -> None:
+    from PySide6.QtCore import QEventLoop, Qt, QTimer
+
+    win.model.cancel_format_scan()
+    win.model._format_scan_row = 0
+    win.model._format_warning.clear()
+    win.search_edit.setFocus(Qt.FocusReason.OtherFocusReason)
+    win.only_format_warnings.setChecked(True)
+    if not win._format_filter_pending:
+        raise AssertionError("cold format filter ran synchronously")
+    # Cancelling a pending filter must not let its eventual result replace the
+    # newer choice or steal focus from the search box.
+    win.only_format_warnings.setChecked(False)
+    if win._format_filter_pending:
+        raise AssertionError("disabling format filtering left an obsolete filter request")
+    win.only_format_warnings.setChecked(True)
+    win.search_edit.setText("label:__NO_SUCH_PERFORMANCE_LABEL__")
+    loop = QEventLoop()
+    watchdog = QTimer()
+    watchdog.setSingleShot(True)
+    watchdog.timeout.connect(loop.quit)
+    pulse = QTimer()
+    ticks: list[None] = []
+    pulse.timeout.connect(lambda: ticks.append(None))
+    win.model.formatWarningsReady.connect(loop.quit)
+    try:
+        watchdog.start(10_000)
+        pulse.start(1)
+        loop.exec()
+    finally:
+        watchdog.stop()
+        pulse.stop()
+        win.model.formatWarningsReady.disconnect(loop.quit)
+    if win._format_filter_pending or not win.model.format_warnings_ready or not ticks:
+        raise AssertionError("format checking failed to finish while yielding to the Qt event loop")
+    if win.proxy.rowCount() or win.last_applied_query != win.search_edit.text():
+        raise AssertionError("format completion applied an obsolete search query")
+    if not win.search_edit.hasFocus():
+        raise AssertionError("format completion stole search input focus")
+    win.only_format_warnings.setChecked(False)
+    win.search_edit.clear()
+    win.search_debounce.stop()
+    win._apply_filters()
+    app.processEvents()
+    index = win.table.currentIndex()
+    if index.data(Qt.ItemDataRole.UserRole) != selected_uid:
+        raise AssertionError("clearing the deferred format filter lost the selected UID")
+    if not win.table.visualRect(index).intersects(win.table.viewport().rect()):
+        raise AssertionError("deferred format filtering left the selected row outside the viewport")
+
+
 def assert_dark_theme() -> None:
     from PySide6.QtGui import QFont, QFontDatabase, QPalette
     from PySide6.QtWidgets import QApplication
 
-    from .app import EditorGroupBox, SettingsDialog, _history_state_html, _theme_editor_highlight, apply_theme
+    from .app import EditorPanel, SettingsDialog, _history_state_html, _theme_editor_highlight, apply_theme
 
     app = QApplication.instance() or QApplication([])
     previous_font = QFont(app.font())
@@ -3932,33 +4006,32 @@ def assert_dark_theme() -> None:
             raise AssertionError("visual theme test could not load the Windows Chinese UI font")
         app.setFont(QFont("Microsoft YaHei UI", 10))
     previous_theme = (
-        "guild2"
-        if app.property("guild2Theme") is True
-        else "dark"
+        "dark"
         if app.property("darkTheme") is True
         else "modern"
     )
     try:
         apply_theme(app, "dark")
-        if app.property("darkTheme") is not True or app.property("guild2Theme") is True:
-            raise AssertionError("dark theme properties were not applied independently of the game theme")
-        if app.palette().color(QPalette.ColorRole.Base).name().lower() != "#111318":
+        if app.property("darkTheme") is not True:
+            raise AssertionError("dark theme properties were not applied")
+        if app.palette().color(QPalette.ColorRole.Base).name().lower() != "#202530":
             raise AssertionError("dark theme did not apply its editor background palette")
-        if "background: #111318" not in _history_state_html("Title", "Detail"):
+        if "background: #202530" not in _history_state_html("Title", "Detail"):
             raise AssertionError("history HTML did not follow the active dark theme")
         if _theme_editor_highlight("search") != ("#31445a", "#f2f4f8"):
             raise AssertionError("editor search matches kept the light-theme highlight colors")
         if _theme_editor_highlight("missing_format") != ("#4b2c34", "#ffd7dc"):
             raise AssertionError("missing format-token highlights kept the light-theme colors")
 
-        editor_box = EditorGroupBox()
+        editor_box = EditorPanel()
         try:
             editor_box.preview_button.setText("预览")
             if chinese_font_path.is_file() and not editor_box.preview_button.fontMetrics().inFontUcs4(ord("预")):
                 raise AssertionError("visual theme test rendered Chinese with a fallback missing-glyph box")
             natural_width = editor_box.preview_button.sizeHint().width()
             editor_box.resize(480, 200)
-            editor_box.position_preview_button()
+            editor_box.show()
+            app.processEvents()
             if editor_box.preview_button.width() < natural_width:
                 raise AssertionError("dark theme clipped the preview toggle below its themed size hint")
         finally:
@@ -3970,8 +4043,8 @@ def assert_dark_theme() -> None:
                 dialog.ui_theme.itemData(index)
                 for index in range(dialog.ui_theme.count())
             )
-            if choices != ("modern", "dark", "guild2"):
-                raise AssertionError("settings did not expose the three fixed theme choices")
+            if choices != ("modern", "dark"):
+                raise AssertionError("settings did not expose only the two supported theme choices")
             if dialog.ui_theme.currentData() != "dark" or dialog.result_settings().ui_theme != "dark":
                 raise AssertionError("dark theme selection was not retained")
         finally:
@@ -3980,17 +4053,9 @@ def assert_dark_theme() -> None:
         apply_theme(app, "modern")
         if (
             app.property("darkTheme") is not False
-            or app.property("guild2Theme") is not False
-            or app.palette().color(QPalette.ColorRole.Base).name().lower() != "#fbf1c7"
+            or app.palette().color(QPalette.ColorRole.Base).name().lower() != "#ffffff"
         ):
             raise AssertionError("switching away from dark did not restore the modern palette")
-        apply_theme(app, "guild2")
-        if (
-            app.property("guild2Theme") is not True
-            or app.property("darkTheme") is not False
-            or "background: #211a12" not in _history_state_html("Title", "Detail")
-        ):
-            raise AssertionError("switching from dark did not restore the game theme state")
     finally:
         apply_theme(app, previous_theme)
         app.setFont(previous_font)
@@ -5722,7 +5787,10 @@ def assert_history_dialog_search_and_entry_timeline() -> None:
         project_root = history_root
         repo = history_repo
         language = "#chinese"
-        history_cache_fingerprint = "plain"
+        history_codec_fingerprint = "plain"
+
+        def source_fingerprint(self, file_rel):
+            return "missing"
 
         def __init__(self):
             self.entry_read_count = 0
@@ -5736,7 +5804,7 @@ def assert_history_dialog_search_and_entry_timeline() -> None:
             self.entry_read_count += 1
             return list(entries.get(commit, ()))
 
-        def iter_entries_for_commits(self, hashes, cancel_event=None):
+        def iter_entries_for_commits(self, hashes, cancel_event=None, *, source_dependencies=None):
             requested = tuple(hashes)
             if len(requested) > 1:
                 self.full_index_read_count += 1
@@ -5821,6 +5889,40 @@ def assert_history_dialog_search_and_entry_timeline() -> None:
         cached_dialog.close()
         cached_dialog.deleteLater()
         app.processEvents()
+
+        # A real filter transition must keep a selected row far below the top
+        # both current and visible, without stealing focus from the search box.
+        from .history_search import build_history_search_index
+
+        many_events = [
+            (commits[0], TranslationLogEntry(
+                "更新", "Text.dbt", str(index), f"Entry_{index:04d}", "Text", "Hello",
+                "even" if index % 2 == 0 else "odd", "before",
+            )) for index in range(450)
+        ]
+        prepared = build_history_search_index(tuple(commits), many_events, threading.Event())
+        dialog._focus_key = None
+        dialog.entry_search.clear()
+        dialog._apply_history_index(dialog._index_request_id, {"index": prepared})
+        dialog._select_entry_key(many_events[350][1].change_key)
+        dialog.activateWindow()
+        dialog.entry_search.setFocus()
+        app.processEvents()
+        selected_item = dialog.entries.currentItem()
+        scroll = dialog.entries.verticalScrollBar().value()
+        dialog.entry_search.setText("hello")
+        app.processEvents()
+        if dialog.entries.currentItem() is not selected_item or dialog.entries.verticalScrollBar().value() != scroll:
+            raise AssertionError("unchanged history results rebuilt the list or reset its viewport")
+        dialog.entry_search.setText("hello even")
+        app.processEvents()
+        current = dialog.entries.currentRow()
+        if current < 0 or dialog._visible_entry_keys[current] != many_events[350][1].change_key:
+            raise AssertionError("history filter lost the selected entry")
+        if not dialog.entries.visualItemRect(dialog.entries.currentItem()).intersects(dialog.entries.viewport().rect()):
+            raise AssertionError("filtered history selection was restored outside the viewport")
+        if not dialog.entry_search.hasFocus():
+            raise AssertionError("history results stole keyboard focus while searching")
     finally:
         dialog.close()
         dialog.deleteLater()
@@ -6123,6 +6225,7 @@ def main() -> int:
     assert_font_glyph_validation(root)
     assert_round_trip(root)
     assert_guild2_encoding_detection()
+    assert_incremental_dbt_parse_matches_full_parse()
     assert_file_tree_groups_nested_paths()
     assert_statuses(root)
     assert_loaded_order_matches_file_lines(root)
@@ -6177,6 +6280,7 @@ def main() -> int:
     assert_code_index_requests_selected_and_visible_rows_without_moving_viewport()
     assert_hot_ui_updates_are_coalesced()
     assert_large_cached_search_filter_stays_interactive()
+    assert_incremental_save_and_format_scan_stay_bounded()
     assert_large_label_catalog_family_lookup_is_cached()
     assert_table_display_does_not_validate_unrelated_columns()
     assert_stale_code_index_workers_are_released()
@@ -6223,6 +6327,12 @@ def main() -> int:
     assert_editor_undo_stays_local(root)
     assert_ui_language_switching()
     assert_dark_theme()
+    assert_theme_text_contrast_and_history_consistency()
+    assert_appearance_preserves_editor_state_and_file_bytes()
+    assert_interface_scale_settings()
+    assert_search_control_geometry_and_help()
+    assert_auxiliary_dialog_layout_and_state()
+    assert_supported_theme_settings_and_assets()
     assert_external_project_uses_tool_codec(root)
     assert_packaged_runtime_finds_sibling_codec(root)
     assert_non_chinese_language_bypasses_codec(root)
@@ -6249,6 +6359,9 @@ def main() -> int:
     assert_git_history(root)
     assert_history_dialog_search_and_entry_timeline()
     assert_history_index_is_persistent_and_bounded()
+    assert_history_search_prepares_complete_cancellable_results()
+    assert_history_diff_preserves_text_and_escapes_markup()
+    assert_history_long_text_and_search_stay_bounded()
     assert_git_subprocess_hides_console()
     assert_git_subprocess_timeout_is_reported()
     assert_tracked_git_commit_skips_redundant_add()

@@ -709,6 +709,9 @@ class Project:
         """Reload only durable target files changed by save, preserving the rest of the project."""
         language_root = (self.languages_root / self.language).resolve()
         replacements: dict[str, list[TranslationUnit]] = {}
+        target_dbt_docs = dict(self.target_dbt_docs)
+        target_text_docs = dict(self.target_text_docs)
+        insertion_anchors = dict(self.insertion_anchors)
         for changed_path in changed_files:
             path = changed_path.resolve()
             try:
@@ -721,10 +724,10 @@ class Project:
                 source_doc = self.source_docs.get(file_rel)
                 if source_doc is None:
                     raise ProjectError(f"saved DBT has no source document: {file_rel}")
-                target_doc = load_dbt(path) if path.exists() else make_virtual_translation_dbt(
+                target_doc = load_dbt(path, previous=self.target_dbt_docs.get(file_rel)) if path.exists() else make_virtual_translation_dbt(
                     source_doc, path, self.language
                 )
-                self.target_dbt_docs[file_rel] = target_doc
+                target_dbt_docs[file_rel] = target_doc
                 order = self.source_order[file_rel]
                 replacements[file_rel] = build_dbt_units(
                     file_rel,
@@ -734,7 +737,7 @@ class Project:
                     order,
                     label_match_first=self.root.name.casefold() != "vanilla",
                 )
-                self.insertion_anchors[file_rel] = _build_insertion_anchors(file_rel, order, target_doc)
+                insertion_anchors[file_rel] = _build_insertion_anchors(file_rel, order, target_doc)
                 continue
 
             if suffix != ".txt":
@@ -748,7 +751,7 @@ class Project:
                         path=target_doc.path,
                         sha256=target_doc.profile.sha256,
                     )
-                self.target_text_docs[file_rel] = target_doc
+                target_text_docs[file_rel] = target_doc
                 replacements[file_rel] = [build_plain_text_unit(file_rel, target_doc, source_doc)]
             elif source_doc is not None:
                 target_doc = load_plain_text_bytes(path, b"")
@@ -757,16 +760,27 @@ class Project:
                     path=target_doc.path,
                     sha256=target_doc.profile.sha256,
                 )
-                self.target_text_docs[file_rel] = target_doc
+                target_text_docs[file_rel] = target_doc
                 replacements[file_rel] = [build_plain_text_unit(file_rel, target_doc, source_doc)]
             else:
-                self.target_text_docs.pop(file_rel, None)
+                target_text_docs.pop(file_rel, None)
                 replacements[file_rel] = []
 
         for replacement in replacements.values():
             replacement.sort(key=_unit_display_sort_key)
         refreshed = [unit for units in replacements.values() for unit in units]
         _apply_workflow_metadata(refreshed, self.root, self.language)
+        # Publish only after every file was parsed successfully. Unchanged units
+        # keep their identity and validation caches, but bind to the new document.
+        for replacement in replacements.values():
+            for index, candidate in enumerate(replacement):
+                previous = self.unit_index.get(candidate.uid)
+                if previous is not None and _unit_reload_state(previous) == _unit_reload_state(candidate):
+                    previous.ref = candidate.ref
+                    replacement[index] = previous
+        self.target_dbt_docs = target_dbt_docs
+        self.target_text_docs = target_text_docs
+        self.insertion_anchors = insertion_anchors
         replaced_uids = {unit.uid for unit in self.units if unit.file_rel in replacements}
         rebuilt: list[TranslationUnit] = []
         emitted: set[str] = set()
@@ -783,10 +797,22 @@ class Project:
         self.units = rebuilt
         self.unit_index = {unit.uid: unit for unit in rebuilt}
         self.edit_unconfirmed_uids.difference_update(replaced_uids)
-        return tuple(refreshed)
+        return tuple(unit for units in replacements.values() for unit in units)
 
     def _insertion_line_index(self, file_rel: str, missing_key: tuple[int, str]) -> int | None:
         return self.insertion_anchors.get(file_rel, {}).get(missing_key)
+
+
+def _unit_reload_state(unit: TranslationUnit) -> tuple[object, ...]:
+    """All non-reference inputs to unit display, search and validation caches."""
+    return (
+        unit.uid, unit.file_rel, unit.record_id, unit.label, unit.field_name,
+        unit.source_text, unit.translate_text, unit.status, unit.initial_issues,
+        unit.font_codec, unit.edited_text, unit.ignored, unit.confirmed,
+        unit.format_confirmation, unit.review_reason, unit.pending_delete,
+        unit.ref.kind, unit.ref.source_field, unit.ref.target_field,
+        unit.ref.target_row is not None, unit.ref.suggested_row is not None,
+    )
 
 
 def _build_insertion_anchors(
@@ -856,6 +882,10 @@ def build_dbt_units(
         for row in target_doc.rows:
             target_by_label.setdefault(row_key(file_name, row)[1], []).append(row)
     target_fields = translatable_fields(file_name, target_doc.string_columns)
+    source_fields = {
+        target_field: matching_source_field(target_field, source_doc.string_columns)
+        for target_field in target_fields
+    }
     matched_target_keys: set[tuple[int, str]] = set()
 
     for source_row in source_doc.rows:
@@ -872,7 +902,7 @@ def build_dbt_units(
             matched_target_keys.add(row_key(file_name, target_row))
         display_order = source_row.line_index
         for field_order, target_field in enumerate(target_fields):
-            source_field = matching_source_field(target_field, source_doc.string_columns)
+            source_field = source_fields[target_field]
             source_text = source_row.get(source_field)
             initial_issues: list[ValidationIssue] = []
             if source_text == "" and translation_row is None:

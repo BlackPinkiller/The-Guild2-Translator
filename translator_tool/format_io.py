@@ -288,15 +288,23 @@ def is_complete_row(buffer: str) -> bool:
     return buffer.count('"') % 2 == 0 and buffer.rstrip().endswith("|")
 
 
-def load_dbt(path: Path) -> DbtDocument:
-    return load_dbt_bytes(path, path.read_bytes())
+def load_dbt(path: Path, *, previous: DbtDocument | None = None) -> DbtDocument:
+    return load_dbt_bytes(path, path.read_bytes(), previous=previous)
 
 
-def load_dbt_bytes(path: Path, raw: bytes) -> DbtDocument:
+def load_dbt_bytes(path: Path, raw: bytes, *, previous: DbtDocument | None = None) -> DbtDocument:
     raw, text, profile = read_profile_bytes(path, raw)
     lines = text.splitlines(keepends=True)
     columns = parse_columns(lines)
     string_columns = [name for name, type_name in columns if type_name == "STRING"]
+    # Reuse only pristine rows with identical text, columns and physical spans.
+    # This temporary index is bounded by the previous document's row count;
+    # raw bytes and the file profile always come from the newly read file.
+    previous_rows = (
+        previous.rows_by_line
+        if previous is not None and previous.path == path and previous.columns == columns
+        else {}
+    )
     data_line_index = -1
     for index, line in enumerate(lines):
         if line.strip().lower().startswith("data:"):
@@ -318,6 +326,19 @@ def load_dbt_bytes(path: Path, raw: bytes) -> DbtDocument:
             index += 1
             buffer += lines[index]
         end_index = index
+        previous_row = previous_rows.get(start_index)
+        if (
+            previous_row is not None
+            and previous_row.line_end_index == end_index
+            and previous_row.original_line == buffer
+            and not previous_row.updates
+            and not previous_row.deleted
+        ):
+            rows.append(previous_row)
+            if previous_row.parse_error:
+                parse_errors.append(f"line {start_index + 1}: {previous_row.parse_error}")
+            index += 1
+            continue
         row_id = int(match.group(1))
         fields, error = parse_fields(buffer, string_columns)
         if error:

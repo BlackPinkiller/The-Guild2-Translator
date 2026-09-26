@@ -44,7 +44,8 @@ if exist build\release rmdir /s /q build\release
   --add-data "%CD%\encoder\guild2_codec.py;encoder" ^
   --add-data "%CD%\encoder\data;encoder\data" ^
   --add-data "%CD%\assets\app-icon.ico;assets" ^
-  --add-data "%CD%\assets\game_theme;assets\game_theme" ^
+  --add-data "%CD%\assets\interface;assets\interface" ^
+  --add-data "%CD%\assets\guide_preview;assets\guide_preview" ^
   --add-data "%CD%\assets\preview_ui;assets\preview_ui" ^
   --add-data "%CD%\assets\preview_presets;assets\preview_presets" ^
   --exclude-module PySide6.QtBluetooth ^

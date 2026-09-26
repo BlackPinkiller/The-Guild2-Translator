@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from collections.abc import Iterable
+from collections.abc import Callable, Iterable, Mapping
 from contextlib import contextmanager
 from pathlib import Path
 import hashlib
@@ -10,7 +10,7 @@ from typing import Iterator
 from .git_history import TranslationLogEntry
 
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 MAX_INDEXED_COMMITS = 5_000
 MAX_INDEXED_CHANGES = 250_000
 MAX_INDEXED_TEXT_BYTES = 128 * 1024 * 1024
@@ -73,9 +73,30 @@ class HistoryIndexStore:
                     entries[row[0]].append(TranslationLogEntry(*row[1:]))
         return entries
 
-    def store_commit(self, commit: str, entries: Iterable[TranslationLogEntry]) -> None:
+    def store_commit(
+        self, commit: str, entries: Iterable[TranslationLogEntry],
+        source_dependencies: Mapping[str, str] | None = None,
+    ) -> None:
         with self.writer() as writer:
-            writer.store_commit(commit, entries)
+            writer.store_commit(commit, entries, source_dependencies)
+
+    def invalidate_changed_sources(self, fingerprint: Callable[[str], str]) -> None:
+        """Only discard commits that used changed/missing live fallback sources."""
+        if not self.path.exists():
+            return
+        with self._database() as database:
+            current = {
+                row[0]: fingerprint(row[0])
+                for row in database.execute("SELECT DISTINCT file_rel FROM source_dependencies")
+            }
+            stale = {
+                commit for commit, file_rel, previous in database.execute(
+                    "SELECT commit_hash, file_rel, fingerprint FROM source_dependencies"
+                ) if current[file_rel] != previous
+            }
+            if stale:
+                database.executemany("DELETE FROM indexed_commits WHERE commit_hash = ?", ((commit,) for commit in stale))
+                self._recount(database)
 
     @contextmanager
     def writer(self) -> Iterator["_HistoryIndexWriter"]:
@@ -102,22 +123,25 @@ class HistoryIndexStore:
             database.execute(
                 "DELETE FROM indexed_commits WHERE commit_hash NOT IN (SELECT commit_hash FROM retained_commits)"
             )
-            commit_count = database.execute("SELECT COUNT(*) FROM indexed_commits").fetchone()[0]
-            change_count = database.execute("SELECT COUNT(*) FROM history_changes").fetchone()[0]
-            text_bytes = sum(
-                _row_text_bytes(row)
-                for row in database.execute(
-                    """
-                    SELECT kind, file_rel, record_id, label, field_name,
-                           source_text, translated_text, previous_text
-                    FROM history_changes
-                    """
-                )
+            self._recount(database)
+
+    @staticmethod
+    def _recount(database: sqlite3.Connection) -> None:
+        commit_count = database.execute("SELECT COUNT(*) FROM indexed_commits").fetchone()[0]
+        change_count = database.execute("SELECT COUNT(*) FROM history_changes").fetchone()[0]
+        text_bytes = sum(
+            _row_text_bytes(row)
+            for row in database.execute(
+                "SELECT kind, file_rel, record_id, label, field_name, source_text, translated_text, previous_text FROM history_changes"
             )
-            database.execute(
-                "UPDATE index_totals SET commit_count = ?, change_count = ?, text_bytes = ? WHERE singleton = 1",
-                (commit_count, change_count, text_bytes),
-            )
+        ) + sum(
+            _row_text_bytes(row)
+            for row in database.execute("SELECT file_rel, fingerprint FROM source_dependencies")
+        )
+        database.execute(
+            "UPDATE index_totals SET commit_count = ?, change_count = ?, text_bytes = ? WHERE singleton = 1",
+            (commit_count, change_count, text_bytes),
+        )
 
     @contextmanager
     def _database(self) -> Iterator[sqlite3.Connection]:
@@ -169,6 +193,12 @@ class HistoryIndexStore:
                     change_count INTEGER NOT NULL,
                     text_bytes INTEGER NOT NULL
                 );
+                CREATE TABLE IF NOT EXISTS source_dependencies(
+                    commit_hash TEXT NOT NULL REFERENCES indexed_commits(commit_hash) ON DELETE CASCADE,
+                    file_rel TEXT NOT NULL,
+                    fingerprint TEXT NOT NULL,
+                    PRIMARY KEY(commit_hash, file_rel)
+                );
                 INSERT OR IGNORE INTO index_totals(singleton, commit_count, change_count, text_bytes)
                 VALUES (1, 0, 0, 0);
                 """
@@ -185,9 +215,15 @@ class _HistoryIndexWriter:
     def __init__(self, database: sqlite3.Connection) -> None:
         self.database = database
 
-    def store_commit(self, commit: str, entries: Iterable[TranslationLogEntry]) -> None:
+    def store_commit(
+        self, commit: str, entries: Iterable[TranslationLogEntry],
+        source_dependencies: Mapping[str, str] | None = None,
+    ) -> None:
         packed = tuple(entries)
-        payload_bytes = sum(_entry_text_bytes(entry) for entry in packed)
+        dependencies = source_dependencies or {}
+        payload_bytes = sum(_entry_text_bytes(entry) for entry in packed) + sum(
+            _row_text_bytes(item) for item in dependencies.items()
+        )
         database = self.database
         if database.execute(
             "SELECT 1 FROM indexed_commits WHERE commit_hash = ?", (commit,)
@@ -203,6 +239,10 @@ class _HistoryIndexWriter:
         if current_bytes + payload_bytes > MAX_INDEXED_TEXT_BYTES:
             raise HistoryIndexCapacityError("text limit reached")
         database.execute("INSERT INTO indexed_commits(commit_hash) VALUES (?)", (commit,))
+        database.executemany(
+            "INSERT INTO source_dependencies(commit_hash, file_rel, fingerprint) VALUES (?, ?, ?)",
+            ((commit, file_rel, fingerprint) for file_rel, fingerprint in dependencies.items()),
+        )
         database.executemany(
             """
             INSERT INTO history_changes(

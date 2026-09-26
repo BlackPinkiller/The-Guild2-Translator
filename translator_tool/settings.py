@@ -17,12 +17,14 @@ from .file_utils import atomic_write
 APP_DIR_NAME = "TheGuild2Translator"
 SETTINGS_FILE_NAME = "settings.json"
 RECENT_PROJECT_LIMIT = 8
+UI_SCALE_PERCENTAGES = (80, 90, 100, 110, 125, 150)
 
 
 @dataclass
 class AppSettings:
     ui_language: str = "en"
     ui_theme: str = "modern"
+    ui_scale_percent: int = 100
     provider: str = "google"
     openai_base_url: str = "https://api.openai.com/v1"
     openai_model: str = "gpt-4o-mini"
@@ -81,6 +83,11 @@ def load_settings() -> AppSettings:
             values[name] = value
         elif name == "recent_project_roots" and isinstance(value, list):
             values[name] = [item for item in value if isinstance(item, str)][:RECENT_PROJECT_LIMIT]
+    if values.get("ui_theme") not in {"modern", "dark"}:
+        values["ui_theme"] = "modern"
+    scale = values.get("ui_scale_percent")
+    if type(scale) is not int or scale not in UI_SCALE_PERCENTAGES:
+        values["ui_scale_percent"] = 100
     return AppSettings(**values)
 
 

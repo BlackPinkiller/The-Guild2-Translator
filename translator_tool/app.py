@@ -40,6 +40,7 @@ from PySide6.QtWidgets import (
     QApplication,
     QAbstractItemView,
     QCheckBox,
+    QBoxLayout,
     QComboBox,
     QDialog,
     QDialogButtonBox,
@@ -66,6 +67,8 @@ from PySide6.QtWidgets import (
     QStyle,
     QStyleOptionViewItem,
     QTableView,
+    QTableWidget,
+    QTableWidgetItem,
     QTextEdit,
     QTabWidget,
     QTextBrowser,
@@ -100,7 +103,8 @@ from .codec_adapter import CodecError, Guild2Codec, load_codec_for_language, lan
 from .diagnostics import configure_diagnostics, log_exception, log_failure, log_metrics, shutdown_diagnostics
 from .entry_clipboard import ENTRY_CLIPBOARD_MIME, decode_translations, encode_entries
 from .git_history import GitCommit, GitError, LanguageGit, TranslationLogEntry
-from .game_theme import GameAssetSet, GameHeaderFrame, GamePanelFrame, install_game_theme_style
+from .workspace_widgets import EditorPanel, ElidedLabel, FadingToolTip, WorkspaceStatusBar
+from .dialog_widgets import dialog_layout, fit_dialog, settings_form
 from .guide_model import guide_page_id, parse_guide_toc
 from .guide_widget import GuidePreviewPane
 from .history import OperationHistory, TranslationOperation, UnitChange
@@ -112,12 +116,14 @@ from .history_index import (
 from .history_render import (
     commit_search_blob,
     entry_meta as _history_entry_meta,
-    entry_search_blob,
     entry_title as _history_entry_title,
     history_text as _history_text,
     inline_diff_html as _history_inline_diff_html,
     render_entry_timeline_html,
 )
+from .history_search import HistorySearchIndex, build_history_search_index, matches_terms, query_terms
+from .theme import INTERFACE_COLORS, history_colors
+from .ui_style import apply_interface_style, configure_interface_scale
 from .i18n import current_language, history_kind_text, set_language, status_text, todo_reason_text, translate, ui_language_options
 from .project import (
     ENABLE_FONT_GLYPH_VALIDATION,
@@ -145,7 +151,7 @@ from .search import (
     search_blob as _search_blob,
     search_field_values as _search_field_values,
 )
-from .settings import AppSettings, load_settings, protect_secret, reveal_secret, save_settings
+from .settings import AppSettings, UI_SCALE_PERCENTAGES, load_settings, protect_secret, reveal_secret, save_settings
 from .source_sync import (
     DEFAULT_TRANSLATION_LANGUAGE,
     SourceProjectSpec,
@@ -201,6 +207,9 @@ APP_ICON_PATH = BUNDLED_ROOT / "assets" / "app-icon.ico"
 MANAGED_PROJECT_ROOT = managed_vanilla_project_root(APP_ROOT)
 TYPING_GROUP_DELAY_MS = 750
 COUNTS_REFRESH_DELAY_MS = 120
+SEARCH_DELAY_MS = 100
+FORMAT_SCAN_SLICE_SECONDS = 0.008
+FORMAT_SCAN_BATCH_ROWS = 128
 CODE_CONTEXT_PREVIEW_DELAY_MS = 300
 HISTORY_ENTRY_RESULT_LIMIT = 500
 FILE_FILTER_ALL = "__all_files__"
@@ -214,23 +223,52 @@ class SearchLineEdit(QLineEdit):
 
     def __init__(self, parent: QWidget | None = None) -> None:
         super().__init__(parent)
+        self.help_popup: FadingToolTip | None = None
         self.case_button = QToolButton(self)
         self.case_button.setObjectName("searchCaseButton")
         self.case_button.setText("Aa")
         self.case_button.setCheckable(True)
+        self.case_button.setFocusPolicy(Qt.FocusPolicy.TabFocus)
         self.case_button.setAutoRaise(True)
         self.case_button.setCursor(Qt.CursorShape.PointingHandCursor)
-        self.case_button.setFixedSize(28, 22)
+        self.case_button.setFixedSize(24, 20)
         self.case_button.toggled.connect(self.case_sensitive_toggled)
-        self.case_button.toggled.connect(lambda checked: self.case_button.setProperty("active", checked))
-        self.setTextMargins(0, 0, 52, 0)
+        self.setTextMargins(0, 0, 30, 0)
+        self.textChanged.connect(self._position_case_button)
+
+    def event(self, event) -> bool:
+        popup = getattr(self, "help_popup", None)
+        if event.type() == QEvent.Type.ToolTip and self.toolTip():
+            if popup is None:
+                self.help_popup = popup = FadingToolTip(self)
+            popup.show_for(self)
+            event.accept()
+            return True
+        if popup is not None:
+            if event.type() in {QEvent.Type.Hide, QEvent.Type.WindowDeactivate}:
+                popup.hide()
+            elif event.type() in {QEvent.Type.Leave, QEvent.Type.FocusOut,
+                                  QEvent.Type.KeyPress, QEvent.Type.MouseButtonPress, QEvent.Type.Wheel}:
+                popup.dismiss()
+        return super().event(event)
+
+    def _position_case_button(self) -> None:
+        right = self.width() - 4
+        if self.isClearButtonEnabled() and self.text():
+            clear_button = next((button for button in self.findChildren(QToolButton)
+                                 if button is not self.case_button), None)
+            if clear_button is not None:
+                right = min(right, clear_button.geometry().left() - 2)
+        self.case_button.move(max(0, right - self.case_button.width()),
+                              max(0, (self.height() - self.case_button.height()) // 2))
 
     def resizeEvent(self, event) -> None:  # noqa: N802
         super().resizeEvent(event)
-        self.case_button.move(max(0, self.width() - 52), max(0, (self.height() - self.case_button.height()) // 2))
+        self._position_case_button()
 
 
 class UnitTableModel(QAbstractTableModel):
+    formatWarningsReady = Signal()
     FILE, ID, LABEL, SOURCE, TRANSLATION, STATUS, FORMAT, AI = range(8)
     HEADER_KEYS = (
         "table.file",
@@ -242,7 +280,7 @@ class UnitTableModel(QAbstractTableModel):
         "table.format",
         "table.ai",
     )
-    WIDTHS = (88, 60, 240, 300, 300, 60, 40, 55)
+    WIDTHS = (90, 52, 196, 300, 300, 76, 48, 56)
 
     def __init__(self, project: Project | None = None) -> None:
         super().__init__()
@@ -252,17 +290,24 @@ class UnitTableModel(QAbstractTableModel):
         self._units_by_file: dict[str, tuple[TranslationUnit, ...]] = {}
         self._units_by_exact_label: dict[str, tuple[TranslationUnit, ...]] = {}
         self._units_by_normalized_label: dict[str, tuple[TranslationUnit, ...]] = {}
-        self._search: dict[str, str] = {}
-        self._search_case_sensitive: dict[str, str] = {}
         self._search_rows: list[str] = []
         self._search_rows_case_sensitive: list[str] = []
         self._format_warning: dict[str, bool] = {}
         self._format_rank: dict[str, int] = {}
         self._glyph_warning: dict[str, bool] = {}
         self._recently_translated: set[str] = set()
+        self._format_scan_row = 0
+        self._format_changed_rows: set[int] = set()
+        self._format_scan_timer = QTimer(self)
+        self._format_scan_timer.setSingleShot(True)
+        self._format_scan_timer.setInterval(16)
+        self._format_scan_timer.timeout.connect(self._scan_format_warnings)
         self._rebuild_indexes()
+        self.prepare_format_warnings()
 
     def set_project(self, project: Project) -> None:
+        self.cancel_format_scan()
+        self._format_scan_row = 0
         self.beginResetModel()
         self.project = project
         self.units = list(project.units)
@@ -272,13 +317,38 @@ class UnitTableModel(QAbstractTableModel):
         self._recently_translated.clear()
         self._rebuild_indexes()
         self.endResetModel()
+        self.prepare_format_warnings()
+
+    def refresh_project(self, project: Project) -> None:
+        """Reuse row indexes and caches when a save preserves the unit order."""
+        if self.project is not project or len(self.units) != len(project.units) or any(
+            (old.uid, old.file_rel, old.label) != (new.uid, new.file_rel, new.label)
+            for old, new in zip(self.units, project.units)
+        ):
+            self.set_project(project)
+            return
+        changed = [new for old, new in zip(self.units, project.units) if old is not new]
+        for unit in changed:
+            self.units[self._row_by_uid[unit.uid]] = unit
+        # Group keys and ordering are unchanged; replace only affected members.
+        for mapping, keys in (
+            (self._units_by_file, {unit.file_rel for unit in changed}),
+            (self._units_by_exact_label, {unit.label for unit in changed if unit.label}),
+            (self._units_by_normalized_label, {normalize_label(unit.label) for unit in changed if unit.label}),
+        ):
+            for key in keys:
+                mapping[key] = tuple(project.unit_index[unit.uid] for unit in mapping[key])
+        recent_rows = [self._row_by_uid[uid] for uid in self._recently_translated]
+        self._recently_translated.clear()
+        self.refresh_units(changed)
+        self._emit_changed_rows(recent_rows)
 
     def clear(self) -> None:
+        self.cancel_format_scan()
+        self._format_scan_row = 0
         self.beginResetModel()
         self.project = None
         self.units = []
-        self._search.clear()
-        self._search_case_sensitive.clear()
         self._search_rows.clear()
         self._search_rows_case_sensitive.clear()
         self._row_by_uid.clear()
@@ -327,20 +397,23 @@ class UnitTableModel(QAbstractTableModel):
             if column == self.STATUS:
                 suffix = translate("table.status.recent_suffix") if unit.uid in self._recently_translated else ""
                 detail = ""
-                if unit.filter_status() == STATUS_TODO and unit.todo_reason:
-                    detail = "\n" + translate("issue.todo_reason_prefix", text=todo_reason_text(unit.todo_reason))
+                reason = unit.review_reason if unit.requires_manual_review else unit.todo_reason
+                if reason and (unit.requires_manual_review or unit.filter_status() == STATUS_TODO):
+                    detail = "\n" + translate("issue.todo_reason_prefix", text=todo_reason_text(reason))
                 label = translate("status.review") if unit.requires_manual_review else status_text(unit.display_status())
                 return label + suffix + detail
         if role == Qt.ItemDataRole.BackgroundRole:
             if unit.pending_delete:
                 return QColor(_theme_row_tint("delete", "#f2d6d3"))
             if unit.requires_manual_review:
-                return QColor(_theme_row_tint("review", "#f4b66f"))
+                return QColor(INTERFACE_COLORS[_active_theme()]["info_bg"])
             if self.has_glyph_warning(row):
                 return QColor(_theme_row_tint("glyph", "#f3d9a4"))
             return QColor(_theme_row_tint("recent", "#dce5b5")) if unit.uid in self._recently_translated else None
         if role == Qt.ItemDataRole.ForegroundRole and unit.pending_delete:
             return QColor(_theme_color("bad_token", "#9d0006"))
+        if role == Qt.ItemDataRole.ForegroundRole and column in (self.FILE, self.ID, self.LABEL):
+            return QColor(INTERFACE_COLORS[_active_theme()]["muted"])
         if role == Qt.ItemDataRole.FontRole and unit.pending_delete:
             font = QFont()
             font.setStrikeOut(True)
@@ -398,18 +471,7 @@ class UnitTableModel(QAbstractTableModel):
         return True
 
     def refresh_unit(self, unit: TranslationUnit) -> None:
-        row = self._row_by_uid.get(unit.uid)
-        if row is None:
-            return
-        raw_search = _search_blob(unit)
-        self._search_case_sensitive[unit.uid] = raw_search
-        self._search[unit.uid] = raw_search.casefold()
-        self._search_rows_case_sensitive[row] = raw_search
-        self._search_rows[row] = raw_search.casefold()
-        self._format_warning.pop(unit.uid, None)
-        self._format_rank.pop(unit.uid, None)
-        self._glyph_warning.pop(unit.uid, None)
-        self.dataChanged.emit(self.index(row, 0), self.index(row, self.columnCount() - 1))
+        self.refresh_units((unit,))
 
     def refresh_units(self, units: Iterable[TranslationUnit]) -> None:
         rows: list[int] = []
@@ -418,19 +480,69 @@ class UnitTableModel(QAbstractTableModel):
             if row is None:
                 continue
             raw_search = _search_blob(unit)
-            self._search_case_sensitive[unit.uid] = raw_search
-            self._search[unit.uid] = raw_search.casefold()
             self._search_rows_case_sensitive[row] = raw_search
             self._search_rows[row] = raw_search.casefold()
             self._format_warning.pop(unit.uid, None)
             self._format_rank.pop(unit.uid, None)
             self._glyph_warning.pop(unit.uid, None)
+            if row < self._format_scan_row:
+                self._format_changed_rows.add(row)
             rows.append(row)
-        if rows:
+        self._emit_changed_rows(rows)
+        self.prepare_format_warnings()
+
+    def _emit_changed_rows(self, rows: Iterable[int]) -> None:
+        ordered = sorted(set(rows))
+        if not ordered:
+            return
+        start = end = ordered[0]
+        for row in ordered[1:]:
+            if row == end + 1:
+                end = row
+                continue
             self.dataChanged.emit(
-                self.index(min(rows), 0),
-                self.index(max(rows), self.columnCount() - 1),
+                self.index(start, 0), self.index(end, self.columnCount() - 1),
             )
+            start = end = row
+        self.dataChanged.emit(self.index(start, 0), self.index(end, self.columnCount() - 1))
+
+    @property
+    def format_warnings_ready(self) -> bool:
+        return self._format_scan_row >= len(self.units) and not self._format_changed_rows
+
+    def prepare_format_warnings(self, *, urgent: bool = False) -> bool:
+        if self.format_warnings_ready:
+            return True
+        # A requested filter continues on the next event-loop turn. Idle
+        # prewarming leaves more time between slices for ordinary interaction.
+        self._format_scan_timer.setInterval(0 if urgent else 16)
+        if QApplication.instance() is not None and not self._format_scan_timer.isActive():
+            self._format_scan_timer.start()
+        return False
+
+    def cancel_format_scan(self) -> None:
+        self._format_scan_timer.stop()
+        self._format_changed_rows.clear()
+
+    def _scan_format_warnings(self) -> None:
+        # One cursor plus a set bounded by loaded rows; edits coalesce by row.
+        # No worker owns mutable Project objects, so invalidation is synchronous.
+        deadline = time.perf_counter() + FORMAT_SCAN_SLICE_SECONDS
+        for _ in range(FORMAT_SCAN_BATCH_ROWS):
+            if self._format_changed_rows:
+                row = self._format_changed_rows.pop()
+            elif self._format_scan_row < len(self.units):
+                row = self._format_scan_row
+                self._format_scan_row += 1
+            else:
+                break
+            self.has_format_warning(row)
+            if time.perf_counter() >= deadline:
+                break
+        if self.format_warnings_ready:
+            self.formatWarningsReady.emit()
+        else:
+            self._format_scan_timer.start()
 
     def set_recently_translated(self, unit: TranslationUnit, recent: bool, *, notify: bool = True) -> None:
         if recent:
@@ -495,11 +607,6 @@ class UnitTableModel(QAbstractTableModel):
         self._row_by_uid = {unit.uid: index for index, unit in enumerate(self.units)}
         self._search_rows_case_sensitive = [_search_blob(unit) for unit in self.units]
         self._search_rows = [text.casefold() for text in self._search_rows_case_sensitive]
-        self._search_case_sensitive = {
-            unit.uid: self._search_rows_case_sensitive[row]
-            for row, unit in enumerate(self.units)
-        }
-        self._search = {uid: text.casefold() for uid, text in self._search_case_sensitive.items()}
         units_by_file: dict[str, list[TranslationUnit]] = {}
         units_by_exact_label: dict[str, list[TranslationUnit]] = {}
         units_by_normalized_label: dict[str, list[TranslationUnit]] = {}
@@ -839,7 +946,14 @@ class UnitFilterProxyModel(QAbstractTableModel):
         self._source_resetting = True
 
     def _source_model_reset(self) -> None:
-        self._rebuild_row_mapping()
+        source = self._source_model
+        if self.only_format_warnings and source is not None and not source.format_warnings_ready:
+            # The window reapplies the requested filter after the bounded scan.
+            # A reset must not synchronously validate an entirely new project.
+            self._source_rows = []
+            self._proxy_row_by_source = {}
+        else:
+            self._rebuild_row_mapping()
         if self._source_resetting:
             self._source_resetting = False
             self.endResetModel()
@@ -905,8 +1019,6 @@ class RowTintDelegate(QStyledItemDelegate):
             text = str(index.data(Qt.ItemDataRole.DisplayRole) or "")
             text = painter.fontMetrics().elidedText(text, option.textElideMode, text_rect.width())
             painter.drawText(text_rect, option.displayAlignment or (Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter), text)
-            painter.setPen(QColor(_theme_color("muted_text", "#d5c4a1")))
-            painter.drawLine(option.rect.bottomLeft(), option.rect.bottomRight())
             painter.restore()
             return
         super().paint(painter, option, index)
@@ -1085,61 +1197,6 @@ class GamePreviewHoverFilter(QObject):
             pass
 
 
-class EditorGroupBox(QGroupBox):
-    """Place the preview toggle in the title line without consuming editor space."""
-
-    def __init__(self) -> None:
-        super().__init__()
-        self.setObjectName("editorPanel")
-        self.game_assets = GameAssetSet()
-        self.code_button = QToolButton(self)
-        self.code_button.setObjectName("codeReferenceButton")
-        self.code_button.setAutoRaise(False)
-        self.code_button.hide()
-        self.reference_label = QLabel(self)
-        self.reference_label.setObjectName("codeReferenceCount")
-        self.reference_label.hide()
-        self.preview_button = QToolButton(self)
-        self.preview_button.setObjectName("previewToggle")
-        self.preview_button.setCheckable(True)
-        self.preview_button.setAutoRaise(False)
-
-    def paintEvent(self, event) -> None:  # noqa: N802
-        super().paintEvent(event)
-        app = QApplication.instance()
-        if app is None or app.property("guild2Theme") is not True:
-            return
-        painter = QPainter(self)
-        self.game_assets.nine_slice(painter, self.rect(), "B_3DWindow_01")
-        painter.end()
-
-    def resizeEvent(self, event: QEvent) -> None:  # noqa: N802
-        super().resizeEvent(event)
-        self.position_preview_button()
-
-    def position_preview_button(self) -> None:
-        height = self.fontMetrics().height() + 6
-        width = max(
-            36,
-            self.preview_button.sizeHint().width(),
-            self.preview_button.fontMetrics().horizontalAdvance(self.preview_button.text()) + 16,
-        )
-        self.preview_button.setFixedSize(width, height)
-        self.preview_button.move(max(8, self.width() - width - 12), 1)
-        if self.code_button.isVisible():
-            title_width = self.fontMetrics().horizontalAdvance(self.title())
-            code_width = max(52, self.code_button.fontMetrics().horizontalAdvance(self.code_button.text()) + 24)
-            code_x = 16 + title_width + 12
-            self.code_button.setFixedSize(code_width, height)
-            self.code_button.move(code_x, 0)
-            label_width = max(74, self.reference_label.fontMetrics().horizontalAdvance(self.reference_label.text()) + 14)
-            max_label_width = max(0, self.preview_button.x() - code_x - code_width - 12)
-            if max_label_width:
-                label_width = min(label_width, max_label_width)
-            self.reference_label.setFixedSize(label_width, height)
-            self.reference_label.move(code_x + code_width + 6, 0)
-
-
 def _single_line_preview_text(text: str) -> str:
     return (
         text.replace(PREVIEW_MARK, "")
@@ -1250,7 +1307,7 @@ class PreviewTextDelegate(RowTintDelegate):
             if rendered != text:
                 break
 
-        painter.setPen(QColor(_theme_color("muted_text", "#d5c4a1")))
+        painter.setPen(QColor(INTERFACE_COLORS[_active_theme()]["divider"]))
         painter.drawLine(option.rect.bottomLeft(), option.rect.bottomRight())
         painter.restore()
 
@@ -1605,6 +1662,8 @@ def _paint_review_background(painter: QPainter, option: QStyleOptionViewItem, in
         return False
     painter.save()
     painter.fillRect(option.rect, tint)
+    painter.setPen(QColor(INTERFACE_COLORS[_active_theme()]["divider"]))
+    painter.drawLine(option.rect.bottomLeft(), option.rect.bottomRight())
     painter.restore()
     return True
 
@@ -1626,10 +1685,6 @@ class AiButtonDelegate(QStyledItemDelegate):
         self.provider = provider
         self._pressed_uid = ""
         self._hover_uid = ""
-        self._hover_phase = 0.0
-        self._hover_timer = QTimer(self)
-        self._hover_timer.setInterval(45)
-        self._hover_timer.timeout.connect(self._advance_hover)
         if isinstance(parent, QTableView):
             parent.setMouseTracking(True)
             parent.viewport().setMouseTracking(True)
@@ -1660,52 +1715,19 @@ class AiButtonDelegate(QStyledItemDelegate):
         pressed = uid == self._pressed_uid
         hovered = uid == self._hover_uid
         painter.save()
-        _paint_review_background(painter, option, index)
-        rect = option.rect.adjusted(7, 6, -7, -6)
-        if pressed:
-            rect.translate(2, 3)
+        if not _paint_review_background(painter, option, index):
+            background = QStyleOptionViewItem(option)
+            background.text = ""
+            style = option.widget.style() if option.widget else QApplication.style()
+            style.drawControl(QStyle.ControlElement.CE_ItemViewItem, background, painter, option.widget)
+        rect = option.rect.adjusted(6, 6, -6, -6)
         painter.setRenderHint(QPainter.RenderHint.Antialiasing)
-        if hovered and not pressed:
-            rect.translate(0, -1)
-        if bool(QApplication.instance().property("guild2Theme")):
-            game_button = QImage(_game_theme_asset("button_start_pressed.png" if pressed else "button_start.png"))
-            if not game_button.isNull():
-                painter.drawImage(rect, game_button)
-                painter.setPen(QColor("#f4e8ae"))
-                font = painter.font()
-                font.setBold(True)
-                painter.setFont(font)
-                painter.drawText(rect, Qt.AlignmentFlag.AlignCenter, translate("table.ai_action"))
-                painter.restore()
-                return
-        if not pressed:
-            painter.setPen(Qt.PenStyle.NoPen)
-            painter.setBrush(QColor("#3c3836"))
-            shadow_offset = 4 if hovered else 3
-            painter.drawRoundedRect(rect.translated(3, shadow_offset), 4, 4)
-        if self.provider == "google":
-            fill = QColor("#d79921")
-        elif self.provider == "deepl":
-            fill = QColor("#287fc4")
-        else:
-            fill = QColor("#b16286")
-        if hovered:
-            fill = fill.lighter(108 + int((math.sin(self._hover_phase) + 1) * 6))
-        if pressed:
-            fill = fill.darker(115)
-        painter.setPen(QPen(QColor("#3c3836"), 2 if not hovered else 3))
-        painter.setBrush(fill)
-        painter.drawRoundedRect(rect, 4, 4)
-        if hovered:
-            shine = QColor("#fbf1c7")
-            shine.setAlpha(150 + int((math.sin(self._hover_phase) + 1) * 40))
-            painter.setPen(QPen(shine, 1.5))
-            painter.drawRoundedRect(rect.adjusted(3, 3, -3, -3), 2, 2)
-        painter.setPen(QColor("#3c3836"))
-        font = painter.font()
-        font.setBold(True)
-        font.setPointSize(max(9, font.pointSize()))
-        painter.setFont(font)
+        colors = INTERFACE_COLORS[_active_theme()]
+        if hovered or pressed:
+            painter.setPen(QPen(QColor(colors["accent"]), 1))
+            painter.setBrush(QColor(colors["selection"]))
+            painter.drawRoundedRect(rect, 4, 4)
+        painter.setPen(QColor(colors["selection_text"] if hovered or pressed else colors["muted"]))
         painter.drawText(rect, Qt.AlignmentFlag.AlignCenter, translate("table.ai_action"))
         painter.restore()
 
@@ -1753,17 +1775,6 @@ class AiButtonDelegate(QStyledItemDelegate):
         if uid == self._hover_uid:
             return
         self._hover_uid = uid
-        self._hover_phase = 0.0
-        if uid:
-            self._hover_timer.start()
-        else:
-            self._hover_timer.stop()
-        table = self.parent()
-        if isinstance(table, QTableView):
-            table.viewport().update()
-
-    def _advance_hover(self) -> None:
-        self._hover_phase += 0.42
         table = self.parent()
         if isinstance(table, QTableView):
             table.viewport().update()
@@ -1810,27 +1821,31 @@ class FormatDiffDelegate(QStyledItemDelegate):
         painter.save()
         font = painter.font()
         font.setBold(True)
-        font.setPointSize(max(font.pointSize(), 12))
+        font.setPixelSize(13)
         painter.setFont(font)
         metrics = painter.fontMetrics()
-        painter.setPen(self.COLORS.get(marker, QColor("#3c3836")))
+        color = INTERFACE_COLORS[_active_theme()]["muted"] if marker == "✓" else self.COLORS.get(marker, QColor("#3c3836"))
+        painter.setPen(QColor(color))
         painter.drawText(option.rect.adjusted(5, 0, -5, 0), Qt.AlignmentFlag.AlignCenter, marker)
         painter.restore()
 
 
 class StatusBadgeDelegate(QStyledItemDelegate):
     STYLES = {
-        STATUS_TODO: ("status.todo", "#d79921", "#3c3836"),
-        STATUS_REVIEW: ("status.review", "#d65d0e", "#fbf1c7"),
-        STATUS_TRANSLATED: ("status.translated", "#98971a", "#fbf1c7"),
-        STATUS_PENDING_DELETE: ("status.pending_delete", "#cc241d", "#fbf1c7"),
-        STATUS_IGNORED: ("status.ignored", "#928374", "#fbf1c7"),
-        STATUS_EXTRA: ("status.extra", "#b16286", "#fbf1c7"),
+        STATUS_TODO: ("status.todo", "warning"),
+        STATUS_REVIEW: ("status.review", "info"),
+        STATUS_TRANSLATED: ("status.translated", "success"),
+        STATUS_PENDING_DELETE: ("status.pending_delete", "danger"),
+        STATUS_IGNORED: ("status.ignored", "muted"),
+        STATUS_EXTRA: ("status.extra", "info"),
     }
 
     def paint(self, painter: QPainter, option: QStyleOptionViewItem, index: QModelIndex) -> None:
         status = str(index.data(Qt.ItemDataRole.DisplayRole) or "")
-        label_key, fill, text = self.STYLES.get(status, ("status.unknown", "#928374", "#fbf1c7"))
+        label_key, tone = self.STYLES.get(status, ("status.unknown", "muted"))
+        colors = INTERFACE_COLORS[_active_theme()]
+        fill = colors["panel"] if tone == "muted" else colors[f"{tone}_bg"]
+        text = colors["muted"] if tone == "muted" else colors[f"{tone}_text"]
         label = translate(label_key) if label_key.startswith("status.") else label_key
         if not _paint_review_background(painter, option, index):
             background = QStyleOptionViewItem(option)
@@ -1841,15 +1856,18 @@ class StatusBadgeDelegate(QStyledItemDelegate):
         painter.save()
         painter.setRenderHint(QPainter.RenderHint.Antialiasing)
         rect = option.rect.adjusted(5, 6, -5, -6)
-        painter.setPen(QPen(QColor("#3c3836"), 1.5))
-        painter.setBrush(QColor(fill))
-        painter.drawRoundedRect(rect, 4, 4)
+        painter.setPen(Qt.PenStyle.NoPen)
+        if tone not in {"muted", "success"}:
+            painter.setBrush(QColor(fill))
+            painter.drawRoundedRect(rect, 4, 4)
+        else:
+            text = colors["muted"]
         font = painter.font()
-        font.setBold(True)
+        font.setWeight(QFont.Weight.Medium)
         font.setPointSize(max(8, font.pointSize() - 1))
         painter.setFont(font)
         painter.setPen(QColor(text))
-        painter.drawText(rect, Qt.AlignmentFlag.AlignCenter, label)
+        painter.drawText(rect, Qt.AlignmentFlag.AlignCenter, painter.fontMetrics().elidedText(label, Qt.TextElideMode.ElideRight, rect.width()))
         painter.restore()
 
 
@@ -3116,10 +3134,11 @@ class HistoryIndexWorker(QRunnable):
             store = HistoryIndexStore.for_repository(
                 self.git.repo,
                 self.git.language,
-                codec_fingerprint=self.git.history_cache_fingerprint,
+                codec_fingerprint=self.git.history_codec_fingerprint,
             )
             hashes = tuple(commit.full_hash for commit in commits)
             store.retain_commits(hashes)
+            store.invalidate_changed_sources(self.git.source_fingerprint)
             indexed = store.indexed_hashes(hashes)
             cached_entries = store.entries_for_commits(
                 commit.full_hash for commit in commits if commit.full_hash in indexed
@@ -3130,12 +3149,15 @@ class HistoryIndexWorker(QRunnable):
             if completed:
                 self.signals.progress.emit(completed, total)
             if missing:
+                dependencies: dict[str, dict[str, str]] = {}
                 with store.writer() as writer:
-                    for commit_hash, entries in self.git.iter_entries_for_commits(missing, self.cancel_event):
+                    for commit_hash, entries in self.git.iter_entries_for_commits(
+                        missing, self.cancel_event, source_dependencies=dependencies,
+                    ):
                         if self.cancel_event.is_set():
                             return
                         try:
-                            writer.store_commit(commit_hash, entries)
+                            writer.store_commit(commit_hash, entries, dependencies.pop(commit_hash, {}))
                         except HistoryIndexCapacityError:
                             limited = True
                             break
@@ -3147,6 +3169,7 @@ class HistoryIndexWorker(QRunnable):
                 if entries is None:
                     continue
                 events.extend((commit, entry) for entry in entries)
+            search_index = build_history_search_index(commits, events, self.cancel_event)
         except (GitError, OSError, UnicodeError) as exc:
             if not self.cancel_event.is_set():
                 self.signals.failed.emit(self.request_id, str(exc))
@@ -3156,7 +3179,7 @@ class HistoryIndexWorker(QRunnable):
                 self.signals.failed.emit(self.request_id, translate("error.unexpected", error=exc))
             return
         if not self.cancel_event.is_set():
-            self.signals.ready.emit(self.request_id, {"events": events, "limited": limited})
+            self.signals.ready.emit(self.request_id, {"index": search_index, "limited": limited})
 
 
 class TextImportDialog(QDialog):
@@ -3174,10 +3197,11 @@ class TextImportDialog(QDialog):
         self._units_by_uid = {unit.uid: unit for unit in self.units}
         self._plan = TextImportPlan((), 0, ())
         self.setWindowTitle(translate("text_import.title"))
-        self.resize(900, 680)
+        self.setMinimumSize(580, 400)
 
-        layout = QVBoxLayout(self)
+        layout = dialog_layout(self)
         intro = QLabel(translate("text_import.intro"))
+        intro.setObjectName("hint")
         intro.setWordWrap(True)
         layout.addWidget(intro)
 
@@ -3210,7 +3234,11 @@ class TextImportDialog(QDialog):
         self.details_button.setCheckable(True)
         self.details_button.setText(translate("text_import.details.show"))
         self.details_button.toggled.connect(self._toggle_details)
-        layout.addWidget(self.details_button, 0, Qt.AlignmentFlag.AlignLeft)
+        summary_row = QHBoxLayout()
+        layout.removeWidget(self.summary)
+        summary_row.addWidget(self.summary, 1)
+        summary_row.addWidget(self.details_button)
+        layout.addLayout(summary_row)
         self.details = QPlainTextEdit()
         self.details.setReadOnly(True)
         self.details.setMaximumHeight(210)
@@ -3224,6 +3252,8 @@ class TextImportDialog(QDialog):
             QDialogButtonBox.ButtonRole.AcceptRole,
         )
         self.import_button.setEnabled(False)
+        self.import_button.setProperty("primaryAction", True)
+        self.buttons.button(QDialogButtonBox.StandardButton.Cancel).setText(translate("dialog.cancel"))
         self.buttons.accepted.connect(self.accept)
         self.buttons.rejected.connect(self.reject)
         layout.addWidget(self.buttons)
@@ -3236,6 +3266,7 @@ class TextImportDialog(QDialog):
         self.mode_combo.currentIndexChanged.connect(self._schedule_refresh)
         self.policy_combo.currentIndexChanged.connect(self._schedule_refresh)
         self.allow_empty.toggled.connect(self._schedule_refresh)
+        fit_dialog(self, 860, 660)
 
     def _schedule_refresh(self, _value: object = None) -> None:
         self.refresh_timer.start()
@@ -3362,47 +3393,95 @@ class SettingsDialog(QDialog):
         super().__init__(parent)
         self.settings = settings
         self._preview_language = settings.ui_language or current_language()
-        self.setMinimumWidth(720)
-        layout = QVBoxLayout(self)
+        self.setObjectName("settingsDialog")
+        self.setMinimumWidth(640)
+        layout = dialog_layout(self)
         self.tabs = QTabWidget()
+        self.tabs.setObjectName("settingsTabs")
         layout.addWidget(self.tabs, 1)
 
         self._build_general_tab()
+        self._build_preview_tab()
         self._build_translation_tab()
-        self._build_git_tab()
         self._build_save_tab()
 
         self.buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Save | QDialogButtonBox.StandardButton.Cancel)
         self.buttons.accepted.connect(self.accept)
         self.buttons.rejected.connect(self.reject)
+        self.buttons.button(QDialogButtonBox.StandardButton.Save).setProperty("primaryAction", True)
         layout.addWidget(self.buttons)
 
         self.provider.currentIndexChanged.connect(self._update_enabled)
+        self.provider.currentIndexChanged.connect(self._show_provider_configuration)
         self.ui_language.currentIndexChanged.connect(self._on_language_changed)
         self._retranslate_ui()
+        self._show_provider_configuration()
+        fit_dialog(self, 740, 600)
+
+    def _add_settings_tab(self, content: QWidget) -> None:
+        scroll = QScrollArea()
+        scroll.setFrameShape(QFrame.Shape.NoFrame)
+        scroll.setWidgetResizable(True)
+        scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        content.layout().setContentsMargins(4, 14, 12, 8)
+        content.layout().setSpacing(16)
+        scroll.setWidget(content)
+        self.tabs.addTab(scroll, "")
 
     def _build_general_tab(self) -> None:
         tab = QWidget()
         layout = QVBoxLayout(tab)
         self.interface_group = QGroupBox()
-        interface_form = QFormLayout(self.interface_group)
+        interface_form = settings_form(self.interface_group)
         self.ui_language = QComboBox()
         self.ui_language_label = QLabel()
         interface_form.addRow(self.ui_language_label, self.ui_language)
         self.ui_theme = QComboBox()
         self.ui_theme_label = QLabel()
         interface_form.addRow(self.ui_theme_label, self.ui_theme)
+        self.ui_scale = QComboBox()
+        for percent in UI_SCALE_PERCENTAGES:
+            self.ui_scale.addItem(f"{percent}%", percent)
+        self.ui_scale.setCurrentIndex(self.ui_scale.findData(self.settings.ui_scale_percent))
+        self.ui_scale_label = QLabel()
+        interface_form.addRow(self.ui_scale_label, self.ui_scale)
+        self.ui_scale_hint = QLabel()
+        self.ui_scale_hint.setObjectName("hint")
+        self.ui_scale_hint.setWordWrap(True)
+        interface_form.addRow(self.ui_scale_hint)
+        layout.addWidget(self.interface_group)
+        layout.addStretch(1)
+        self._add_settings_tab(tab)
+
+    def _build_preview_tab(self) -> None:
+        tab = QWidget()
+        layout = QVBoxLayout(tab)
+        self.preview_display_group = QGroupBox()
+        preview_form = settings_form(self.preview_display_group)
         self.preview_scope = QComboBox()
         self.preview_scope_label = QLabel()
-        interface_form.addRow(self.preview_scope_label, self.preview_scope)
+        preview_form.addRow(self.preview_scope_label, self.preview_scope)
+        self.preview_window_scale = QComboBox()
+        for percent in (100, 125, 150, 175, 200):
+            self.preview_window_scale.addItem(f"{percent}%", percent)
+        scale_index = self.preview_window_scale.findData(self.settings.preview_window_scale_percent)
+        self.preview_window_scale.setCurrentIndex(scale_index if scale_index >= 0 else 0)
+        self.preview_window_scale_label = QLabel()
+        preview_form.addRow(self.preview_window_scale_label, self.preview_window_scale)
         self.preview_scope_hint = QLabel()
         self.preview_scope_hint.setObjectName("hint")
         self.preview_scope_hint.setWordWrap(True)
-        interface_form.addRow(self.preview_scope_hint)
-        layout.addWidget(self.interface_group)
+        preview_form.addRow(self.preview_scope_hint)
+        self.preview_game_font_in_editors = QCheckBox()
+        self.preview_game_font_in_editors.setChecked(self.settings.preview_game_font_in_editors)
+        preview_form.addRow(self.preview_game_font_in_editors)
+        self.preview_use_code_context = QCheckBox()
+        self.preview_use_code_context.setChecked(self.settings.preview_use_code_context)
+        preview_form.addRow(self.preview_use_code_context)
+        layout.addWidget(self.preview_display_group)
 
         self.preview_assets_group = QGroupBox()
-        preview_assets_form = QFormLayout(self.preview_assets_group)
+        preview_assets_form = settings_form(self.preview_assets_group)
         self.preview_translation_font_dir = QLineEdit(self.settings.preview_translation_font_dir)
         self.preview_ui_assets_dir = QLineEdit(self.settings.preview_ui_assets_dir)
         self.preview_translation_font_label = QLabel()
@@ -3421,32 +3500,19 @@ class SettingsDialog(QDialog):
             row_layout.addWidget(browse)
             self.preview_path_buttons.append(browse)
             preview_assets_form.addRow(label, row)
-        self.preview_game_font_in_editors = QCheckBox()
-        self.preview_game_font_in_editors.setChecked(self.settings.preview_game_font_in_editors)
-        preview_assets_form.addRow(self.preview_game_font_in_editors)
-        self.preview_use_code_context = QCheckBox()
-        self.preview_use_code_context.setChecked(self.settings.preview_use_code_context)
-        preview_assets_form.addRow(self.preview_use_code_context)
-        self.preview_window_scale = QComboBox()
-        for percent in (100, 125, 150, 175, 200):
-            self.preview_window_scale.addItem(f"{percent}%", percent)
-        scale_index = self.preview_window_scale.findData(
-            self.settings.preview_window_scale_percent
-        )
-        self.preview_window_scale.setCurrentIndex(scale_index if scale_index >= 0 else 0)
-        self.preview_window_scale_label = QLabel()
-        preview_assets_form.addRow(
-            self.preview_window_scale_label,
-            self.preview_window_scale,
-        )
         self.preview_assets_hint = QLabel()
         self.preview_assets_hint.setObjectName("hint")
         self.preview_assets_hint.setWordWrap(True)
         preview_assets_form.addRow(self.preview_assets_hint)
         layout.addWidget(self.preview_assets_group)
+        layout.addStretch(1)
+        self._add_settings_tab(tab)
 
+    def _build_translation_tab(self) -> None:
+        tab = QWidget()
+        layout = QVBoxLayout(tab)
         self.service_group = QGroupBox()
-        service_form = QFormLayout(self.service_group)
+        service_form = settings_form(self.service_group)
         self.provider = QComboBox()
         self.provider_label = QLabel()
         service_form.addRow(self.provider_label, self.provider)
@@ -3455,32 +3521,27 @@ class SettingsDialog(QDialog):
         self.provider_note.setWordWrap(True)
         service_form.addRow(self.provider_note)
         layout.addWidget(self.service_group)
-        layout.addStretch(1)
-        self.tabs.addTab(tab, "")
-
-    def _build_translation_tab(self) -> None:
-        tab = QWidget()
-        layout = QVBoxLayout(tab)
 
         self.translation_languages_group = QGroupBox()
-        languages_form = QFormLayout(self.translation_languages_group)
+        languages_form = settings_form(self.translation_languages_group)
         self.source_language = QLineEdit(self.settings.source_language)
         self.target_language = QLineEdit(self.settings.target_language)
         self.source_language_label = QLabel()
         self.target_language_label = QLabel()
         languages_form.addRow(self.source_language_label, self.source_language)
         languages_form.addRow(self.target_language_label, self.target_language)
-        layout.addWidget(self.translation_languages_group)
 
+        self.provider_tabs = QTabWidget()
+        self.provider_tabs.setObjectName("providerTabs")
         self.google_group = QGroupBox()
-        google_form = QFormLayout(self.google_group)
+        google_form = settings_form(self.google_group)
         self.google_endpoint = QLineEdit(self.settings.google_endpoint)
         self.google_endpoint_label = QLabel()
         google_form.addRow(self.google_endpoint_label, self.google_endpoint)
-        layout.addWidget(self.google_group)
+        self.provider_tabs.addTab(self.google_group, "")
 
         self.deepl_group = QGroupBox()
-        deepl_form = QFormLayout(self.deepl_group)
+        deepl_form = settings_form(self.deepl_group)
         self.deepl_plan = QComboBox()
         self.deepl_key = QLineEdit(reveal_secret(self.settings.deepl_api_key_protected))
         self.deepl_key.setEchoMode(QLineEdit.EchoMode.Password)
@@ -3488,10 +3549,10 @@ class SettingsDialog(QDialog):
         self.deepl_key_label = QLabel()
         deepl_form.addRow(self.deepl_plan_label, self.deepl_plan)
         deepl_form.addRow(self.deepl_key_label, self.deepl_key)
-        layout.addWidget(self.deepl_group)
+        self.provider_tabs.addTab(self.deepl_group, "")
 
         self.openai_group = QGroupBox()
-        openai_form = QFormLayout(self.openai_group)
+        openai_form = settings_form(self.openai_group)
         self.openai_base_url = QLineEdit(self.settings.openai_base_url)
         self.openai_model = QLineEdit(self.settings.openai_model)
         self.openai_key = QLineEdit(reveal_secret(self.settings.openai_api_key_protected))
@@ -3502,20 +3563,20 @@ class SettingsDialog(QDialog):
         openai_form.addRow(self.openai_base_url_label, self.openai_base_url)
         openai_form.addRow(self.openai_model_label, self.openai_model)
         openai_form.addRow(self.openai_key_label, self.openai_key)
-        layout.addWidget(self.openai_group)
+        self.provider_tabs.addTab(self.openai_group, "")
+        layout.addWidget(self.provider_tabs)
+        layout.addWidget(self.translation_languages_group)
 
         self.translation_note = QLabel()
         self.translation_note.setWordWrap(True)
         self.translation_note.setObjectName("hint")
         layout.addWidget(self.translation_note)
         layout.addStretch(1)
-        self.tabs.addTab(tab, "")
+        self._add_settings_tab(tab)
 
-    def _build_git_tab(self) -> None:
-        tab = QWidget()
-        layout = QVBoxLayout(tab)
+    def _build_git_section(self, layout: QVBoxLayout) -> None:
         self.git_group = QGroupBox()
-        git_form = QFormLayout(self.git_group)
+        git_form = settings_form(self.git_group)
         self.git_name = QLineEdit(self.settings.git_author_name)
         self.git_email = QLineEdit(self.settings.git_author_email)
         self.git_name_label = QLabel()
@@ -3523,14 +3584,14 @@ class SettingsDialog(QDialog):
         git_form.addRow(self.git_name_label, self.git_name)
         git_form.addRow(self.git_email_label, self.git_email)
         layout.addWidget(self.git_group)
-        layout.addStretch(1)
-        self.tabs.addTab(tab, "")
 
     def _build_save_tab(self) -> None:
         tab = QWidget()
         layout = QVBoxLayout(tab)
         self.save_group = QGroupBox()
         save_layout = QVBoxLayout(self.save_group)
+        save_layout.setContentsMargins(0, 20, 0, 4)
+        save_layout.setSpacing(10)
         self.enable_chinese_codec = QCheckBox()
         self.enable_chinese_codec.setChecked(self.settings.enable_chinese_codec)
         save_layout.addWidget(self.enable_chinese_codec)
@@ -3546,8 +3607,9 @@ class SettingsDialog(QDialog):
         self.save_hint.setWordWrap(True)
         save_layout.addWidget(self.save_hint)
         layout.addWidget(self.save_group)
+        self._build_git_section(layout)
         layout.addStretch(1)
-        self.tabs.addTab(tab, "")
+        self._add_settings_tab(tab)
 
     def _populate_ui_language_combo(self) -> None:
         current = str(self.ui_language.currentData() or self.settings.ui_language or current_language())
@@ -3600,7 +3662,7 @@ class SettingsDialog(QDialog):
         current = str(self.ui_theme.currentData() or self.settings.ui_theme or "modern")
         blocker = QSignalBlocker(self.ui_theme)
         self.ui_theme.clear()
-        for value in ("modern", "dark", "guild2"):
+        for value in ("modern", "dark"):
             self.ui_theme.addItem(
                 translate(f"settings.theme.{value}", locale=self._preview_language),
                 value,
@@ -3623,22 +3685,25 @@ class SettingsDialog(QDialog):
         self._populate_preview_scope_combo()
 
         self.tabs.setTabText(0, translate("settings.tab.general", locale=locale))
-        self.tabs.setTabText(1, translate("settings.tab.translation", locale=locale))
-        self.tabs.setTabText(2, translate("settings.tab.git", locale=locale))
+        self.tabs.setTabText(1, translate("settings.tab.preview", locale=locale))
+        self.tabs.setTabText(2, translate("settings.tab.translation", locale=locale))
         self.tabs.setTabText(3, translate("settings.tab.save", locale=locale))
 
         self.interface_group.setTitle(translate("settings.group.ui", locale=locale))
         self.service_group.setTitle(translate("settings.group.service", locale=locale))
         self.translation_languages_group.setTitle(translate("settings.group.languages", locale=locale))
-        self.google_group.setTitle(translate("settings.group.google", locale=locale))
-        self.deepl_group.setTitle(translate("settings.group.deepl", locale=locale))
-        self.openai_group.setTitle(translate("settings.group.openai", locale=locale))
         self.git_group.setTitle(translate("settings.group.git", locale=locale))
         self.save_group.setTitle(translate("settings.group.save", locale=locale))
         self.preview_assets_group.setTitle(translate("settings.preview_assets_group", locale=locale))
+        self.preview_display_group.setTitle(translate("settings.preview_display_group", locale=locale))
+        self.provider_tabs.setTabText(0, translate("settings.provider_config.google", locale=locale))
+        self.provider_tabs.setTabText(1, translate("settings.provider_config.deepl", locale=locale))
+        self.provider_tabs.setTabText(2, translate("settings.provider_config.openai", locale=locale))
 
         self.ui_language_label.setText(translate("settings.ui_language", locale=locale))
         self.ui_theme_label.setText(translate("settings.ui_theme", locale=locale))
+        self.ui_scale_label.setText(translate("settings.ui_scale", locale=locale))
+        self.ui_scale_hint.setText(translate("settings.ui_scale_hint", locale=locale))
         self.preview_scope_label.setText(translate("settings.preview_scope", locale=locale))
         self.preview_scope_hint.setText(translate("settings.preview_scope_hint", locale=locale))
         self.preview_translation_font_label.setText(translate("settings.preview_translation_font_dir", locale=locale))
@@ -3676,6 +3741,12 @@ class SettingsDialog(QDialog):
         self.auto_space_before_color_tokens.setText(translate("settings.auto_space_before_color_tokens", locale=locale))
         self.save_hint.setText(translate("settings.save_hint", locale=locale))
         self.translation_note.setText(translate("settings.note", locale=locale))
+        for form in self.findChildren(QFormLayout):
+            for row in range(form.rowCount()):
+                item = form.itemAt(row, QFormLayout.ItemRole.LabelRole)
+                if item is not None and isinstance(label := item.widget(), QLabel):
+                    label.setFixedWidth(180)
+                    label.setWordWrap(True)
 
         save_button = self.buttons.button(QDialogButtonBox.StandardButton.Save)
         cancel_button = self.buttons.button(QDialogButtonBox.StandardButton.Cancel)
@@ -3684,6 +3755,9 @@ class SettingsDialog(QDialog):
         if cancel_button is not None:
             cancel_button.setText(translate("settings.button.cancel", locale=locale))
         self._update_enabled()
+
+    def _show_provider_configuration(self) -> None:
+        self.provider_tabs.setCurrentIndex(("google", "deepl", "openai").index(str(self.provider.currentData() or "google")))
 
     def _update_enabled(self) -> None:
         locale = self._preview_language
@@ -3711,6 +3785,7 @@ class SettingsDialog(QDialog):
             self.settings,
             ui_language=str(self.ui_language.currentData() or current_language()),
             ui_theme=str(self.ui_theme.currentData() or "modern"),
+            ui_scale_percent=int(self.ui_scale.currentData() or 100),
             provider=str(self.provider.currentData()),
             google_endpoint=self.google_endpoint.text().strip(),
             source_language=self.source_language.text().strip() or "en",
@@ -3741,7 +3816,7 @@ class NewLanguageDialog(QDialog):
         self.setModal(True)
         self.setWindowTitle(translate("dialog.new_language_title"))
         self.setMinimumWidth(420)
-        layout = QVBoxLayout(self)
+        layout = dialog_layout(self)
         hint = QLabel(translate("dialog.new_language_detail"))
         hint.setWordWrap(True)
         hint.setObjectName("hint")
@@ -3759,6 +3834,7 @@ class NewLanguageDialog(QDialog):
         self.name_edit.returnPressed.connect(self.accept)
         row.addWidget(self.name_edit, 1)
         layout.addLayout(row)
+        layout.addStretch(1)
 
         self.buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel)
         self.buttons.accepted.connect(self.accept)
@@ -3766,10 +3842,12 @@ class NewLanguageDialog(QDialog):
         ok_button = self.buttons.button(QDialogButtonBox.StandardButton.Ok)
         if ok_button is not None:
             ok_button.setText(translate("dialog.new_language_confirm"))
+            ok_button.setProperty("primaryAction", True)
         cancel_button = self.buttons.button(QDialogButtonBox.StandardButton.Cancel)
         if cancel_button is not None:
             cancel_button.setText(translate("dialog.cancel"))
         layout.addWidget(self.buttons)
+        fit_dialog(self, 460, 180)
 
     def result_language(self) -> str:
         return "#" + self.name_edit.text().strip().lstrip("#")
@@ -3811,22 +3889,11 @@ class ProjectManagerRow(QFrame):
         layout.setContentsMargins(12, 10, 12, 10)
         layout.setSpacing(12)
 
-        action_layout = QVBoxLayout()
-        action_layout.setContentsMargins(0, 0, 0, 0)
-        action_layout.setSpacing(6)
-        self.add_button = QToolButton()
-        self.add_button.setObjectName("projectAddButton")
-        self.add_button.setFixedWidth(36)
-        self.add_button.clicked.connect(lambda: self.add_requested.emit(self.spec))
-        action_layout.addWidget(self.add_button, 0, Qt.AlignmentFlag.AlignTop)
-
         self.added_check = QCheckBox()
-        self.added_check.setEnabled(False)
-        self.added_check.setChecked(True)
         self.added_check.setObjectName("projectAddedCheck")
-        action_layout.addWidget(self.added_check, 0, Qt.AlignmentFlag.AlignTop)
-        action_layout.addStretch(1)
-        layout.addLayout(action_layout)
+        self.added_check.setEnabled(False)
+        self.added_check.setFixedWidth(18)
+        layout.addWidget(self.added_check, 0, Qt.AlignmentFlag.AlignTop)
 
         details_layout = QVBoxLayout()
         details_layout.setContentsMargins(0, 0, 0, 0)
@@ -3835,27 +3902,21 @@ class ProjectManagerRow(QFrame):
         header_layout.setContentsMargins(0, 0, 0, 0)
         header_layout.setSpacing(8)
 
-        self.name_label = QLabel()
+        self.name_label = ElidedLabel()
         self.name_label.setObjectName("projectManagerName")
-        header_layout.addWidget(self.name_label)
+        header_layout.addWidget(self.name_label, 1)
 
         self.kind_badge = QLabel()
         self.kind_badge.setObjectName("projectKindBadge")
         header_layout.addWidget(self.kind_badge)
 
-        self.state_badge = QLabel()
-        self.state_badge.setObjectName("projectStateBadge")
-        header_layout.addWidget(self.state_badge)
-        header_layout.addStretch(1)
         details_layout.addLayout(header_layout)
 
-        self.source_label = QLabel()
-        self.source_label.setWordWrap(True)
+        self.source_label = ElidedLabel()
         self.source_label.setObjectName("projectManagerPath")
         details_layout.addWidget(self.source_label)
 
-        self.project_label = QLabel()
-        self.project_label.setWordWrap(True)
+        self.project_label = ElidedLabel()
         self.project_label.setObjectName("projectManagerPath")
         details_layout.addWidget(self.project_label)
 
@@ -3863,11 +3924,17 @@ class ProjectManagerRow(QFrame):
 
         button_layout = QVBoxLayout()
         button_layout.setContentsMargins(0, 0, 0, 0)
-        button_layout.setSpacing(6)
+        button_layout.setSpacing(0)
+        self.add_button = QPushButton()
+        self.add_button.setObjectName("projectAddButton")
+        self.add_button.clicked.connect(lambda: self.add_requested.emit(self.spec))
+        button_layout.addWidget(self.add_button)
         self.update_button = QPushButton()
         self.update_button.clicked.connect(lambda: self.update_requested.emit(self.spec))
-        button_layout.addWidget(self.update_button, 0, Qt.AlignmentFlag.AlignTop)
-        button_layout.addStretch(1)
+        button_layout.addWidget(self.update_button)
+        for button in (self.add_button, self.update_button):
+            button.setAutoDefault(False)
+            button.setMinimumWidth(104)
         layout.addLayout(button_layout)
         self.refresh(spec)
 
@@ -3882,14 +3949,10 @@ class ProjectManagerRow(QFrame):
             if spec.kind == "vanilla"
             else translate("project.manager.kind.mod")
         )
-        self.state_badge.setProperty("state", "added" if spec.added else "missing")
-        self.state_badge.style().unpolish(self.state_badge)
-        self.state_badge.style().polish(self.state_badge)
-        self.state_badge.setText(
-            translate("project.manager.state.added")
-            if spec.added
-            else translate("project.manager.state.not_added")
-        )
+        self.added_check.setChecked(spec.added)
+        state_text = translate("project.manager.state.added" if spec.added else "project.manager.state.not_added")
+        self.added_check.setAccessibleName(state_text)
+        self.added_check.setToolTip(state_text)
         source_path = _compact_managed_path(
             spec.source_root,
             ("GameRoot", self.game_root),
@@ -3905,10 +3968,9 @@ class ProjectManagerRow(QFrame):
         self.project_label.setText(translate("project.manager.project_path", path=project_path))
         self.project_label.setToolTip(str(spec.project_root))
         self.add_button.setVisible(not spec.added)
-        self.added_check.setVisible(spec.added)
         self.update_button.setVisible(spec.added)
         self.update_button.setEnabled(spec.added)
-        self.add_button.setText(translate("project.manager.add_symbol"))
+        self.add_button.setText(translate("project.manager.add"))
         self.add_button.setToolTip(translate("project.manager.add_tooltip", name=spec.name))
         self.update_button.setText(translate("project.manager.update"))
         self.update_button.setToolTip(translate("project.manager.update_tooltip", name=spec.name))
@@ -3926,7 +3988,7 @@ class ProjectManagerDialog(QDialog):
         super().__init__(parent)
         self.setObjectName("projectManagerDialog")
         self.setWindowTitle(translate("dialog.project_manager_title"))
-        self.setMinimumSize(880, 520)
+        self.setMinimumSize(620, 360)
         self.game_root = game_root
         self.app_root = app_root
         self.preflight_callback = preflight_callback
@@ -3937,31 +3999,34 @@ class ProjectManagerDialog(QDialog):
         self._worker_spec: SourceProjectSpec | None = None
         self._close_when_idle = False
 
-        layout = QVBoxLayout(self)
-        layout.setContentsMargins(16, 16, 16, 16)
-        layout.setSpacing(10)
+        layout = dialog_layout(self)
 
+        header = QHBoxLayout()
+        title = QLabel(translate("dialog.project_manager_title"))
+        title.setObjectName("dialogHeading")
+        header.addWidget(title, 1)
         self.summary_label = QLabel()
         self.summary_label.setObjectName("projectManagerSummary")
-        self.summary_label.setWordWrap(True)
-        layout.addWidget(self.summary_label)
+        header.addWidget(self.summary_label)
+        layout.addLayout(header)
 
-        self.game_root_label = QLabel()
+        self.game_root_label = ElidedLabel()
         self.game_root_label.setObjectName("projectManagerGameRoot")
         self.game_root_label.setText(
-            translate("project.manager.game_root", path=f"GameRoot/{self.game_root.name}")
+            translate("project.manager.game_root", path=str(self.game_root))
         )
         self.game_root_label.setToolTip(str(self.game_root))
-        self.game_root_label.setWordWrap(True)
         layout.addWidget(self.game_root_label)
 
         self.scroll = QScrollArea()
+        self.scroll.setObjectName("projectList")
         self.scroll.setWidgetResizable(True)
+        self.scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
         self.scroll.setFrameShape(QFrame.Shape.NoFrame)
         self.list_container = QWidget()
         self.list_layout = QVBoxLayout(self.list_container)
         self.list_layout.setContentsMargins(0, 0, 0, 0)
-        self.list_layout.setSpacing(10)
+        self.list_layout.setSpacing(1)
         self.scroll.setWidget(self.list_container)
         layout.addWidget(self.scroll, 1)
 
@@ -3982,8 +4047,12 @@ class ProjectManagerDialog(QDialog):
         self.cancel_button.clicked.connect(self._cancel_work)
         self.cancel_button.hide()
         progress_row.addWidget(self.cancel_button)
+        self.close_button = QPushButton(translate("button.close"))
+        self.close_button.clicked.connect(self.close)
+        progress_row.addWidget(self.close_button, 0, Qt.AlignmentFlag.AlignRight)
         layout.addLayout(progress_row)
         self.refresh_projects()
+        fit_dialog(self, 820, 560)
 
     def refresh_projects(self) -> None:
         while self.list_layout.count():
@@ -4070,6 +4139,8 @@ class ProjectManagerDialog(QDialog):
         self.progress.hide()
         self.cancel_button.hide()
         self.cancel_button.setEnabled(True)
+        self.feedback_label.clear()
+        self.feedback_label.hide()
         if self._close_when_idle:
             QTimer.singleShot(0, self.reject)
             return None
@@ -4080,11 +4151,8 @@ class ProjectManagerDialog(QDialog):
         if spec is None:
             return
         if not plan.has_changes:
-            QMessageBox.information(
-                self,
-                translate("dialog.project_manager_title"),
-                translate("project.manager.update_none", name=spec.name),
-            )
+            self.feedback_label.setText(translate("project.manager.update_none", name=spec.name))
+            self.feedback_label.show()
             return
 
         confirmation = SourceSyncConfirmationDialog(spec, plan, self)
@@ -4145,25 +4213,13 @@ class ProjectManagerDialog(QDialog):
         self._cancel_work()
         event.ignore()
 
-    @staticmethod
-    def _format_plan_details(plan: SourceSyncPlan) -> str:
-        kind_keys = {
-            "added": "project.manager.change.added",
-            "modified": "project.manager.change.modified",
-            "removed": "project.manager.change.removed",
-        }
-        return "\n".join(
-            translate(
-                "project.manager.change_line",
-                kind=translate(kind_keys[change.kind]),
-                path=change.rel_path,
-                added=change.added_entries,
-                modified=change.modified_entries,
-                removed=change.removed_entries,
-            )
-            for change in plan.changes
-        )
-
+    def reject(self) -> None:
+        # Escape must follow the same cancellation path as the window close button.
+        if self._worker is not None:
+            self._close_when_idle = True
+            self._cancel_work()
+            return
+        super().reject()
 
 class SourceSyncConfirmationDialog(QDialog):
     def __init__(
@@ -4175,14 +4231,13 @@ class SourceSyncConfirmationDialog(QDialog):
         super().__init__(parent)
         self.setObjectName("sourceSyncConfirmDialog")
         self.setWindowTitle(translate("project.manager.update_confirm_title", name=spec.name))
-        self.setMinimumSize(720, 400)
+        self.setMinimumSize(580, 360)
 
-        layout = QVBoxLayout(self)
-        layout.setContentsMargins(18, 18, 18, 18)
-        layout.setSpacing(12)
+        layout = dialog_layout(self)
 
         title = QLabel(translate("project.manager.update_confirm_title", name=spec.name))
-        title.setObjectName("sourceSyncConfirmTitle")
+        title.setObjectName("dialogHeading")
+        title.setWordWrap(True)
         layout.addWidget(title)
 
         summary = QLabel(
@@ -4210,11 +4265,33 @@ class SourceSyncConfirmationDialog(QDialog):
         entries.setWordWrap(True)
         layout.addWidget(entries)
 
-        details = QPlainTextEdit(ProjectManagerDialog._format_plan_details(plan))
-        details.setObjectName("sourceSyncDetails")
-        details.setReadOnly(True)
-        details.setLineWrapMode(QPlainTextEdit.LineWrapMode.NoWrap)
-        layout.addWidget(details, 1)
+        self.details = QTableWidget(len(plan.changes), 5)
+        self.details.setObjectName("sourceSyncDetails")
+        self.details.setHorizontalHeaderLabels([
+            translate(key) for key in ("project.manager.change.kind", "table.file",
+                                       "project.manager.change.added", "project.manager.change.modified",
+                                       "project.manager.change.removed")
+        ])
+        self.details.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
+        self.details.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
+        self.details.setShowGrid(False)
+        self.details.verticalHeader().hide()
+        self.details.verticalHeader().setDefaultSectionSize(30)
+        self.details.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeMode.ResizeToContents)
+        self.details.horizontalHeader().setSectionResizeMode(1, QHeaderView.ResizeMode.Stretch)
+        self.details.horizontalHeader().setDefaultAlignment(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter)
+        for column in range(2, 5):
+            self.details.horizontalHeaderItem(column).setTextAlignment(Qt.AlignmentFlag.AlignCenter)
+        for row, change in enumerate(plan.changes):
+            values = (translate(f"project.manager.change.{change.kind}"), change.rel_path,
+                      str(change.added_entries), str(change.modified_entries), str(change.removed_entries))
+            for column, value in enumerate(values):
+                item = QTableWidgetItem(value)
+                item.setToolTip(value)
+                if column >= 2:
+                    item.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
+                self.details.setItem(row, column, item)
+        layout.addWidget(self.details, 1)
 
         buttons = QDialogButtonBox()
         apply_button = buttons.addButton(
@@ -4226,11 +4303,13 @@ class SourceSyncConfirmationDialog(QDialog):
             QDialogButtonBox.ButtonRole.RejectRole,
         )
         apply_button.setObjectName("sourceSyncApplyButton")
+        apply_button.setProperty("primaryAction", True)
         cancel_button.setObjectName("sourceSyncCancelButton")
         cancel_button.setDefault(True)
         buttons.accepted.connect(self.accept)
         buttons.rejected.connect(self.reject)
         layout.addWidget(buttons)
+        fit_dialog(self, 800, 520)
 
 
 class SuggestionDialog(QDialog):
@@ -4241,10 +4320,8 @@ class SuggestionDialog(QDialog):
         super().__init__(parent)
         self.setObjectName("suggestionDialog")
         self.setWindowTitle(translate("suggestion.title"))
-        self.setWindowFlag(Qt.WindowType.FramelessWindowHint, True)
         self.setModal(False)
-        self.setMinimumSize(350, 200)
-        self.resize(350, 250)
+        self.setMinimumSize(400, 240)
         self._markdown = ""
         self._pending_chunks: list[str] = []
         self._recommended_translation = ""
@@ -4253,7 +4330,7 @@ class SuggestionDialog(QDialog):
         self._render_timer.setInterval(40)
         self._render_timer.timeout.connect(self._flush_chunks)
 
-        layout = QVBoxLayout(self)
+        layout = dialog_layout(self)
         self.loading_label = QLabel(translate("suggestion.loading"))
         self.loading_label.setObjectName("suggestionStatus")
         layout.addWidget(self.loading_label)
@@ -4267,9 +4344,11 @@ class SuggestionDialog(QDialog):
             close_button.setText(translate("button.close"))
         self.apply_button = buttons.addButton(translate("suggestion.apply"), QDialogButtonBox.ButtonRole.AcceptRole)
         self.apply_button.setEnabled(False)
+        self.apply_button.setProperty("primaryAction", True)
         self.apply_button.clicked.connect(self._apply)
         buttons.rejected.connect(self.close)
         layout.addWidget(buttons)
+        fit_dialog(self, 520, 380)
 
     def append_chunk(self, chunk: str) -> None:
         self._pending_chunks.append(chunk)
@@ -4318,8 +4397,8 @@ class HistoryDialog(QDialog):
         self._focus_key = focus_key
         self.setObjectName("historyDialog")
         self.setWindowTitle(translate("history.dialog.title", project=git.project_root.name, language=git.language))
-        self.resize(1180, 720)
-        layout = QHBoxLayout(self)
+        self.setMinimumSize(680, 420)
+        layout = dialog_layout(self)
         splitter = QSplitter(Qt.Orientation.Horizontal)
         self.left_tabs = QTabWidget()
 
@@ -4336,8 +4415,10 @@ class HistoryDialog(QDialog):
         commit_column.addWidget(selection_hint)
         self.commits = QListWidget()
         self.commits.setObjectName("historyList")
-        self.commits.setMinimumWidth(370)
+        self.commits.setMinimumWidth(260)
         self.commits.setUniformItemSizes(True)
+        self.commits.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        self.commits.setTextElideMode(Qt.TextElideMode.ElideRight)
         self.commits.setSpacing(1)
         self.commits.setSelectionMode(QAbstractItemView.SelectionMode.ExtendedSelection)
         commit_column.addWidget(self.commits, 1)
@@ -4351,11 +4432,12 @@ class HistoryDialog(QDialog):
         self.entry_search.setPlaceholderText(translate("history.search.entries"))
         entry_column.addWidget(self.entry_search)
         self.entry_status = QLabel(translate("history.entry_index.idle"))
+        self.entry_status.setObjectName("historyIndexStatus")
         self.entry_status.setWordWrap(True)
         entry_column.addWidget(self.entry_status)
         self.entries = QListWidget()
         self.entries.setObjectName("historyEntryList")
-        self.entries.setMinimumWidth(370)
+        self.entries.setMinimumWidth(260)
         self.entries.setSpacing(2)
         entry_column.addWidget(self.entries, 1)
         self.left_tabs.addTab(entry_page, translate("history.tab.entries"))
@@ -4368,7 +4450,14 @@ class HistoryDialog(QDialog):
         splitter.addWidget(self.content)
         splitter.setStretchFactor(0, 1)
         splitter.setStretchFactor(1, 2)
-        layout.addWidget(splitter)
+        splitter.setChildrenCollapsible(False)
+        splitter.setSizes([340, 760])
+        layout.addWidget(splitter, 1)
+        buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Close)
+        buttons.button(QDialogButtonBox.StandardButton.Close).setText(translate("button.close"))
+        buttons.rejected.connect(self.close)
+        layout.addWidget(buttons)
+        fit_dialog(self, 1120, 720)
 
         self._items: list[GitCommit] = []
         self._commit_blobs: dict[str, str] = {}
@@ -4420,6 +4509,8 @@ class HistoryDialog(QDialog):
         self._commit_list_worker = None
         self._items = [commit for commit in commits if isinstance(commit, GitCommit)]
         self.commits.addItems([commit.display for commit in self._items])
+        for row, commit in enumerate(self._items):
+            self.commits.item(row).setToolTip(commit.display)
         self.commits.setEnabled(True)
         self._commit_blobs = {
             commit.full_hash: commit_search_blob(commit)
@@ -4433,7 +4524,8 @@ class HistoryDialog(QDialog):
         )
         if self._focus_key is None:
             QTimer.singleShot(0, self._select_latest_commit)
-        else:
+        self._filter_commits(self.commit_search.text())
+        if self._focus_key is not None or self.left_tabs.currentIndex() == 1 or self.commit_search.text().strip():
             self._ensure_entry_index()
 
     def _commit_list_failed(self, message: str) -> None:
@@ -4450,15 +4542,14 @@ class HistoryDialog(QDialog):
         )
         self.entry_status.setText(message)
 
-    @staticmethod
-    def _matches_query(blob: str, query: str) -> bool:
-        return all(part in blob for part in query.casefold().split())
-
     def _filter_commits(self, query: str) -> None:
+        terms = query_terms(query)
         for row, commit in enumerate(self._items):
             item = self.commits.item(row)
             if item is not None:
-                item.setHidden(not self._matches_query(self._commit_blobs.get(commit.full_hash, ""), query))
+                hidden = not matches_terms(self._commit_blobs.get(commit.full_hash, ""), terms)
+                if item.isHidden() != hidden:
+                    item.setHidden(hidden)
 
     def _on_commit_search_changed(self, query: str) -> None:
         self._filter_commits(query)
@@ -4474,10 +4565,11 @@ class HistoryDialog(QDialog):
             self._select_latest_commit()
 
     def _filter_entries(self, query: str) -> None:
+        terms = query_terms(query)
         matches = [
             key
             for key in self._entry_keys
-            if self._matches_query(self._entry_blobs.get(key, ""), query)
+            if matches_terms(self._entry_blobs.get(key, ""), terms)
         ]
         self._populate_entry_items(matches[:HISTORY_ENTRY_RESULT_LIMIT])
         if self._index_worker is None and self._index_started:
@@ -4497,6 +4589,11 @@ class HistoryDialog(QDialog):
 
     def _populate_entry_items(self, keys: Iterable[tuple[str, str, str, str]]) -> None:
         selected = list(keys)
+        if selected == self._visible_entry_keys:
+            return
+        old_row = self.entries.currentRow()
+        old_key = self._visible_entry_keys[old_row] if 0 <= old_row < len(self._visible_entry_keys) else None
+        scroll = self.entries.verticalScrollBar().value()
         blocker = QSignalBlocker(self.entries)
         self.entries.clear()
         self._visible_entry_keys = selected
@@ -4511,6 +4608,11 @@ class HistoryDialog(QDialog):
                     meta=_history_entry_meta(entry),
                 )
             )
+        if old_key in selected:
+            row = selected.index(old_key)
+            self.entries.setCurrentRow(row)
+            self.entries.verticalScrollBar().setValue(scroll)
+            self.entries.scrollToItem(self.entries.item(row), QAbstractItemView.ScrollHint.EnsureVisible)
         del blocker
 
     def _ensure_entry_index(self) -> None:
@@ -4536,40 +4638,16 @@ class HistoryDialog(QDialog):
     def _apply_history_index(self, request_id: int, result: object) -> None:
         if request_id != self._index_request_id or not isinstance(result, dict):
             return
-        raw_events = result.get("events")
-        if not isinstance(raw_events, list):
+        index = result.get("index")
+        if not isinstance(index, HistorySearchIndex):
             return
         limited = bool(result.get("limited"))
         self._index_worker = None
-        events_by_commit: dict[str, list[TranslationLogEntry]] = {}
-        for event in raw_events:
-            if not isinstance(event, tuple) or len(event) != 2:
-                continue
-            commit, entry = event
-            if not isinstance(commit, GitCommit) or not isinstance(entry, TranslationLogEntry):
-                continue
-            self._events_by_key.setdefault(entry.change_key, []).append((commit, entry))
-            events_by_commit.setdefault(commit.full_hash, []).append(entry)
-        for commit in self._items:
-            self._commit_blobs[commit.full_hash] = commit_search_blob(
-                commit,
-                events_by_commit.get(commit.full_hash, ()),
-            )
-        self._entry_keys = sorted(
-            self._events_by_key,
-            key=lambda key: (
-                _history_entry_title(self._events_by_key[key][0][1]).casefold(),
-                _history_entry_meta(self._events_by_key[key][0][1]).casefold(),
-            ),
-        )
-        self._entry_blobs.clear()
-        for key in self._entry_keys:
-            events = self._events_by_key[key]
-            self._entry_blobs[key] = "\n".join(
-                [entry_search_blob(change) for _commit, change in events]
-                + [commit_search_blob(commit) for commit, _change in events]
-            )
-        self._indexed_change_count = len(raw_events)
+        self._events_by_key = index.events_by_key
+        self._entry_keys = index.entry_keys
+        self._entry_blobs = index.entry_blobs
+        self._commit_blobs.update(index.commit_blobs)
+        self._indexed_change_count = index.change_count
         self._index_limited = limited
         self._filter_commits(self.commit_search.text())
         self._filter_entries(self.entry_search.text())
@@ -4617,7 +4695,7 @@ class HistoryDialog(QDialog):
         self._selection_timer.stop()
         self._request_id += 1
         self._rendered_rows = ()
-        self.content.setHtml(render_entry_timeline_html(self._events_by_key[self._visible_entry_keys[row]]))
+        self.content.setHtml(render_entry_timeline_html(self._events_by_key[self._visible_entry_keys[row]], theme=_active_theme()))
 
     def _select_latest_commit(self) -> None:
         if not self._items:
@@ -4687,7 +4765,8 @@ class TranslatorWindow(QMainWindow):
         self.settings = load_settings()
         set_language(self.settings.ui_language)
         self.setWindowTitle(translate("window.title.unloaded"))
-        self.resize(1480, 920)
+        available = self.screen().availableGeometry()
+        self.resize(min(1480, available.width() - 32), min(920, available.height() - 64))
         self.project_root = self._startup_project_root()
         # The active local project and the source game root are tracked
         # separately. Reopening a sources project must not forget which game
@@ -4724,6 +4803,11 @@ class TranslatorWindow(QMainWindow):
         self._git_init_workers: list[GitInitWorker] = []
         self.project: Project | None = None
         self.model = UnitTableModel()
+        self._format_filter_pending = False
+        self._layout_restore_timer = QTimer(self)
+        self._layout_restore_timer.setSingleShot(True)
+        self._layout_restore_timer.timeout.connect(self._restore_layout_selection)
+        self.model.formatWarningsReady.connect(self._format_warnings_ready)
         self.proxy = UnitFilterProxyModel()
         self.proxy.setSourceModel(self.model)
         self.history = OperationHistory()
@@ -4798,44 +4882,39 @@ class TranslatorWindow(QMainWindow):
             QTimer.singleShot(0, self.choose_project_folder)
 
     def _build_ui(self) -> None:
-        app = QApplication.instance()
-        theme_qss = app.property("gameThemeQss") if app is not None else None
-        if isinstance(theme_qss, str):
-            self.setStyleSheet(theme_qss)
         root = QWidget()
         root.setObjectName("root")
         self.setCentralWidget(root)
         layout = QVBoxLayout(root)
-        layout.setContentsMargins(14, 12, 14, 12)
-        layout.setSpacing(9)
+        layout.setContentsMargins(10, 6, 10, 6)
+        layout.setSpacing(0)
 
-        titlebar = GameHeaderFrame()
+        titlebar = QFrame()
         titlebar.setObjectName("titlebar")
         title_layout = QHBoxLayout(titlebar)
-        title_layout.setContentsMargins(14, 9, 12, 9)
+        title_layout.setContentsMargins(0, 0, 0, 6)
         title_layout.setSpacing(8)
-        title_copy = QVBoxLayout()
-        title_copy.setSpacing(0)
-        self.workspace_title = QLabel("THE GUILD 2 · TRANSLATOR")
-        self.workspace_title.setObjectName("workspaceTitle")
-        self.workspace_subtitle = QLabel()
-        self.workspace_subtitle.setObjectName("workspaceSubtitle")
-        title_copy.addWidget(self.workspace_title)
-        title_copy.addWidget(self.workspace_subtitle)
-        title_layout.addLayout(title_copy)
-        title_layout.addStretch(1)
         layout.addWidget(titlebar)
 
         toolbar = QFrame()
+        self.toolbar = toolbar
         toolbar.setObjectName("toolbar")
-        toolbar_layout = QHBoxLayout(toolbar)
-        toolbar_layout.setContentsMargins(10, 8, 10, 8)
-        toolbar_layout.setSpacing(8)
+        self.toolbar_layout = QBoxLayout(QBoxLayout.Direction.LeftToRight, toolbar)
+        self.toolbar_layout.setContentsMargins(8, 6, 8, 6)
+        self.toolbar_layout.setSpacing(8)
+        self.toolbar_filters = QWidget()
+        filter_layout = QHBoxLayout(self.toolbar_filters)
+        filter_layout.setContentsMargins(0, 0, 0, 0)
+        filter_layout.setSpacing(8)
+        self.toolbar_search = QWidget()
+        search_layout = QHBoxLayout(self.toolbar_search)
+        search_layout.setContentsMargins(0, 0, 0, 0)
+        search_layout.setSpacing(8)
+        self.toolbar_layout.addWidget(self.toolbar_filters)
+        self.toolbar_layout.addStretch(1)
+        self.toolbar_layout.addWidget(self.toolbar_search)
         layout.addWidget(toolbar)
 
-        self.project_manager_button = QToolButton()
-        self.project_manager_button.clicked.connect(self.show_project_manager)
-        title_layout.addWidget(self.project_manager_button)
         self.project_button = QToolButton()
         self.project_button.setPopupMode(QToolButton.ToolButtonPopupMode.InstantPopup)
         self.project_menu = QMenu(self.project_button)
@@ -4843,104 +4922,121 @@ class TranslatorWindow(QMainWindow):
         self.project_button.setMenu(self.project_menu)
         title_layout.addWidget(self.project_button)
         self.language_label = QLabel()
-        toolbar_layout.addWidget(self.language_label)
+        title_layout.addWidget(self.language_label)
         self.language_combo = PopupSelectionComboBox()
-        self.language_combo.setMinimumWidth(160)
+        self.language_combo.setFixedWidth(150)
         self.language_combo.activated.connect(self._on_language_combo_activated)
-        toolbar_layout.addWidget(self.language_combo)
+        title_layout.addWidget(self.language_combo)
+        title_layout.addSpacing(8)
+        self.top_buttons: list[QToolButton] = []
+        save_button = QToolButton()
+        save_button.setProperty("text_key", "button.save")
+        save_button.setObjectName("saveProject")
+        save_button.clicked.connect(self.save_all)
+        title_layout.addWidget(save_button)
+        self.top_buttons.append(save_button)
+        title_layout.addStretch(1)
         self.status_label = QLabel()
-        toolbar_layout.addWidget(self.status_label)
+
         self.status_combo = PopupSelectionComboBox()
+        self.status_combo.setFixedWidth(112)
         self.status_combo.currentTextChanged.connect(self._apply_filters)
-        toolbar_layout.addWidget(self.status_combo)
+
         self.file_label = QLabel()
-        toolbar_layout.addWidget(self.file_label)
+        filter_layout.addWidget(self.file_label)
         self.file_combo = HierarchicalFileComboBox()
-        self.file_combo.setMinimumWidth(190)
+        self.file_combo.setFixedWidth(166)
         self.file_combo.currentTextChanged.connect(self._apply_filters)
-        toolbar_layout.addWidget(self.file_combo)
+        filter_layout.addWidget(self.file_combo)
+        filter_layout.addSpacing(10)
+        filter_layout.addWidget(self.status_label)
+        filter_layout.addWidget(self.status_combo)
         self.only_missing = QCheckBox()
         self.only_missing.setChecked(True)
         self.only_missing.toggled.connect(self._apply_filters)
-        toolbar_layout.addWidget(self.only_missing)
+        filter_layout.addWidget(self.only_missing)
         self.only_format_warnings = QCheckBox()
         self.only_format_warnings.toggled.connect(self._apply_filters)
-        toolbar_layout.addWidget(self.only_format_warnings)
+        filter_layout.addWidget(self.only_format_warnings)
         self.reset_sort_button = QToolButton()
         self.reset_sort_button.clicked.connect(self._reset_table_sort)
         self.reset_sort_button.hide()
-        toolbar_layout.addWidget(self.reset_sort_button)
-        toolbar_layout.addStretch(1)
-        self.search_label = QLabel()
-        toolbar_layout.addWidget(self.search_label)
+        filter_layout.addWidget(self.reset_sort_button)
         self.search_edit = SearchLineEdit()
         self.search_edit.setClearButtonEnabled(True)
-        self.search_edit.setMinimumWidth(240)
+        self.search_edit.setFixedWidth(220)
         self.search_edit.case_sensitive_toggled.connect(self._on_search_case_toggled)
         self.search_debounce = QTimer(self)
         self.search_debounce.setSingleShot(True)
-        self.search_debounce.setInterval(250)
+        self.search_debounce.setInterval(SEARCH_DELAY_MS)
         self.search_debounce.timeout.connect(self._apply_filters)
         self.search_edit.textChanged.connect(self._on_search_changed)
-        toolbar_layout.addWidget(self.search_edit)
+        search_layout.addWidget(self.search_edit, 1)
 
         self.batch_ai_button = BatchTranslateButton()
         self.batch_ai_button.clicked.connect(self._on_batch_ai_button_clicked)
-        toolbar_layout.addWidget(self.batch_ai_button)
-        self.top_buttons: list[QPushButton] = []
-        for key, slot, primary in (("button.save", self.save_all, True),):
-            button = QPushButton()
+        search_layout.addWidget(self.batch_ai_button)
+        self.navigation_buttons = []
+        for key, slot in (("button.history", self.show_history), ("button.settings", self.show_settings)):
+            button = QToolButton()
             button.setProperty("text_key", key)
-            if primary:
-                button.setObjectName("primary")
+            button.setProperty("quiet", True)
             button.clicked.connect(slot)
             title_layout.addWidget(button)
-            self.top_buttons.append(button)
+            self.navigation_buttons.append(button)
         self.more_button = QToolButton()
         self.more_button.setPopupMode(QToolButton.ToolButtonPopupMode.InstantPopup)
         self.more_menu = QMenu(self.more_button)
         self.more_actions: list[QAction] = []
         for key, slot in (
+            ("project.button.manage", self.show_project_manager),
             ("button.import_text", self.show_text_import),
-            ("button.history", self.show_history),
-            ("button.settings", self.show_settings),
         ):
             action = self.more_menu.addAction("")
             action.setProperty("text_key", key)
             action.triggered.connect(slot)
             self.more_actions.append(action)
         self.more_button.setMenu(self.more_menu)
+        self.more_button.setProperty("quiet", True)
         title_layout.addWidget(self.more_button)
         self.retry_button = QToolButton()
         self.retry_button.clicked.connect(self.retry_commit)
         self.retry_button.setVisible(False)
         title_layout.addWidget(self.retry_button)
 
-        counts_row = QHBoxLayout()
-        counts_row.setContentsMargins(0, 0, 0, 0)
-        counts_row.setSpacing(8)
+        status_bar = WorkspaceStatusBar(self)
+        self.setStatusBar(status_bar)
         self.counts_label = QLabel()
         self.counts_label.setObjectName("counts")
-        counts_row.addWidget(self.counts_label, 1)
-        self.review_attention_button = QPushButton()
+        status_bar.content_layout.addWidget(self.counts_label)
+        self.review_attention_button = QToolButton()
         self.review_attention_button.setObjectName("reviewAttention")
+        self.review_attention_button.setCursor(Qt.CursorShape.PointingHandCursor)
         self.review_attention_button.clicked.connect(self._show_review_attention)
         self.review_attention_button.hide()
-        counts_row.addWidget(self.review_attention_button)
-        layout.addLayout(counts_row)
+        status_bar.content_layout.addWidget(self.review_attention_button)
+
 
         self.main_splitter = QSplitter(Qt.Orientation.Vertical)
         layout.addWidget(self.main_splitter, 1)
-        self.table_frame = GamePanelFrame()
+        self.table_frame = QFrame()
         self.table_frame.setObjectName("tablePanel")
         table_layout = QVBoxLayout(self.table_frame)
         self.table_layout = table_layout
-        table_layout.setContentsMargins(0, 0, 0, 0)
+        table_layout.setContentsMargins(1, 1, 1, 1)
+        table_layout.setSpacing(0)
         self.table = QTableView()
+        self.table.setObjectName("entryTable")
+        self.empty_table_label = QLabel(self.table.viewport())
+        self.empty_table_label.setObjectName("emptyEntries")
+        self.empty_table_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.empty_table_label.setWordWrap(True)
+        self.empty_table_label.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents)
         self.table.setModel(self.proxy)
         self.table.setSelectionBehavior(QTableView.SelectionBehavior.SelectRows)
         self.table.setSelectionMode(QTableView.SelectionMode.ExtendedSelection)
         self.table.setAlternatingRowColors(False)
+        self.table.setShowGrid(False)
         self.table.setSortingEnabled(True)
         self.proxy.sort(-1)
         self.table.horizontalHeader().setSortIndicatorShown(False)
@@ -4989,12 +5085,21 @@ class TranslatorWindow(QMainWindow):
         )
         self.table.setItemDelegateForColumn(UnitTableModel.SOURCE, self.source_preview_delegate)
         self.table.setItemDelegateForColumn(UnitTableModel.TRANSLATION, self.translation_preview_delegate)
-        table_layout.addWidget(self.table)
+        table_layout.addWidget(self.table, 1)
         self.main_splitter.addWidget(self.table_frame)
+        self.main_splitter.setChildrenCollapsible(False)
+        self.main_splitter.setHandleWidth(8)
 
         self.editors_splitter = QSplitter(Qt.Orientation.Horizontal)
         self.source_box, self.source_edit, self.source_preview_button = self._editor_group(True)
         self.translation_box, self.translation_edit, self.translation_preview_button = self._editor_group(False)
+        self.editors_splitter.setChildrenCollapsible(False)
+        self.editors_splitter.setHandleWidth(8)
+        self.entry_history_button = QToolButton()
+        self.entry_history_button.setObjectName("entryHistory")
+        self.entry_history_button.clicked.connect(self._show_current_entry_history)
+        target_header = self.translation_box.header_layout
+        target_header.insertWidget(target_header.count() - 1, self.entry_history_button)
         self.source_box.code_button.show()
         self.source_box.reference_label.show()
         self.source_code_button = self.source_box.code_button
@@ -5097,21 +5202,28 @@ class TranslatorWindow(QMainWindow):
         self.editor_stack.addWidget(self.editors_splitter)
         self.editor_stack.addWidget(self.guide_preview)
         self.editor_stack.setCurrentWidget(self.editors_splitter)
-        self.main_splitter.addWidget(self.editor_stack)
+        self.editor_workspace = QWidget()
+        editor_layout = QVBoxLayout(self.editor_workspace)
+        editor_layout.setContentsMargins(0, 0, 0, 0)
+        editor_layout.setSpacing(8)
+        editor_layout.addWidget(self.editor_stack, 1)
+        self.main_splitter.addWidget(self.editor_workspace)
         self.main_splitter.setSizes([560, 270])
         self._table_visible_splitter_sizes = [560, 270]
         self._apply_editor_zoom()
 
         self.issue_label = QLabel()
         self.issue_label.setObjectName("issues")
+        self.issue_label.setTextFormat(Qt.TextFormat.PlainText)
         self.issue_label.setWordWrap(True)
-        layout.addWidget(self.issue_label)
+        editor_layout.addWidget(self.issue_label)
         self._populate_status_choices()
         self._retranslate_ui()
         self._apply_theme_layout()
         self.statusBar().showMessage(translate("status.ready"))
 
         for shortcut, slot in (
+            (QKeySequence.StandardKey.Find, self._focus_entry_search),
             (QKeySequence.StandardKey.Save, self.save_all),
             (QKeySequence.StandardKey.Undo, self.undo),
             (QKeySequence.StandardKey.Redo, self.redo),
@@ -5146,6 +5258,12 @@ class TranslatorWindow(QMainWindow):
             return self._handle_code_popup_event(event)
         editor = self._watched_editor(watched)
         if isinstance(editor, PreviewPlainTextEdit):
+            if watched is editor and event.type() in {QEvent.Type.FocusIn, QEvent.Type.FocusOut}:
+                panel = self.source_box if editor is self.source_edit else self.translation_box
+                panel.setProperty("focused", event.type() == QEvent.Type.FocusIn)
+                panel.style().unpolish(panel)
+                panel.style().polish(panel)
+                panel.update()
             if event.type() == QEvent.Type.ShortcutOverride and isinstance(event, QKeyEvent):
                 if (
                     editor is self.translation_edit
@@ -5179,6 +5297,7 @@ class TranslatorWindow(QMainWindow):
         table = getattr(self, "table", None)
         if isinstance(table, QTableView) and (watched is table or watched is table.viewport()):
             if watched is table.viewport() and event.type() == QEvent.Type.Resize:
+                self.empty_table_label.setGeometry(table.viewport().rect().adjusted(24, 12, -24, -12))
                 visible_timer = getattr(self, "code_index_visible_timer", None)
                 if isinstance(visible_timer, QTimer):
                     visible_timer.start()
@@ -5277,21 +5396,51 @@ class TranslatorWindow(QMainWindow):
         self.typing_before_cursor = None
         self.typing_after_cursor = None
 
-    def _editor_group(self, read_only: bool) -> tuple[QGroupBox, PreviewPlainTextEdit, QToolButton]:
-        box = EditorGroupBox()
-        layout = QVBoxLayout(box)
-        layout.setContentsMargins(8, 12, 8, 8)
+    def _editor_group(self, read_only: bool) -> tuple[EditorPanel, PreviewPlainTextEdit, QToolButton]:
+        box = EditorPanel()
+        box.setProperty("target", not read_only)
         editor = PreviewPlainTextEdit()
         editor.setReadOnly(read_only)
         editor.setLineWrapMode(QTextEdit.LineWrapMode.WidgetWidth)
-        layout.addWidget(editor)
+        editor.document().setDocumentMargin(16)
+        box.content_layout.addWidget(editor, 1)
         return box, editor, box.preview_button
 
+    def _focus_entry_search(self) -> None:
+        self.search_edit.setFocus()
+        self.search_edit.selectAll()
+
+    def _show_current_entry_history(self) -> None:
+        unit = self._current_unit()
+        if unit is not None:
+            self.show_entry_history(unit)
+
     def _apply_theme_layout(self) -> None:
-        app = QApplication.instance()
-        game_theme = app is not None and app.property("guild2Theme") is True
-        margin = 7 if game_theme else 0
-        self.table_layout.setContentsMargins(margin, margin, margin, margin)
+        self._schedule_layout_selection_restore()
+
+    def _set_table_visible(self, visible: bool) -> None:
+        self.table_frame.setVisible(visible)
+        self.toolbar.setProperty("standalone", not visible)
+        self.toolbar.style().unpolish(self.toolbar)
+        self.toolbar.style().polish(self.toolbar)
+
+    def resizeEvent(self, event) -> None:  # noqa: N802
+        super().resizeEvent(event)
+        if hasattr(self, "toolbar_layout"):
+            self._schedule_layout_selection_restore()
+
+    def _schedule_layout_selection_restore(self) -> None:
+        self._layout_restore_timer.start(0)
+
+    def _restore_layout_selection(self) -> None:
+        # Settle native layout geometry before keeping the current row in view.
+        self.centralWidget().layout().activate()
+        self.centralWidget().updateGeometry()
+        self.layout().invalidate()
+        self.layout().activate()
+        current = self.table.currentIndex()
+        if current.isValid():
+            self.table.scrollTo(current, QAbstractItemView.ScrollHint.EnsureVisible)
 
     def _start_code_reference_index(self) -> None:
         for stale_worker in self.code_reference_workers:
@@ -5548,8 +5697,6 @@ class TranslatorWindow(QMainWindow):
         if unit is None or unit.ref.kind != "dbt":
             self.code_reference_label.setText("")
             self.source_code_button.setEnabled(False)
-            if isinstance(self.source_box, EditorGroupBox):
-                self.source_box.position_preview_button()
             return
         if self.code_reference_index is None:
             self.code_reference_label.setText(translate("code.references.loading"))
@@ -5572,8 +5719,6 @@ class TranslatorWindow(QMainWindow):
                 self.code_reference_label.setText(translate("code.references.loading"))
                 self.source_code_button.setEnabled(False)
         self.source_code_button.setToolTip(self.code_reference_label.text())
-        if isinstance(self.source_box, EditorGroupBox):
-            self.source_box.position_preview_button()
 
     def _handle_code_button_event(self, event: QEvent) -> bool:
         if event.type() == QEvent.Type.MouseButtonPress and event.button() == Qt.MouseButton.LeftButton:
@@ -5775,7 +5920,7 @@ class TranslatorWindow(QMainWindow):
             self.table.horizontalScrollBar().value(),
         )
         self._table_visible_splitter_sizes = list(sizes)
-        self.table_frame.setVisible(False)
+        self._set_table_visible(False)
         self.main_splitter.setSizes([0, total])
 
     def _restore_guide_preview_table(self) -> None:
@@ -5790,7 +5935,7 @@ class TranslatorWindow(QMainWindow):
         if self._is_document_file_selected():
             self.main_splitter.setSizes([0, max(sum(restore_sizes), 1)])
             return
-        self.table_frame.setVisible(True)
+        self._set_table_visible(True)
         total = sum(self.main_splitter.sizes())
         if total <= 0:
             restored = list(restore_sizes)
@@ -6424,6 +6569,7 @@ class TranslatorWindow(QMainWindow):
         return root if self._project_folder_problem(root) is None else None
 
     def _clear_loaded_project(self) -> None:
+        self._format_filter_pending = False
         for worker in self.project_load_workers:
             worker.cancel()
         self.project_load_token += 1
@@ -7079,15 +7225,21 @@ class TranslatorWindow(QMainWindow):
         del blocker
 
     def _retranslate_ui(self) -> None:
-        self.workspace_subtitle.setText(translate("workspace.subtitle"))
+        self.source_box.mode_label.setText(translate("editor.read_only"))
+        self.translation_box.mode_label.hide()
+        self.entry_history_button.setText(translate("editor.history_action"))
+        self.entry_history_button.setToolTip(translate("editor.entry_history"))
+        self.search_edit.setToolTip(translate("toolbar.search_shortcut"))
+        for button in self.navigation_buttons:
+            button.setText(translate(str(button.property("text_key"))))
         self.language_label.setText(translate("toolbar.language"))
         current_language = self.project.language if self.project is not None else self._normalized_language_name(str(self.language_combo.currentData() or ""))
         self._load_language_choices(current_language)
         self.status_label.setText(translate("toolbar.status"))
         self.file_label.setText(translate("toolbar.file"))
-        self.search_label.setText(translate("toolbar.search"))
         self.search_edit.setPlaceholderText(translate("toolbar.search_placeholder"))
         self.search_edit.case_button.setToolTip(translate("toolbar.search_case_sensitive"))
+        self.search_edit.case_button.setAccessibleName(translate("toolbar.search_case_sensitive"))
         self.only_missing.setText(translate("toolbar.only_missing"))
         self.only_format_warnings.setText(translate("toolbar.only_format_warnings"))
         self.reset_sort_button.setText(translate("toolbar.reset_sort"))
@@ -7108,10 +7260,6 @@ class TranslatorWindow(QMainWindow):
         if hasattr(self, "guide_preview"):
             self.guide_preview.retranslate_ui()
         self._update_code_reference_display()
-        if isinstance(self.source_box, EditorGroupBox):
-            self.source_box.position_preview_button()
-        if isinstance(self.translation_box, EditorGroupBox):
-            self.translation_box.position_preview_button()
         self.source_edit.setPlaceholderText(translate("editor.placeholder"))
         self.translation_edit.setPlaceholderText(translate("editor.placeholder"))
         self.batch_ai_button._update_presentation()
@@ -7119,29 +7267,47 @@ class TranslatorWindow(QMainWindow):
         self._update_project_button()
         self._update_file_choices()
         self.model.retranslate()
+        metrics = self.table.fontMetrics()
+        for column, label in (
+            (UnitTableModel.STATUS, max(
+                (translate("status.translated"), translate("status.review")),
+                key=metrics.horizontalAdvance,
+            )),
+            (UnitTableModel.FORMAT, translate("table.format")),
+            (UnitTableModel.AI, translate("table.ai_action")),
+        ):
+            header = translate(UnitTableModel.HEADER_KEYS[column])
+            self.table.setColumnWidth(column, max(
+                UnitTableModel.WIDTHS[column], metrics.horizontalAdvance(label) + 20,
+                metrics.horizontalAdvance(header) + 20,
+            ))
         self.table.viewport().update()
         self._update_counts()
         self._update_issue_detail(self._current_unit())
         self._update_window_title()
         self._refresh_preview_presentations()
+        self.toolbar_filters.layout().invalidate()
+        self.toolbar_filters.setMinimumWidth(self.toolbar_filters.layout().minimumSize().width())
+        self.toolbar_filters.updateGeometry()
+        self.toolbar_layout.invalidate()
+        self._schedule_layout_selection_restore()
 
     def _update_project_button(self) -> None:
-        self.project_manager_button.setText(translate("project.button.manage"))
-        if self.game_root is None:
-            self.project_manager_button.setToolTip(translate("project.button.manage_choose_tooltip"))
-        else:
-            self.project_manager_button.setToolTip(
-                translate("project.button.manage_tooltip", path=str(self.game_root))
-            )
         if self.project_root is not None:
-            self.project_button.setText(translate("project.button.current_project", name=self.project_root.name))
+            self.project_button.setText(self.project_button.fontMetrics().elidedText(
+                translate("project.button.current_project", name=self.project_root.name),
+                Qt.TextElideMode.ElideMiddle, 220,
+            ))
             self.project_button.setToolTip(str(self.project_root))
             return
         if self.game_root is None:
             self.project_button.setText(translate("project.button.open"))
             self.project_button.setToolTip(translate("project.button.open_tooltip"))
             return
-        self.project_button.setText(translate("project.button.current", name=self.game_root.name))
+        self.project_button.setText(self.project_button.fontMetrics().elidedText(
+            translate("project.button.current", name=self.game_root.name),
+            Qt.TextElideMode.ElideMiddle, 220,
+        ))
         self.project_button.setToolTip(str(self.game_root))
 
     def _populate_project_menu(self) -> None:
@@ -7195,7 +7361,7 @@ class TranslatorWindow(QMainWindow):
                 sizes = self.main_splitter.sizes()
                 if len(sizes) == 2 and sizes[0] > 0:
                     self._table_visible_splitter_sizes = sizes
-            self.table_frame.setVisible(False)
+            self._set_table_visible(False)
             self.main_splitter.setSizes([0, max(sum(self._table_visible_splitter_sizes), 1)])
             unit = self._current_document_unit()
             self.current_uid = unit.uid if unit is not None else ""
@@ -7207,12 +7373,19 @@ class TranslatorWindow(QMainWindow):
         if self._guide_preview_restore_splitter_sizes is not None and self._guide_preview_is_active():
             return False
         if not self.table_frame.isVisible():
-            self.table_frame.setVisible(True)
+            self._set_table_visible(True)
             self.main_splitter.setSizes(self._table_visible_splitter_sizes)
         return False
 
     def _apply_filters(self) -> None:
         self._defer_background_code_index()
+        self._format_filter_pending = False
+        if self.only_format_warnings.isChecked() and not self.model.prepare_format_warnings(urgent=True):
+            self._format_filter_pending = True
+            self.statusBar().showMessage(translate("status.checking_format"))
+            return
+        if self.statusBar().currentMessage() == translate("status.checking_format"):
+            self.statusBar().clearMessage()
         query = self.search_edit.text()
         previous_document_mode = not self.table_frame.isVisible()
         selected_uid = self._filter_anchor_uid or self.current_uid
@@ -7241,6 +7414,10 @@ class TranslatorWindow(QMainWindow):
             return
         if selected_visible:
             self._restore_selected_row(selected_uid)
+
+    def _format_warnings_ready(self) -> None:
+        if self._format_filter_pending:
+            self._apply_filters()
 
     def _change_proxy_rows(self, change: Callable[[], None], selected_uid: str) -> bool:
         """Apply a proxy change without letting Qt invent a new current row."""
@@ -7320,8 +7497,13 @@ class TranslatorWindow(QMainWindow):
             self.table.scrollTo(proxy_index, QAbstractItemView.ScrollHint.PositionAtCenter)
 
     def _update_counts(self) -> None:
+        self.empty_table_label.setText(translate(
+            "workspace.no_project" if self.project is None else "workspace.no_results"
+        ))
+        self.empty_table_label.setVisible(self.proxy.rowCount() == 0)
         if self.project is None:
             self.counts_label.setText("")
+            self.counts_label.setToolTip("")
             self.review_attention_button.hide()
             return
         effective: Counter[str] = Counter()
@@ -7337,7 +7519,7 @@ class TranslatorWindow(QMainWindow):
         recent = self.model.recently_translated_count
         self.counts_label.setText(
             translate(
-                "counts.summary",
+                "counts.overview",
                 visible=self.proxy.rowCount(),
                 total=len(self.project.units),
                 todo=todo,
@@ -7347,6 +7529,11 @@ class TranslatorWindow(QMainWindow):
                 ignored=effective[STATUS_IGNORED],
             )
         )
+        self.counts_label.setToolTip(translate(
+            "counts.summary", visible=self.proxy.rowCount(), total=len(self.project.units),
+            todo=todo, review=review, translated=effective[STATUS_TRANSLATED],
+            recent=recent, ignored=effective[STATUS_IGNORED],
+        ))
         self.review_attention_button.setText(translate("review_attention.button", count=review))
         self.review_attention_button.setVisible(review > 0)
 
@@ -7354,16 +7541,22 @@ class TranslatorWindow(QMainWindow):
         status_index = self.status_combo.findData(STATUS_FILTER_REVIEW)
         if status_index < 0:
             return
-        status_blocker = QSignalBlocker(self.status_combo)
-        missing_blocker = QSignalBlocker(self.only_missing)
+        blockers = [QSignalBlocker(widget) for widget in (
+            self.status_combo, self.only_missing, self.only_format_warnings, self.file_combo, self.search_edit,
+        )]
         self.status_combo.setCurrentIndex(status_index)
         self.only_missing.setChecked(False)
-        del status_blocker, missing_blocker
+        self.only_format_warnings.setChecked(False)
+        self.file_combo.setCurrentIndex(self.file_combo.findData(FILE_FILTER_ALL))
+        self.search_edit.clear()
+        self.search_debounce.stop()
+        del blockers
         self._apply_filters()
 
     def _update_window_title(self) -> None:
         if self.project is None:
             self.setWindowTitle(translate("window.title.unloaded"))
+            self.top_buttons[0].setEnabled(False)
             return
         unit = self._current_unit()
         if unit is None:
@@ -7378,6 +7571,11 @@ class TranslatorWindow(QMainWindow):
             if dirty_count
             else translate("window.save_state.saved")
         )
+        self.top_buttons[0].setText(
+            translate("button.save_count", count=dirty_count) if dirty_count else translate("button.save")
+        )
+        self.top_buttons[0].setEnabled(True)
+        self.top_buttons[0].setToolTip(translate("workspace.save_hint", count=dirty_count))
         git_state = translate("window.git_pending") if self.git_pending else ""
         project_name = (
             self.project_root.name
@@ -7432,6 +7630,10 @@ class TranslatorWindow(QMainWindow):
         self.loading_editor = False
         self._cancel_pending_typing_operation()
         self._update_issue_detail(unit)
+        context = f"{unit.file_rel} · {unit.record_id} · {unit.label}" if unit is not None else ""
+        self.source_box.title_label.setToolTip(context)
+        self.translation_box.title_label.setToolTip(context)
+        self.entry_history_button.setEnabled(unit is not None)
         self._update_preview_tooltips()
         self._refresh_editor_highlights()
         self._update_code_reference_display()
@@ -8503,7 +8705,7 @@ class TranslatorWindow(QMainWindow):
         self.current_uid = ""
         self._filter_anchor_uid = selected_uid if self.project.unit_by_uid(selected_uid) is not None else ""
         self._set_editor_unit(None)
-        self.model.set_project(self.project)
+        self._change_proxy_rows(lambda: self.model.refresh_project(self.project), selected_uid)
         self._update_file_choices()
         self._apply_filters()
         self._update_pending_state()
@@ -8692,12 +8894,7 @@ class TranslatorWindow(QMainWindow):
             return
         self.setUpdatesEnabled(False)
         try:
-            # Clear the window-level game QSS before replacing the proxy style.
-            # Otherwise Qt repolishes the large table and both editor trees twice.
-            self.setStyleSheet("")
             apply_theme(app, theme)
-            if theme == "guild2":
-                self.setStyleSheet(str(app.property("gameThemeQss") or ""))
             if hasattr(self, "source_highlighter"):
                 self.source_highlighter.refresh_theme()
             if hasattr(self, "translation_highlighter"):
@@ -8721,10 +8918,10 @@ class TranslatorWindow(QMainWindow):
 
     def _update_issue_detail(self, unit: TranslationUnit | None) -> None:
         if unit is None:
-            self.issue_label.setText(translate("issue.empty"))
+            self._set_issue_detail(translate("issue.empty"), "normal")
             return
         if unit.pending_delete:
-            self.issue_label.setText(translate("issue.pending_delete"))
+            self._set_issue_detail(translate("issue.pending_delete"), "error")
             return
         raw_issues = unit.issues()
         format_confirmed = unit.format_differences_confirmed(raw_issues)
@@ -8753,9 +8950,24 @@ class TranslatorWindow(QMainWindow):
             parts.append(translate("issue.info_prefix", text=_localized_detail_join(information)))
         if unit.is_dirty:
             parts.append(translate("issue.unsaved"))
-        self.issue_label.setText("   ·   ".join(parts) if parts else translate("issue.format_ok"))
+        self._set_issue_detail(
+            "   ·   ".join(parts) if parts else translate("issue.format_ok"),
+            "error" if errors else "warning" if actions or reviews else "normal",
+        )
+
+    def _set_issue_detail(self, text: str, severity: str) -> None:
+        self.issue_label.setText(text)
+        self.issue_label.setVisible(severity != "normal" or text not in {
+            translate("issue.empty"), translate("issue.format_ok"), translate("issue.unsaved"),
+        })
+        if self.issue_label.property("severity") != severity:
+            self.issue_label.setProperty("severity", severity)
+            self.issue_label.style().unpolish(self.issue_label)
+            self.issue_label.style().polish(self.issue_label)
+            self.issue_label.update()
 
     def closeEvent(self, event: QCloseEvent) -> None:  # noqa: N802
+        self._layout_restore_timer.stop()
         popup = getattr(self, "game_preview_popup", None)
         if isinstance(popup, GamePreviewPopup):
             popup.hide()
@@ -8794,6 +9006,8 @@ class TranslatorWindow(QMainWindow):
         event.ignore()
 
     def _prepare_shutdown(self) -> None:
+        self._format_filter_pending = False
+        self.model.cancel_format_scan()
         self.search_debounce.stop()
         self.typing_timer.stop()
         self.recovery_timer.stop()
@@ -8886,34 +9100,15 @@ def _make_editor_selection(
     return selection
 
 
-def _history_colors() -> dict[str, str]:
+def _active_theme() -> str:
     app = QApplication.instance()
-    if app is not None and bool(app.property("guild2Theme")):
-        return {
-            "base": "#211a12", "text": "#eadca7", "panel": "#2b2419", "border": "#806537",
-            "error_bg": "#4b241d", "error_border": "#a84f36", "muted": "#b8a274",
-            "header": "#4a321d", "entry": "#30271a", "diff": "#211a12",
-            "add_bg": "#32462d", "add_text": "#b9d59e", "danger_bg": "#542822",
-            "danger_text": "#f0a18d", "diff_add_bg": "#735727", "diff_add_text": "#fff0b8",
-            "empty": "#a99667",
-        }
     if app is not None and bool(app.property("darkTheme")):
-        return {
-            "base": "#111318", "text": "#e3e7ee", "panel": "#20252d", "border": "#3a424e",
-            "error_bg": "#45262b", "error_border": "#8f4d58", "muted": "#9aa4b2",
-            "header": "#252a33", "entry": "#1b1f26", "diff": "#111318",
-            "add_bg": "#20392d", "add_text": "#89d3a7", "danger_bg": "#45262b",
-            "danger_text": "#ff9b96", "diff_add_bg": "#315f8a", "diff_add_text": "#ffffff",
-            "empty": "#747d8b",
-        }
-    return {
-        "base": "#fbf1c7", "text": "#3c3836", "panel": "#f2e5bc", "border": "#bdae93",
-        "error_bg": "#f2d8d8", "error_border": "#cc241d", "muted": "#665c54",
-        "header": "#d5c4a1", "entry": "#f9efc9", "diff": "#fbf1c7",
-        "add_bg": "#d8f0d2", "add_text": "#076678", "danger_bg": "#f5d6d6",
-        "danger_text": "#9d0006", "diff_add_bg": "#c6a15b", "diff_add_text": "#1d2021",
-        "empty": "#928374",
-    }
+        return "dark"
+    return "modern"
+
+
+def _history_colors() -> dict[str, str]:
+    return history_colors(_active_theme())
 
 
 def _history_state_html(title: str, detail: str, *, kind: str = "info") -> str:
@@ -8925,12 +9120,12 @@ def _history_state_html(title: str, detail: str, *, kind: str = "info") -> str:
           body.history-root {{
             background: {colors["base"]};
             color: {colors["text"]};
-            font-family: "Segoe UI", "Microsoft YaHei UI";
+            font-family: "Microsoft YaHei UI", "Segoe UI";
             margin: 0;
           }}
           .history-state {{
             background: {colors["panel"]};
-            border: 2px solid {colors["border"]};
+            border: 1px solid {colors["border"]};
             border-radius: 10px;
             padding: 14px 16px;
           }}
@@ -8940,7 +9135,7 @@ def _history_state_html(title: str, detail: str, *, kind: str = "info") -> str:
           }}
           .history-state__title {{
             font-size: 16px;
-            font-weight: 900;
+            font-weight: 600;
           }}
           .history-state__detail {{
             margin-top: 6px;
@@ -9065,12 +9260,12 @@ def _render_history_html(commits_oldest_first: tuple[GitCommit, ...], entries: l
           body.history-root {{
             background: {colors["base"]};
             color: {colors["text"]};
-            font-family: "Segoe UI", "Microsoft YaHei UI";
+            font-family: "Microsoft YaHei UI", "Segoe UI";
             margin: 0;
           }}
           .history-summary, .history-state {{
             background: {colors["panel"]};
-            border: 2px solid {colors["border"]};
+            border: 1px solid {colors["border"]};
             border-radius: 10px;
             padding: 14px 16px;
             margin-bottom: 16px;
@@ -9081,7 +9276,7 @@ def _render_history_html(commits_oldest_first: tuple[GitCommit, ...], entries: l
           }}
           .history-state__title, .history-summary__title {{
             font-size: 16px;
-            font-weight: 900;
+            font-weight: 600;
           }}
           .history-state__detail, .history-summary__meta, .history-summary__note {{
             margin-top: 6px;
@@ -9096,10 +9291,10 @@ def _render_history_html(commits_oldest_first: tuple[GitCommit, ...], entries: l
           }}
           .history-file__name {{
             background: {colors["header"]};
-            border: 2px solid {colors["border"]};
+            border: 1px solid {colors["border"]};
             border-radius: 8px;
             font-size: 14px;
-            font-weight: 900;
+            font-weight: 600;
             padding: 5px 9px;
             margin-bottom: 8px;
           }}
@@ -9115,7 +9310,7 @@ def _render_history_html(commits_oldest_first: tuple[GitCommit, ...], entries: l
             margin-bottom: 2px;
           }}
           .history-entry__title {{
-            font-weight: 900;
+            font-weight: 600;
             font-size: 13px;
           }}
           .history-entry__meta {{
@@ -9148,7 +9343,7 @@ def _render_history_html(commits_oldest_first: tuple[GitCommit, ...], entries: l
             padding: 1px 7px;
             margin-right: 7px;
             font-size: 11px;
-            font-weight: 900;
+            font-weight: 600;
           }}
           .history-badge--add {{
             background: {colors["add_bg"]};
@@ -9301,17 +9496,6 @@ def _extract_recommended_translation(markdown: str) -> str:
 
 def _theme_color(name: str, fallback: str) -> str:
     app = QApplication.instance()
-    if app is not None and bool(app.property("guild2Theme")):
-        return {
-            "text": "#d8c68f",
-            "muted_text": "#a99667",
-            "format_token": "#9bb69b",
-            "color_token": "#c49a82",
-            "markup_token": "#d0ad61",
-            "quote_token": "#9bb276",
-            "bad_token": "#d4775d",
-            "glyph_token": "#d4775d",
-        }.get(name, fallback)
     if app is not None and bool(app.property("darkTheme")):
         return {
             "text": "#e3e7ee",
@@ -9331,28 +9515,15 @@ def _theme_row_tint(name: str, fallback: str) -> str:
     if app is not None and bool(app.property("darkTheme")):
         return {
             "delete": "#45262b",
-            "review": "#4b3823",
             "glyph": "#433b25",
             "recent": "#20392d",
-        }.get(name, fallback)
-    if app is not None and bool(app.property("guild2Theme")):
-        return {
-            "delete": "#4b241d",
-            "review": "#57401f",
-            "glyph": "#4b4025",
-            "recent": "#283c28",
         }.get(name, fallback)
     return fallback
 
 
 def _theme_editor_highlight(kind: str) -> tuple[str, str]:
     app = QApplication.instance()
-    if app is not None and bool(app.property("guild2Theme")):
-        colors = {
-            "search": ("#735727", "#fff0b8"),
-            "missing_format": ("#542822", "#f0a18d"),
-        }
-    elif app is not None and bool(app.property("darkTheme")):
+    if app is not None and bool(app.property("darkTheme")):
         colors = {
             "search": ("#31445a", "#f2f4f8"),
             "missing_format": ("#4b2c34", "#ffd7dc"),
@@ -9380,274 +9551,17 @@ def _text_format(color: str, underline: bool = False) -> QTextCharFormat:
 
 
 def apply_modern_style(app: QApplication) -> None:
-    app.setProperty("guild2Theme", False)
-    app.setProperty("darkTheme", False)
-    app.setProperty("gameThemeQss", "")
-    app.setStyleSheet("")
-    app.setStyle("Fusion")
-    app._game_theme_style = None
-    palette = app.palette()
-    palette.setColor(QPalette.ColorRole.Window, QColor("#ebdbb2"))
-    palette.setColor(QPalette.ColorRole.WindowText, QColor("#3c3836"))
-    palette.setColor(QPalette.ColorRole.Base, QColor("#fbf1c7"))
-    palette.setColor(QPalette.ColorRole.AlternateBase, QColor("#ebdbb2"))
-    palette.setColor(QPalette.ColorRole.ToolTipBase, QColor("#3c3836"))
-    palette.setColor(QPalette.ColorRole.ToolTipText, QColor("#fbf1c7"))
-    palette.setColor(QPalette.ColorRole.Text, QColor("#3c3836"))
-    palette.setColor(QPalette.ColorRole.Button, QColor("#d79921"))
-    palette.setColor(QPalette.ColorRole.ButtonText, QColor("#3c3836"))
-    palette.setColor(QPalette.ColorRole.BrightText, QColor("#cc241d"))
-    palette.setColor(QPalette.ColorRole.Link, QColor("#076678"))
-    palette.setColor(QPalette.ColorRole.Highlight, QColor("#c6a15b"))
-    palette.setColor(QPalette.ColorRole.HighlightedText, QColor("#3c3836"))
-    palette.setColor(QPalette.ColorRole.PlaceholderText, QColor("#7c6f64"))
-    palette.setColor(QPalette.ColorGroup.Disabled, QPalette.ColorRole.Text, QColor("#928374"))
-    palette.setColor(QPalette.ColorGroup.Disabled, QPalette.ColorRole.ButtonText, QColor("#928374"))
-    app.setPalette(palette)
-    app.setStyleSheet(
-        """
-        QWidget { color: #3c3836; font-family: "Segoe UI", "Microsoft YaHei UI"; font-size: 13px; }
-        QMainWindow, #root { background: #ebdbb2; }
-        #titlebar { background: #3c3836; border: 3px solid #282828; border-radius: 10px; }
-        #workspaceTitle { color: #fbf1c7; font-size: 18px; font-weight: 900; letter-spacing: 1px; }
-        #workspaceSubtitle { color: #d5c4a1; font-size: 10px; font-weight: 800; letter-spacing: 2px; }
-        #toolbar { background: #d5c4a1; border: 3px solid #3c3836; border-radius: 10px; }
-        #toolbar QLabel { font-weight: 800; }
-        #counts { background: #fbf1c7; border: 2px solid #3c3836; border-radius: 6px; color: #3c3836; font-weight: 800; padding: 5px 8px; }
-        QPushButton#reviewAttention { background: #cc241d; color: #fbf1c7; min-height: 25px; }
-        QPushButton#reviewAttention:hover { background: #d65d0e; }
-        #issues { background: #d3869b; border: 3px solid #3c3836; border-radius: 7px; padding: 8px 10px; color: #3c3836; font-weight: 600; }
-        #hint { color: #3c3836; padding: 4px 0; font-weight: 600; }
-        #projectManagerDialog { background: #ebdbb2; }
-        #projectManagerSummary { background: #fbf1c7; border: 2px solid #3c3836; border-radius: 8px; padding: 8px 10px; font-weight: 800; }
-        #projectManagerGameRoot { background: #f2e5bc; border: 2px solid #bdae93; border-radius: 8px; padding: 7px 10px; font-weight: 700; }
-        #projectManagerRow { background: #fbf1c7; border: 3px solid #3c3836; border-radius: 10px; }
-        #projectManagerName { font-size: 15px; font-weight: 900; }
-        #projectKindBadge, #projectStateBadge { border-radius: 9px; padding: 3px 9px; font-weight: 900; }
-        #projectKindBadge[kind="vanilla"] { background: #458588; color: #fbf1c7; }
-        #projectKindBadge[kind="mod"] { background: #689d6a; color: #fbf1c7; }
-        #projectStateBadge[state="added"] { background: #c6a15b; color: #3c3836; }
-        #projectStateBadge[state="missing"] { background: #d79921; color: #3c3836; }
-        #projectManagerPath { color: #665c54; font-weight: 600; }
-        #projectManagerFeedback { background: #dce5b5; border: 2px solid #3c3836; border-radius: 8px; padding: 8px 10px; font-weight: 700; }
-        #projectAddButton { font-size: 18px; min-width: 36px; }
-        QGroupBox { background: #fbf1c7; border: 3px solid #3c3836; border-radius: 8px; margin-top: 14px; padding-top: 8px; font-weight: 900; color: #3c3836; }
-        QGroupBox::title { subcontrol-origin: margin; subcontrol-position: top left; left: 12px; padding: 0 6px; background: #fbf1c7; }
-        QTableView { background: #fbf1c7; border: 3px solid #3c3836; border-radius: 8px; gridline-color: #928374; selection-background-color: #c6a15b; selection-color: #3c3836; }
-        QTableView::item { background: transparent; border-bottom: 1px solid #d5c4a1; padding: 2px 4px; }
-        QTableView::item:selected { background: #c6a15b; color: #3c3836; }
-        QHeaderView::section { background: #d79921; color: #3c3836; border: 0; border-right: 2px solid #3c3836; border-bottom: 3px solid #3c3836; padding: 8px; font-weight: 900; }
-        QPlainTextEdit, QTextEdit, QTextBrowser { background: #fbf1c7; border: 0; padding: 8px; selection-background-color: #c6a15b; selection-color: #3c3836; }
-        QListWidget { background: #fbf1c7; border: 3px solid #3c3836; border-radius: 8px; padding: 3px; font-size: 12px; }
-        QListWidget::item { padding: 4px 7px; border-radius: 4px; }
-        QListWidget::item:selected { background: #c6a15b; color: #3c3836; }
-        QLineEdit, QComboBox { background: #f2e5bc; border: 2px solid #3c3836; border-radius: 5px; padding: 5px 7px; min-height: 20px; font-weight: 600; }
-        QLineEdit:focus, QComboBox:focus { border: 3px solid #458588; }
-        QComboBox QAbstractItemView { background: #f2e5bc; border: 2px solid #3c3836; selection-background-color: #c6a15b; selection-color: #3c3836; }
-        QPushButton, QToolButton { background: #d79921; color: #3c3836; border: 2px solid #3c3836; border-bottom: 5px solid #3c3836; border-radius: 5px; padding: 5px 10px 3px 10px; font-weight: 900; }
-        QPushButton:hover, QToolButton:hover { background: #e8b75d; }
-        QToolButton#codeReferenceButton { background: #d79921; border: 2px solid #3c3836; border-radius: 4px; padding: 0 8px; }
-        QToolButton#codeReferenceButton:disabled { background: #d5c4a1; color: #7c6f64; }
-        QLabel#codeReferenceCount { background: #fbf1c7; color: #665c54; font-weight: 800; padding: 0 6px; }
-        QListWidget { background: #fbf1c7; border: 3px solid #3c3836; border-radius: 8px; padding: 3px; font-size: 12px; }
-        QListWidget::item { padding: 4px 7px; border-radius: 4px; }
-        QListWidget::item:selected { background: #c6a15b; color: #3c3836; }
-        QToolButton#previewToggle { border: 2px solid #3c3836; border-radius: 4px; padding: 0 6px; }
-        QToolButton#previewToggle:pressed { border: 2px solid #3c3836; padding: 1px 5px 0 7px; }
-        QToolButton#previewToggle:checked { background: #689d6a; color: #fbf1c7; }
-        QToolButton#searchCaseButton { color: #665c54; font-weight: 800; border-radius: 4px; padding: 0; }
-        QToolButton#searchCaseButton:hover { background: #e5d6aa; }
-        QToolButton#searchCaseButton:checked { color: #fbf1c7; background: #458588; }
-        QPushButton:pressed, QToolButton:pressed { border-top: 5px solid #3c3836; border-bottom: 2px solid #3c3836; padding: 8px 8px 2px 12px; }
-        QPushButton#primary { background: #458588; color: #fbf1c7; }
-        QPushButton#primary:hover { background: #689d6a; }
-        QPushButton#batchAi[mode="busy"] { background: #689d6a; color: #fbf1c7; }
-        QPushButton#batchAi[mode="cancel"] { background: #cc241d; color: #fbf1c7; }
-        QPushButton#batchAi[mode="cancelling"] { background: #d65d0e; color: #fbf1c7; }
-        QMenu { background: #fbf1c7; border: 3px solid #3c3836; padding: 4px; }
-        QMenu::item { padding: 7px 22px 7px 10px; font-weight: 700; }
-        QMenu::item:selected { background: #c6a15b; color: #3c3836; }
-        QMenu::separator { height: 1px; background: #bdae93; margin: 6px 8px; }
-        QDialog#suggestionDialog { background: #ebdbb2; border: 3px solid #3c3836; }
-        QDialog#historyDialog { background: #ebdbb2; }
-        #historyHint { color: #665c54; font-weight: 700; padding-bottom: 4px; }
-        #historyContent { border: 3px solid #3c3836; border-radius: 8px; }
-        #suggestionStatus { color: #665c54; font-weight: 700; }
-        QToolTip { background: #3c3836; color: #fbf1c7; border: 2px solid #d79921; padding: 5px; font-weight: 700; }
-        QStatusBar { background: #ebdbb2; color: #3c3836; font-weight: 700; }
-        """
-    )
+    apply_interface_style(app, "modern")
 
 
 def apply_dark_style(app: QApplication) -> None:
-    app.setProperty("guild2Theme", False)
-    app.setProperty("darkTheme", True)
-    app.setProperty("gameThemeQss", "")
-    app.setStyleSheet("")
-    app.setStyle("Fusion")
-    app._game_theme_style = None
-    palette = app.palette()
-    palette.setColor(QPalette.ColorRole.Window, QColor("#171a1f"))
-    palette.setColor(QPalette.ColorRole.WindowText, QColor("#e3e7ee"))
-    palette.setColor(QPalette.ColorRole.Base, QColor("#111318"))
-    palette.setColor(QPalette.ColorRole.AlternateBase, QColor("#1d2128"))
-    palette.setColor(QPalette.ColorRole.ToolTipBase, QColor("#252a33"))
-    palette.setColor(QPalette.ColorRole.ToolTipText, QColor("#f2f4f8"))
-    palette.setColor(QPalette.ColorRole.Text, QColor("#e3e7ee"))
-    palette.setColor(QPalette.ColorRole.Button, QColor("#252a33"))
-    palette.setColor(QPalette.ColorRole.ButtonText, QColor("#e3e7ee"))
-    palette.setColor(QPalette.ColorRole.BrightText, QColor("#ff7b72"))
-    palette.setColor(QPalette.ColorRole.Link, QColor("#79b8ff"))
-    palette.setColor(QPalette.ColorRole.Highlight, QColor("#3f6693"))
-    palette.setColor(QPalette.ColorRole.HighlightedText, QColor("#ffffff"))
-    palette.setColor(QPalette.ColorRole.PlaceholderText, QColor("#747d8b"))
-    palette.setColor(QPalette.ColorGroup.Disabled, QPalette.ColorRole.Text, QColor("#68717d"))
-    palette.setColor(QPalette.ColorGroup.Disabled, QPalette.ColorRole.ButtonText, QColor("#68717d"))
-    app.setPalette(palette)
-    app.setStyleSheet(
-        """
-        QWidget { color: #e3e7ee; font-family: "Segoe UI", "Microsoft YaHei UI"; font-size: 13px; }
-        QMainWindow, #root, QDialog { background: #171a1f; }
-        #titlebar { background: #20252d; border: 1px solid #343b46; border-radius: 8px; }
-        #workspaceTitle { color: #f2f4f8; font-size: 18px; font-weight: 900; letter-spacing: 1px; }
-        #workspaceSubtitle { color: #8c96a5; font-size: 10px; font-weight: 800; letter-spacing: 2px; }
-        #toolbar { background: #20252d; border: 1px solid #343b46; border-radius: 8px; }
-        #toolbar QLabel { font-weight: 800; }
-        #counts { background: #111318; border: 1px solid #343b46; border-radius: 6px; color: #cdd3dc; font-weight: 800; padding: 5px 8px; }
-        #issues { background: #38252c; border: 1px solid #75414c; border-radius: 7px; padding: 8px 10px; color: #ffd7dc; font-weight: 600; }
-        #hint, #historyHint, #suggestionStatus { color: #9aa4b2; font-weight: 600; }
-        #projectManagerDialog { background: #171a1f; }
-        #projectManagerSummary, #projectManagerRow { background: #20252d; border: 1px solid #3a424e; border-radius: 8px; padding: 8px 10px; }
-        #projectManagerGameRoot { background: #111318; border: 1px solid #343b46; border-radius: 8px; padding: 7px 10px; }
-        #projectManagerPath { color: #9aa4b2; font-weight: 600; }
-        #projectManagerFeedback { background: #1f382d; border: 1px solid #3f765b; border-radius: 8px; padding: 8px 10px; }
-        #projectKindBadge[kind="vanilla"] { background: #315f78; color: #f2f4f8; }
-        #projectKindBadge[kind="mod"] { background: #376b4b; color: #f2f4f8; }
-        #projectStateBadge[state="added"] { background: #806b31; color: #ffffff; }
-        #projectStateBadge[state="missing"] { background: #8b5628; color: #ffffff; }
-        QGroupBox { background: #20252d; border: 1px solid #3a424e; border-radius: 8px; margin-top: 14px; padding-top: 8px; font-weight: 900; }
-        QGroupBox::title { subcontrol-origin: margin; subcontrol-position: top left; left: 12px; padding: 0 6px; background: #20252d; color: #dce1e8; }
-        QTableView, QListWidget, QPlainTextEdit, QTextEdit, QTextBrowser { background: #111318; color: #e3e7ee; border: 1px solid #343b46; border-radius: 7px; selection-background-color: #3f6693; selection-color: #ffffff; }
-        QTableView { gridline-color: #303641; }
-        QTableView::item { background: transparent; border-bottom: 1px solid #292f38; padding: 2px 4px; }
-        QTableView::item:selected, QListWidget::item:selected { background: #3f6693; color: #ffffff; }
-        QHeaderView::section { background: #252a33; color: #dce1e8; border: 0; border-right: 1px solid #3a424e; border-bottom: 1px solid #4b5563; padding: 8px; font-weight: 900; }
-        QLineEdit, QComboBox, QSpinBox { background: #111318; color: #e3e7ee; border: 1px solid #3a424e; border-radius: 5px; padding: 5px 7px; min-height: 20px; }
-        QLineEdit:focus, QComboBox:focus, QSpinBox:focus { border: 1px solid #6ea8e0; }
-        QComboBox QAbstractItemView { background: #20252d; color: #e3e7ee; border: 1px solid #4b5563; selection-background-color: #3f6693; selection-color: #ffffff; }
-        QPushButton, QToolButton { background: #2b313b; color: #e3e7ee; border: 1px solid #4b5563; border-radius: 5px; padding: 6px 10px; font-weight: 800; }
-        QPushButton:hover, QToolButton:hover { background: #353d49; border-color: #687483; }
-        QPushButton:pressed, QToolButton:pressed { background: #20252d; }
-        QPushButton:disabled, QToolButton:disabled { background: #20242b; color: #68717d; border-color: #303641; }
-        QPushButton#primary { background: #315f8a; color: #ffffff; border-color: #578bc0; }
-        QPushButton#primary:hover { background: #3b70a1; }
-        QPushButton#reviewAttention, QPushButton#batchAi[mode="cancel"] { background: #793b43; color: #ffffff; border-color: #a85a64; }
-        QPushButton#batchAi[mode="busy"] { background: #326848; color: #ffffff; }
-        QPushButton#batchAi[mode="cancelling"] { background: #875626; color: #ffffff; }
-        QToolButton#previewToggle { padding: 0 6px; }
-        QToolButton#previewToggle:checked, QToolButton#searchCaseButton:checked { background: #315f8a; color: #ffffff; border-color: #578bc0; }
-        QToolButton#searchCaseButton { color: #9aa4b2; padding: 0; }
-        QLabel#codeReferenceCount { background: #111318; color: #9aa4b2; padding: 0 6px; }
-        QTabWidget::pane { background: #171a1f; border: 1px solid #3a424e; top: -1px; }
-        QTabBar::tab { background: #20252d; color: #aeb7c4; border: 1px solid #343b46; padding: 7px 12px; }
-        QTabBar::tab:selected { background: #2b313b; color: #ffffff; border-bottom-color: #2b313b; }
-        QMenu { background: #20252d; color: #e3e7ee; border: 1px solid #4b5563; padding: 4px; }
-        QMenu::item { padding: 7px 22px 7px 10px; }
-        QMenu::item:selected { background: #3f6693; color: #ffffff; }
-        QMenu::separator { height: 1px; background: #3a424e; margin: 6px 8px; }
-        QToolTip { background: #252a33; color: #f2f4f8; border: 1px solid #687483; padding: 5px; }
-        QStatusBar { background: #171a1f; color: #9aa4b2; }
-        QScrollBar:vertical { background: #111318; width: 14px; margin: 0; }
-        QScrollBar:horizontal { background: #111318; height: 14px; margin: 0; }
-        QScrollBar::handle { background: #3a424e; border-radius: 5px; min-height: 28px; min-width: 28px; }
-        QScrollBar::handle:hover { background: #4b5563; }
-        QScrollBar::add-line, QScrollBar::sub-line { width: 0; height: 0; }
-        QSplitter::handle { background: #343b46; }
-        """
-    )
-
-
-def _game_theme_asset(name: str) -> str:
-    return (Path(__file__).resolve().parents[1] / "assets" / "game_theme" / name).as_posix()
-
-
-def apply_game_style(app: QApplication) -> None:
-    asset = _game_theme_asset
-    app.setProperty("guild2Theme", True)
-    app.setProperty("darkTheme", False)
-    app.setStyleSheet("")
-    app.setStyle("Fusion")
-    palette = app.palette()
-    palette.setColor(QPalette.ColorRole.Window, QColor("#2b2419"))
-    palette.setColor(QPalette.ColorRole.WindowText, QColor("#eadca7"))
-    palette.setColor(QPalette.ColorRole.Base, QColor("#2b2419"))
-    palette.setColor(QPalette.ColorRole.AlternateBase, QColor("#33291c"))
-    palette.setColor(QPalette.ColorRole.ToolTipBase, QColor("#2b2419"))
-    palette.setColor(QPalette.ColorRole.ToolTipText, QColor("#eadca7"))
-    palette.setColor(QPalette.ColorRole.Text, QColor("#eadca7"))
-    palette.setColor(QPalette.ColorRole.Button, QColor("#4a321d"))
-    palette.setColor(QPalette.ColorRole.ButtonText, QColor("#eadca7"))
-    palette.setColor(QPalette.ColorRole.BrightText, QColor("#d4775d"))
-    palette.setColor(QPalette.ColorRole.Link, QColor("#d0ad61"))
-    palette.setColor(QPalette.ColorRole.Highlight, QColor("#876a2f"))
-    palette.setColor(QPalette.ColorRole.HighlightedText, QColor("#fff0b8"))
-    palette.setColor(QPalette.ColorRole.PlaceholderText, QColor("#a99667"))
-    palette.setColor(QPalette.ColorGroup.Disabled, QPalette.ColorRole.Text, QColor("#75684a"))
-    palette.setColor(QPalette.ColorGroup.Disabled, QPalette.ColorRole.ButtonText, QColor("#75684a"))
-    app.setPalette(palette)
-    install_game_theme_style(app)
-    qss = f"""
-        QMainWindow, #root {{ background-color: #2b2419; background-image: url({asset("dark_panel_background_2048.png")}); background-repeat: no-repeat; background-position: top left; border: 4px solid transparent; border-image: url({asset("Border_4px_4.png")}) 4 4 4 4 stretch stretch; }}
-        #titlebar {{ background-color: #4a1e12; min-height: 42px; }}
-        #workspaceTitle {{ color: #e1c777; font-size: 18px; font-weight: 900; letter-spacing: 1px; }}
-        #workspaceSubtitle {{ color: #b89a57; font-size: 10px; font-weight: 800; letter-spacing: 2px; }}
-        #toolbar {{ background-color: #2b2419; background-image: url({asset("dark_panel_background_2048.png")}); background-repeat: no-repeat; border: 4px solid transparent; border-image: url({asset("Border_4px_4.png")}) 4 4 4 4 stretch stretch; padding: 2px; }}
-        #toolbar QLabel {{ font-weight: 800; }}
-        #counts, #issues, #hint {{ background: transparent; color: #eadca7; }}
-        #counts {{ border-image: url({asset("Border_4px_4.png")}) 4 4 4 4 stretch stretch; padding: 5px 8px; font-weight: 800; }}
-        QPushButton#reviewAttention {{ background: #8f2f20; color: #f3dfa0; border: 2px solid #c49b55; padding: 5px 10px; font-weight: 900; }}
-        QPushButton#reviewAttention:hover {{ background: #b0442c; }}
-        #issues {{ border-image: url({asset("Border_4px_4.png")}) 4 4 4 4 stretch stretch; padding: 8px 10px; font-weight: 600; }}
-        #tablePanel, #editorPanel {{ background-color: #2b2419; background-image: url({asset("dark_panel_background_2048.png")}); background-repeat: no-repeat; border: 0px; }}
-        #editorPanel {{ margin-top: 10px; }}
-        #editorPanel QPlainTextEdit {{ background-color: #211a12; background-image: url({asset("dark_panel_background_2048.png")}); background-repeat: no-repeat; color: #d8c68f; selection-background-color: #6c4d25; selection-color: #ead79a; padding: 10px; }}
-        QSplitter::handle {{ background: #806537; }}
-        QDialog {{ background-color: #2b2419; background-image: url({asset("dark_panel_background_2048.png")}); background-repeat: no-repeat; }}
-        #projectManagerSummary, #sourceSyncConfirmTitle {{ color: #e1c777; font-size: 16px; font-weight: 900; }}
-        #projectManagerGameRoot, #sourceSyncConfirmEntries {{ color: #bda86f; font-weight: 700; }}
-        #projectManagerRow {{ background-color: #241d14; border: 4px solid transparent; border-image: url({asset("Border_4px_4.png")}) 4 4 4 4 stretch stretch; }}
-        #projectManagerName, #sourceSyncConfirmSummary {{ color: #eadca7; font-weight: 900; }}
-        #projectManagerPath {{ color: #c8b77f; }}
-        #sourceSyncDetails {{ background-color: #17130e; color: #d8c68f; border: 4px solid transparent; border-image: url({asset("Border_4px_4.png")}) 4 4 4 4 stretch stretch; padding: 8px; }}
-        QGroupBox {{ background: transparent; border: 0px; margin-top: 14px; padding-top: 8px; font-weight: 900; color: #eadca7; }}
-        QGroupBox::title {{ subcontrol-origin: margin; subcontrol-position: top left; left: 12px; padding: 0 6px; background: #33291c; color: #d8c68f; }}
-        QAbstractScrollArea {{ background: transparent; }}
-        QTableView, QListWidget, QPlainTextEdit, QTextEdit, QTextBrowser {{ background: transparent; border: 0px; selection-background-color: #735727; selection-color: #fff0b8; }}
-        QTableView::viewport, QListWidget::viewport, QAbstractScrollArea > QWidget {{ background: transparent; }}
-        QTableView::item {{ background: transparent; border-bottom: 1px solid #5a4526; padding: 2px 4px; }}
-        QTableView::item:selected, QListWidget::item:selected {{ background: #735727; color: #fff0b8; }}
-        QHeaderView::section {{ background-color: #4a1e12; background-image: url({asset("header_middle.png")}); background-repeat: repeat-x; color: #d8c68f; border-right: 1px solid #9d7a36; border-bottom: 2px solid #c4a258; padding: 8px; font-weight: 900; }}
-        QLineEdit {{ background: #0d0b08; color: #d8c68f; padding: 5px 7px; min-height: 20px; font-weight: 600; }}
-        QComboBox QAbstractItemView {{ background: #2b2419; color: #d8c68f; selection-background-color: #735727; selection-color: #ead79a; }}
-        QTabWidget, QTabWidget > QWidget {{ background: transparent; }}
-        QTabWidget::pane {{ background: transparent; border: 2px solid #806537; top: -1px; }}
-        QScrollBar:vertical {{ background: #1b1510; width: 18px; margin: 18px 0 18px 0; }}
-        QScrollBar:horizontal {{ background: #1b1510; height: 18px; margin: 0 18px 0 18px; }}
-        QStatusBar {{ background: #2b2419; color: #eadca7; font-weight: 700; }}
-        QMenu, QToolTip {{ background-color: #2b2419; color: #eadca7; border: 2px solid #806537; padding: 4px; }}
-        QMenu::item {{ padding: 7px 22px 7px 10px; font-weight: 700; }}
-        QMenu::item:selected {{ background: #735727; color: #fff0b8; }}
-        """
-    app.setProperty("gameThemeQss", qss)
-    app.setStyleSheet("")
+    apply_interface_style(app, "dark")
 
 
 def apply_theme(app: QApplication | None, theme: str) -> None:
     if app is None:
         return
-    if theme == "guild2":
-        apply_game_style(app)
-    elif theme == "dark":
+    if theme == "dark":
         apply_dark_style(app)
     else:
         apply_modern_style(app)
@@ -9658,11 +9572,13 @@ def main() -> None:
     configure_diagnostics()
     startup_started = time.perf_counter()
     try:
+        startup_settings = load_settings()
+        configure_interface_scale(startup_settings.ui_scale_percent)
         app = QApplication([])
         app.setApplicationName("The Guild 2 Translator")
         if APP_ICON_PATH.exists():
             app.setWindowIcon(QIcon(str(APP_ICON_PATH)))
-        apply_theme(app, load_settings().ui_theme)
+        apply_theme(app, startup_settings.ui_theme)
         window = TranslatorWindow()
         log_metrics("startup_window_ready", total_ms=(time.perf_counter() - startup_started) * 1000)
         if APP_ICON_PATH.exists():
